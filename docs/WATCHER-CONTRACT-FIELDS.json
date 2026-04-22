@@ -1,0 +1,72 @@
+{
+  "WatcherBridgeRequiredFields": [
+    "Status",
+    "MutexName",
+    "StatusFileState",
+    "StatusFileUpdatedAt",
+    "HeartbeatAt",
+    "HeartbeatAgeSeconds",
+    "StatusSequence",
+    "ProcessStartedAt",
+    "StatusReason",
+    "StopCategory",
+    "ForwardedCount",
+    "ConfiguredMaxForwardCount",
+    "StatusRequestId",
+    "StatusAction",
+    "LastHandledRequestId",
+    "LastHandledAction",
+    "LastHandledResult",
+    "LastHandledAt",
+    "StatusExists",
+    "StatusParseError",
+    "StatusLastWriteAt",
+    "StatusAgeSeconds",
+    "StatusPath",
+    "ControlExists",
+    "ControlParseError",
+    "ControlLastWriteAt",
+    "ControlRequestedAt",
+    "ControlAgeSeconds",
+    "ControlPendingAction",
+    "ControlPendingRequestId",
+    "ControlPath"
+  ],
+  "WatcherBridgeIsoTimestampFields": [
+    "StatusFileUpdatedAt",
+    "HeartbeatAt",
+    "ProcessStartedAt",
+    "LastHandledAt",
+    "StatusLastWriteAt",
+    "ControlLastWriteAt",
+    "ControlRequestedAt"
+  ],
+  "WatcherBridgeDerivedFields": [
+    "Status",
+    "HeartbeatAgeSeconds",
+    "StatusAgeSeconds",
+    "ControlAgeSeconds",
+    "StopCategory",
+    "ForwardedCount",
+    "ConfiguredMaxForwardCount"
+  ],
+  "WatcherAuditRequiredFields": [
+    "ActionId",
+    "Timestamp",
+    "Action",
+    "RunRoot",
+    "RunRootHash",
+    "RequestedBy",
+    "Ok",
+    "State",
+    "Message",
+    "RequestId",
+    "ReasonCodes",
+    "WarningCodes"
+  ],
+  "WatcherAuditPolicy": {
+    "MaxBytes": 524288,
+    "MaxArchives": 5,
+    "RetentionDays": 14
+  }
+}

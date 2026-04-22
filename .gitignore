@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Local environment files
+.env
+.env.*
+
+# Runtime and generated artifacts
+_tmp/
+.tmp-smoke/
+logs/
+runtime/
+inbox/
+processed/
+failed/
+retry-pending/
+pair-test/
+reviewfile/
+evidence/
