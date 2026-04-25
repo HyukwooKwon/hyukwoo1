@@ -65,9 +65,31 @@
         StatePath = 'C:\dev\python\hyukwoo\hyukwoo1\runtime\pair-activation\bottest-live-visible.json'
     }
     DefaultFixedSuffix = '여기에 고정문구 입력'
-    SendTimeoutMs = 5000
+    SendTimeoutMs = 5000
+
+    ActivateSettleMs = 250
+
+    TextSettleMs = 2200
+
+    TextSettlePerKbMs = 350
+
+    TextSettleMaxMs = 5000
+
+    EnterDelayMs = 900
+
+    PostSubmitDelayMs = 900
+
+    SubmitRetryIntervalMs = 1800
     WindowLookupRetryCount = 1
-    LauncherWrapperPath = 'C:\Users\USER\s_8windows_left_monitor_codex_visible.py'
+    LauncherWrapperPath = 'C:\Users\USER\s_8windows_left_monitor_codex_visible.py'
+    WindowLaunch = @{
+        LauncherMode = 'wrapper'
+        ReuseMode = 'attach-only'
+        DirectStartAllowed = $false
+        AllowReplaceExisting = $false
+        DirectStartAllowEnvVar = 'RELAY_ALLOW_DIRECT_START_TARGETS_BOTTEST_LIVE_VISIBLE'
+        ReplaceExistingAllowEnvVar = 'RELAY_ALLOW_REPLACE_EXISTING_BOTTEST_LIVE_VISIBLE'
+    }
     RetryDelayMs = 1000
     AhkExePath = 'C:\Program Files\AutoHotkey\v2\AutoHotkey64.exe'
     RuntimeRoot = 'C:\dev\python\hyukwoo\hyukwoo1\runtime\bottest-live-visible'
@@ -94,8 +116,16 @@
     RouterLogPath = 'C:\dev\python\hyukwoo\hyukwoo1\logs\bottest-live-visible\router.log'
     FailedRoot = 'C:\dev\python\hyukwoo\hyukwoo1\failed\bottest-live-visible'
     ShellPath = 'powershell.exe'
-    PairTest = @{
-        ReviewZipPattern = 'review_{TargetId}_{yyyyMMdd_HHmmss}_{Guid}.zip'
+    PairTest = @{
+        ExecutionPathMode = 'visible-worker'
+        AcceptanceProfile = 'smoke'
+        SmokeSeedTaskText = @'
+현재 run은 acceptance smoke 테스트입니다.
+실제 프로젝트 전반을 깊게 수정하려 하지 말고, 현재 run 계약만 만족하는 최소 산출물만 만드세요.
+summary.txt 에는 간단한 smoke 결과 2~4줄만 적고, review.zip 에는 smoke-note.txt 1개만 포함해도 됩니다.
+상대가 handoff를 받더라도 같은 원칙으로 최소 산출물만 이어서 생성하세요.
+'@
+        ReviewZipPattern = 'review_{TargetId}_{yyyyMMdd_HHmmss}_{Guid}.zip'
         RunRootPattern = 'run_{yyyyMMdd_HHmmss}'
         MessageTemplates = @{
             Handoff = @{
@@ -162,10 +192,116 @@
             PromptFileName = 'headless-prompt.txt'
             OutputLastMessageFileName = 'codex-last-message.txt'
             DoneFileName = 'done.json'
-            MaxRunSeconds = 900
+            MaxRunSeconds = 1800
             ErrorFileName = 'error.json'
         }
-        TargetOverrides = @{
+        VisibleWorker = @{
+
+            Enabled = $true
+
+            QueueRoot = 'C:\dev\python\hyukwoo\hyukwoo1\runtime\bottest-live-visible\visible-worker\queue'
+
+            StatusRoot = 'C:\dev\python\hyukwoo\hyukwoo1\runtime\bottest-live-visible\visible-worker\status'
+
+            LogRoot = 'C:\dev\python\hyukwoo\hyukwoo1\runtime\bottest-live-visible\visible-worker\logs'
+
+            PollIntervalMs = 500
+
+            IdleExitSeconds = 90
+
+            CommandTimeoutSeconds = 1860
+
+            DispatchTimeoutSeconds = 1860
+
+            PreflightTimeoutSeconds = 180
+
+            WorkerReadyFreshnessSeconds = 30
+
+            DispatchAcceptedStaleSeconds = 15
+
+            DispatchRunningStaleSeconds = 30
+
+            AcceptanceSeedSoftTimeoutSeconds = 120
+
+        }
+
+        PairDefinitions = @(
+
+            @{
+                PairId = 'pair01'
+                TopTargetId = 'target01'
+                BottomTargetId = 'target05'
+                SeedTargetId = 'target01'
+            }
+
+            @{
+                PairId = 'pair02'
+                TopTargetId = 'target02'
+                BottomTargetId = 'target06'
+                SeedTargetId = 'target02'
+            }
+
+            @{
+                PairId = 'pair03'
+                TopTargetId = 'target03'
+                BottomTargetId = 'target07'
+                SeedTargetId = 'target03'
+            }
+
+            @{
+                PairId = 'pair04'
+                TopTargetId = 'target04'
+                BottomTargetId = 'target08'
+                SeedTargetId = 'target04'
+            }
+
+        )
+
+        DefaultWatcherMaxForwardCount = 0
+
+        DefaultWatcherRunDurationSec = 900
+
+        DefaultPairMaxRoundtripCount = 0
+
+        DefaultPublishContractMode = 'strict'
+
+        DefaultRecoveryPolicy = 'manual-review'
+
+        DefaultPauseAllowed = $true
+
+        PairPolicies = @{
+
+            pair01 = @{
+                DefaultSeedTargetId = 'target01'
+                PublishContractMode = 'strict'
+                RecoveryPolicy = 'manual-review'
+                PauseAllowed = $true
+            }
+
+            pair02 = @{
+                DefaultSeedTargetId = 'target02'
+                PublishContractMode = 'strict'
+                RecoveryPolicy = 'manual-review'
+                PauseAllowed = $true
+            }
+
+            pair03 = @{
+                DefaultSeedTargetId = 'target03'
+                PublishContractMode = 'strict'
+                RecoveryPolicy = 'manual-review'
+                PauseAllowed = $true
+            }
+
+            pair04 = @{
+                DefaultSeedTargetId = 'target04'
+                PublishContractMode = 'strict'
+                RecoveryPolicy = 'manual-review'
+                PauseAllowed = $true
+            }
+
+        }
+
+        TargetOverrides = @{
             target04 = @{
                 InitialExtraBlocks = @(
                     'target04는 pair04 상단 시작 target입니다.'

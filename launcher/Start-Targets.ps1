@@ -13,6 +13,92 @@ if ([string]::IsNullOrWhiteSpace($ConfigPath)) {
 }
 
 . (Join-Path $PSScriptRoot '..\router\RuntimeMap.ps1')
+. (Join-Path $PSScriptRoot 'WindowDiscovery.ps1')
+
+function Test-NonEmptyString {
+    param([object]$Value)
+
+    return ($Value -is [string] -and -not [string]::IsNullOrWhiteSpace($Value))
+}
+
+function Get-EnvironmentFlagValue {
+    param([Parameter(Mandatory)][string]$Name)
+
+    foreach ($scope in @('Process', 'User', 'Machine')) {
+        $value = [Environment]::GetEnvironmentVariable($Name, $scope)
+        if (-not [string]::IsNullOrWhiteSpace($value)) {
+            return [string]$value
+        }
+    }
+
+    return ''
+}
+
+function ConvertTo-EnvironmentToken {
+    param([Parameter(Mandatory)][string]$Value)
+
+    $normalized = ([string]$Value).ToUpperInvariant() -replace '[^A-Z0-9]+', '_'
+    $normalized = $normalized.Trim('_')
+    if (-not (Test-NonEmptyString $normalized)) {
+        return 'WRAPPER_MANAGED'
+    }
+
+    return $normalized
+}
+
+function Get-WrapperManagedLanePolicy {
+    param([Parameter(Mandatory)][string]$ResolvedConfigPath)
+
+    $configDoc = Import-PowerShellDataFile -Path $ResolvedConfigPath
+    $launcherWrapperPath = if ($configDoc.ContainsKey('LauncherWrapperPath')) { [string]$configDoc.LauncherWrapperPath } else { '' }
+    if (-not (Test-NonEmptyString $launcherWrapperPath)) {
+        return [pscustomobject]@{
+            WrapperManaged            = $false
+            LaneName                  = if ($configDoc.ContainsKey('LaneName')) { [string]$configDoc.LaneName } else { '' }
+            LauncherWrapperPath       = ''
+            DirectStartAllowed        = $true
+            AllowReplaceExisting      = $true
+            DirectStartAllowEnvVar    = ''
+            ReplaceExistingAllowEnvVar = ''
+        }
+    }
+
+    $laneName = if ($configDoc.ContainsKey('LaneName')) { [string]$configDoc.LaneName } else { '' }
+    $windowLaunch = if ($configDoc.ContainsKey('WindowLaunch')) { $configDoc.WindowLaunch } else { @{} }
+    $laneToken = ConvertTo-EnvironmentToken -Value $laneName
+    $directStartAllowEnvVar = if ($windowLaunch.ContainsKey('DirectStartAllowEnvVar')) { [string]$windowLaunch.DirectStartAllowEnvVar } else { ('RELAY_ALLOW_DIRECT_START_TARGETS_' + $laneToken) }
+    $replaceExistingAllowEnvVar = if ($windowLaunch.ContainsKey('ReplaceExistingAllowEnvVar')) { [string]$windowLaunch.ReplaceExistingAllowEnvVar } else { ('RELAY_ALLOW_REPLACE_EXISTING_' + $laneToken) }
+
+    return [pscustomobject]@{
+        WrapperManaged             = $true
+        LaneName                   = $laneName
+        LauncherWrapperPath        = $launcherWrapperPath
+        DirectStartAllowed         = [bool]$(if ($windowLaunch.ContainsKey('DirectStartAllowed')) { $windowLaunch.DirectStartAllowed } else { $false })
+        AllowReplaceExisting       = [bool]$(if ($windowLaunch.ContainsKey('AllowReplaceExisting')) { $windowLaunch.AllowReplaceExisting } else { $false })
+        DirectStartAllowEnvVar     = $directStartAllowEnvVar
+        ReplaceExistingAllowEnvVar = $replaceExistingAllowEnvVar
+    }
+}
+
+function Assert-WrapperManagedLaneDirectLaunchAllowed {
+    param([Parameter(Mandatory)]$Policy)
+
+    if (-not [bool]$Policy.WrapperManaged) {
+        return
+    }
+
+    if (-not [bool]$Policy.DirectStartAllowed) {
+        throw ("Direct Start-Targets is blocked for wrapper-managed lanes. Use the UI '8창 열기' action or LauncherWrapperPath instead: {0}. This lane only allows attach-only reuse." -f [string]$Policy.LauncherWrapperPath)
+    }
+
+    $allowFlagName = [string]$Policy.DirectStartAllowEnvVar
+    $allowFlagValue = Get-EnvironmentFlagValue -Name $allowFlagName
+    if ($allowFlagValue -eq '1') {
+        return
+    }
+
+    throw ("Direct Start-Targets requires wrapper-managed maintenance unlock. Use the UI '8창 열기' action or LauncherWrapperPath instead: {0}. Set {1}=1 only when the lane explicitly allows direct launch." -f [string]$Policy.LauncherWrapperPath, $allowFlagName)
+}
 
 function ConvertTo-EncodedCommand {
     param([Parameter(Mandatory)][string]$CommandText)
@@ -25,77 +111,6 @@ function ConvertTo-SingleQuotedLiteral {
     param([Parameter(Mandatory)][string]$Value)
 
     return ($Value -replace "'", "''")
-}
-
-function Ensure-WindowApiType {
-    if ('Relay.WindowApi' -as [type]) {
-        return
-    }
-
-    Add-Type @'
-using System;
-using System.Text;
-using System.Runtime.InteropServices;
-
-namespace Relay {
-    public static class WindowApi {
-        public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
-
-        [DllImport("user32.dll")]
-        public static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
-
-        [DllImport("user32.dll")]
-        public static extern bool IsWindowVisible(IntPtr hWnd);
-
-        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
-        public static extern int GetWindowText(IntPtr hWnd, StringBuilder text, int maxCount);
-
-        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
-        public static extern int GetClassName(IntPtr hWnd, StringBuilder className, int maxCount);
-
-        [DllImport("user32.dll")]
-        public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
-    }
-}
-'@
-}
-
-function Get-VisibleWindows {
-    Ensure-WindowApiType
-
-    $windows = New-Object System.Collections.Generic.List[object]
-    [Relay.WindowApi]::EnumWindows({
-        param($hWnd, $lParam)
-
-        if (-not [Relay.WindowApi]::IsWindowVisible($hWnd)) {
-            return $true
-        }
-
-        $windowProcessId = 0
-        [Relay.WindowApi]::GetWindowThreadProcessId($hWnd, [ref]$windowProcessId) | Out-Null
-
-        $sb = [System.Text.StringBuilder]::new(1024)
-        [Relay.WindowApi]::GetWindowText($hWnd, $sb, $sb.Capacity) | Out-Null
-        $title = $sb.ToString()
-
-        if ([string]::IsNullOrWhiteSpace($title)) {
-            return $true
-        }
-
-        $classNameSb = [System.Text.StringBuilder]::new(256)
-        [Relay.WindowApi]::GetClassName($hWnd, $classNameSb, $classNameSb.Capacity) | Out-Null
-
-        $windows.Add([pscustomobject]@{
-            Hwnd      = $hWnd.ToInt64()
-            ProcessId = [int]$windowProcessId
-            Title     = $title
-            ClassName = $classNameSb.ToString()
-        })
-
-        return $true
-    }, [IntPtr]::Zero) | Out-Null
-
-    return $windows
 }
 
 function Wait-ForWindowByTitle {
@@ -159,19 +174,6 @@ function Get-ProcessCommandLine {
     catch {
         return ''
     }
-}
-
-function Get-EnvironmentFlagValue {
-    param([Parameter(Mandatory)][string]$Name)
-
-    foreach ($scope in @('Process', 'User', 'Machine')) {
-        $value = [Environment]::GetEnvironmentVariable($Name, $scope)
-        if (-not [string]::IsNullOrWhiteSpace($value)) {
-            return [string]$value
-        }
-    }
-
-    return ''
 }
 
 function Write-UnsafeRelaunchAuditLog {
@@ -368,7 +370,10 @@ function Stop-TargetProcessSet {
     }
 }
 
-$config = Import-PowerShellDataFile -Path $ConfigPath
+$resolvedConfigPath = (Resolve-Path -LiteralPath $ConfigPath).Path
+$wrapperManagedLanePolicy = Get-WrapperManagedLanePolicy -ResolvedConfigPath $resolvedConfigPath
+Assert-WrapperManagedLaneDirectLaunchAllowed -Policy $wrapperManagedLanePolicy
+$config = Import-PowerShellDataFile -Path $resolvedConfigPath
 $launcherSessionId = [guid]::NewGuid().ToString('N')
 $launchedAt = (Get-Date).ToString('o')
 $launcherPid = $PID
@@ -378,8 +383,20 @@ foreach ($path in @($config.RuntimeRoot, $config.LogsRoot)) {
 }
 
 if ($ReplaceExisting) {
+    if ([bool]$wrapperManagedLanePolicy.WrapperManaged -and -not [bool]$wrapperManagedLanePolicy.AllowReplaceExisting) {
+        throw ("ReplaceExisting is blocked for wrapper-managed lanes. Use the UI '8창 열기' path instead: {0}. This shared lane only allows attach-only reuse." -f [string]$wrapperManagedLanePolicy.LauncherWrapperPath)
+    }
+
     if (-not $UnsafeForceKillManagedTargets) {
         throw 'ReplaceExisting requires -UnsafeForceKillManagedTargets. Prefer ensure-targets.ps1 or attach-targets.ps1 on shared machines.'
+    }
+
+    $replaceExistingAllowFlagName = if ([bool]$wrapperManagedLanePolicy.WrapperManaged) { [string]$wrapperManagedLanePolicy.ReplaceExistingAllowEnvVar } else { '' }
+    if (Test-NonEmptyString $replaceExistingAllowFlagName) {
+        $replaceExistingAllowFlagValue = Get-EnvironmentFlagValue -Name $replaceExistingAllowFlagName
+        if ($replaceExistingAllowFlagValue -ne '1') {
+            throw ("ReplaceExisting requires {0}=1 because this lane is wrapper-managed." -f $replaceExistingAllowFlagName)
+        }
     }
 
     $unsafeForceKillFlagName = 'RELAY_ALLOW_UNSAFE_FORCE_KILL'
@@ -392,7 +409,7 @@ if ($ReplaceExisting) {
     Write-UnsafeRelaunchAuditLog `
         -Path $unsafeForceKillAuditLogPath `
         -Root ([string]$config.Root) `
-        -ConfigPath $ConfigPath `
+        -ConfigPath $resolvedConfigPath `
         -LauncherSessionId $launcherSessionId `
         -LauncherPid $launcherPid `
         -Targets $config.Targets `
@@ -429,7 +446,9 @@ foreach ($target in $config.Targets) {
         '-RootPath',
         ([string]$config.Root),
         '-ManagedMarker',
-        $managedMarker
+        $managedMarker,
+        '-ConfigPath',
+        $resolvedConfigPath
     ) -PassThru
 
     $resolution = Resolve-WindowForTarget `

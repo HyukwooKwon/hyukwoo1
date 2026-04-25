@@ -15,6 +15,21 @@ function Test-NonEmptyString {
     return ($Value -is [string] -and -not [string]::IsNullOrWhiteSpace($Value))
 }
 
+function Get-ConfigIntValue {
+    param(
+        [Parameter(Mandatory)]$Config,
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)][int]$DefaultValue
+    )
+
+    $property = $Config.PSObject.Properties[$Name]
+    if ($null -eq $property -or $null -eq $property.Value) {
+        return $DefaultValue
+    }
+
+    return [int]$property.Value
+}
+
 function Test-HasSendLocator {
     param([Parameter(Mandatory)]$RuntimeEntry)
 
@@ -142,6 +157,11 @@ else {
     ,$runtimeParsed
 }
 $runtimeById = Assert-RuntimeMapContract -RuntimeItems $runtime -ConfigTargets $config.Targets
+$activateSettleMs = Get-ConfigIntValue -Config $config -Name 'ActivateSettleMs' -DefaultValue 120
+$textSettleMs = Get-ConfigIntValue -Config $config -Name 'TextSettleMs' -DefaultValue 400
+$enterDelayMs = Get-ConfigIntValue -Config $config -Name 'EnterDelayMs' -DefaultValue 150
+$postSubmitDelayMs = Get-ConfigIntValue -Config $config -Name 'PostSubmitDelayMs' -DefaultValue 150
+$submitRetryIntervalMs = Get-ConfigIntValue -Config $config -Name 'SubmitRetryIntervalMs' -DefaultValue 1000
 
 $results = @()
 
@@ -171,7 +191,12 @@ foreach ($targetConfig in $config.Targets | Sort-Object Id) {
             '--resolverShell', [string]$config.ResolverShellPath,
             '--file', $payloadPath,
             '--enter', [string]$enterCount,
-            '--timeoutMs', [string]$config.SendTimeoutMs
+            '--timeoutMs', [string]$config.SendTimeoutMs,
+            '--activateSettleMs', [string]$activateSettleMs,
+            '--textSettleMs', [string]$textSettleMs,
+            '--enterDelayMs', [string]$enterDelayMs,
+            '--postSubmitDelayMs', [string]$postSubmitDelayMs,
+            '--submitRetryIntervalMs', [string]$submitRetryIntervalMs
         ) -Wait -PassThru
 
         $result = if ($proc.ExitCode -eq 0) { 'ok' } else { 'failed' }

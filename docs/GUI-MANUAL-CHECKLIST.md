@@ -95,13 +95,31 @@
 ### 11. live acceptance smoke 결과 확인
 
 1. shared `bottest-live-visible` lane에서 active acceptance를 돌릴 때는 먼저 조용한 시점인지 확인한다. 이미 다른 입력 흐름이 돌고 있으면 active acceptance를 새로 시작하지 않는다.
-2. active acceptance를 실제로 돌릴 수 있는 시점이면 CLI에서 `tests\Run-LiveVisiblePairAcceptance.ps1`를 새 RunRoot로 실행한다.
-3. 실행 후에는 `tests\Confirm-SharedVisiblePairAcceptance.ps1 -RequireVisibleReceipt`로 같은 RunRoot를 재검증한다.
-4. `.state\live-acceptance-result.json`의 `Stage=completed`, `Outcome.AcceptanceState=roundtrip-confirmed`를 확인한다.
-5. `Seed.FinalState=publish-detected`, `Seed.OutboxPublished=true`를 확인한다.
-6. `Outcome.Diagnostics.Seed.SourceOutboxState=imported`, `Outcome.Diagnostics.Partner.SourceOutboxState=imported`를 확인한다.
-7. 실패 시에는 receipt의 `Outcome.AcceptanceReason`부터 보고, 이어서 `router.log`, `ahk-debug`, `.state\source-outbox-status.json` 순으로 확인한다.
-8. active acceptance를 새로 돌릴 수 없는 shared 시점이면, 기존 successful RunRoot에 대해서는 `tests\Confirm-SharedVisiblePairAcceptance.ps1`만 실행해서 passive 판정만 확인한다. 이 경우 visible acceptance 완료로 간주하지 않고 `shared visible deferred`로 기록한다.
+2. active acceptance를 실제로 돌릴 수 있는 시점이면 먼저 `visible\Cleanup-VisibleWorkerQueue.ps1` dry-run과 actual apply를 실행하고, 이어서 `tests\Run-LiveVisiblePairAcceptance.ps1 -PreflightOnly`가 clean pass인지 확인한다.
+3. clean pass가 확인되면 CLI에서 `tests\Run-LiveVisiblePairAcceptance.ps1`를 새 RunRoot로 실행한다.
+4. 실행 후에는 `tests\Confirm-SharedVisiblePairAcceptance.ps1 -RequireVisibleReceipt`로 같은 RunRoot를 재검증한다.
+5. `.state\live-acceptance-result.json`의 `Stage=completed`, `Outcome.AcceptanceState=roundtrip-confirmed`를 확인한다.
+6. `tests\Show-PairedExchangeStatus.ps1 -AsJson` 기준 `Counts.ForwardedStateCount=2`, `Counts.DonePresentCount=2`, `Counts.ErrorPresentCount=0`인지 확인한다.
+7. visible worker run에서는 `Seed.FinalState=submit-unconfirmed`가 남아도, 최종 `summary/review.zip/publish.ready.json`과 `ForwardedStateCount`가 채워졌으면 성공으로 본다.
+8. 여기까지는 `2-forward acceptance`다. `4-forward closeout`과 혼동하지 않는다.
+9. 실패 시에는 receipt의 `Outcome.AcceptanceReason`부터 보고, 이어서 `worker status`, `.state\source-outbox-status.json`, `headless-dispatch stderr` 순으로 확인한다.
+10. active acceptance가 끝나면 다시 cleanup apply 후 `-PreflightOnly` clean pass로 lane이 비었는지 재확인한다.
+11. active acceptance를 새로 돌릴 수 없는 shared 시점이면, 기존 successful RunRoot에 대해서는 `tests\Confirm-SharedVisiblePairAcceptance.ps1`만 실행해서 passive 판정만 확인한다. 이 경우 visible acceptance 완료로 간주하지 않고 `shared visible deferred`로 기록한다.
+12. shared lane active acceptance에서는 공식 `BotTestLive-Window-01`~`08`만 사용한다. `Fresh-*`, `Surrogate-*`, `Candidate-*` 같은 ad-hoc 임시 창이 보이면 먼저 정리하고 시작한다.
+13. clean preflight recheck 뒤 latest receipt current state가 `preflight-passed`로 보이더라도, runroot summary와 receipt-required confirm은 `PhaseHistory`의 마지막 성공 acceptance를 읽어 계속 `overall=success`를 유지해야 한다.
+
+### 11-1. visible pair 정식 경로
+
+1. visible pair 자동화의 정식 경로는 `visible worker queue -> Invoke-CodexExecTurn -> source-outbox publish -> watcher handoff` 입니다.
+2. `router/AHK typed REPL` 경로는 manual smoke / fallback 전용으로만 사용합니다.
+
+### 11-2. 연속 왕복 확인
+
+1. `target01` seed 1건만 넣고, CLI에서 `tests\Run-LiveVisiblePairAcceptance.ps1 -WatcherMaxForwardCount 4 -KeepWatcherRunning`으로 실행한다.
+2. acceptance receipt가 `roundtrip-confirmed`를 반환한 뒤에도 watcher는 계속 돌 수 있으므로, `tests\Show-PairedExchangeStatus.ps1 -AsJson`로 `Counts.ForwardedStateCount=4`를 확인한다.
+3. 연속 왕복 성공 기준은 `Counts.ForwardedStateCount=4`, `Counts.DonePresentCount=2`, `Counts.ErrorPresentCount=0` 이다.
+4. receipt에서는 `Outcome`가 acceptance 결과, `Closeout`가 연속 왕복 결과를 따로 보여준다.
+5. 확인 후에는 cleanup apply와 `-PreflightOnly`로 lane clean pass를 다시 남긴다.
 
 ### 12. runroot summary helper 빠른 점검
 
@@ -129,5 +147,6 @@
 - `열린 pair 재사용`에서는 active pair만 `2/2`, `4/4`, `6/6`처럼 session scope 기준으로 보인다.
 - live pair01 왕복에서는 `target01 -> target05 -> target01` handoff 파일과 양쪽 `source-outbox` publish가 모두 확인된다.
 - live acceptance smoke에서는 receipt 기준으로 `completed / roundtrip-confirmed`가 확인된다.
+- clean preflight recheck 뒤에도 runroot summary와 receipt-required confirm이 `PhaseHistory` precedence 덕분에 계속 `overall=success`를 유지한다.
 - shared lane에서 active acceptance를 생략한 경우에는 `tests\Confirm-SharedVisiblePairAcceptance.ps1` 결과가 `overall=success`, `mode=passive-runroot-verification`으로만 남고, visible receipt 요구는 deferred로 기록된다.
 - runroot summary helper에서도 동일 runroot가 `overall=success`로 요약된다.

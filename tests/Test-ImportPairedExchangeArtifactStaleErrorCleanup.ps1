@@ -120,8 +120,18 @@ $cases = @(
         ShouldRemoveErrorFile = $true
     },
     [pscustomobject]@{
+        Label                 = 'matching-timeout'
+        ErrorContentKind      = 'json-timeout'
+        ShouldRemoveErrorFile = $true
+    },
+    [pscustomobject]@{
         Label                 = 'unrelated'
         ErrorContentKind      = 'json-other-path'
+        ShouldRemoveErrorFile = $false
+    },
+    [pscustomobject]@{
+        Label                 = 'summary-path-only-match'
+        ErrorContentKind      = 'json-summary-only-match'
         ShouldRemoveErrorFile = $false
     },
     [pscustomobject]@{
@@ -140,6 +150,7 @@ foreach ($case in $cases) {
     $requestPath = Join-Path $targetRoot 'request.json'
     $summaryPath = Join-Path $targetRoot 'summary.txt'
     $errorPath = Join-Path $targetRoot 'error.json'
+    $publishReadyPath = Join-Path $targetRoot 'source-outbox\publish.ready.json'
 
     switch ([string]$case.ErrorContentKind) {
         'json' {
@@ -150,6 +161,18 @@ foreach ($case in $cases) {
                     SummaryPath      = $summaryPath
                     SourceSummaryPath = [string]$source.SummaryPath
                     SourceReviewZipPath = [string]$source.ZipPath
+                    PublishReadyPath = $publishReadyPath
+                } | ConvertTo-Json -Depth 6) | Set-Content -LiteralPath $errorPath -Encoding UTF8
+        }
+        'json-timeout' {
+            ([ordered]@{
+                    FailedAt         = (Get-Date).AddMinutes(-10).ToString('o')
+                    Reason           = 'codex-exec-timeout'
+                    RequestPath      = $requestPath
+                    SummaryPath      = $summaryPath
+                    SourceSummaryPath = [string]$source.SummaryPath
+                    SourceReviewZipPath = [string]$source.ZipPath
+                    PublishReadyPath = $publishReadyPath
                 } | ConvertTo-Json -Depth 6) | Set-Content -LiteralPath $errorPath -Encoding UTF8
         }
         'json-other-path' {
@@ -160,6 +183,18 @@ foreach ($case in $cases) {
                     SummaryPath      = (Join-Path $targetRoot 'summary-other.txt')
                     SourceSummaryPath = (Join-Path $sourceRoot 'other-summary.txt')
                     SourceReviewZipPath = (Join-Path $sourceRoot 'other-review.zip')
+                    PublishReadyPath = (Join-Path $sourceRoot 'other-publish.ready.json')
+                } | ConvertTo-Json -Depth 6) | Set-Content -LiteralPath $errorPath -Encoding UTF8
+        }
+        'json-summary-only-match' {
+            ([ordered]@{
+                    FailedAt         = (Get-Date).AddMinutes(-10).ToString('o')
+                    Reason           = 'summary-missing-after-exec'
+                    RequestPath      = (Join-Path $targetRoot 'request-other.json')
+                    SummaryPath      = $summaryPath
+                    SourceSummaryPath = (Join-Path $sourceRoot 'other-summary.txt')
+                    SourceReviewZipPath = (Join-Path $sourceRoot 'other-review.zip')
+                    PublishReadyPath = (Join-Path $sourceRoot 'other-publish.ready.json')
                 } | ConvertTo-Json -Depth 6) | Set-Content -LiteralPath $errorPath -Encoding UTF8
         }
         'malformed-json' {

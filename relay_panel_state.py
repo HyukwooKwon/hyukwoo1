@@ -17,6 +17,19 @@ from relay_panel_models import (
 
 
 class DashboardAggregator:
+    PAIR_PHASE_CANONICAL = {
+        "seed-running": "seed-running",
+        "partner-running": "partner-running",
+        "waiting-partner-handoff": "waiting-partner-handoff",
+        "waiting-handoff": "waiting-partner-handoff",
+        "waiting-return": "waiting-return",
+        "paused": "paused",
+        "limit-reached": "limit-reached",
+        "manual-attention": "manual-attention",
+        "manual-review": "manual-attention",
+        "error-blocked": "error-blocked",
+        "completed": "completed",
+    }
     IGNORED_REASON_LABELS = {
         "metadata-missing": "메타 없음",
         "metadata-missing-fields": "메타 필수값 누락",
@@ -172,6 +185,115 @@ class DashboardAggregator:
                 continue
             pair_map.setdefault(pair_id, []).append(row)
         return pair_map
+
+    @staticmethod
+    def _pair_status_map(paired_status: dict | None) -> dict[str, dict]:
+        pair_map: dict[str, dict] = {}
+        if not paired_status:
+            return pair_map
+        for row in paired_status.get("Pairs", []):
+            pair_id = str(row.get("PairId", ""))
+            if pair_id:
+                pair_map[pair_id] = row
+        return pair_map
+
+    @staticmethod
+    def _derive_pair_next_action(
+        *,
+        latest_states: list[str],
+        handoff_ready_count: int,
+        dispatch_running_count: int,
+        dispatch_failed_count: int,
+        failure_count: int,
+        zip_count: int,
+        error_present_count: int,
+    ) -> str:
+        if error_present_count > 0 or failure_count > 0:
+            return "manual-review"
+        if handoff_ready_count > 0:
+            return "handoff-ready"
+        if dispatch_running_count > 0:
+            return "dispatch-running"
+        if dispatch_failed_count > 0:
+            return "dispatch-failed"
+        if zip_count <= 0 or "no-zip" in latest_states:
+            return "await-review-zip"
+        if any(state in latest_states for state in ("summary-missing", "summary-stale", "done-stale")):
+            return "artifact-check-needed"
+        if "forwarded" in latest_states:
+            return "await-partner-output"
+        return ""
+
+    @classmethod
+    def _normalize_pair_phase(
+        cls,
+        raw_phase: object,
+        *,
+        watcher_status: str = "",
+        next_action: str = "",
+        reached_roundtrip_limit: bool = False,
+    ) -> str:
+        normalized = str(raw_phase or "").strip().lower()
+        if normalized in cls.PAIR_PHASE_CANONICAL:
+            return cls.PAIR_PHASE_CANONICAL[normalized]
+        if reached_roundtrip_limit or next_action == "limit-reached":
+            return "limit-reached"
+        if watcher_status == "paused":
+            return "paused"
+        if next_action == "manual-review":
+            return "manual-attention"
+        return ""
+
+    @staticmethod
+    def _load_acceptance_receipt_summary(paired_status: dict | None) -> dict[str, str]:
+        receipt = ((paired_status or {}).get("AcceptanceReceipt", {}) or {})
+        path = str(receipt.get("Path", "") or "").strip()
+        payload: dict[str, object] = {}
+        parse_error = str(receipt.get("ParseError", "") or "").strip()
+        if path:
+            try:
+                loaded = json.loads(Path(path).read_text(encoding="utf-8"))
+            except Exception as exc:
+                if not parse_error:
+                    parse_error = str(exc)
+            else:
+                if isinstance(loaded, dict):
+                    payload = loaded
+
+        outcome = payload.get("Outcome", {}) if isinstance(payload.get("Outcome", {}), dict) else {}
+        phase_history = payload.get("PhaseHistory", [])
+        if not isinstance(phase_history, list):
+            phase_history = []
+        history_tail_entries: list[str] = []
+        for entry in phase_history[-4:]:
+            if not isinstance(entry, dict):
+                continue
+            stage = str(entry.get("Stage", "") or "")
+            state = str(entry.get("AcceptanceState", "") or "")
+            if stage and state:
+                history_tail_entries.append(f"{stage}:{state}")
+            elif stage:
+                history_tail_entries.append(stage)
+            elif state:
+                history_tail_entries.append(state)
+        return {
+            "Path": path,
+            "ParseError": parse_error,
+            "Exists": "true" if bool(receipt.get("Exists", False) or payload) else "false",
+            "LastWriteAt": str(receipt.get("LastWriteAt", "") or ""),
+            "LastUpdatedAt": str(payload.get("LastUpdatedAt", "") or ""),
+            "GeneratedAt": str(payload.get("GeneratedAt", "") or ""),
+            "Stage": str(payload.get("Stage", "") or ""),
+            "AcceptanceState": str(outcome.get("AcceptanceState", "") or receipt.get("AcceptanceState", "") or ""),
+            "AcceptanceReason": str(outcome.get("AcceptanceReason", "") or receipt.get("AcceptanceReason", "") or ""),
+            "BlockedBy": str(payload.get("BlockedBy", "") or ""),
+            "BlockedTargetId": str(payload.get("BlockedTargetId", "") or ""),
+            "BlockedRunRoot": str(payload.get("BlockedRunRoot", "") or ""),
+            "BlockedPath": str(payload.get("BlockedPath", "") or ""),
+            "BlockedDetail": str(payload.get("BlockedDetail", "") or ""),
+            "PhaseHistoryCount": str(len(phase_history)),
+            "PhaseHistoryTail": " -> ".join(history_tail_entries),
+        }
 
     @staticmethod
     def _map_next_action(command_text: str) -> ActionModel:
@@ -700,6 +822,7 @@ class DashboardAggregator:
         ignored_total = int((relay_status.get("Counts", {}) or {}).get("Ignored", 0) or 0)
         primary_ignored_reason = self._primary_ignored_reason(relay_status)
         paired_counts = (paired_status or {}).get("Counts", {})
+        acceptance_receipt = self._load_acceptance_receipt_summary(paired_status)
         pair_stage_ready = bool(visibility_stage.get("ready", False)) and bool(run_root_status.get("ready", False))
         watcher_status = ((paired_status or {}).get("Watcher", {}) or {}).get("Status", "stopped")
         if not visibility_stage.get("ready", False):
@@ -723,6 +846,47 @@ class DashboardAggregator:
                 selected_pair or "(pair 없음)",
                 watcher_status,
             )
+        acceptance_value = "(none)"
+        acceptance_detail = "visible receipt 없음"
+        if acceptance_receipt.get("ParseError", ""):
+            acceptance_value = "parse-error"
+            acceptance_detail = str(acceptance_receipt.get("ParseError", "") or "receipt parse error")
+        elif acceptance_receipt.get("Exists", "") == "true":
+            acceptance_state = str(acceptance_receipt.get("AcceptanceState", "") or "")
+            acceptance_stage = str(acceptance_receipt.get("Stage", "") or "")
+            blocked_by = str(acceptance_receipt.get("BlockedBy", "") or "")
+            blocked_target = str(acceptance_receipt.get("BlockedTargetId", "") or "")
+            blocked_run_root = str(acceptance_receipt.get("BlockedRunRoot", "") or "")
+            blocked_path = str(acceptance_receipt.get("BlockedPath", "") or "")
+            acceptance_reason = str(acceptance_receipt.get("AcceptanceReason", "") or "")
+            blocked_detail = str(acceptance_receipt.get("BlockedDetail", "") or "")
+            history_count = str(acceptance_receipt.get("PhaseHistoryCount", "") or "")
+            history_tail = str(acceptance_receipt.get("PhaseHistoryTail", "") or "")
+            acceptance_value = blocked_by or acceptance_state or acceptance_stage or "receipt"
+            detail_parts: list[str] = []
+            if acceptance_stage:
+                detail_parts.append("stage={0}".format(acceptance_stage))
+            if blocked_target:
+                detail_parts.append("target={0}".format(blocked_target))
+            if blocked_run_root:
+                detail_parts.append("runRoot={0}".format(blocked_run_root))
+            if blocked_path:
+                detail_parts.append("path={0}".format(blocked_path))
+            if blocked_detail:
+                detail_parts.append(blocked_detail)
+            elif acceptance_reason:
+                detail_parts.append(acceptance_reason)
+            if history_count:
+                detail_parts.append("history={0}".format(history_count))
+            if history_tail:
+                detail_parts.append(history_tail)
+            elif str(acceptance_receipt.get("LastUpdatedAt", "") or acceptance_receipt.get("LastWriteAt", "") or ""):
+                detail_parts.append(
+                    "updated={0}".format(
+                        str(acceptance_receipt.get("LastUpdatedAt", "") or acceptance_receipt.get("LastWriteAt", "") or "")
+                    )
+                )
+            acceptance_detail = " / ".join(detail_parts) if detail_parts else "receipt 존재"
         cards = [
             StatusCardModel(
                 key="windows",
@@ -786,6 +950,12 @@ class DashboardAggregator:
                     warning_summary.get("HighestDecision", "none"),
                 ),
             ),
+            StatusCardModel(
+                key="acceptance",
+                title="Visible Receipt",
+                value=acceptance_value,
+                detail=acceptance_detail,
+            ),
         ]
 
         stages = [
@@ -827,11 +997,11 @@ class DashboardAggregator:
             ),
             StageModel(
                 key="pair_action",
-                title="5. Pair 실행 준비",
+                title="5. Headless Drill 준비",
                 status_text="차단" if (not pair_enabled or not pair_in_scope) else ("완료" if workflow.overall in {"ready", "running", "review_needed"} else "대기"),
                 detail=pair_stage_detail,
                 action_key="enable_pair" if not pair_enabled else "run_selected_pair",
-                action_label="pair 활성화" if not pair_enabled else "선택 Pair 실행",
+                action_label="pair 활성화" if not pair_enabled else "선택 Pair Headless Drill",
                 enabled=pair_stage_ready and pair_in_scope,
             ),
         ]
@@ -934,6 +1104,14 @@ class DashboardAggregator:
             watcher_row = ((paired_status.get("Watcher", {}) or {}))
             watcher_stop_category = str(watcher_row.get("StopCategory", "") or "")
             watcher_status = str(watcher_row.get("Status", "") or "")
+            acceptance_state = str(acceptance_receipt.get("AcceptanceState", "") or "")
+            blocked_by = str(acceptance_receipt.get("BlockedBy", "") or "")
+            blocked_target = str(acceptance_receipt.get("BlockedTargetId", "") or "")
+            blocked_run_root = str(acceptance_receipt.get("BlockedRunRoot", "") or "")
+            blocked_path = str(acceptance_receipt.get("BlockedPath", "") or "")
+            blocked_detail = str(acceptance_receipt.get("BlockedDetail", "") or "")
+            acceptance_reason = str(acceptance_receipt.get("AcceptanceReason", "") or "")
+            history_tail = str(acceptance_receipt.get("PhaseHistoryTail", "") or "")
             if handoff_ready_count > 0:
                 add_issue(
                     70,
@@ -941,6 +1119,49 @@ class DashboardAggregator:
                     "다음 전달 가능 target {0}개가 있어 먼저 검토가 필요합니다.".format(handoff_ready_count),
                     "focus_ready_to_forward_artifact",
                     "전달 가능 target 보기",
+                )
+            if blocked_by:
+                detail_parts = [blocked_by]
+                if blocked_target:
+                    detail_parts.append("target={0}".format(blocked_target))
+                if blocked_run_root:
+                    detail_parts.append("runRoot={0}".format(blocked_run_root))
+                if blocked_path:
+                    detail_parts.append("path={0}".format(blocked_path))
+                if blocked_detail:
+                    detail_parts.append(blocked_detail)
+                if history_tail:
+                    detail_parts.append(history_tail)
+                add_issue(
+                    72,
+                    "Visible preflight 차단",
+                    " / ".join(detail_parts),
+                    "visible_preflight",
+                    "visible preflight-only",
+                )
+            elif acceptance_state == "preflight-passed":
+                add_issue(
+                    73,
+                    "Visible preflight 완료",
+                    acceptance_reason or "공식 창 기준 preflight-only는 통과했고 active acceptance가 아직 실행되지 않았습니다.",
+                    "visible_active_acceptance",
+                    "active visible acceptance",
+                )
+            elif acceptance_state == "error":
+                add_issue(
+                    74,
+                    "Visible acceptance 실패",
+                    acceptance_reason or "live acceptance receipt가 error 상태입니다.",
+                    "visible_active_acceptance",
+                    "active visible acceptance",
+                )
+            elif acceptance_state == "pending":
+                add_issue(
+                    75,
+                    "Visible acceptance 대기",
+                    acceptance_reason or "live acceptance receipt가 pending 상태입니다.",
+                    "visible_confirm",
+                    "shared visible confirm",
                 )
             if paired_counts.get("ErrorPresentCount", 0) > 0:
                 add_issue(80, "실행 오류 감지", "error marker가 존재합니다.", "run_paired_status", "Pair 상태 보기")
@@ -961,12 +1182,14 @@ class DashboardAggregator:
                 add_issue(110, "watch 제어 진행 중", "watcher 상태 전이를 확인하는 중입니다.", "run_paired_status", "Pair 상태 보기")
 
         pair_target_map = self._pair_target_map(paired_status)
+        pair_status_map = self._pair_status_map(paired_status)
         pair_summaries: list[PairSummaryModel] = []
         for pair in effective_data.get("OverviewPairs", []):
             pair_id = str(pair.get("PairId", ""))
             if not pair_id:
                 continue
             rows = pair_target_map.get(pair_id, [])
+            pair_status_row = pair_status_map.get(pair_id, {})
             activation = activation_map.get(pair_id, {})
             latest_states = sorted({str(row.get("LatestState", "")) for row in rows if row.get("LatestState", "")})
             zip_count = sum(int(row.get("ZipCount", 0) or 0) for row in rows)
@@ -984,14 +1207,74 @@ class DashboardAggregator:
             )
             dispatch_running_count = sum(1 for row in rows if str(row.get("DispatchState", "") or "").strip() == "running")
             dispatch_failed_count = sum(1 for row in rows if str(row.get("DispatchState", "") or "").strip() == "failed")
-            state_text = ", ".join(latest_states) if latest_states else "no-run"
-            detail_parts = ["상태={0}".format(state_text), "zip={0}".format(zip_count), "fail={0}".format(failure_count)]
-            if handoff_ready_count > 0:
-                detail_parts.append("전달가능={0}".format(handoff_ready_count))
-            if dispatch_running_count > 0:
-                detail_parts.append("실행중={0}".format(dispatch_running_count))
-            if dispatch_failed_count > 0:
-                detail_parts.append("실패={0}".format(dispatch_failed_count))
+            error_present_count = sum(1 for row in rows if bool(row.get("ErrorPresent", False)))
+            current_phase = ""
+            next_expected_handoff = ""
+            if pair_status_row:
+                state_text = str(pair_status_row.get("LatestStateSummary", "") or pair_status_row.get("LatestState", "") or "")
+                if not state_text:
+                    state_text = ", ".join(latest_states) if latest_states else "no-run"
+                roundtrip_count = int(pair_status_row.get("RoundtripCount", 0) or 0)
+                forwarded_state_count = int(pair_status_row.get("ForwardedStateCount", 0) or 0)
+                handoff_ready_count = int(pair_status_row.get("HandoffReadyCount", handoff_ready_count) or 0)
+                next_action = str(pair_status_row.get("NextAction", "") or "")
+                current_phase = self._normalize_pair_phase(
+                    pair_status_row.get("CurrentPhase", ""),
+                    watcher_status=watcher_status,
+                    next_action=next_action,
+                    reached_roundtrip_limit=bool(pair_status_row.get("ReachedRoundtripLimit", False)),
+                )
+                next_expected_handoff = str(pair_status_row.get("NextExpectedHandoff", "") or "")
+                detail_text = str(pair_status_row.get("ProgressDetail", "") or "").strip()
+                if not detail_text:
+                    detail_parts = [
+                        "상태={0}".format(state_text),
+                        "왕복={0}".format(roundtrip_count),
+                        "forwardedState={0}".format(forwarded_state_count),
+                    ]
+                    if current_phase:
+                        detail_parts.append("단계={0}".format(current_phase))
+                    if next_expected_handoff:
+                        detail_parts.append("예정={0}".format(next_expected_handoff))
+                    if next_action:
+                        detail_parts.append("다음={0}".format(next_action))
+                    detail_text = " ".join(detail_parts)
+            else:
+                state_text = ", ".join(latest_states) if latest_states else "no-run"
+                forwarded_state_count = sum(1 for row in rows if str(row.get("LatestState", "") or "").strip() == "forwarded")
+                roundtrip_count = forwarded_state_count // 2
+                next_action = self._derive_pair_next_action(
+                    latest_states=latest_states,
+                    handoff_ready_count=handoff_ready_count,
+                    dispatch_running_count=dispatch_running_count,
+                    dispatch_failed_count=dispatch_failed_count,
+                    failure_count=failure_count,
+                    zip_count=zip_count,
+                    error_present_count=error_present_count,
+                )
+                current_phase = self._normalize_pair_phase(
+                    current_phase,
+                    watcher_status=watcher_status,
+                    next_action=next_action,
+                )
+                detail_parts = [
+                    "상태={0}".format(state_text),
+                    "왕복={0}".format(roundtrip_count),
+                    "forwardedState={0}".format(forwarded_state_count),
+                    "zip={0}".format(zip_count),
+                    "fail={0}".format(failure_count),
+                ]
+                if current_phase:
+                    detail_parts.append("단계={0}".format(current_phase))
+                if handoff_ready_count > 0:
+                    detail_parts.append("전달가능={0}".format(handoff_ready_count))
+                if dispatch_running_count > 0:
+                    detail_parts.append("실행중={0}".format(dispatch_running_count))
+                if dispatch_failed_count > 0:
+                    detail_parts.append("실패={0}".format(dispatch_failed_count))
+                if next_action:
+                    detail_parts.append("다음={0}".format(next_action))
+                detail_text = " ".join(detail_parts)
             pair_summaries.append(
                 PairSummaryModel(
                     pair_id=pair_id,
@@ -1001,7 +1284,13 @@ class DashboardAggregator:
                     zip_count=zip_count,
                     failure_count=failure_count,
                     lane_watcher_status=watcher_status if paired_status else "stopped",
-                    detail=" ".join(detail_parts),
+                    detail=detail_text,
+                    roundtrip_count=roundtrip_count,
+                    forwarded_state_count=forwarded_state_count,
+                    handoff_ready_count=handoff_ready_count,
+                    current_phase=current_phase,
+                    next_expected_handoff=next_expected_handoff,
+                    next_action=next_action,
                 )
             )
 

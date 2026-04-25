@@ -79,6 +79,12 @@ class PairSummaryModel:
     failure_count: int
     lane_watcher_status: str
     detail: str
+    roundtrip_count: int = 0
+    forwarded_state_count: int = 0
+    handoff_ready_count: int = 0
+    current_phase: str = ""
+    next_expected_handoff: str = ""
+    next_action: str = ""
 
 
 @dataclass

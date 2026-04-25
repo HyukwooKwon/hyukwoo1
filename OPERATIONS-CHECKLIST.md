@@ -170,6 +170,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\show-paired-exchange-statu
 - `기존 8창 재사용` 실패 시에는 output/마지막 결과의 실패 요약을 먼저 확인하고, 창 상태가 불완전하면 기존 8창을 종료한 뒤 `8창 열기`로 새로 시작합니다.
 - `열린 pair 재사용`은 orphan target 1개만 남은 경우에는 성공하지 않습니다. `target01 + target05`처럼 complete pair여야 합니다.
 - 운영 기본 순서는 `재사용 먼저 시도 -> 실패 시 8창 새로 열기`입니다. 자동 재사용이나 패널 시작 시 자동 흡수는 현재 표준 절차가 아닙니다.
+- shared `bottest-live-visible` lane에서는 ad-hoc 임시 창을 띄우지 않습니다. `BotTestLive-Fresh-*`, `BotTestLive-Surrogate-*`, `BotTestLive-Candidate-*` 창은 금지하고, 반드시 공식 `BotTestLive-Window-01`~`08` 기존 창을 재사용하거나 그 공식 창만 재기동합니다.
 - 기본 진입점은 `ensure-targets.ps1`입니다.
 - `attach 됨`과 `실제 입력 가능`은 별도 단계로 취급합니다. `check-target-window-visibility.ps1`를 통과하지 못하면 router/manual E2E를 진행하지 않습니다.
 - 기존 invisible BotTest 세션과 새 visible 승인 lane이 함께 있으면 `BotTestLive-Window-*` 제목과 `config\settings.bottest-live-visible.psd1` 기준 lane을 사용합니다.
@@ -294,10 +295,11 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\tests\Run-LiveVisiblePairA
 자동 acceptance 합격 기준:
 - receipt `.state\live-acceptance-result.json`의 `Stage=completed`
 - `Outcome.AcceptanceState=roundtrip-confirmed`
-- `Seed.FinalState=publish-detected`, `Seed.OutboxPublished=true`
-- `Outcome.Diagnostics.Seed.SourceOutboxState=imported`
-- `Outcome.Diagnostics.Partner.SourceOutboxState=imported`
+- `tests\Show-PairedExchangeStatus.ps1 -AsJson` 기준 `Counts.ForwardedStateCount=2`, `Counts.DonePresentCount=2`, `Counts.ErrorPresentCount=0`
+- visible worker run에서는 `Seed.FinalState=submit-unconfirmed`가 남아도, 이후 `summary/review.zip/publish.ready.json`과 `ForwardedStateCount`가 채워지면 성공으로 본다
 - `tests\Confirm-SharedVisiblePairAcceptance.ps1 -RequireVisibleReceipt`가 `overall=success`를 반환
+- 이 단계는 `2-forward acceptance` 기준입니다. `4-forward closeout`과 같은 의미로 섞지 않습니다.
+- clean preflight recheck가 마지막 receipt current state를 `preflight-passed`로 덮어써도, `show-paired-run-summary.ps1`와 confirm 계열은 `PhaseHistory`의 마지막 성공 acceptance를 effective result로 읽어야 합니다.
 
 자동 acceptance 실패 시 우선 확인:
 - receipt의 `Stage`, `Outcome.AcceptanceReason`
@@ -317,6 +319,57 @@ shared lane에서 active acceptance를 새로 돌릴 수 없는 시점이면:
 - `Run-LiveVisiblePairAcceptance.ps1`는 실행하지 않습니다.
 - `Confirm-SharedVisiblePairAcceptance.ps1` 결과만 근거로 `shared visible deferred` 상태를 기록합니다.
 - 이 상태에서는 headless closure와 isolated smoke만 닫힌 것으로 판단하고, visible receipt 완료로 오해하지 않습니다.
+
+visible pair 자동화 정식 경로:
+- `visible worker queue -> Invoke-CodexExecTurn -> source-outbox publish -> watcher handoff`
+- `router/AHK typed REPL`은 manual smoke / fallback 전용으로만 사용합니다.
+
+shared lane 표준 절차:
+1. `visible\Cleanup-VisibleWorkerQueue.ps1` dry-run
+2. 같은 cleanup actual apply
+3. `tests\Run-LiveVisiblePairAcceptance.ps1 -PreflightOnly`
+4. `tests\Run-LiveVisiblePairAcceptance.ps1` active acceptance
+5. cleanup apply
+6. `tests\Run-LiveVisiblePairAcceptance.ps1 -PreflightOnly` clean pass 재확인
+
+2026-04-25 successful shared visible closeout 기준선:
+- example run root: [run_shared_visible_closeout_20260425_021309](C:\dev\python\hyukwoo\hyukwoo1\pair-test\bottest-live-visible\run_shared_visible_closeout_20260425_021309)
+- final summary: `overall=success acceptance=roundtrip-confirmed stage=completed`
+- `tests\Confirm-SharedVisiblePairAcceptance.ps1 -RequireVisibleReceipt`도 같은 RunRoot에서 `overall=success`
+- final lane check는 `visible\Cleanup-VisibleWorkerQueue.ps1 -AsJson` 기준 `Summary.ProtectedRunCount=0`
+
+baseline recheck 명령:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\show-paired-run-summary.ps1 -ConfigPath .\config\settings.bottest-live-visible.psd1 -RunRoot .\pair-test\bottest-live-visible\run_shared_visible_closeout_20260425_021309
+powershell -NoProfile -ExecutionPolicy Bypass -File .\tests\Confirm-SharedVisiblePairAcceptance.ps1 -ConfigPath .\config\settings.bottest-live-visible.psd1 -RunRoot .\pair-test\bottest-live-visible\run_shared_visible_closeout_20260425_021309 -PairId pair01 -SeedTargetId target01 -RequireVisibleReceipt -AsJson
+powershell -NoProfile -ExecutionPolicy Bypass -File .\visible\Cleanup-VisibleWorkerQueue.ps1 -ConfigPath .\config\settings.bottest-live-visible.psd1 -AsJson
+```
+
+운영 해석 고정:
+- `show-paired-run-summary.ps1`와 confirm 계열의 effective acceptance는 latest current receipt가 아니라 `PhaseHistory`의 마지막 성공 acceptance를 우선합니다.
+- clean preflight recheck는 shared lane이 clean으로 돌아왔는지 확인하는 단계이지, 직전 성공 acceptance를 무효화하는 단계가 아닙니다.
+- reopen은 success closeout 재현 실패, `PhaseHistory` precedence 붕괴, `ProtectedRunCount=0`인데 confirm 실패, foreign protected run 반복 병목 때만 검토합니다.
+
+baseline success 이후 shared lane clean recovery 규칙:
+- baseline success run이 이미 있으면, 이후 shared lane이 foreign active run 때문에 다시 더러워져도 active acceptance를 새로 재실행하지 않습니다.
+- 먼저 foreign watcher/worker가 terminal state가 될 때까지 기다립니다.
+- 그 전에는 foreign active run을 강제로 reclaim/stop 하지 않습니다.
+- watcher 종료 후 `visible\Cleanup-VisibleWorkerQueue.ps1 -AsJson`로 `Summary.ProtectedRunCount=0`인지 먼저 확인합니다.
+- reclaim 대상이 있을 때만 cleanup apply를 실행하고, 마지막에는 새 recheck RunRoot로 `tests\Run-LiveVisiblePairAcceptance.ps1 -PreflightOnly` clean pass만 다시 남깁니다.
+- 이 단계의 목적은 새 acceptance가 아니라 `현재 시점 shared lane clean 복귀 확인`입니다.
+
+shared lane 창 사용 규칙:
+- active acceptance는 공식 운영 `BotTestLive-Window-01`~`08`만 사용합니다.
+- 가능한 경우 기존 8창을 재사용합니다.
+- 창 상태가 나쁘면 공식 운영 창만 재기동합니다.
+- `Fresh/Surrogate/Candidate` 같은 ad-hoc 창이 보이면 active acceptance를 시작하지 않습니다.
+
+연속 왕복 확인 절차:
+- `target01` seed 1건만 넣고 `-WatcherMaxForwardCount 4 -KeepWatcherRunning`으로 시작합니다.
+- 성공 기준은 `Counts.ForwardedStateCount=4`, `Counts.DonePresentCount=2`, `Counts.ErrorPresentCount=0` 입니다.
+- `Run-LiveVisiblePairAcceptance.ps1` receipt에서는 `Outcome`가 acceptance 결과, `Closeout`가 연속 왕복 진행/충족 여부를 따로 나타냅니다.
+- `ConfiguredMaxForwardCount=4` run은 watcher가 4-forward 도달 후 멈추거나, 확인 후 수동 stop request로 정리합니다.
 
 ## source-outbox artifact acceptance
 

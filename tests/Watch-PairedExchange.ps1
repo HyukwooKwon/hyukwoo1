@@ -5,11 +5,15 @@ param(
     [int]$PollIntervalMs = 1500,
     [int]$RunDurationSec = 0,
     [switch]$UseHeadlessDispatch,
-    [int]$MaxForwardCount = 0
+    [int]$MaxForwardCount = 0,
+    [int]$PairMaxRoundtripCount = 0
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+$SupportedSourceOutboxSchemaVersions = @('1.0.0', '1.0')
+$CurrentPairStateSchemaVersion = '1.0.0'
+$SupportedPairStateSchemaVersions = @('1.0.0', '1.0')
 
 if ($PSVersionTable.PSEdition -ne 'Core') {
     $currentVersion = [string]$PSVersionTable.PSVersion
@@ -26,6 +30,79 @@ function Ensure-Directory {
 
 function New-Utf8NoBomEncoding {
     return [System.Text.UTF8Encoding]::new($false)
+}
+
+function Test-ZipArchiveReadable {
+    param([Parameter(Mandatory)][string]$Path)
+
+    try {
+        Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction SilentlyContinue
+    }
+    catch {
+    }
+
+    try {
+        $archive = [System.IO.Compression.ZipFile]::OpenRead($Path)
+        try {
+            $null = $archive.Entries.Count
+        }
+        finally {
+            if ($null -ne $archive) {
+                $archive.Dispose()
+            }
+        }
+
+        return [pscustomobject]@{
+            Ok = $true
+            ErrorMessage = ''
+        }
+    }
+    catch {
+        return [pscustomobject]@{
+            Ok = $false
+            ErrorMessage = $_.Exception.Message
+        }
+    }
+}
+
+function Write-JsonFileAtomically {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)]$Payload,
+        [int]$Depth = 8,
+        [int]$MaxAttempts = 8,
+        [int]$RetryDelayMs = 125
+    )
+
+    $parent = Split-Path -Parent $Path
+    if (Test-NonEmptyString $parent) {
+        Ensure-Directory -Path $parent
+    }
+
+    $encoding = New-Utf8NoBomEncoding
+    $lastError = $null
+    for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+        $tempPath = ($Path + '.' + [guid]::NewGuid().ToString('N') + '.tmp')
+        try {
+            $json = $Payload | ConvertTo-Json -Depth $Depth
+            [System.IO.File]::WriteAllText($tempPath, $json, $encoding)
+            Move-Item -LiteralPath $tempPath -Destination $Path -Force
+            return
+        }
+        catch {
+            $lastError = $_
+            if (Test-Path -LiteralPath $tempPath) {
+                Remove-Item -LiteralPath $tempPath -Force -ErrorAction SilentlyContinue
+            }
+
+            if ($attempt -lt $MaxAttempts) {
+                Start-Sleep -Milliseconds $RetryDelayMs
+                continue
+            }
+        }
+    }
+
+    throw $lastError
 }
 
 function Resolve-PowerShellExecutable {
@@ -78,7 +155,7 @@ function Save-HeadlessDispatchStatus {
     }
 
     $persisted['UpdatedAt'] = (Get-Date).ToString('o')
-    $persisted | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $Path -Encoding UTF8
+    Write-JsonFileAtomically -Path $Path -Payload $persisted -Depth 8
 }
 
 function Invoke-HeadlessDispatch {
@@ -209,6 +286,83 @@ function Test-NonEmptyString {
     return ($Value -is [string] -and -not [string]::IsNullOrWhiteSpace($Value))
 }
 
+function Normalize-PairPhase {
+    param(
+        [string]$Phase = '',
+        [string]$WatcherStatus = '',
+        [string]$NextAction = '',
+        [bool]$LimitReached = $false
+    )
+
+    $normalized = if (Test-NonEmptyString $Phase) { $Phase.Trim().ToLowerInvariant() } else { '' }
+    switch ($normalized) {
+        'seed-running' { return 'seed-running' }
+        'partner-running' { return 'partner-running' }
+        'waiting-partner-handoff' { return 'waiting-partner-handoff' }
+        'waiting-handoff' { return 'waiting-partner-handoff' }
+        'waiting-return' { return 'waiting-return' }
+        'paused' { return 'paused' }
+        'limit-reached' { return 'limit-reached' }
+        'manual-attention' { return 'manual-attention' }
+        'manual-review' { return 'manual-attention' }
+        'error-blocked' { return 'error-blocked' }
+        'completed' { return 'completed' }
+    }
+
+    if ($LimitReached -or $NextAction -eq 'limit-reached') {
+        return 'limit-reached'
+    }
+    if ($WatcherStatus -eq 'paused') {
+        return 'paused'
+    }
+    if ($NextAction -eq 'manual-review') {
+        return 'manual-attention'
+    }
+
+    return ''
+}
+
+function Get-PairStateSchemaMetadata {
+    param($DocumentData)
+
+    if ($null -eq $DocumentData) {
+        return [pscustomobject]@{
+            SchemaVersion = ''
+            DeclaredSchemaVersion = ''
+            SchemaStatus = ''
+            Warnings = @()
+        }
+    }
+
+    $warnings = New-Object System.Collections.Generic.List[string]
+    $declaredSchemaVersion = [string](Get-ConfigValue -Object $DocumentData -Name 'SchemaVersion' -DefaultValue '')
+    $effectiveSchemaVersion = $declaredSchemaVersion
+    $schemaStatus = 'current'
+
+    if (-not (Test-NonEmptyString $declaredSchemaVersion)) {
+        $effectiveSchemaVersion = $CurrentPairStateSchemaVersion
+        $schemaStatus = 'legacy-missing'
+        $warnings.Add(('pair-state schema version missing; assuming {0}' -f $CurrentPairStateSchemaVersion))
+    }
+    elseif ($declaredSchemaVersion -eq $CurrentPairStateSchemaVersion) {
+        $schemaStatus = 'current'
+    }
+    elseif ($declaredSchemaVersion -in $SupportedPairStateSchemaVersions) {
+        $schemaStatus = 'legacy-supported'
+    }
+    else {
+        $schemaStatus = 'unsupported'
+        $warnings.Add(('unsupported pair-state schema version: {0}' -f $declaredSchemaVersion))
+    }
+
+    return [pscustomobject]@{
+        SchemaVersion = $effectiveSchemaVersion
+        DeclaredSchemaVersion = $declaredSchemaVersion
+        SchemaStatus = $schemaStatus
+        Warnings = @($warnings)
+    }
+}
+
 function Load-State {
     param([Parameter(Mandatory)][string]$Path)
 
@@ -241,7 +395,7 @@ function Save-State {
         $ordered[$key] = [string]$State[$key]
     }
 
-    $ordered | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $Path -Encoding UTF8
+    Write-JsonFileAtomically -Path $Path -Payload $ordered -Depth 4
 }
 
 function Read-JsonObject {
@@ -277,6 +431,7 @@ function Get-WatcherStopCategory {
     switch ($Reason) {
         'completed' { return 'completed' }
         'max-forward-count-reached' { return 'expected-limit' }
+        'pair-roundtrip-limit-reached' { return 'expected-limit' }
         'control-stop-request' { return 'manual-stop' }
         'run-duration-reached' { return 'time-limit' }
         default { return 'error' }
@@ -312,6 +467,8 @@ function Save-WatcherStatus {
         [string]$ProcessStartedAt = '',
         [int]$ForwardedCount = 0,
         [int]$ConfiguredMaxForwardCount = 0,
+        [int]$ConfiguredRunDurationSec = 0,
+        [int]$ConfiguredMaxRoundtripCount = 0,
         [string]$StopCategory = ''
     )
 
@@ -332,6 +489,8 @@ function Save-WatcherStatus {
         StopCategory         = $StopCategory
         ForwardedCount       = $ForwardedCount
         ConfiguredMaxForwardCount = $ConfiguredMaxForwardCount
+        ConfiguredRunDurationSec = $ConfiguredRunDurationSec
+        ConfiguredMaxRoundtripCount = $ConfiguredMaxRoundtripCount
         RequestId            = $RequestId
         Action               = $Action
         LastHandledRequestId = $LastHandledRequestId
@@ -340,7 +499,7 @@ function Save-WatcherStatus {
         LastHandledAt        = $LastHandledAt
     }
 
-    $payload | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $Path -Encoding UTF8
+    Write-JsonFileAtomically -Path $Path -Payload $payload -Depth 4
 }
 
 function Get-WatcherControlRequest {
@@ -351,7 +510,7 @@ function Get-WatcherControlRequest {
         return $null
     }
 
-    if ([string]$doc.Action -ne 'stop') {
+    if ([string]$doc.Action -notin @('stop', 'pause', 'resume')) {
         return $null
     }
 
@@ -359,11 +518,33 @@ function Get-WatcherControlRequest {
 }
 
 function Clear-WatcherControlRequest {
-    param([Parameter(Mandatory)][string]$Path)
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [int]$RetryCount = 20,
+        [int]$RetryDelayMs = 100
+    )
 
-    if (Test-Path -LiteralPath $Path) {
-        Remove-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+    for ($attempt = 0; $attempt -le $RetryCount; $attempt++) {
+        if (-not (Test-Path -LiteralPath $Path)) {
+            return $true
+        }
+
+        try {
+            Remove-Item -LiteralPath $Path -Force -ErrorAction Stop
+        }
+        catch {
+        }
+
+        if (-not (Test-Path -LiteralPath $Path)) {
+            return $true
+        }
+
+        if ($attempt -lt $RetryCount) {
+            Start-Sleep -Milliseconds $RetryDelayMs
+        }
     }
+
+    return (-not (Test-Path -LiteralPath $Path))
 }
 
 function Get-ZipFingerprint {
@@ -378,6 +559,123 @@ function Get-ZipFingerprint {
         [int64]$ZipFile.Length,
         [int64]$ZipFile.LastWriteTimeUtc.Ticks
     )
+}
+
+function Get-PairForwardedCounts {
+    param(
+        [Parameter(Mandatory)][hashtable]$State,
+        [Parameter(Mandatory)][hashtable]$TargetItemsById
+    )
+
+    $counts = @{}
+    foreach ($stateKey in @($State.Keys)) {
+        $rawStateKey = [string]$stateKey
+        if (-not (Test-NonEmptyString $rawStateKey)) {
+            continue
+        }
+
+        $segments = $rawStateKey.Split('|', 2)
+        if ($segments.Count -lt 2) {
+            continue
+        }
+
+        $targetId = [string]$segments[0]
+        if (-not (Test-NonEmptyString $targetId)) {
+            continue
+        }
+
+        $targetItem = Get-ConfigValue -Object $TargetItemsById -Name $targetId -DefaultValue $null
+        if ($null -eq $targetItem) {
+            continue
+        }
+
+        $pairId = [string](Get-ConfigValue -Object $targetItem -Name 'PairId' -DefaultValue '')
+        if (-not (Test-NonEmptyString $pairId)) {
+            continue
+        }
+
+        if (-not $counts.ContainsKey($pairId)) {
+            $counts[$pairId] = 0
+        }
+        $counts[$pairId] += 1
+    }
+
+    return $counts
+}
+
+function Get-ActiveWatcherElapsedSeconds {
+    param(
+        [Parameter(Mandatory)][System.Diagnostics.Stopwatch]$Stopwatch,
+        [double]$PausedDurationSeconds = 0
+    )
+
+    return [math]::Max(0, ($Stopwatch.Elapsed.TotalSeconds - $PausedDurationSeconds))
+}
+
+function Get-PairRoundtripLimitMap {
+    param(
+        [Parameter(Mandatory)][object[]]$TargetItems,
+        [int]$GlobalPairMaxRoundtripCount = 0
+    )
+
+    $limitMap = @{}
+    foreach ($item in @($TargetItems)) {
+        $pairId = [string](Get-ConfigValue -Object $item -Name 'PairId' -DefaultValue '')
+        if (-not (Test-NonEmptyString $pairId) -or $limitMap.ContainsKey($pairId)) {
+            continue
+        }
+
+        $limit = 0
+        if ($GlobalPairMaxRoundtripCount -gt 0) {
+            $limit = [int]$GlobalPairMaxRoundtripCount
+        }
+        else {
+            $pairPolicy = Get-ConfigValue -Object $item -Name 'PairPolicy' -DefaultValue $null
+            $limit = [int](Get-ConfigValue -Object $pairPolicy -Name 'DefaultPairMaxRoundtripCount' -DefaultValue 0)
+        }
+
+        if ($limit -lt 0) {
+            $limit = 0
+        }
+        $limitMap[$pairId] = [int]$limit
+    }
+
+    return $limitMap
+}
+
+function Test-AllPairsReachedRoundtripLimit {
+    param(
+        [Parameter(Mandatory)][hashtable]$PairForwardedCounts,
+        [Parameter(Mandatory)][hashtable]$PairRoundtripLimitMap
+    )
+
+    $pairIds = @($PairRoundtripLimitMap.Keys | ForEach-Object { [string]$_ } | Where-Object { Test-NonEmptyString $_ } | Sort-Object -Unique)
+    if ($pairIds.Count -eq 0) {
+        return $false
+    }
+
+    $hasUnlimitedPair = $false
+    $limitedPairCount = 0
+    foreach ($pairId in $pairIds) {
+        $pairRoundtripLimit = [int](Get-ConfigValue -Object $PairRoundtripLimitMap -Name $pairId -DefaultValue 0)
+        if ($pairRoundtripLimit -le 0) {
+            $hasUnlimitedPair = $true
+            continue
+        }
+
+        $limitedPairCount += 1
+        $forwardLimit = [math]::Max(1, $pairRoundtripLimit) * 2
+        $currentForwardCount = [int](Get-ConfigValue -Object $PairForwardedCounts -Name $pairId -DefaultValue 0)
+        if ($currentForwardCount -lt $forwardLimit) {
+            return $false
+        }
+    }
+
+    if ($hasUnlimitedPair) {
+        return $false
+    }
+
+    return ($limitedPairCount -gt 0)
 }
 
 function Get-NormalizedFullPath {
@@ -516,6 +814,25 @@ function Test-SourceOutboxReady {
     $readyPath = [string]$paths.PublishReadyPath
     $readyExists = Test-Path -LiteralPath $readyPath -PathType Leaf
     $readyItem = if ($readyExists) { Get-Item -LiteralPath $readyPath -ErrorAction Stop } else { $null }
+    $markerArchived = $false
+    if (-not $readyExists) {
+        $archiveRoot = [string]$paths.PublishedArchivePath
+        if (Test-NonEmptyString $archiveRoot -and (Test-Path -LiteralPath $archiveRoot -PathType Container)) {
+            $archiveItems = @(
+                Get-ChildItem -LiteralPath $archiveRoot -Filter '*.ready.json' -File -ErrorAction SilentlyContinue |
+                    Sort-Object LastWriteTimeUtc -Descending |
+                    Select-Object -First 1
+            )
+            if ($archiveItems.Count -ge 1) {
+                $readyItem = $archiveItems[0]
+                $readyPath = [string]$readyItem.FullName
+                $readyExists = $true
+                $markerArchived = $true
+            }
+        }
+    }
+    $paths | Add-Member -NotePropertyName 'EffectivePublishReadyPath' -NotePropertyValue $readyPath -Force
+    $paths | Add-Member -NotePropertyName 'PublishReadyArchived' -NotePropertyValue $markerArchived -Force
     if (-not $readyExists) {
         return [pscustomobject]@{
             MarkerPresent = $false
@@ -560,6 +877,22 @@ function Test-SourceOutboxReady {
                 ZipItem = $null
                 StateKey = (New-SourceOutboxStateKey -TargetId ([string]$Item.TargetId) -Reason ('marker-missing-field-' + $requiredField) -PublishReadyPath $readyPath -PublishReadyTicks ([int64]$readyItem.LastWriteTimeUtc.Ticks))
             }
+        }
+    }
+
+    $markerSchemaVersion = [string](Get-ConfigValue -Object $marker -Name 'SchemaVersion' -DefaultValue '')
+    if ($markerSchemaVersion -notin $SupportedSourceOutboxSchemaVersions) {
+        return [pscustomobject]@{
+            MarkerPresent = $true
+            IsReady = $false
+            Reason = 'marker-schema-version-unsupported'
+            Paths = $paths
+            Marker = $marker
+            PublishedAt = [string](Get-ConfigValue -Object $marker -Name 'PublishedAt' -DefaultValue '')
+            SummaryItem = $null
+            ZipItem = $null
+            ErrorMessage = ('unsupported schema version: ' + $markerSchemaVersion)
+            StateKey = (New-SourceOutboxStateKey -TargetId ([string]$Item.TargetId) -Reason 'marker-schema-version-unsupported' -PublishReadyPath $readyPath -PublishReadyTicks ([int64]$readyItem.LastWriteTimeUtc.Ticks))
         }
     }
 
@@ -654,6 +987,22 @@ function Test-SourceOutboxReady {
 
     $summaryItem = Get-Item -LiteralPath $paths.SourceSummaryPath -ErrorAction Stop
     $zipItem = Get-Item -LiteralPath $paths.SourceReviewZipPath -ErrorAction Stop
+    $zipValidation = Test-ZipArchiveReadable -Path $paths.SourceReviewZipPath
+    if (-not [bool]$zipValidation.Ok) {
+        return [pscustomobject]@{
+            MarkerPresent = $true
+            IsReady = $false
+            Reason = 'source-reviewzip-invalid'
+            Paths = $paths
+            Marker = $marker
+            PublishedAt = [string](Get-ConfigValue -Object $marker -Name 'PublishedAt' -DefaultValue '')
+            SummaryItem = $summaryItem
+            ZipItem = $zipItem
+            ErrorMessage = [string]$zipValidation.ErrorMessage
+            StateKey = (New-SourceOutboxStateKey -TargetId ([string]$Item.TargetId) -Reason 'source-reviewzip-invalid' -PublishReadyPath $readyPath -PublishReadyTicks ([int64]$readyItem.LastWriteTimeUtc.Ticks) -SummaryTicks ([int64]$summaryItem.LastWriteTimeUtc.Ticks) -ZipTicks ([int64]$zipItem.LastWriteTimeUtc.Ticks))
+        }
+    }
+
     if ($readyItem.LastWriteTimeUtc -lt $summaryItem.LastWriteTimeUtc -or $readyItem.LastWriteTimeUtc -lt $zipItem.LastWriteTimeUtc) {
         return [pscustomobject]@{
             MarkerPresent = $true
@@ -887,7 +1236,345 @@ function Save-SourceOutboxStatus {
         )
     }
 
-    $payload | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $Path -Encoding UTF8
+    Write-JsonFileAtomically -Path $Path -Payload $payload -Depth 8
+}
+
+function Load-PairStateEntries {
+    param([Parameter(Mandatory)][string]$Path)
+
+    $doc = Read-JsonDocumentWithStatus -Path $Path
+    $entries = @{}
+    if (-not [bool]$doc.Ok -or $null -eq $doc.Data) {
+        return $entries
+    }
+
+    foreach ($row in @($doc.Data.Pairs)) {
+        $pairId = [string](Get-ConfigValue -Object $row -Name 'PairId' -DefaultValue '')
+        if (Test-NonEmptyString $pairId) {
+            $entries[$pairId] = $row
+        }
+    }
+
+    return $entries
+}
+
+function Save-PairState {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$RunRoot,
+        [Parameter(Mandatory)][hashtable]$Entries
+    )
+
+    $payload = [ordered]@{
+        SchemaVersion = $CurrentPairStateSchemaVersion
+        RunRoot = $RunRoot
+        UpdatedAt = (Get-Date).ToString('o')
+        Pairs = @(
+            $Entries.Keys | Sort-Object | ForEach-Object { $Entries[[string]$_] }
+        )
+    }
+
+    Write-JsonFileAtomically -Path $Path -Payload $payload -Depth 8
+}
+
+function Get-PairProfiles {
+    param([Parameter(Mandatory)][object[]]$TargetItems)
+
+    $profiles = @{}
+    foreach ($item in @($TargetItems)) {
+        $pairId = [string](Get-ConfigValue -Object $item -Name 'PairId' -DefaultValue '')
+        $targetId = [string](Get-ConfigValue -Object $item -Name 'TargetId' -DefaultValue '')
+        if (-not (Test-NonEmptyString $pairId) -or -not (Test-NonEmptyString $targetId)) {
+            continue
+        }
+
+        if (-not $profiles.ContainsKey($pairId)) {
+            $profiles[$pairId] = [ordered]@{
+                PairId = $pairId
+                TopTargetId = ''
+                BottomTargetId = ''
+                SeedTargetId = ''
+                TargetIds = @()
+            }
+        }
+
+        $profile = $profiles[$pairId]
+        $profile.TargetIds = @($profile.TargetIds + $targetId | Where-Object { Test-NonEmptyString $_ } | Select-Object -Unique)
+        $roleName = [string](Get-ConfigValue -Object $item -Name 'RoleName' -DefaultValue '')
+        if ($roleName -eq 'top') {
+            $profile.TopTargetId = $targetId
+        }
+        elseif ($roleName -eq 'bottom') {
+            $profile.BottomTargetId = $targetId
+        }
+
+        if ([bool](Get-ConfigValue -Object $item -Name 'SeedEnabled' -DefaultValue $false)) {
+            $profile.SeedTargetId = $targetId
+        }
+    }
+
+    foreach ($pairId in @($profiles.Keys)) {
+        $profile = $profiles[$pairId]
+        $targetIds = @($profile.TargetIds | Where-Object { Test-NonEmptyString $_ })
+        if (-not (Test-NonEmptyString $profile.TopTargetId) -and $targetIds.Count -gt 0) {
+            $profile.TopTargetId = [string]$targetIds[0]
+        }
+        if (-not (Test-NonEmptyString $profile.BottomTargetId) -and $targetIds.Count -gt 1) {
+            $profile.BottomTargetId = [string](@($targetIds | Where-Object { $_ -ne $profile.TopTargetId })[0])
+        }
+        if (-not (Test-NonEmptyString $profile.SeedTargetId)) {
+            if (Test-NonEmptyString $profile.TopTargetId) {
+                $profile.SeedTargetId = $profile.TopTargetId
+            }
+            elseif ($targetIds.Count -gt 0) {
+                $profile.SeedTargetId = [string]$targetIds[0]
+            }
+        }
+        $profiles[$pairId] = [pscustomobject]$profile
+    }
+
+    return $profiles
+}
+
+function Test-PairStatusReadyForHandoff {
+    param($StatusEntry)
+
+    if ($null -eq $StatusEntry) {
+        return $false
+    }
+
+    $nextAction = [string](Get-ConfigValue -Object $StatusEntry -Name 'NextAction' -DefaultValue '')
+    if ($nextAction -eq 'handoff-ready') {
+        return $true
+    }
+
+    $contractLatestState = [string](Get-ConfigValue -Object $StatusEntry -Name 'ContractLatestState' -DefaultValue '')
+    if ($contractLatestState -eq 'ready-to-forward') {
+        return $true
+    }
+
+    $latestState = [string](Get-ConfigValue -Object $StatusEntry -Name 'LatestState' -DefaultValue '')
+    return ($latestState -eq 'ready-to-forward')
+}
+
+function Get-PairAttentionCategory {
+    param([object[]]$StatusEntries = @())
+
+    $attentionCategory = ''
+    foreach ($row in @($StatusEntries)) {
+        if ($null -eq $row) {
+            continue
+        }
+
+        $state = [string](Get-ConfigValue -Object $row -Name 'State' -DefaultValue '')
+        $latestState = [string](Get-ConfigValue -Object $row -Name 'LatestState' -DefaultValue '')
+        $contractLatestState = [string](Get-ConfigValue -Object $row -Name 'ContractLatestState' -DefaultValue '')
+        $nextAction = [string](Get-ConfigValue -Object $row -Name 'NextAction' -DefaultValue '')
+        $manualAttentionRequired = [bool](Get-ConfigValue -Object $row -Name 'SeedManualAttentionRequired' -DefaultValue $false)
+
+        if ($state -eq 'failed' -or $latestState -eq 'error-present' -or $contractLatestState -eq 'error-present') {
+            return 'error-blocked'
+        }
+
+        if ($manualAttentionRequired -or $nextAction -eq 'manual-review' -or $state -in @('target-unresponsive-after-send', 'submit-unconfirmed')) {
+            $attentionCategory = 'manual-attention'
+        }
+    }
+
+    return $attentionCategory
+}
+
+function Sync-PairStateEntries {
+    param(
+        [Parameter(Mandatory)][hashtable]$Entries,
+        [Parameter(Mandatory)][hashtable]$PairProfiles,
+        [Parameter(Mandatory)][hashtable]$PairForwardedCounts,
+        [Parameter(Mandatory)][hashtable]$SourceOutboxStatusEntries,
+        [Parameter(Mandatory)][hashtable]$PairRoundtripLimitMap,
+        [bool]$WatcherPaused = $false
+    )
+
+    $updatedAt = (Get-Date).ToString('o')
+    foreach ($pairId in @($PairProfiles.Keys | Sort-Object)) {
+        $profile = Get-ConfigValue -Object $PairProfiles -Name ([string]$pairId) -DefaultValue $null
+        if ($null -eq $profile) {
+            continue
+        }
+
+        $targetIds = @((Get-ConfigValue -Object $profile -Name 'TargetIds' -DefaultValue @()) | Where-Object { Test-NonEmptyString $_ })
+        $topTargetId = [string](Get-ConfigValue -Object $profile -Name 'TopTargetId' -DefaultValue '')
+        $bottomTargetId = [string](Get-ConfigValue -Object $profile -Name 'BottomTargetId' -DefaultValue '')
+        $seedTargetId = [string](Get-ConfigValue -Object $profile -Name 'SeedTargetId' -DefaultValue '')
+        if (-not (Test-NonEmptyString $seedTargetId) -and (Test-NonEmptyString $topTargetId)) {
+            $seedTargetId = $topTargetId
+        }
+        $partnerTargetId = [string](@($targetIds | Where-Object { $_ -ne $seedTargetId } | Select-Object -First 1)[0])
+        $forwardCount = [int](Get-ConfigValue -Object $PairForwardedCounts -Name ([string]$pairId) -DefaultValue 0)
+        $roundtripCount = [int][math]::Floor($forwardCount / 2)
+        $configuredMaxRoundtripCount = [int](Get-ConfigValue -Object $PairRoundtripLimitMap -Name ([string]$pairId) -DefaultValue 0)
+        $limitReached = [bool]($configuredMaxRoundtripCount -gt 0 -and $roundtripCount -ge $configuredMaxRoundtripCount)
+        $existing = Get-ConfigValue -Object $Entries -Name ([string]$pairId) -DefaultValue $null
+
+        $lastFromTargetId = [string](Get-ConfigValue -Object $existing -Name 'LastFromTargetId' -DefaultValue '')
+        $lastToTargetId = [string](Get-ConfigValue -Object $existing -Name 'LastToTargetId' -DefaultValue '')
+        if ($targetIds -notcontains $lastFromTargetId) {
+            $lastFromTargetId = ''
+        }
+        if ($targetIds -notcontains $lastToTargetId) {
+            $lastToTargetId = ''
+        }
+
+        if (-not (Test-NonEmptyString $lastToTargetId) -and $forwardCount -gt 0) {
+            if (($forwardCount % 2) -eq 1) {
+                $lastToTargetId = $partnerTargetId
+            }
+            else {
+                $lastToTargetId = $seedTargetId
+            }
+        }
+        if (-not (Test-NonEmptyString $lastFromTargetId) -and (Test-NonEmptyString $lastToTargetId)) {
+            $lastFromTargetId = [string](@($targetIds | Where-Object { $_ -ne $lastToTargetId } | Select-Object -First 1)[0])
+        }
+
+        $nextExpectedSourceTargetId = ''
+        $nextExpectedTargetId = ''
+        if ($forwardCount -le 0) {
+            $nextExpectedSourceTargetId = $seedTargetId
+            $nextExpectedTargetId = $partnerTargetId
+        }
+        elseif (Test-NonEmptyString $lastToTargetId) {
+            $nextExpectedSourceTargetId = $lastToTargetId
+            $nextExpectedTargetId = [string](@($targetIds | Where-Object { $_ -ne $lastToTargetId } | Select-Object -First 1)[0])
+        }
+        else {
+            $nextExpectedSourceTargetId = $seedTargetId
+            $nextExpectedTargetId = $partnerTargetId
+        }
+        $nextExpectedHandoff = if ((Test-NonEmptyString $nextExpectedSourceTargetId) -and (Test-NonEmptyString $nextExpectedTargetId)) {
+            ('{0} -> {1}' -f $nextExpectedSourceTargetId, $nextExpectedTargetId)
+        }
+        else {
+            ''
+        }
+
+        $statusRows = @()
+        foreach ($targetId in @($targetIds)) {
+            $row = Get-ConfigValue -Object $SourceOutboxStatusEntries -Name ([string]$targetId) -DefaultValue $null
+            if ($null -ne $row) {
+                $statusRows += $row
+            }
+        }
+
+        $handoffReadyCount = 0
+        $statusSummaryParts = @()
+        foreach ($targetId in @($targetIds)) {
+            $row = Get-ConfigValue -Object $SourceOutboxStatusEntries -Name ([string]$targetId) -DefaultValue $null
+            if ($null -eq $row) {
+                continue
+            }
+            if (Test-PairStatusReadyForHandoff -StatusEntry $row) {
+                $handoffReadyCount++
+            }
+            $displayState = [string](Get-ConfigValue -Object $row -Name 'ContractLatestState' -DefaultValue '')
+            if (-not (Test-NonEmptyString $displayState)) {
+                $displayState = [string](Get-ConfigValue -Object $row -Name 'LatestState' -DefaultValue '')
+            }
+            if (-not (Test-NonEmptyString $displayState)) {
+                $displayState = [string](Get-ConfigValue -Object $row -Name 'State' -DefaultValue '')
+            }
+            if (Test-NonEmptyString $displayState) {
+                $statusSummaryParts += ('{0}:{1}' -f [string]$targetId, $displayState)
+            }
+        }
+
+        $attentionCategory = Get-PairAttentionCategory -StatusEntries @($statusRows)
+        $expectedTargetStatus = if (Test-NonEmptyString $nextExpectedSourceTargetId) {
+            Get-ConfigValue -Object $SourceOutboxStatusEntries -Name $nextExpectedSourceTargetId -DefaultValue $null
+        }
+        else {
+            $null
+        }
+        $expectedReady = Test-PairStatusReadyForHandoff -StatusEntry $expectedTargetStatus
+        $currentPhase = ''
+        $nextAction = ''
+        if ($limitReached) {
+            $currentPhase = 'limit-reached'
+            $nextAction = 'limit-reached'
+        }
+        elseif ($WatcherPaused) {
+            $currentPhase = 'paused'
+            $nextAction = 'resume-required'
+        }
+        elseif (Test-NonEmptyString $attentionCategory) {
+            $currentPhase = $attentionCategory
+            $nextAction = 'manual-review'
+        }
+        elseif ($expectedReady) {
+            $currentPhase = if ($nextExpectedSourceTargetId -eq $seedTargetId) { 'waiting-partner-handoff' } else { 'waiting-return' }
+            $nextAction = 'handoff-ready'
+        }
+        else {
+            $currentPhase = if ($nextExpectedSourceTargetId -eq $seedTargetId) { 'seed-running' } else { 'partner-running' }
+            $nextAction = if ($nextExpectedSourceTargetId -eq $seedTargetId) { 'await-seed-output' } else { 'await-partner-output' }
+        }
+
+        $limitReachedAt = [string](Get-ConfigValue -Object $existing -Name 'LimitReachedAt' -DefaultValue '')
+        if ($limitReached -and -not (Test-NonEmptyString $limitReachedAt)) {
+            $limitReachedAt = $updatedAt
+        }
+        elseif (-not $limitReached) {
+            $limitReachedAt = ''
+        }
+
+        $currentPhase = Normalize-PairPhase -Phase $currentPhase -WatcherStatus $(if ($WatcherPaused) { 'paused' } else { '' }) -NextAction $nextAction -LimitReached:$limitReached
+
+        $Entries[[string]$pairId] = [pscustomobject]@{
+            PairId = [string]$pairId
+            TopTargetId = $topTargetId
+            BottomTargetId = $bottomTargetId
+            SeedTargetId = $seedTargetId
+            ForwardCount = $forwardCount
+            RoundtripCount = $roundtripCount
+            CurrentPhase = $currentPhase
+            NextAction = $nextAction
+            HandoffReadyCount = $handoffReadyCount
+            NextExpectedSourceTargetId = $nextExpectedSourceTargetId
+            NextExpectedTargetId = $nextExpectedTargetId
+            NextExpectedHandoff = $nextExpectedHandoff
+            LastFromTargetId = $lastFromTargetId
+            LastToTargetId = $lastToTargetId
+            LastForwardedAt = [string](Get-ConfigValue -Object $existing -Name 'LastForwardedAt' -DefaultValue '')
+            LastForwardedZipPath = [string](Get-ConfigValue -Object $existing -Name 'LastForwardedZipPath' -DefaultValue '')
+            StateSummary = (@($statusSummaryParts) -join ', ')
+            ConfiguredMaxRoundtripCount = $configuredMaxRoundtripCount
+            LimitReached = [bool]$limitReached
+            LimitReachedAt = $limitReachedAt
+            Paused = [bool]$WatcherPaused
+            UpdatedAt = $updatedAt
+        }
+    }
+}
+
+function Write-PairStateSnapshot {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$RunRoot,
+        [Parameter(Mandatory)][hashtable]$Entries,
+        [Parameter(Mandatory)][hashtable]$PairProfiles,
+        [Parameter(Mandatory)][hashtable]$PairForwardedCounts,
+        [Parameter(Mandatory)][hashtable]$SourceOutboxStatusEntries,
+        [Parameter(Mandatory)][hashtable]$PairRoundtripLimitMap,
+        [bool]$WatcherPaused = $false
+    )
+
+    Sync-PairStateEntries `
+        -Entries $Entries `
+        -PairProfiles $PairProfiles `
+        -PairForwardedCounts $PairForwardedCounts `
+        -SourceOutboxStatusEntries $SourceOutboxStatusEntries `
+        -PairRoundtripLimitMap $PairRoundtripLimitMap `
+        -WatcherPaused:$WatcherPaused
+    Save-PairState -Path $Path -RunRoot $RunRoot -Entries $Entries
 }
 
 function Load-SeedSendStatusState {
@@ -1315,6 +2002,7 @@ try {
     }
     Ensure-Directory -Path $stateRoot
     $statePath = Join-Path $stateRoot 'forwarded.json'
+    $pairStatePath = Join-Path $stateRoot 'pair-state.json'
     $sourceOutboxStatePath = Join-Path $stateRoot 'source-outbox-processed.json'
     $sourceOutboxFailureLogPath = Join-Path $stateRoot 'source-outbox-failures.log'
     $sourceOutboxStatusPath = Join-Path $stateRoot 'source-outbox-status.json'
@@ -1338,37 +2026,135 @@ try {
     $sourceOutboxPendingState = @{}
     $sourceOutboxFailureState = @{}
     $sourceOutboxStatusEntries = @{}
+    $pairProfiles = Get-PairProfiles -TargetItems @($targetItems)
+    $pairRoundtripLimitMap = Get-PairRoundtripLimitMap -TargetItems @($targetItems) -GlobalPairMaxRoundtripCount $PairMaxRoundtripCount
+    $pairStateEntries = Load-PairStateEntries -Path $pairStatePath
+    $pairForwardedCounts = Get-PairForwardedCounts -State $state -TargetItemsById $targetItemsById
+    $watcherPaused = $false
+    $pauseStartedAtUtc = $null
+    $pausedDurationSeconds = 0.0
     $forwardedThisRun = 0
     Save-SourceOutboxStatus -Path $sourceOutboxStatusPath -RunRoot $resolvedRunRoot -Entries $sourceOutboxStatusEntries
+    Write-PairStateSnapshot `
+        -Path $pairStatePath `
+        -RunRoot $resolvedRunRoot `
+        -Entries $pairStateEntries `
+        -PairProfiles $pairProfiles `
+        -PairForwardedCounts $pairForwardedCounts `
+        -SourceOutboxStatusEntries $sourceOutboxStatusEntries `
+        -PairRoundtripLimitMap $pairRoundtripLimitMap `
+        -WatcherPaused:$watcherPaused
     $watcherStatusSequence++
     $watcherHeartbeatAt = (Get-Date).ToString('o')
-    Save-WatcherStatus -Path $watcherStatusPath -RunRoot $resolvedRunRoot -MutexName $watcherMutexName -State 'running' -Reason 'started' -LastHandledRequestId $watcherLastHandledRequestId -LastHandledAction $watcherLastHandledAction -LastHandledResult $watcherLastHandledResult -LastHandledAt $watcherLastHandledAt -HeartbeatAt $watcherHeartbeatAt -StatusSequence $watcherStatusSequence -ProcessStartedAt $watcherProcessStartedAt -ForwardedCount $forwardedThisRun -ConfiguredMaxForwardCount $MaxForwardCount
+    Save-WatcherStatus -Path $watcherStatusPath -RunRoot $resolvedRunRoot -MutexName $watcherMutexName -State 'running' -Reason 'started' -LastHandledRequestId $watcherLastHandledRequestId -LastHandledAction $watcherLastHandledAction -LastHandledResult $watcherLastHandledResult -LastHandledAt $watcherLastHandledAt -HeartbeatAt $watcherHeartbeatAt -StatusSequence $watcherStatusSequence -ProcessStartedAt $watcherProcessStartedAt -ForwardedCount $forwardedThisRun -ConfiguredMaxForwardCount $MaxForwardCount -ConfiguredRunDurationSec $RunDurationSec -ConfiguredMaxRoundtripCount $PairMaxRoundtripCount
     $watcherStarted = $true
 
     Write-Host "watching paired exchange root: $resolvedRunRoot mutex=$watcherMutexName"
 
     while ($true) {
-        if ($RunDurationSec -gt 0 -and $stopwatch.Elapsed.TotalSeconds -ge $RunDurationSec) {
+        Write-PairStateSnapshot `
+            -Path $pairStatePath `
+            -RunRoot $resolvedRunRoot `
+            -Entries $pairStateEntries `
+            -PairProfiles $pairProfiles `
+            -PairForwardedCounts $pairForwardedCounts `
+            -SourceOutboxStatusEntries $sourceOutboxStatusEntries `
+            -PairRoundtripLimitMap $pairRoundtripLimitMap `
+            -WatcherPaused:$watcherPaused
+        $activeElapsedSeconds = Get-ActiveWatcherElapsedSeconds -Stopwatch $stopwatch -PausedDurationSeconds $pausedDurationSeconds
+        if ($RunDurationSec -gt 0 -and $activeElapsedSeconds -ge $RunDurationSec) {
             $watcherStopReason = 'run-duration-reached'
             break
         }
 
         $watcherStatusSequence++
         $watcherHeartbeatAt = (Get-Date).ToString('o')
-        Save-WatcherStatus -Path $watcherStatusPath -RunRoot $resolvedRunRoot -MutexName $watcherMutexName -State 'running' -Reason 'heartbeat' -RequestId $watcherRequestId -Action $watcherAction -LastHandledRequestId $watcherLastHandledRequestId -LastHandledAction $watcherLastHandledAction -LastHandledResult $watcherLastHandledResult -LastHandledAt $watcherLastHandledAt -HeartbeatAt $watcherHeartbeatAt -StatusSequence $watcherStatusSequence -ProcessStartedAt $watcherProcessStartedAt -ForwardedCount $forwardedThisRun -ConfiguredMaxForwardCount $MaxForwardCount
+        $watcherLoopState = if ($watcherPaused) { 'paused' } else { 'running' }
+        $watcherLoopReason = if ($watcherPaused) { 'paused' } else { 'heartbeat' }
+        Save-WatcherStatus -Path $watcherStatusPath -RunRoot $resolvedRunRoot -MutexName $watcherMutexName -State $watcherLoopState -Reason $watcherLoopReason -RequestId $watcherRequestId -Action $watcherAction -LastHandledRequestId $watcherLastHandledRequestId -LastHandledAction $watcherLastHandledAction -LastHandledResult $watcherLastHandledResult -LastHandledAt $watcherLastHandledAt -HeartbeatAt $watcherHeartbeatAt -StatusSequence $watcherStatusSequence -ProcessStartedAt $watcherProcessStartedAt -ForwardedCount $forwardedThisRun -ConfiguredMaxForwardCount $MaxForwardCount -ConfiguredRunDurationSec $RunDurationSec -ConfiguredMaxRoundtripCount $PairMaxRoundtripCount
         $controlRequest = Get-WatcherControlRequest -Path $watcherControlPath
         if ($null -ne $controlRequest -and [string]$controlRequest.RunRoot -eq $resolvedRunRoot) {
             $watcherRequestId = [string]$controlRequest.RequestId
             $watcherAction = [string]$controlRequest.Action
             $watcherLastHandledRequestId = $watcherRequestId
             $watcherLastHandledAction = $watcherAction
-            $watcherLastHandledResult = 'accepted'
             $watcherLastHandledAt = (Get-Date).ToString('o')
-            $watcherStopReason = 'control-stop-request'
-            $watcherStatusSequence++
-            $watcherHeartbeatAt = (Get-Date).ToString('o')
-            Save-WatcherStatus -Path $watcherStatusPath -RunRoot $resolvedRunRoot -MutexName $watcherMutexName -State 'stop_requested' -Reason $watcherStopReason -RequestId $watcherRequestId -Action $watcherAction -LastHandledRequestId $watcherLastHandledRequestId -LastHandledAction $watcherLastHandledAction -LastHandledResult $watcherLastHandledResult -LastHandledAt $watcherLastHandledAt -HeartbeatAt $watcherHeartbeatAt -StatusSequence $watcherStatusSequence -ProcessStartedAt $watcherProcessStartedAt -ForwardedCount $forwardedThisRun -ConfiguredMaxForwardCount $MaxForwardCount
-            Clear-WatcherControlRequest -Path $watcherControlPath
+            $exitWatcherLoop = $false
+            switch ($watcherAction) {
+                'stop' {
+                    $watcherLastHandledResult = 'accepted'
+                    $watcherStopReason = 'control-stop-request'
+                    $watcherStatusSequence++
+                    $watcherHeartbeatAt = (Get-Date).ToString('o')
+                    Save-WatcherStatus -Path $watcherStatusPath -RunRoot $resolvedRunRoot -MutexName $watcherMutexName -State 'stop_requested' -Reason $watcherStopReason -RequestId $watcherRequestId -Action $watcherAction -LastHandledRequestId $watcherLastHandledRequestId -LastHandledAction $watcherLastHandledAction -LastHandledResult $watcherLastHandledResult -LastHandledAt $watcherLastHandledAt -HeartbeatAt $watcherHeartbeatAt -StatusSequence $watcherStatusSequence -ProcessStartedAt $watcherProcessStartedAt -ForwardedCount $forwardedThisRun -ConfiguredMaxForwardCount $MaxForwardCount -ConfiguredRunDurationSec $RunDurationSec -ConfiguredMaxRoundtripCount $PairMaxRoundtripCount
+                    Clear-WatcherControlRequest -Path $watcherControlPath
+                    $exitWatcherLoop = $true
+                }
+                'pause' {
+                    if (-not $watcherPaused) {
+                        $watcherPaused = $true
+                        $pauseStartedAtUtc = [DateTime]::UtcNow
+                        $watcherLastHandledResult = 'paused'
+                        $watcherLoopReason = 'control-pause-request'
+                    }
+                    else {
+                        $watcherLastHandledResult = 'already-paused'
+                        $watcherLoopReason = 'paused'
+                    }
+                    Clear-WatcherControlRequest -Path $watcherControlPath
+                    Write-PairStateSnapshot `
+                        -Path $pairStatePath `
+                        -RunRoot $resolvedRunRoot `
+                        -Entries $pairStateEntries `
+                        -PairProfiles $pairProfiles `
+                        -PairForwardedCounts $pairForwardedCounts `
+                        -SourceOutboxStatusEntries $sourceOutboxStatusEntries `
+                        -PairRoundtripLimitMap $pairRoundtripLimitMap `
+                        -WatcherPaused:$watcherPaused
+                    $watcherStatusSequence++
+                    $watcherHeartbeatAt = (Get-Date).ToString('o')
+                    Save-WatcherStatus -Path $watcherStatusPath -RunRoot $resolvedRunRoot -MutexName $watcherMutexName -State 'paused' -Reason $watcherLoopReason -RequestId $watcherRequestId -Action $watcherAction -LastHandledRequestId $watcherLastHandledRequestId -LastHandledAction $watcherLastHandledAction -LastHandledResult $watcherLastHandledResult -LastHandledAt $watcherLastHandledAt -HeartbeatAt $watcherHeartbeatAt -StatusSequence $watcherStatusSequence -ProcessStartedAt $watcherProcessStartedAt -ForwardedCount $forwardedThisRun -ConfiguredMaxForwardCount $MaxForwardCount -ConfiguredRunDurationSec $RunDurationSec -ConfiguredMaxRoundtripCount $PairMaxRoundtripCount
+                    Start-Sleep -Milliseconds $PollIntervalMs
+                    continue
+                }
+                'resume' {
+                    if ($watcherPaused) {
+                        if ($null -ne $pauseStartedAtUtc) {
+                            $pausedDurationSeconds += ([DateTime]::UtcNow - $pauseStartedAtUtc).TotalSeconds
+                            $pauseStartedAtUtc = $null
+                        }
+                        $watcherPaused = $false
+                        $watcherLastHandledResult = 'resumed'
+                        $watcherLoopReason = 'control-resume-request'
+                    }
+                    else {
+                        $watcherLastHandledResult = 'already-running'
+                        $watcherLoopReason = 'heartbeat'
+                    }
+                    Clear-WatcherControlRequest -Path $watcherControlPath
+                    Write-PairStateSnapshot `
+                        -Path $pairStatePath `
+                        -RunRoot $resolvedRunRoot `
+                        -Entries $pairStateEntries `
+                        -PairProfiles $pairProfiles `
+                        -PairForwardedCounts $pairForwardedCounts `
+                        -SourceOutboxStatusEntries $sourceOutboxStatusEntries `
+                        -PairRoundtripLimitMap $pairRoundtripLimitMap `
+                        -WatcherPaused:$watcherPaused
+                    $watcherStatusSequence++
+                    $watcherHeartbeatAt = (Get-Date).ToString('o')
+                    Save-WatcherStatus -Path $watcherStatusPath -RunRoot $resolvedRunRoot -MutexName $watcherMutexName -State 'running' -Reason $watcherLoopReason -RequestId $watcherRequestId -Action $watcherAction -LastHandledRequestId $watcherLastHandledRequestId -LastHandledAction $watcherLastHandledAction -LastHandledResult $watcherLastHandledResult -LastHandledAt $watcherLastHandledAt -HeartbeatAt $watcherHeartbeatAt -StatusSequence $watcherStatusSequence -ProcessStartedAt $watcherProcessStartedAt -ForwardedCount $forwardedThisRun -ConfiguredMaxForwardCount $MaxForwardCount -ConfiguredRunDurationSec $RunDurationSec -ConfiguredMaxRoundtripCount $PairMaxRoundtripCount
+                    continue
+                }
+            }
+            if ($exitWatcherLoop) {
+                break
+            }
+        }
+
+        if (Test-AllPairsReachedRoundtripLimit -PairForwardedCounts $pairForwardedCounts -PairRoundtripLimitMap $pairRoundtripLimitMap) {
+            Write-Host 'paired exchange watcher reached pair roundtrip limit.'
+            $watcherStopReason = 'pair-roundtrip-limit-reached'
             break
         }
 
@@ -1423,7 +2209,7 @@ try {
                     $sourcePendingKey = [string]$sourceOutboxReadiness.StateKey
                     if (Test-NonEmptyString $sourcePendingKey -and -not $sourceOutboxPendingState.ContainsKey($sourcePendingKey)) {
                         $sourceOutboxPendingState[$sourcePendingKey] = $true
-                        Write-Host ("source-outbox waiting {0} marker={1} reason={2}" -f [string]$item.TargetId, [string]$sourceOutboxReadiness.Paths.PublishReadyPath, [string]$sourceOutboxReadiness.Reason)
+                        Write-Host ("source-outbox waiting {0} marker={1} reason={2}" -f [string]$item.TargetId, [string]$sourceOutboxReadiness.Paths.EffectivePublishReadyPath, [string]$sourceOutboxReadiness.Reason)
                     }
 
                     $sourceOutboxStatusEntries[[string]$item.TargetId] = [pscustomobject]@{
@@ -1435,7 +2221,7 @@ try {
                         SourceOutboxPath    = [string]$sourceOutboxReadiness.Paths.SourceOutboxPath
                         SourceSummaryPath   = [string]$sourceOutboxReadiness.Paths.SourceSummaryPath
                         SourceReviewZipPath = [string]$sourceOutboxReadiness.Paths.SourceReviewZipPath
-                        PublishReadyPath    = [string]$sourceOutboxReadiness.Paths.PublishReadyPath
+                        PublishReadyPath    = [string]$sourceOutboxReadiness.Paths.EffectivePublishReadyPath
                         PublishedAt         = [string]$sourceOutboxReadiness.PublishedAt
                         ContractLatestState = ''
                         NextAction          = ''
@@ -1483,10 +2269,10 @@ try {
                                     -Path $sourceOutboxFailureLogPath `
                                     -PairId ([string]$item.PairId) `
                                     -TargetId ([string]$item.TargetId) `
-                                    -MarkerPath ([string]$sourceOutboxReadiness.Paths.PublishReadyPath) `
+                                    -MarkerPath ([string]$sourceOutboxReadiness.Paths.EffectivePublishReadyPath) `
                                     -StateKey $sourceFingerprint `
                                     -Message $sourceImportFailure
-                                Write-Host ("source-outbox import failed {0} marker={1} error={2}" -f [string]$item.TargetId, [string]$sourceOutboxReadiness.Paths.PublishReadyPath, $sourceImportFailure)
+                                Write-Host ("source-outbox import failed {0} marker={1} error={2}" -f [string]$item.TargetId, [string]$sourceOutboxReadiness.Paths.EffectivePublishReadyPath, $sourceImportFailure)
                             }
 
                             $sourceOutboxStatusEntries[[string]$item.TargetId] = [pscustomobject]@{
@@ -1498,7 +2284,7 @@ try {
                                 SourceOutboxPath    = [string]$sourceOutboxReadiness.Paths.SourceOutboxPath
                                 SourceSummaryPath   = [string]$sourceOutboxReadiness.Paths.SourceSummaryPath
                                 SourceReviewZipPath = [string]$sourceOutboxReadiness.Paths.SourceReviewZipPath
-                                PublishReadyPath    = [string]$sourceOutboxReadiness.Paths.PublishReadyPath
+                                PublishReadyPath    = [string]$sourceOutboxReadiness.Paths.EffectivePublishReadyPath
                                 PublishedAt         = [string]$sourceOutboxReadiness.PublishedAt
                                 ContractLatestState = ''
                                 NextAction          = ''
@@ -1509,10 +2295,15 @@ try {
                             $archivedReadyPath = ''
                             $archiveFailure = ''
                             try {
-                                $archivedReadyPath = Archive-SourceOutboxReadyMarker `
-                                    -PublishReadyPath ([string]$sourceOutboxReadiness.Paths.PublishReadyPath) `
-                                    -ArchiveRoot ([string]$sourceOutboxReadiness.Paths.PublishedArchivePath) `
-                                    -TargetId ([string]$item.TargetId)
+                                if ([bool]$sourceOutboxReadiness.Paths.PublishReadyArchived) {
+                                    $archivedReadyPath = [string]$sourceOutboxReadiness.Paths.EffectivePublishReadyPath
+                                }
+                                else {
+                                    $archivedReadyPath = Archive-SourceOutboxReadyMarker `
+                                        -PublishReadyPath ([string]$sourceOutboxReadiness.Paths.EffectivePublishReadyPath) `
+                                        -ArchiveRoot ([string]$sourceOutboxReadiness.Paths.PublishedArchivePath) `
+                                        -TargetId ([string]$item.TargetId)
+                                }
                             }
                             catch {
                                 $archiveFailure = $_.Exception.Message
@@ -1520,7 +2311,7 @@ try {
                                     -Path $sourceOutboxFailureLogPath `
                                     -PairId ([string]$item.PairId) `
                                     -TargetId ([string]$item.TargetId) `
-                                    -MarkerPath ([string]$sourceOutboxReadiness.Paths.PublishReadyPath) `
+                                    -MarkerPath ([string]$sourceOutboxReadiness.Paths.EffectivePublishReadyPath) `
                                     -StateKey $sourceFingerprint `
                                     -Message ('archive-failed:' + $archiveFailure)
                             }
@@ -1544,7 +2335,7 @@ try {
                                 SourceOutboxPath    = [string]$sourceOutboxReadiness.Paths.SourceOutboxPath
                                 SourceSummaryPath   = [string]$sourceOutboxReadiness.Paths.SourceSummaryPath
                                 SourceReviewZipPath = [string]$sourceOutboxReadiness.Paths.SourceReviewZipPath
-                                PublishReadyPath    = [string]$sourceOutboxReadiness.Paths.PublishReadyPath
+                                PublishReadyPath    = [string]$sourceOutboxReadiness.Paths.EffectivePublishReadyPath
                                 PublishedAt         = [string]$sourceOutboxReadiness.PublishedAt
                                 ArchivedReadyPath   = $archivedReadyPath
                                 ImportedZipPath     = if ($null -ne $sourceImportResult.Json -and $null -ne $sourceImportResult.Json.Contract) { [string]$sourceImportResult.Json.Contract.DestinationZipPath } else { '' }
@@ -1553,17 +2344,22 @@ try {
                                 NextAction          = Get-ContractNextAction -LatestState $contractLatestState
                             }
                             Save-SourceOutboxStatus -Path $sourceOutboxStatusPath -RunRoot $resolvedRunRoot -Entries $sourceOutboxStatusEntries
-                            Write-Host ("source-outbox imported {0} marker={1} destZip={2}" -f [string]$item.TargetId, [string]$sourceOutboxReadiness.Paths.PublishReadyPath, [string]$sourceOutboxStatusEntries[[string]$item.TargetId].ImportedZipPath)
+                            Write-Host ("source-outbox imported {0} marker={1} destZip={2}" -f [string]$item.TargetId, [string]$sourceOutboxReadiness.Paths.EffectivePublishReadyPath, [string]$sourceOutboxStatusEntries[[string]$item.TargetId].ImportedZipPath)
                         }
                     }
                     else {
                         $duplicateArchivePath = ''
                         $duplicateArchiveFailure = ''
                         try {
-                            $duplicateArchivePath = Archive-SourceOutboxReadyMarker `
-                                -PublishReadyPath ([string]$sourceOutboxReadiness.Paths.PublishReadyPath) `
-                                -ArchiveRoot ([string]$sourceOutboxReadiness.Paths.PublishedArchivePath) `
-                                -TargetId ([string]$item.TargetId)
+                            if ([bool]$sourceOutboxReadiness.Paths.PublishReadyArchived) {
+                                $duplicateArchivePath = [string]$sourceOutboxReadiness.Paths.EffectivePublishReadyPath
+                            }
+                            else {
+                                $duplicateArchivePath = Archive-SourceOutboxReadyMarker `
+                                    -PublishReadyPath ([string]$sourceOutboxReadiness.Paths.EffectivePublishReadyPath) `
+                                    -ArchiveRoot ([string]$sourceOutboxReadiness.Paths.PublishedArchivePath) `
+                                    -TargetId ([string]$item.TargetId)
+                            }
                         }
                         catch {
                             $duplicateArchiveFailure = $_.Exception.Message
@@ -1571,7 +2367,7 @@ try {
                                 -Path $sourceOutboxFailureLogPath `
                                 -PairId ([string]$item.PairId) `
                                 -TargetId ([string]$item.TargetId) `
-                                -MarkerPath ([string]$sourceOutboxReadiness.Paths.PublishReadyPath) `
+                                -MarkerPath ([string]$sourceOutboxReadiness.Paths.EffectivePublishReadyPath) `
                                 -StateKey $sourceFingerprint `
                                 -Message ('duplicate-archive-failed:' + $duplicateArchiveFailure)
                         }
@@ -1585,7 +2381,7 @@ try {
                             SourceOutboxPath    = [string]$sourceOutboxReadiness.Paths.SourceOutboxPath
                             SourceSummaryPath   = [string]$sourceOutboxReadiness.Paths.SourceSummaryPath
                             SourceReviewZipPath = [string]$sourceOutboxReadiness.Paths.SourceReviewZipPath
-                            PublishReadyPath    = [string]$sourceOutboxReadiness.Paths.PublishReadyPath
+                            PublishReadyPath    = [string]$sourceOutboxReadiness.Paths.EffectivePublishReadyPath
                             PublishedAt         = [string]$sourceOutboxReadiness.PublishedAt
                             ArchivedReadyPath   = $duplicateArchivePath
                             ImportedZipPath     = ''
@@ -1594,7 +2390,7 @@ try {
                             NextAction          = 'duplicate-skipped'
                         }
                         Save-SourceOutboxStatus -Path $sourceOutboxStatusPath -RunRoot $resolvedRunRoot -Entries $sourceOutboxStatusEntries
-                        Write-Host ("source-outbox duplicate skipped {0} marker={1}" -f [string]$item.TargetId, [string]$sourceOutboxReadiness.Paths.PublishReadyPath)
+                        Write-Host ("source-outbox duplicate skipped {0} marker={1}" -f [string]$item.TargetId, [string]$sourceOutboxReadiness.Paths.EffectivePublishReadyPath)
                     }
                 }
             }
@@ -1609,86 +2405,108 @@ try {
             $donePath = Join-Path $targetFolder ([string]$pairTest.HeadlessExec.DoneFileName)
             $summaryValue = if (Test-Path -LiteralPath $summaryPath) { $summaryPath } else { '' }
 
-            $zipFiles = @(
-                Get-ChildItem -LiteralPath $reviewRoot -Filter '*.zip' -File -ErrorAction SilentlyContinue |
-                    Sort-Object LastWriteTimeUtc, Name
-            )
+            $latestZipFile = Get-ChildItem -LiteralPath $reviewRoot -Filter '*.zip' -File -ErrorAction SilentlyContinue |
+                Sort-Object LastWriteTimeUtc, Name -Descending |
+                Select-Object -First 1
+            if ($null -eq $latestZipFile) {
+                continue
+            }
 
-            foreach ($zipFile in $zipFiles) {
-                $stateKey = Get-ZipFingerprint -TargetId ([string]$item.TargetId) -ZipFile $zipFile
-                if ($state.ContainsKey($stateKey)) {
-                    continue
+            $stateKey = Get-ZipFingerprint -TargetId ([string]$item.TargetId) -ZipFile $latestZipFile
+            if ($state.ContainsKey($stateKey)) {
+                continue
+            }
+
+            $pairRoundtripLimit = [int](Get-ConfigValue -Object $pairRoundtripLimitMap -Name ([string]$item.PairId) -DefaultValue 0)
+            $pairForwardLimit = if ($pairRoundtripLimit -gt 0) { ([math]::Max(1, $pairRoundtripLimit) * 2) } else { 0 }
+            $pairForwardedCount = [int](Get-ConfigValue -Object $pairForwardedCounts -Name ([string]$item.PairId) -DefaultValue 0)
+            if ($pairForwardLimit -gt 0 -and $pairForwardedCount -ge $pairForwardLimit) {
+                continue
+            }
+
+            $readinessStatus = $null
+            if (Test-Path -LiteralPath $donePath) {
+                $readinessStatus = Test-DoneMarkerReadyForZip -DonePath $donePath -ZipFile $latestZipFile -MaxSkewSeconds ([double]$pairTest.SummaryZipMaxSkewSeconds)
+            }
+
+            if ($null -eq $readinessStatus -or -not $readinessStatus.IsReady) {
+                if ($null -eq $readinessStatus -or [string]$readinessStatus.Reason -eq 'done-missing') {
+                    $readinessStatus = Test-SummaryReadyForZip -SummaryPath $summaryPath -ZipFile $latestZipFile -MaxSkewSeconds ([double]$pairTest.SummaryZipMaxSkewSeconds)
                 }
+            }
 
-                $readinessStatus = $null
-                if (Test-Path -LiteralPath $donePath) {
-                    $readinessStatus = Test-DoneMarkerReadyForZip -DonePath $donePath -ZipFile $zipFile -MaxSkewSeconds ([double]$pairTest.SummaryZipMaxSkewSeconds)
+            if (-not $readinessStatus.IsReady) {
+                $pendingStateKey = ($stateKey + '|' + [string]$readinessStatus.Reason)
+                if (-not $pendingState.ContainsKey($pendingStateKey)) {
+                    $pendingState[$pendingStateKey] = $true
+                    Write-Host ("waiting {0} zip={1} reason={2}" -f [string]$item.TargetId, $latestZipFile.FullName, [string]$readinessStatus.Reason)
                 }
+                continue
+            }
 
-                if ($null -eq $readinessStatus -or -not $readinessStatus.IsReady) {
-                    if ($null -eq $readinessStatus -or [string]$readinessStatus.Reason -eq 'done-missing') {
-                        $readinessStatus = Test-SummaryReadyForZip -SummaryPath $summaryPath -ZipFile $zipFile -MaxSkewSeconds ([double]$pairTest.SummaryZipMaxSkewSeconds)
-                    }
-                }
+            $recipientItem = Get-ConfigValue -Object $targetItemsById -Name ([string]$item.PartnerTargetId) -DefaultValue $null
+            if ($null -eq $recipientItem) {
+                throw ("recipient target item not found: {0}" -f [string]$item.PartnerTargetId)
+            }
 
-                if (-not $readinessStatus.IsReady) {
-                    $pendingStateKey = ($stateKey + '|' + [string]$readinessStatus.Reason)
-                    if (-not $pendingState.ContainsKey($pendingStateKey)) {
-                        $pendingState[$pendingStateKey] = $true
-                        Write-Host ("waiting {0} zip={1} reason={2}" -f [string]$item.TargetId, $zipFile.FullName, [string]$readinessStatus.Reason)
-                    }
-                    continue
-                }
+            $pauseBlocksDirectDispatch = $watcherPaused -and ($UseHeadlessDispatch -or -not [bool]$pairTest.VisibleWorker.Enabled)
+            if ($pauseBlocksDirectDispatch) {
+                continue
+            }
 
-                $recipientItem = Get-ConfigValue -Object $targetItemsById -Name ([string]$item.PartnerTargetId) -DefaultValue $null
-                if ($null -eq $recipientItem) {
-                    throw ("recipient target item not found: {0}" -f [string]$item.PartnerTargetId)
-                }
+            $queueState = Get-OneTimeQueueDocument -Root $root -Config $config -PairId ([string]$recipientItem.PairId)
+            $handoffOneTimeItems = @(Get-ApplicableOneTimeQueueItems `
+                -QueueDocument $queueState.Document `
+                -PairId ([string]$recipientItem.PairId) `
+                -RoleName ([string]$recipientItem.RoleName) `
+                -TargetId ([string]$recipientItem.TargetId) `
+                -MessageType 'handoff')
+            $messageText = Get-HandoffMessageText -PairTest $pairTest -SourceItem $item -RecipientItem $recipientItem -ZipPath $latestZipFile.FullName -SummaryPath $summaryValue -OneTimeItems $handoffOneTimeItems
+            $stamp = Get-Date -Format 'yyyyMMdd_HHmmss_fff'
+            $messagePath = Join-Path $messageRoot ("handoff_{0}_to_{1}_{2}.txt" -f [string]$item.TargetId, [string]$item.PartnerTargetId, $stamp)
+            [System.IO.File]::WriteAllText($messagePath, $messageText, (New-Utf8NoBomEncoding))
+            $messageMetadata = New-PairedRelayMessageMetadata `
+                -RunRoot $resolvedRunRoot `
+                -PairId ([string]$recipientItem.PairId) `
+                -TargetId ([string]$recipientItem.TargetId) `
+                -PartnerTargetId ([string]$recipientItem.PartnerTargetId) `
+                -RoleName ([string]$recipientItem.RoleName) `
+                -InitialRoleMode ([string](Get-ConfigValue -Object $recipientItem -Name 'InitialRoleMode' -DefaultValue '')) `
+                -MessageType 'pair-handoff' `
+                -SourceTargetId ([string]$item.TargetId) `
+                -MessagePath $messagePath
+            Write-RelayMessageMetadata -MessagePath $messagePath -Metadata $messageMetadata | Out-Null
 
-                $queueState = Get-OneTimeQueueDocument -Root $root -Config $config -PairId ([string]$recipientItem.PairId)
-                $handoffOneTimeItems = @(Get-ApplicableOneTimeQueueItems `
-                    -QueueDocument $queueState.Document `
-                    -PairId ([string]$recipientItem.PairId) `
-                    -RoleName ([string]$recipientItem.RoleName) `
-                    -TargetId ([string]$recipientItem.TargetId) `
-                    -MessageType 'handoff')
-                $messageText = Get-HandoffMessageText -PairTest $pairTest -SourceItem $item -RecipientItem $recipientItem -ZipPath $zipFile.FullName -SummaryPath $summaryValue -OneTimeItems $handoffOneTimeItems
-                $stamp = Get-Date -Format 'yyyyMMdd_HHmmss_fff'
-                $messagePath = Join-Path $messageRoot ("handoff_{0}_to_{1}_{2}.txt" -f [string]$item.TargetId, [string]$item.PartnerTargetId, $stamp)
-                [System.IO.File]::WriteAllText($messagePath, $messageText, (New-Utf8NoBomEncoding))
-                $messageMetadata = New-PairedRelayMessageMetadata `
-                    -RunRoot $resolvedRunRoot `
-                    -PairId ([string]$recipientItem.PairId) `
-                    -TargetId ([string]$recipientItem.TargetId) `
-                    -PartnerTargetId ([string]$recipientItem.PartnerTargetId) `
-                    -RoleName ([string]$recipientItem.RoleName) `
-                    -InitialRoleMode ([string](Get-ConfigValue -Object $recipientItem -Name 'InitialRoleMode' -DefaultValue '')) `
-                    -MessageType 'pair-handoff' `
-                    -SourceTargetId ([string]$item.TargetId) `
-                    -MessagePath $messagePath
-                Write-RelayMessageMetadata -MessagePath $messagePath -Metadata $messageMetadata | Out-Null
+            try {
+                if ($UseHeadlessDispatch) {
+                    $dispatchLogPath = Join-Path $headlessDispatchLogRoot ("handoff_{0}_to_{1}_{2}.log" -f [string]$item.TargetId, [string]$item.PartnerTargetId, $stamp)
+                    Invoke-HeadlessDispatch `
+                        -Root $root `
+                        -ConfigPath $resolvedConfigPath `
+                        -RunRoot $resolvedRunRoot `
+                        -TargetId ([string]$item.PartnerTargetId) `
+                        -PromptFilePath $messagePath `
+                        -LogPath $dispatchLogPath `
+                        -StatusRoot $headlessDispatchLogRoot
 
-                try {
-                    if ($UseHeadlessDispatch) {
-                        $dispatchLogPath = Join-Path $headlessDispatchLogRoot ("handoff_{0}_to_{1}_{2}.log" -f [string]$item.TargetId, [string]$item.PartnerTargetId, $stamp)
-                        Invoke-HeadlessDispatch `
+                    $handoffOneTimeItemIds = @($handoffOneTimeItems | ForEach-Object { [string](Get-ConfigValue -Object $_ -Name 'Id' -DefaultValue '') } | Where-Object { Test-NonEmptyString $_ })
+                    if ($handoffOneTimeItemIds.Count -gt 0) {
+                        [void](Complete-OneTimeQueueItems `
                             -Root $root `
+                            -Config $config `
+                            -PairId ([string]$item.PairId) `
+                            -ItemIds $handoffOneTimeItemIds `
+                            -IgnoreMissing)
+                    }
+                }
+                else {
+                    if ([bool]$pairTest.VisibleWorker.Enabled) {
+                        & (Join-Path $root 'visible\Queue-VisibleWorkerCommand.ps1') `
                             -ConfigPath $resolvedConfigPath `
                             -RunRoot $resolvedRunRoot `
                             -TargetId ([string]$item.PartnerTargetId) `
                             -PromptFilePath $messagePath `
-                            -LogPath $dispatchLogPath `
-                            -StatusRoot $headlessDispatchLogRoot
-
-                        $handoffOneTimeItemIds = @($handoffOneTimeItems | ForEach-Object { [string](Get-ConfigValue -Object $_ -Name 'Id' -DefaultValue '') } | Where-Object { Test-NonEmptyString $_ })
-                        if ($handoffOneTimeItemIds.Count -gt 0) {
-                            [void](Complete-OneTimeQueueItems `
-                                -Root $root `
-                                -Config $config `
-                                -PairId ([string]$item.PairId) `
-                                -ItemIds $handoffOneTimeItemIds `
-                                -IgnoreMissing)
-                        }
+                            -Mode 'handoff' | Out-Null
                     }
                     else {
                         & (Join-Path $root 'producer-example.ps1') `
@@ -1697,43 +2515,65 @@ try {
                             -TextFilePath $messagePath | Out-Null
                     }
                 }
-                catch {
-                    $failureMessage = $_.Exception.Message
-                    $failureStateKey = ($stateKey + '|' + $failureMessage)
-                    if (-not $handoffFailureState.ContainsKey($failureStateKey)) {
-                        $handoffFailureState[$failureStateKey] = $true
-                        Write-HandoffFailureLog `
-                            -Path $handoffFailureLogPath `
-                            -PairId ([string]$item.PairId) `
-                            -TargetId ([string]$item.TargetId) `
-                            -PartnerTargetId ([string]$item.PartnerTargetId) `
-                            -ZipPath $zipFile.FullName `
-                            -StateKey $stateKey `
-                            -Message $failureMessage
-                        Write-Host ("handoff failed {0} -> {1} zip={2} error={3}" -f [string]$item.TargetId, [string]$item.PartnerTargetId, $zipFile.FullName, $failureMessage)
-                    }
-                    continue
+            }
+            catch {
+                $failureMessage = $_.Exception.Message
+                $failureStateKey = ($stateKey + '|' + $failureMessage)
+                if (-not $handoffFailureState.ContainsKey($failureStateKey)) {
+                    $handoffFailureState[$failureStateKey] = $true
+                    Write-HandoffFailureLog `
+                        -Path $handoffFailureLogPath `
+                        -PairId ([string]$item.PairId) `
+                        -TargetId ([string]$item.TargetId) `
+                        -PartnerTargetId ([string]$item.PartnerTargetId) `
+                        -ZipPath $latestZipFile.FullName `
+                        -StateKey $stateKey `
+                        -Message $failureMessage
+                    Write-Host ("handoff failed {0} -> {1} zip={2} error={3}" -f [string]$item.TargetId, [string]$item.PartnerTargetId, $latestZipFile.FullName, $failureMessage)
                 }
-
-                $state[$stateKey] = (Get-Date).ToString('o')
-                foreach ($pendingKey in @($pendingState.Keys | Where-Object { $_ -like ($stateKey + '|*') })) {
-                    $pendingState.Remove([string]$pendingKey) | Out-Null
-                }
-                foreach ($failureKey in @($handoffFailureState.Keys | Where-Object { $_ -like ($stateKey + '|*') })) {
-                    $handoffFailureState.Remove([string]$failureKey) | Out-Null
-                }
-                Save-State -Path $statePath -State $state
-                $forwardedThisRun++
-                Write-Host ("forwarded {0} -> {1} zip={2}" -f [string]$item.TargetId, [string]$item.PartnerTargetId, $zipFile.FullName)
-
-                if ($MaxForwardCount -gt 0 -and $forwardedThisRun -ge $MaxForwardCount) {
-                    Write-Host ("paired exchange watcher reached max forward count: {0}" -f $MaxForwardCount)
-                    $watcherStopReason = 'max-forward-count-reached'
-                    break
-                }
+                continue
             }
 
+            $state[$stateKey] = (Get-Date).ToString('o')
+            foreach ($pendingKey in @($pendingState.Keys | Where-Object { $_ -like ($stateKey + '|*') })) {
+                $pendingState.Remove([string]$pendingKey) | Out-Null
+            }
+            foreach ($failureKey in @($handoffFailureState.Keys | Where-Object { $_ -like ($stateKey + '|*') })) {
+                $handoffFailureState.Remove([string]$failureKey) | Out-Null
+            }
+            Save-State -Path $statePath -State $state
+            $forwardedThisRun++
+            if (-not $pairForwardedCounts.ContainsKey([string]$item.PairId)) {
+                $pairForwardedCounts[[string]$item.PairId] = 0
+            }
+            $pairForwardedCounts[[string]$item.PairId] += 1
+            $pairStateEntries[[string]$item.PairId] = [pscustomobject]@{
+                PairId = [string]$item.PairId
+                LastFromTargetId = [string]$item.TargetId
+                LastToTargetId = [string]$item.PartnerTargetId
+                LastForwardedAt = (Get-Date).ToString('o')
+                LastForwardedZipPath = [string]$latestZipFile.FullName
+                LimitReachedAt = [string](Get-ConfigValue -Object (Get-ConfigValue -Object $pairStateEntries -Name ([string]$item.PairId) -DefaultValue $null) -Name 'LimitReachedAt' -DefaultValue '')
+            }
+            Write-PairStateSnapshot `
+                -Path $pairStatePath `
+                -RunRoot $resolvedRunRoot `
+                -Entries $pairStateEntries `
+                -PairProfiles $pairProfiles `
+                -PairForwardedCounts $pairForwardedCounts `
+                -SourceOutboxStatusEntries $sourceOutboxStatusEntries `
+                -PairRoundtripLimitMap $pairRoundtripLimitMap `
+                -WatcherPaused:$watcherPaused
+            Write-Host ("forwarded {0} -> {1} zip={2}" -f [string]$item.TargetId, [string]$item.PartnerTargetId, $latestZipFile.FullName)
+
             if ($MaxForwardCount -gt 0 -and $forwardedThisRun -ge $MaxForwardCount) {
+                Write-Host ("paired exchange watcher reached max forward count: {0}" -f $MaxForwardCount)
+                $watcherStopReason = 'max-forward-count-reached'
+                break
+            }
+            if (Test-AllPairsReachedRoundtripLimit -PairForwardedCounts $pairForwardedCounts -PairRoundtripLimitMap $pairRoundtripLimitMap) {
+                Write-Host 'paired exchange watcher reached pair roundtrip limit.'
+                $watcherStopReason = 'pair-roundtrip-limit-reached'
                 break
             }
         }
@@ -1741,13 +2581,35 @@ try {
         if ($MaxForwardCount -gt 0 -and $forwardedThisRun -ge $MaxForwardCount) {
             break
         }
+        if (Test-AllPairsReachedRoundtripLimit -PairForwardedCounts $pairForwardedCounts -PairRoundtripLimitMap $pairRoundtripLimitMap) {
+            break
+        }
 
+        Write-PairStateSnapshot `
+            -Path $pairStatePath `
+            -RunRoot $resolvedRunRoot `
+            -Entries $pairStateEntries `
+            -PairProfiles $pairProfiles `
+            -PairForwardedCounts $pairForwardedCounts `
+            -SourceOutboxStatusEntries $sourceOutboxStatusEntries `
+            -PairRoundtripLimitMap $pairRoundtripLimitMap `
+            -WatcherPaused:$watcherPaused
         Start-Sleep -Milliseconds $PollIntervalMs
     }
 
+    [void](Clear-WatcherControlRequest -Path $watcherControlPath -RetryCount 10 -RetryDelayMs 100)
+    Write-PairStateSnapshot `
+        -Path $pairStatePath `
+        -RunRoot $resolvedRunRoot `
+        -Entries $pairStateEntries `
+        -PairProfiles $pairProfiles `
+        -PairForwardedCounts $pairForwardedCounts `
+        -SourceOutboxStatusEntries $sourceOutboxStatusEntries `
+        -PairRoundtripLimitMap $pairRoundtripLimitMap `
+        -WatcherPaused:$watcherPaused
     $watcherStatusSequence++
     $watcherHeartbeatAt = (Get-Date).ToString('o')
-    Save-WatcherStatus -Path $watcherStatusPath -RunRoot $resolvedRunRoot -MutexName $watcherMutexName -State 'stopping' -Reason $watcherStopReason -RequestId $watcherRequestId -Action $watcherAction -LastHandledRequestId $watcherLastHandledRequestId -LastHandledAction $watcherLastHandledAction -LastHandledResult $watcherLastHandledResult -LastHandledAt $watcherLastHandledAt -HeartbeatAt $watcherHeartbeatAt -StatusSequence $watcherStatusSequence -ProcessStartedAt $watcherProcessStartedAt -ForwardedCount $forwardedThisRun -ConfiguredMaxForwardCount $MaxForwardCount
+    Save-WatcherStatus -Path $watcherStatusPath -RunRoot $resolvedRunRoot -MutexName $watcherMutexName -State 'stopping' -Reason $watcherStopReason -RequestId $watcherRequestId -Action $watcherAction -LastHandledRequestId $watcherLastHandledRequestId -LastHandledAction $watcherLastHandledAction -LastHandledResult $watcherLastHandledResult -LastHandledAt $watcherLastHandledAt -HeartbeatAt $watcherHeartbeatAt -StatusSequence $watcherStatusSequence -ProcessStartedAt $watcherProcessStartedAt -ForwardedCount $forwardedThisRun -ConfiguredMaxForwardCount $MaxForwardCount -ConfiguredRunDurationSec $RunDurationSec -ConfiguredMaxRoundtripCount $PairMaxRoundtripCount
     Write-Host 'paired exchange watcher stopped.'
 }
 finally {
@@ -1763,6 +2625,16 @@ finally {
 
     if ($watcherStarted) {
         Ensure-Directory -Path $stateRoot
+        [void](Clear-WatcherControlRequest -Path $watcherControlPath -RetryCount 10 -RetryDelayMs 100)
+        Write-PairStateSnapshot `
+            -Path $pairStatePath `
+            -RunRoot $resolvedRunRoot `
+            -Entries $pairStateEntries `
+            -PairProfiles $pairProfiles `
+            -PairForwardedCounts $pairForwardedCounts `
+            -SourceOutboxStatusEntries $sourceOutboxStatusEntries `
+            -PairRoundtripLimitMap $pairRoundtripLimitMap `
+            -WatcherPaused:$watcherPaused
         if (Test-NonEmptyString $watcherRequestId) {
             $watcherLastHandledRequestId = $watcherRequestId
             $watcherLastHandledAction = $watcherAction
@@ -1771,6 +2643,6 @@ finally {
         }
         $watcherStatusSequence++
         $watcherHeartbeatAt = (Get-Date).ToString('o')
-        Save-WatcherStatus -Path $watcherStatusPath -RunRoot $resolvedRunRoot -MutexName $watcherMutexName -State 'stopped' -Reason $watcherStopReason -RequestId $watcherRequestId -Action $watcherAction -LastHandledRequestId $watcherLastHandledRequestId -LastHandledAction $watcherLastHandledAction -LastHandledResult $watcherLastHandledResult -LastHandledAt $watcherLastHandledAt -HeartbeatAt $watcherHeartbeatAt -StatusSequence $watcherStatusSequence -ProcessStartedAt $watcherProcessStartedAt -ForwardedCount $forwardedThisRun -ConfiguredMaxForwardCount $MaxForwardCount
+        Save-WatcherStatus -Path $watcherStatusPath -RunRoot $resolvedRunRoot -MutexName $watcherMutexName -State 'stopped' -Reason $watcherStopReason -RequestId $watcherRequestId -Action $watcherAction -LastHandledRequestId $watcherLastHandledRequestId -LastHandledAction $watcherLastHandledAction -LastHandledResult $watcherLastHandledResult -LastHandledAt $watcherLastHandledAt -HeartbeatAt $watcherHeartbeatAt -StatusSequence $watcherStatusSequence -ProcessStartedAt $watcherProcessStartedAt -ForwardedCount $forwardedThisRun -ConfiguredMaxForwardCount $MaxForwardCount -ConfiguredRunDurationSec $RunDurationSec -ConfiguredMaxRoundtripCount $PairMaxRoundtripCount
     }
 }

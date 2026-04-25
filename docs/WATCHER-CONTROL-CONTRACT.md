@@ -34,13 +34,13 @@
 - `SchemaVersion`: 현재 `"1.0.0"`
 - `RequestedAt`: ISO timestamp
 - `RequestedBy`: 요청 주체. 기본 `relay_operator_panel`
-- `Action`: 현재 `stop`
+- `Action`: `stop | pause | resume`
 - `RunRoot`: 대상 run root
 - `RequestId`: 제어 요청 고유 식별자
 
 의미:
 
-- watcher loop는 control file을 polling 하다가 `Action=stop`을 읽으면 먼저 `accepted` ack를 남긴다.
+- watcher loop는 control file을 polling 하다가 `Action=stop|pause|resume` 을 읽으면 먼저 ack를 남긴다.
 - control file은 watcher가 소비한 뒤 지워야 한다.
 
 ## Status File Schema
@@ -49,7 +49,7 @@
 
 핵심 필드:
 
-- `State`: `running | stop_requested | stopping | stopped`
+- `State`: `starting | running | paused | pause_requested | resume_requested | stop_requested | stopping | stopped`
 - `Reason`: 상태 전이 사유
 - `UpdatedAt`: status write timestamp
 - `HeartbeatAt`: watcher loop 기준 최신 heartbeat timestamp
@@ -69,6 +69,14 @@
   - `LastHandledRequestId = request_id`
   - `LastHandledAction = stop`
   - `LastHandledResult = accepted`
+- pause 요청을 읽은 뒤:
+  - `LastHandledRequestId = request_id`
+  - `LastHandledAction = pause`
+  - `LastHandledResult = paused`
+- resume 요청을 읽은 뒤:
+  - `LastHandledRequestId = request_id`
+  - `LastHandledAction = resume`
+  - `LastHandledResult = resumed`
 - 실제 종료 직전 최종 기록:
   - `LastHandledRequestId = request_id`
   - `LastHandledAction = stop`
@@ -92,6 +100,8 @@
 - `Watcher.StopCategory`
 - `Watcher.ForwardedCount`
 - `Watcher.ConfiguredMaxForwardCount`
+- `Watcher.ConfiguredRunDurationSec`
+- `Watcher.ConfiguredMaxRoundtripCount`
 - `Watcher.StatusRequestId`
 - `Watcher.StatusAction`
 - `Watcher.LastHandledRequestId`
@@ -145,7 +155,7 @@ Python `StatusService` 는 bridge 로드 직후 watcher required field / ISO tim
 허용 조건:
 
 - `RunRoot` 존재
-- watcher 상태가 `running` 아님
+- watcher 상태가 `running` 또는 `paused` 아님
 - `control_file_unreadable`, `status_file_unreadable`, `status_file_stale`, `stop_requested_timeout`, `stale_control_file`, `control_pending_action_exists` 가 없음
 
 예외:
@@ -159,7 +169,7 @@ Python `StatusService` 는 bridge 로드 직후 watcher required field / ISO tim
 
 허용 조건:
 
-- watcher 상태가 `running`
+- watcher 상태가 `running | paused`
 - `ReadyToForwardCount == 0`
 - stale/unreadable/timeout blocker 없음
 
@@ -167,6 +177,31 @@ Python `StatusService` 는 bridge 로드 직후 watcher required field / ISO tim
 
 - `FailureLineCount > 0`
 - `NoZipCount > 0`
+
+### Pause
+
+허용 조건:
+
+- watcher 상태가 `running`
+- stale/unreadable/timeout blocker 없음
+
+의미:
+
+- `pause` 는 in-flight child를 강제 종료하지 않는다.
+- 다음 handoff 생성과 다음 queue claim만 멈춘다.
+- pair phase는 `limit-reached` 를 유지하고, 나머지는 `paused` overlay 로 보인다.
+
+### Resume
+
+허용 조건:
+
+- watcher 상태가 `paused`
+- stale/unreadable/timeout blocker 없음
+
+의미:
+
+- `resume` 이후 pair phase는 pair-state / source-outbox 상태에서 다시 재계산된다.
+- `manual-attention`, `partner-running`, `waiting-return` 같은 phase는 resume 뒤 복원된다.
 
 ### Restart
 
@@ -200,6 +235,13 @@ Python `StatusService` 는 bridge 로드 직후 watcher required field / ISO tim
 - start eligibility가 `cleanup_allowed=True`
 
 현재 recover는 stale watcher control 정리만 수행한다.
+
+### Pair Roundtrip Limit
+
+- CLI `-PairMaxRoundtripCount` 가 0보다 크면 모든 pair에 동일한 왕복 limit 를 적용한다.
+- CLI 값이 0이면 pair별 `PairPolicies.<pairId>.DefaultPairMaxRoundtripCount` 를 사용한다.
+- limit는 pair별로 먼저 적용된다. 어떤 pair가 limit에 도달해도 다른 pair가 unlimited 이거나 아직 미도달이면 watcher 전체는 계속 돌 수 있다.
+- 모든 limited pair가 limit에 도달하면 watcher는 `Reason = pair-roundtrip-limit-reached` 로 자동 정지한다.
 
 ## Reason Codes
 

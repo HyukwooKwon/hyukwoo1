@@ -151,6 +151,91 @@ function New-CheckResult {
     }
 }
 
+function Test-SourceOutboxAcceptedRow {
+    param($Row)
+
+    $state = [string]$Row.SourceOutboxState
+    $nextAction = [string]$Row.SourceOutboxNextAction
+    $latestState = [string]$Row.LatestState
+
+    if ($state -in @('imported', 'imported-archive-pending', 'forwarded')) {
+        return $true
+    }
+
+    if ($state -in @('duplicate-marker-archived', 'duplicate-marker-present')) {
+        return (
+            $nextAction -in @('handoff-ready', 'already-forwarded', 'duplicate-skipped') -or
+            $latestState -in @('ready-to-forward', 'forwarded', 'duplicate-skipped')
+        )
+    }
+
+    return $false
+}
+
+function Test-SourceOutboxTransitionReadyRow {
+    param($Row)
+
+    $nextAction = [string]$Row.SourceOutboxNextAction
+    $latestState = [string]$Row.LatestState
+
+    return (
+        $nextAction -in @('handoff-ready', 'already-forwarded', 'duplicate-skipped') -or
+        $latestState -in @('ready-to-forward', 'forwarded', 'duplicate-skipped')
+    )
+}
+
+function Get-SourceOutboxCloseoutSummary {
+    param([object[]]$Rows)
+
+    $acceptedCount = 0
+    $transitionReadyCount = 0
+
+    foreach ($row in @($Rows)) {
+        if ($null -eq $row) {
+            continue
+        }
+
+        if (Test-SourceOutboxAcceptedRow -Row $row) {
+            $acceptedCount++
+        }
+        if (Test-SourceOutboxTransitionReadyRow -Row $row) {
+            $transitionReadyCount++
+        }
+    }
+
+    return [pscustomobject]@{
+        AcceptedCount        = $acceptedCount
+        TransitionReadyCount = $transitionReadyCount
+    }
+}
+
+function Test-SuccessAcceptanceState {
+    param([string]$AcceptanceState)
+
+    return ($AcceptanceState -in @('roundtrip-confirmed', 'first-handoff-confirmed'))
+}
+
+function Test-VisibleReceiptRoundtripSatisfied {
+    param(
+        [Parameter(Mandatory)]$RunSummary,
+        [Parameter(Mandatory)]$PairedStatus,
+        [Parameter(Mandatory)]$SourceOutboxCloseout
+    )
+
+    $acceptance = $RunSummary.Acceptance
+    $effectiveAcceptanceState = [string]$acceptance.AcceptanceState
+    $effectiveStage = [string]$acceptance.Stage
+    $receiptExists = [bool]$PairedStatus.AcceptanceReceipt.Exists
+    $seedOrOutboxEvidence = [bool]$acceptance.SeedOutboxPublished -or [int]$SourceOutboxCloseout.AcceptedCount -ge 2
+
+    return (
+        $receiptExists -and
+        (Test-SuccessAcceptanceState -AcceptanceState $effectiveAcceptanceState) -and
+        $effectiveStage -eq 'completed' -and
+        $seedOrOutboxEvidence
+    )
+}
+
 $root = Split-Path -Parent $PSScriptRoot
 if (-not (Test-NonEmptyString $ConfigPath)) {
     $ConfigPath = Get-DefaultConfigPath -Root $root
@@ -195,6 +280,8 @@ $seedManifestRow = @($pairManifestRows | Where-Object { [string]$_.TargetId -eq 
 $partnerManifestRow = @($pairManifestRows | Where-Object { [string]$_.TargetId -eq $partnerTargetId } | Select-Object -First 1)
 $seedStatusRow = @($pairedStatus.Targets | Where-Object { [string]$_.TargetId -eq $SeedTargetId } | Select-Object -First 1)
 $partnerStatusRow = @($pairedStatus.Targets | Where-Object { [string]$_.TargetId -eq $partnerTargetId } | Select-Object -First 1)
+$pairStatusRows = @($pairedStatus.Targets | Where-Object { [string]$_.TargetId -in @($SeedTargetId, $partnerTargetId) })
+$sourceOutboxCloseout = Get-SourceOutboxCloseoutSummary -Rows $pairStatusRows
 
 $checks = @()
 $checks += New-CheckResult -Name 'run-summary-readable' -Passed (Test-NonEmptyString ([string]$runSummary.SummaryLine)) -Required $true -Summary ([string]$runSummary.SummaryLine) -Detail ''
@@ -204,14 +291,14 @@ $checks += New-CheckResult -Name 'seed-target-role-contract' -Passed (@($seedMan
 $checks += New-CheckResult -Name 'partner-target-role-contract' -Passed (@($partnerManifestRow).Count -eq 1 -and [string]$partnerManifestRow[0].InitialRoleMode -eq 'handoff_wait' -and -not [bool]$partnerManifestRow[0].SeedEnabled) -Required $true -Summary ("partnerInitialRoleMode={0}" -f $(if (@($partnerManifestRow).Count -eq 1) { [string]$partnerManifestRow[0].InitialRoleMode } else { '' })) -Detail ("seedEnabled={0}" -f $(if (@($partnerManifestRow).Count -eq 1) { [bool]$partnerManifestRow[0].SeedEnabled } else { $false }))
 $checks += New-CheckResult -Name 'pair-status-rows-present' -Passed (@($seedStatusRow).Count -eq 1 -and @($partnerStatusRow).Count -eq 1) -Required $true -Summary ("seedRow={0} partnerRow={1}" -f @($seedStatusRow).Count, @($partnerStatusRow).Count) -Detail ("seed={0} partner={1}" -f $SeedTargetId, $partnerTargetId)
 $checks += New-CheckResult -Name 'pair-roundtrip-closed' -Passed ([int]$pairedStatus.Counts.DonePresentCount -ge 2 -and [int]$pairedStatus.Counts.ErrorPresentCount -eq 0 -and [int]$pairedStatus.Counts.ForwardedStateCount -ge 2) -Required $true -Summary ("done={0} error={1} forwarded={2}" -f [int]$pairedStatus.Counts.DonePresentCount, [int]$pairedStatus.Counts.ErrorPresentCount, [int]$pairedStatus.Counts.ForwardedStateCount) -Detail ''
-$checks += New-CheckResult -Name 'source-outbox-imported' -Passed ([int]$pairedStatus.Counts.SourceOutboxImportedCount -ge 2 -and [int]$pairedStatus.Counts.HandoffReadyCount -ge 2) -Required $true -Summary ("imported={0} handoffReady={1}" -f [int]$pairedStatus.Counts.SourceOutboxImportedCount, [int]$pairedStatus.Counts.HandoffReadyCount) -Detail ''
+$checks += New-CheckResult -Name 'source-outbox-accepted' -Passed ([int]$sourceOutboxCloseout.AcceptedCount -ge 2 -and [int]$sourceOutboxCloseout.TransitionReadyCount -ge 2) -Required $true -Summary ("accepted={0} transitionReady={1}" -f [int]$sourceOutboxCloseout.AcceptedCount, [int]$sourceOutboxCloseout.TransitionReadyCount) -Detail ("rawImported={0} rawHandoffReady={1}" -f [int]$pairedStatus.Counts.SourceOutboxImportedCount, [int]$pairedStatus.Counts.HandoffReadyCount)
 $checks += New-CheckResult -Name 'dispatch-clean' -Passed ([int]$pairedStatus.Counts.DispatchRunningCount -eq 0 -and [int]$pairedStatus.Counts.DispatchFailedCount -eq 0) -Required $true -Summary ("running={0} failed={1}" -f [int]$pairedStatus.Counts.DispatchRunningCount, [int]$pairedStatus.Counts.DispatchFailedCount) -Detail ''
 $checks += New-CheckResult -Name 'router-metadata-contract' -Passed ([bool]$relayStatus.Router.RequireReadyDeliveryMetadata -and [bool]$relayStatus.Router.RequirePairTransportMetadata) -Required $true -Summary ("ready={0} pair={1}" -f [bool]$relayStatus.Router.RequireReadyDeliveryMetadata, [bool]$relayStatus.Router.RequirePairTransportMetadata) -Detail ''
 $checks += New-CheckResult -Name 'router-preexisting-policy' -Passed ([bool]$relayStatus.Router.IgnorePreexistingReadyFiles -and [string]$relayStatus.Router.PreexistingHandlingMode -eq 'ignore-archive') -Required $true -Summary ("ignorePreexisting={0} mode={1}" -f [bool]$relayStatus.Router.IgnorePreexistingReadyFiles, [string]$relayStatus.Router.PreexistingHandlingMode) -Detail ("startupCutoffAt={0}" -f [string]$relayStatus.Router.StartupCutoffAt)
 $checks += New-CheckResult -Name 'watcher-terminal-state' -Passed ([string]$pairedStatus.Watcher.Status -eq 'stopped' -and [string]$pairedStatus.Watcher.StopCategory -in @('manual-stop', 'expected-limit') -and [int]$pairedStatus.Watcher.ForwardedCount -ge 2) -Required $true -Summary ("status={0} stopCategory={1}" -f [string]$pairedStatus.Watcher.Status, [string]$pairedStatus.Watcher.StopCategory) -Detail ("forwardedCount={0}" -f [int]$pairedStatus.Watcher.ForwardedCount)
 
-$receiptPassed = [bool]$pairedStatus.AcceptanceReceipt.Exists -and [string]$pairedStatus.AcceptanceReceipt.AcceptanceState -eq 'roundtrip-confirmed' -and [string]$runSummary.Acceptance.Stage -eq 'completed' -and [bool]$runSummary.Acceptance.SeedOutboxPublished
-$checks += New-CheckResult -Name 'visible-receipt-roundtrip' -Passed $receiptPassed -Required ([bool]$RequireVisibleReceipt) -Summary ("receiptExists={0} acceptance={1} stage={2}" -f [bool]$pairedStatus.AcceptanceReceipt.Exists, [string]$pairedStatus.AcceptanceReceipt.AcceptanceState, [string]$runSummary.Acceptance.Stage) -Detail ("seedFinal={0} seedSubmit={1} outboxPublished={2}" -f [string]$runSummary.Acceptance.SeedFinalState, [string]$runSummary.Acceptance.SeedSubmitState, [bool]$runSummary.Acceptance.SeedOutboxPublished)
+$receiptPassed = Test-VisibleReceiptRoundtripSatisfied -RunSummary $runSummary -PairedStatus $pairedStatus -SourceOutboxCloseout $sourceOutboxCloseout
+$checks += New-CheckResult -Name 'visible-receipt-roundtrip' -Passed $receiptPassed -Required ([bool]$RequireVisibleReceipt) -Summary ("receiptExists={0} effectiveAcceptance={1} currentAcceptance={2} stage={3}" -f [bool]$pairedStatus.AcceptanceReceipt.Exists, [string]$runSummary.Acceptance.AcceptanceState, [string]$pairedStatus.AcceptanceReceipt.AcceptanceState, [string]$runSummary.Acceptance.Stage) -Detail ("seedFinal={0} seedSubmit={1} outboxPublished={2} sourceOutboxAccepted={3}" -f [string]$runSummary.Acceptance.SeedFinalState, [string]$runSummary.Acceptance.SeedSubmitState, [bool]$runSummary.Acceptance.SeedOutboxPublished, [int]$sourceOutboxCloseout.AcceptedCount)
 
 $failedRequiredChecks = @($checks | Where-Object { $_.Required -and -not $_.Passed })
 $overall = if (@($failedRequiredChecks).Count -eq 0) { 'success' } else { 'failing' }

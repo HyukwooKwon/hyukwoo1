@@ -385,33 +385,78 @@ function Write-TargetAutomationScripts {
 }
 
 function Get-PairDefinitions {
-    param([string[]]$IncludePairId)
-
-    $pairs = @(
-        [pscustomobject]@{ PairId = 'pair01'; TopTargetId = 'target01'; BottomTargetId = 'target05' }
-        [pscustomobject]@{ PairId = 'pair02'; TopTargetId = 'target02'; BottomTargetId = 'target06' }
-        [pscustomobject]@{ PairId = 'pair03'; TopTargetId = 'target03'; BottomTargetId = 'target07' }
-        [pscustomobject]@{ PairId = 'pair04'; TopTargetId = 'target04'; BottomTargetId = 'target08' }
+    param(
+        [Parameter(Mandatory)]$PairTest,
+        [string[]]$IncludePairId
     )
 
-    $requestedPairIds = @($IncludePairId | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | ForEach-Object { [string]$_ } | Sort-Object -Unique)
-    if ($requestedPairIds.Count -eq 0) {
-        return $pairs
+    return @(Select-PairDefinitions -PairDefinitions @($PairTest.PairDefinitions) -IncludePairId $IncludePairId)
+}
+
+function New-DisabledSeedReviewSelection {
+    return [pscustomobject]@{
+        Path                     = ''
+        SelectionMode            = 'disabled'
+        SearchRoot               = ''
+        CandidateCount           = 0
+        SelectedLastWriteTimeUtc = ''
+        RejectionReason          = ''
+    }
+}
+
+function Resolve-TargetSeedContext {
+    param(
+        [Parameter(Mandatory)]$PairTest,
+        [Parameter(Mandatory)]$PairPolicy,
+        [bool]$IsSeedTarget = $false,
+        [string]$ExplicitSeedWorkRepoRoot = '',
+        [string]$ExplicitSeedReviewInputPath = '',
+        [string]$ExplicitSeedTaskText = ''
+    )
+
+    if (-not $IsSeedTarget) {
+        return [pscustomobject]@{
+            WorkRepoRoot = ''
+            ReviewInputPath = ''
+            SeedTaskText = ''
+            ReviewInputSelection = (New-DisabledSeedReviewSelection)
+        }
     }
 
-    $pairIdSet = @{}
-    foreach ($pairId in $requestedPairIds) {
-        $pairIdSet[$pairId] = $true
+    $workRepoRootCandidate = if (Test-NonEmptyString $ExplicitSeedWorkRepoRoot) {
+        $ExplicitSeedWorkRepoRoot
     }
-
-    $selectedPairs = @($pairs | Where-Object { $pairIdSet.ContainsKey([string]$_.PairId) })
-    $selectedPairIds = @($selectedPairs | ForEach-Object { [string]$_.PairId })
-    $missingPairIds = @($requestedPairIds | Where-Object { $_ -notin $selectedPairIds })
-    if ($missingPairIds.Count -gt 0) {
-        throw ("unknown pair id(s): " + ($missingPairIds -join ', '))
+    else {
+        [string](Get-ConfigValue -Object $PairPolicy -Name 'DefaultSeedWorkRepoRoot' -DefaultValue '')
     }
+    $resolvedWorkRepoRoot = Resolve-OptionalLiteralPath -PathValue $workRepoRootCandidate
 
-    return $selectedPairs
+    $reviewInputCandidate = if (Test-NonEmptyString $ExplicitSeedReviewInputPath) {
+        $ExplicitSeedReviewInputPath
+    }
+    else {
+        [string](Get-ConfigValue -Object $PairPolicy -Name 'DefaultSeedReviewInputPath' -DefaultValue '')
+    }
+    $seedReviewSearchRoot = if (-not (Test-NonEmptyString $reviewInputCandidate) -and (Test-NonEmptyString $resolvedWorkRepoRoot)) {
+        Join-Path $resolvedWorkRepoRoot ([string](Get-ConfigValue -Object $PairPolicy -Name 'DefaultSeedReviewInputSearchRelativePath' -DefaultValue ([string]$PairTest.DefaultSeedReviewInputSearchRelativePath)))
+    }
+    else {
+        ''
+    }
+    $seedReviewSelection = Resolve-SeedReviewInputSelection `
+        -ExplicitPath $reviewInputCandidate `
+        -SearchRoot $seedReviewSearchRoot `
+        -Filter ([string](Get-ConfigValue -Object $PairPolicy -Name 'DefaultSeedReviewInputFilter' -DefaultValue ([string]$PairTest.DefaultSeedReviewInputFilter))) `
+        -NameRegex ([string](Get-ConfigValue -Object $PairPolicy -Name 'DefaultSeedReviewInputNameRegex' -DefaultValue ([string]$PairTest.DefaultSeedReviewInputNameRegex))) `
+        -MaxAgeHours ([double](Get-ConfigValue -Object $PairPolicy -Name 'DefaultSeedReviewInputMaxAgeHours' -DefaultValue ([double]$PairTest.DefaultSeedReviewInputMaxAgeHours))) `
+        -RequireSingleCandidate ([bool](Get-ConfigValue -Object $PairPolicy -Name 'DefaultSeedReviewInputRequireSingleCandidate' -DefaultValue ([bool]$PairTest.DefaultSeedReviewInputRequireSingleCandidate)))
+
+    return [pscustomobject]@{
+        WorkRepoRoot = $resolvedWorkRepoRoot
+        ReviewInputPath = [string]$seedReviewSelection.Path
+        SeedTaskText = [string]$ExplicitSeedTaskText
+        ReviewInputSelection = $seedReviewSelection
+    }
 }
 
 function Get-AutomaticPathGuideBlock {
@@ -607,7 +652,7 @@ $pathGuideBlock
 1. 프로젝트 작업은 현재 work repo 또는 '$WorkFolderPath' 아래에서 자유롭게 진행합니다.
 2. 최종 source 산출물은 '$SourceOutboxPath' 아래의 '$sourceSummaryFileName' 와 '$sourceReviewZipFileName' 으로만 정리합니다.
 3. publish 완료 신호는 '$PublishReadyPath' 파일입니다. 이 파일은 반드시 summary/zip 작성이 끝난 뒤 마지막에 생성합니다.
-4. '$publishReadyFileName' 필수 필드는 SchemaVersion, PairId, TargetId, SummaryPath, ReviewZipPath, PublishedAt, SummarySizeBytes, ReviewZipSizeBytes 입니다. SummarySha256, ReviewZipSha256, SourceContext 는 선택입니다.
+4. '$publishReadyFileName' 필수 필드는 SchemaVersion, PairId, TargetId, SummaryPath, ReviewZipPath, PublishedAt, SummarySizeBytes, ReviewZipSizeBytes 입니다. SchemaVersion 값은 정확히 '1.0.0' 으로 작성합니다. SummarySha256, ReviewZipSha256, SourceContext 는 선택입니다.
 5. marker의 SummaryPath / ReviewZipPath 는 '$SourceSummaryPath' 와 '$SourceReviewZipPath' 를 가리켜야 합니다. 크기나 선택 해시가 실제 파일과 다르면 자동 publish가 거부됩니다.
 6. 직접 paired contract 경로(SummaryPath / ReviewFolderPath / Done/Result)에 복사하지 마세요. watcher가 source-outbox marker를 감지하면 기존 import를 자동 호출합니다.
 7. 자동 publish가 성공하면 ready marker는 '$PublishedArchivePath' 아래로 archive 되고, 기존 handoff는 contract folder 기준으로 계속 진행됩니다.
@@ -689,7 +734,7 @@ ReviewInputPath: $ReviewInputPath
 
 규칙:
 1. summary.txt 와 review.zip 작성이 끝난 뒤 마지막에 publish.ready.json 을 생성합니다.
-2. publish.ready.json 최소 필드는 SchemaVersion, PairId, TargetId, SummaryPath, ReviewZipPath, PublishedAt, SummarySizeBytes, ReviewZipSizeBytes 입니다.
+2. publish.ready.json 최소 필드는 SchemaVersion, PairId, TargetId, SummaryPath, ReviewZipPath, PublishedAt, SummarySizeBytes, ReviewZipSizeBytes 입니다. SchemaVersion 값은 정확히 '1.0.0' 으로 작성합니다.
 3. marker의 SummaryPath / ReviewZipPath 는 위 source-outbox 파일을 가리켜야 합니다.
 4. 직접 target contract 경로에 복사하거나 별도 submit 명령을 다시 실행하지 마세요.
 5. 상세 계약과 recovery 경로는 instructions.txt 를 확인하세요: $InstructionPath
@@ -754,62 +799,25 @@ $resolvedConfigPath = (Resolve-Path -LiteralPath $ConfigPath).Path
 $config = Import-PowerShellDataFile -Path $resolvedConfigPath
 $pairTest = Resolve-PairTestConfig -Root $root -ConfigPath $resolvedConfigPath
 $RunRoot = Resolve-PairRunRootPath -Root $root -RunRoot $RunRoot -PairTest $pairTest
+$selectedPairs = @(Get-PairDefinitions -PairTest $pairTest -IncludePairId $IncludePairId)
 
 $requestedSeedTargetIds = @(
-    if (@($SeedTargetId | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }).Count -gt 0) {
+    if ($PSBoundParameters.ContainsKey('SeedTargetId') -and @($SeedTargetId | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }).Count -gt 0) {
         @($SeedTargetId | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | ForEach-Object { [string]$_ } | Sort-Object -Unique)
     }
-    else {
+    elseif ($PSBoundParameters.ContainsKey('InitialTargetId') -and @($InitialTargetId | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }).Count -gt 0) {
         @($InitialTargetId | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | ForEach-Object { [string]$_ } | Sort-Object -Unique)
+    }
+    else {
+        @(
+            foreach ($pair in @($selectedPairs)) {
+                $pairPolicy = Get-PairPolicyForPair -PairTest $pairTest -PairId ([string]$pair.PairId)
+                [string](Get-ConfigValue -Object $pairPolicy -Name 'DefaultSeedTargetId' -DefaultValue ([string]$pair.TopTargetId))
+            }
+        ) | Where-Object { Test-NonEmptyString $_ } | Sort-Object -Unique
     }
 )
 $seedTargetId = if ($requestedSeedTargetIds.Count -eq 1) { [string]$requestedSeedTargetIds[0] } else { '' }
-$seedWorkRepoRootCandidate = if (Test-NonEmptyString $SeedWorkRepoRoot) {
-    [string]$SeedWorkRepoRoot
-}
-elseif ($requestedSeedTargetIds.Count -eq 1) {
-    [string]$pairTest.DefaultSeedWorkRepoRoot
-}
-else {
-    ''
-}
-$resolvedSeedWorkRepoRoot = Resolve-OptionalLiteralPath -PathValue $seedWorkRepoRootCandidate
-$seedReviewInputCandidate = if (Test-NonEmptyString $SeedReviewInputPath) {
-    [string]$SeedReviewInputPath
-}
-elseif ($requestedSeedTargetIds.Count -eq 1) {
-    [string]$pairTest.DefaultSeedReviewInputPath
-}
-else {
-    ''
-}
-$seedReviewSelection = if ($requestedSeedTargetIds.Count -eq 1) {
-    $seedReviewSearchRoot = if (Test-NonEmptyString $resolvedSeedWorkRepoRoot) {
-        Join-Path $resolvedSeedWorkRepoRoot ([string]$pairTest.DefaultSeedReviewInputSearchRelativePath)
-    }
-    else {
-        ''
-    }
-
-    Resolve-SeedReviewInputSelection `
-        -ExplicitPath $seedReviewInputCandidate `
-        -SearchRoot $seedReviewSearchRoot `
-        -Filter ([string]$pairTest.DefaultSeedReviewInputFilter) `
-        -NameRegex ([string]$pairTest.DefaultSeedReviewInputNameRegex) `
-        -MaxAgeHours ([double]$pairTest.DefaultSeedReviewInputMaxAgeHours) `
-        -RequireSingleCandidate ([bool]$pairTest.DefaultSeedReviewInputRequireSingleCandidate)
-}
-else {
-    [pscustomobject]@{
-        Path                     = ''
-        SelectionMode            = 'disabled-multiple-seed-targets'
-        SearchRoot               = ''
-        CandidateCount           = 0
-        SelectedLastWriteTimeUtc = ''
-        RejectionReason          = ''
-    }
-}
-$resolvedSeedReviewInputPath = [string]$seedReviewSelection.Path
 $seedTaskTextSpecified = $PSBoundParameters.ContainsKey('SeedTaskText') -and (Test-NonEmptyString $SeedTaskText)
 $seedTaskFileSpecified = $PSBoundParameters.ContainsKey('SeedTaskFilePath') -and (Test-NonEmptyString $SeedTaskFilePath)
 if ($seedTaskTextSpecified -and $seedTaskFileSpecified) {
@@ -825,14 +833,50 @@ elseif ($seedTaskTextSpecified) {
     $resolvedSeedTaskText = [string]$SeedTaskText
 }
 
-$hasSeedContext = (
-    (Test-NonEmptyString $resolvedSeedWorkRepoRoot) -or
-    (Test-NonEmptyString $resolvedSeedReviewInputPath) -or
+$hasExplicitSeedContext = (
+    ($PSBoundParameters.ContainsKey('SeedWorkRepoRoot') -and (Test-NonEmptyString $SeedWorkRepoRoot)) -or
+    ($PSBoundParameters.ContainsKey('SeedReviewInputPath') -and (Test-NonEmptyString $SeedReviewInputPath)) -or
     (Test-NonEmptyString $resolvedSeedTaskText)
 )
-if ($hasSeedContext -and $requestedSeedTargetIds.Count -ne 1) {
+if ($hasExplicitSeedContext -and $requestedSeedTargetIds.Count -ne 1) {
     throw 'SeedWorkRepoRoot / SeedReviewInputPath / SeedTaskText require exactly one SeedTargetId (or InitialTargetId).'
 }
+$seedTargetPairPolicy = $null
+if (Test-NonEmptyString $seedTargetId) {
+    $seedTargetPair = @($selectedPairs | Where-Object {
+            ([string]$_.TopTargetId -eq $seedTargetId) -or ([string]$_.BottomTargetId -eq $seedTargetId)
+        } | Select-Object -First 1)
+    if (@($seedTargetPair).Count -gt 0) {
+        $seedTargetPairPolicy = Get-PairPolicyForPair -PairTest $pairTest -PairId ([string]$seedTargetPair[0].PairId)
+    }
+}
+$manifestSeedContext = if ($null -ne $seedTargetPairPolicy) {
+    Resolve-TargetSeedContext `
+        -PairTest $pairTest `
+        -PairPolicy $seedTargetPairPolicy `
+        -IsSeedTarget $true `
+        -ExplicitSeedWorkRepoRoot $SeedWorkRepoRoot `
+        -ExplicitSeedReviewInputPath $SeedReviewInputPath `
+        -ExplicitSeedTaskText $resolvedSeedTaskText
+}
+else {
+    [pscustomobject]@{
+        WorkRepoRoot = ''
+        ReviewInputPath = ''
+        SeedTaskText = ''
+        ReviewInputSelection = [pscustomobject]@{
+            Path                     = ''
+            SelectionMode            = 'disabled-multiple-seed-targets'
+            SearchRoot               = ''
+            CandidateCount           = 0
+            SelectedLastWriteTimeUtc = ''
+            RejectionReason          = ''
+        }
+    }
+}
+$resolvedSeedWorkRepoRoot = [string]$manifestSeedContext.WorkRepoRoot
+$seedReviewSelection = $manifestSeedContext.ReviewInputSelection
+$resolvedSeedReviewInputPath = [string]$manifestSeedContext.ReviewInputPath
 
 Ensure-Directory -Path $RunRoot
 $messagesRoot = Join-Path $RunRoot ([string]$pairTest.MessageFolderName)
@@ -842,7 +886,7 @@ $targetFolderMap = @{}
 $pairRows = @()
 $pairActivationSummary = @()
 
-foreach ($pair in Get-PairDefinitions -IncludePairId $IncludePairId) {
+foreach ($pair in @($selectedPairs)) {
     $pairActivationSummary += @(Assert-PairActivationEnabled -Root $root -Config $config -PairId ([string]$pair.PairId))
     $pairRoot = Join-Path $RunRoot ([string]$pair.PairId)
     Ensure-Directory -Path $pairRoot
@@ -864,7 +908,13 @@ foreach ($pair in Get-PairDefinitions -IncludePairId $IncludePairId) {
         $targetFolderMap[[string]$entry.TargetId] = $targetRoot
     }
 
-    $pairRows += $pair
+    $pairRows += [pscustomobject]@{
+        PairId = [string]$pair.PairId
+        TopTargetId = [string]$pair.TopTargetId
+        BottomTargetId = [string]$pair.BottomTargetId
+        SeedTargetId = [string]$pair.SeedTargetId
+        Policy = (Get-PairPolicyForPair -PairTest $pairTest -PairId ([string]$pair.PairId))
+    }
 }
 
 $messageFiles = @()
@@ -888,11 +938,20 @@ foreach ($pair in $pairRows) {
             PartnerTargetId = [string]$pair.TopTargetId
         }
     )) {
-        $isSeedTarget = if ($requestedSeedTargetIds.Count -eq 0) { $true } else { ([string]$entry.TargetId -in $requestedSeedTargetIds) }
+        $pairPolicy = Get-PairPolicyForPair -PairTest $pairTest -PairId ([string]$entry.PairId)
+        $isSeedTarget = ([string]$entry.TargetId -in $requestedSeedTargetIds)
+        $targetSeedContext = Resolve-TargetSeedContext `
+            -PairTest $pairTest `
+            -PairPolicy $pairPolicy `
+            -IsSeedTarget $isSeedTarget `
+            -ExplicitSeedWorkRepoRoot $SeedWorkRepoRoot `
+            -ExplicitSeedReviewInputPath $SeedReviewInputPath `
+            -ExplicitSeedTaskText $resolvedSeedTaskText
         $initialRoleMode = if ($isSeedTarget) { 'seed' } else { 'handoff_wait' }
-        $targetWorkRepoRoot = if ($isSeedTarget) { $resolvedSeedWorkRepoRoot } else { '' }
-        $targetReviewInputPath = if ($isSeedTarget) { $resolvedSeedReviewInputPath } else { '' }
-        $targetSeedTaskText = if ($isSeedTarget) { $resolvedSeedTaskText } else { '' }
+        $targetWorkRepoRoot = [string]$targetSeedContext.WorkRepoRoot
+        $targetReviewInputPath = [string]$targetSeedContext.ReviewInputPath
+        $targetSeedTaskText = [string]$targetSeedContext.SeedTaskText
+        $targetReviewInputSelection = $targetSeedContext.ReviewInputSelection
         $targetFolder = [string]$targetFolderMap[[string]$entry.TargetId]
         $partnerFolder = [string]$targetFolderMap[[string]$entry.PartnerTargetId]
         $summaryPath = Join-Path $targetFolder ([string]$pairTest.SummaryFileName)
@@ -1057,13 +1116,14 @@ foreach ($pair in $pairRows) {
             SeedTargetId           = $seedTargetId
             SeedTargetIds          = @($requestedSeedTargetIds)
             InitialRoleMode        = $initialRoleMode
+            PairPolicy             = $pairPolicy
             WorkRepoRoot           = $targetWorkRepoRoot
             ReviewInputPath        = $targetReviewInputPath
-            ReviewInputSelectionMode = if ($isSeedTarget) { [string]$seedReviewSelection.SelectionMode } else { '' }
-            ReviewInputSearchRoot  = if ($isSeedTarget) { [string]$seedReviewSelection.SearchRoot } else { '' }
-            ReviewInputCandidateCount = if ($isSeedTarget) { [int]$seedReviewSelection.CandidateCount } else { 0 }
-            ReviewInputSelectedLastWriteTimeUtc = if ($isSeedTarget) { [string]$seedReviewSelection.SelectedLastWriteTimeUtc } else { '' }
-            ReviewInputSelectionWarning = if ($isSeedTarget) { [string]$seedReviewSelection.RejectionReason } else { '' }
+            ReviewInputSelectionMode = if ($isSeedTarget) { [string]$targetReviewInputSelection.SelectionMode } else { '' }
+            ReviewInputSearchRoot  = if ($isSeedTarget) { [string]$targetReviewInputSelection.SearchRoot } else { '' }
+            ReviewInputCandidateCount = if ($isSeedTarget) { [int]$targetReviewInputSelection.CandidateCount } else { 0 }
+            ReviewInputSelectedLastWriteTimeUtc = if ($isSeedTarget) { [string]$targetReviewInputSelection.SelectedLastWriteTimeUtc } else { '' }
+            ReviewInputSelectionWarning = if ($isSeedTarget) { [string]$targetReviewInputSelection.RejectionReason } else { '' }
             SeedTaskText           = $targetSeedTaskText
             ReviewZipPattern       = [string]$pairTest.ReviewZipPattern
             RequestFilePath        = $requestPath
@@ -1113,13 +1173,14 @@ foreach ($pair in $pairRows) {
             SeedTargetId    = $seedTargetId
             SeedTargetIds   = @($requestedSeedTargetIds)
             InitialRoleMode = $initialRoleMode
+            PairPolicy      = $pairPolicy
             WorkRepoRoot    = $targetWorkRepoRoot
             ReviewInputPath = $targetReviewInputPath
-            ReviewInputSelectionMode = if ($isSeedTarget) { [string]$seedReviewSelection.SelectionMode } else { '' }
-            ReviewInputSearchRoot = if ($isSeedTarget) { [string]$seedReviewSelection.SearchRoot } else { '' }
-            ReviewInputCandidateCount = if ($isSeedTarget) { [int]$seedReviewSelection.CandidateCount } else { 0 }
-            ReviewInputSelectedLastWriteTimeUtc = if ($isSeedTarget) { [string]$seedReviewSelection.SelectedLastWriteTimeUtc } else { '' }
-            ReviewInputSelectionWarning = if ($isSeedTarget) { [string]$seedReviewSelection.RejectionReason } else { '' }
+            ReviewInputSelectionMode = if ($isSeedTarget) { [string]$targetReviewInputSelection.SelectionMode } else { '' }
+            ReviewInputSearchRoot = if ($isSeedTarget) { [string]$targetReviewInputSelection.SearchRoot } else { '' }
+            ReviewInputCandidateCount = if ($isSeedTarget) { [int]$targetReviewInputSelection.CandidateCount } else { 0 }
+            ReviewInputSelectedLastWriteTimeUtc = if ($isSeedTarget) { [string]$targetReviewInputSelection.SelectedLastWriteTimeUtc } else { '' }
+            ReviewInputSelectionWarning = if ($isSeedTarget) { [string]$targetReviewInputSelection.RejectionReason } else { '' }
             SeedTaskText    = $targetSeedTaskText
             CheckScriptPath = [string]$automationPaths.CheckScriptPath
             SubmitScriptPath = [string]$automationPaths.SubmitScriptPath

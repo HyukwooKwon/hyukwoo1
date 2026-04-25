@@ -14,6 +14,9 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
+from relay_panel_operator_state import (
+    VisibleAcceptanceWorkflowProgress,
+)
 from relay_panel_audit import (
     WATCHER_AUDIT_LOCK_STALE_AFTER_SEC,
     WATCHER_AUDIT_MAX_ARCHIVES,
@@ -23,6 +26,7 @@ from relay_panel_audit import (
     WatcherAuditLogger,
 )
 from relay_panel_artifact_controller import ArtifactTabController
+from relay_panel_artifact_workflow import ArtifactActionContextSnapshot, ArtifactCommandPlan
 from relay_panel_artifacts import ArtifactQuery, ArtifactService, TargetArtifactState
 from relay_panel_contract import (
     WATCHER_BRIDGE_DERIVED_FIELDS,
@@ -34,6 +38,12 @@ from relay_panel_message_config import MessageConfigService
 from relay_panel_models import AppContext, DashboardRawBundle, PairSummaryModel
 from relay_panel_pair_controller import PairController
 from relay_panel_refresh_controller import PanelRefreshController, RuntimeRefreshResult
+from relay_panel_runtime_workflow import (
+    PanelRuntimeWorkflowService,
+    PrepareAllRequest,
+    ReuseWindowsRequest,
+    RunRootPrepareRequest,
+)
 from relay_panel_services import (
     POWERSHELL_REQUIRED_MESSAGE,
     CommandService,
@@ -42,8 +52,25 @@ from relay_panel_services import (
 )
 from relay_panel_state import DashboardAggregator
 from relay_panel_watcher_controller import WatcherController
+from relay_panel_watcher_workflow import (
+    PanelWatcherWorkflowService,
+    WatcherActionContextSnapshot,
+    WatcherPanelUpdate,
+    WatcherRestartFailure,
+    WatcherRestartRequest,
+)
 from relay_panel_watchers import WATCHER_BRIDGE_REQUIRED_FIELDS, WatcherService, WatcherStartRequest
 from relay_operator_panel import ARTIFACT_SOURCE_MEMORY_SCHEMA_VERSION, RelayOperatorPanel
+from relay_test_temp import configure_workspace_tempfile, make_workspace_tempdir, restore_tempfile_configuration
+
+
+def setUpModule() -> None:
+    # Windows ACL issues in this environment make stdlib tempfile roots unreliable.
+    configure_workspace_tempfile()
+
+
+def tearDownModule() -> None:
+    restore_tempfile_configuration()
 
 
 def make_artifact_state(
@@ -82,7 +109,6 @@ def make_artifact_state(
         dispatch_updated_at=dispatch_updated_at,
         notes=[],
     )
-
 
 def make_watcher_bridge_payload(**watcher_overrides: object) -> dict[str, object]:
     watcher = {
@@ -507,7 +533,9 @@ class StatusServiceScopeTests(unittest.TestCase):
         repo_root = Path(__file__).resolve().parent
         powershell_exe = require_pwsh_or_skip()
 
-        with tempfile.TemporaryDirectory() as tmp:
+        tmp_root = Path("_tmp")
+        tmp_root.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=str(tmp_root.resolve())) as tmp:
             tmp_root = Path(tmp)
             runtime_map_path = tmp_root / "runtime-map.json"
             router_state_path = tmp_root / "router-state.json"
@@ -697,6 +725,34 @@ class PairControllerTests(unittest.TestCase):
 
         self.assertIn("차단 이유=summary.txt가 최신 zip보다 오래됐습니다.", detail)
         self.assertIn("다음 조치=summary 갱신 확인", detail)
+
+    def test_build_summary_detail_includes_roundtrip_progress(self) -> None:
+        controller = PairController()
+
+        detail = controller.build_summary_detail(
+            PairSummaryModel(
+                pair_id="pair01",
+                targets="target01 ↔ target05",
+                enabled=True,
+                latest_state="forwarded",
+                zip_count=2,
+                failure_count=0,
+                lane_watcher_status="running",
+                detail="왕복=1 / forwardedState=2 / 다음=await-partner-output",
+                roundtrip_count=1,
+                forwarded_state_count=2,
+                handoff_ready_count=0,
+                current_phase="partner-running",
+                next_expected_handoff="target05 -> target01",
+                next_action="await-partner-output",
+            )
+        )
+
+        self.assertIn("forwardedState=2", detail)
+        self.assertIn("왕복=1", detail)
+        self.assertIn("현재 단계=partner-running", detail)
+        self.assertIn("다음 예정 handoff=target05 -> target01", detail)
+        self.assertIn("다음 자동 동작=await-partner-output", detail)
 
     def test_resolve_top_target_for_pair_prefers_preview_rows(self) -> None:
         controller = PairController()
@@ -953,7 +1009,9 @@ class ArtifactControllerTests(unittest.TestCase):
 
 class WatcherAuditTests(unittest.TestCase):
     def test_audit_logger_appends_json_lines(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
+        tmp_root = Path("_tmp")
+        tmp_root.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=str(tmp_root.resolve())) as tmp:
             logger = WatcherAuditLogger(Path(tmp))
 
             log_path = logger.record(
@@ -976,7 +1034,9 @@ class WatcherAuditTests(unittest.TestCase):
             self.assertTrue(payload["RunRootHash"])
 
     def test_audit_logger_rotates_and_prunes_archives(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
+        tmp_root = Path("_tmp")
+        tmp_root.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=str(tmp_root.resolve())) as tmp:
             logger = WatcherAuditLogger(Path(tmp))
             logger.max_bytes = 1
             logger.max_archives = 1
@@ -1019,7 +1079,9 @@ class WatcherAuditTests(unittest.TestCase):
             self.assertFalse(old_archive.exists())
 
     def test_audit_logger_breaks_stale_lock_and_records(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
+        tmp_root = Path("_tmp")
+        tmp_root.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=str(tmp_root.resolve())) as tmp:
             logger = WatcherAuditLogger(Path(tmp))
             logger.lock_path.write_text("{}", encoding="utf-8")
             old_time = time.time() - (WATCHER_AUDIT_LOCK_STALE_AFTER_SEC + 5.0)
@@ -1152,7 +1214,9 @@ class PairedExchangePromptTextTests(unittest.TestCase):
         config_path = repo_root / "config" / "settings.bottest-live-visible.psd1"
         powershell_exe = require_pwsh_or_skip()
 
-        with tempfile.TemporaryDirectory() as tmp:
+        tmp_root = Path("_tmp")
+        tmp_root.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=str(tmp_root.resolve())) as tmp:
             run_root = Path(tmp) / "run_real_preview"
             start_command = [
                 powershell_exe,
@@ -1218,7 +1282,9 @@ class PairedExchangePromptTextTests(unittest.TestCase):
         source_config = repo_root / "config" / "settings.bottest-live-visible.psd1"
         powershell_exe = require_pwsh_or_skip()
 
-        with tempfile.TemporaryDirectory() as tmp:
+        tmp_root = Path("_tmp")
+        tmp_root.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=str(tmp_root.resolve())) as tmp:
             tmp_root = Path(tmp)
             config_path = tmp_root / "settings.handoff-recipient.psd1"
             config_text = source_config.read_text(encoding="utf-8")
@@ -1271,7 +1337,7 @@ class PairedExchangePromptTextTests(unittest.TestCase):
             publish_ready_path.write_text(
                 json.dumps(
                     {
-                        "SchemaVersion": 1,
+                        "SchemaVersion": "1.0.0",
                         "PairId": "pair01",
                         "TargetId": "target01",
                         "SummaryPath": str(summary_path),
@@ -1326,7 +1392,9 @@ class PairedExchangePromptTextTests(unittest.TestCase):
         repo_root = Path(__file__).resolve().parent
         powershell_exe = require_pwsh_or_skip()
 
-        with tempfile.TemporaryDirectory() as tmp:
+        tmp_root = Path("_tmp")
+        tmp_root.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=str(tmp_root.resolve())) as tmp:
             tmp_root = Path(tmp)
             inbox_root = tmp_root / "very" / "long" / "nested" / "inbox" / "path" / "for" / "seed" / "target01"
             inbox_root.mkdir(parents=True)
@@ -1439,7 +1507,9 @@ class MessageConfigServiceTests(unittest.TestCase):
 
     def test_save_and_rollback_restore_previous_config(self) -> None:
         service = MessageConfigService(CommandService())
-        with tempfile.TemporaryDirectory() as tmp:
+        tmp_root = Path("_tmp")
+        tmp_root.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=str(tmp_root.resolve())) as tmp:
             config_path = Path(tmp) / "settings.test.psd1"
             config_path.write_text(
                 "@{\n"
@@ -1471,7 +1541,9 @@ class MessageConfigServiceTests(unittest.TestCase):
 
     def test_slot_order_save_flows_into_show_effective_config(self) -> None:
         service = MessageConfigService(CommandService())
-        with tempfile.TemporaryDirectory() as tmp:
+        tmp_root = Path("_tmp")
+        tmp_root.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=str(tmp_root.resolve())) as tmp:
             temp_root = Path(tmp)
             source_config = Path("config/settings.bottest-live-visible.psd1")
             config_path = temp_root / "settings.slot-order.psd1"
@@ -1512,7 +1584,9 @@ class MessageConfigServiceTests(unittest.TestCase):
 
     def test_render_effective_preview_can_use_unsaved_document(self) -> None:
         service = MessageConfigService(CommandService())
-        with tempfile.TemporaryDirectory() as tmp:
+        tmp_root = Path("_tmp")
+        tmp_root.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=str(tmp_root.resolve())) as tmp:
             temp_root = Path(tmp)
             source_config = Path("config/settings.bottest-live-visible.psd1")
             config_path = temp_root / "settings.preview-edit.psd1"
@@ -1659,6 +1733,7 @@ class RelayOperatorPanelRuntimeCommandTests(unittest.TestCase):
         panel = RelayOperatorPanel.__new__(RelayOperatorPanel)
         panel.command_service = CommandService()
         panel.status_service = StatusService(panel.command_service)
+        panel.home_controller = HomeController()
         panel.refresh_controller = None
         panel.effective_data = {
             "RunContext": {
@@ -1677,19 +1752,53 @@ class RelayOperatorPanelRuntimeCommandTests(unittest.TestCase):
         panel.run_root_var = VarStub("")
         panel.pair_id_var = VarStub("pair01")
         panel.target_id_var = VarStub("")
+        panel.inspection_pair_id = ""
+        panel.inspection_target_id = ""
+        panel.action_context_source = "controls"
+        panel.inspection_context_source = ""
+        panel.inspection_context_row_index = None
+        panel.watcher_max_forward_var = VarStub("2")
+        panel.watcher_run_duration_var = VarStub("900")
+        panel.watcher_pair_roundtrip_var = VarStub("0")
+        panel.watcher_quick_start_note_var = VarStub("")
+        panel.watcher_current_note_var = VarStub("")
+        panel.watcher_start_note_var = VarStub("")
         panel.last_command_var = VarStub("")
         panel.last_result_var = VarStub("")
+        panel.last_query_result_var = VarStub("")
+        panel.query_history_var = VarStub("최근 조회: (없음)")
+        panel.query_history_entries = []
+        panel.query_history_records = []
+        panel.visible_workflow_progress_by_scope = {}
+        panel.artifact_run_root_filter_var = VarStub("")
+        panel.artifact_pair_filter_var = VarStub("")
+        panel.artifact_target_filter_var = VarStub("")
+        panel.artifact_path_kind_var = VarStub("summary")
+        panel.artifact_latest_only_var = VarStub(False)
+        panel.artifact_include_missing_var = VarStub(True)
         panel.operator_status_var = VarStub("")
         panel.operator_hint_var = VarStub("")
+        panel.mode_banner_var = VarStub("")
+        panel.mode_banner_detail_var = VarStub("")
+        panel.visible_acceptance_status_var = VarStub("")
+        panel.visible_acceptance_detail_var = VarStub("")
+        panel.home_context_var = VarStub("")
         panel.preview_rows = []
         panel.pair_controller = PairController()
+        panel.watcher_service = WatcherService()
+        panel.watcher_controller = WatcherController(panel.watcher_service)
         panel.set_text = lambda _widget, value: setattr(panel, "_captured_output", value)
+        panel.visible_acceptance_text = object()
+        panel.query_output_text = object()
+        panel.result_notebook = SimpleNamespace(select=lambda tab: setattr(panel, "_selected_result_tab", tab))
+        panel.query_output_tab = object()
         panel.render_home_dashboard = lambda: None
         panel.rebuild_panel_state = lambda: setattr(panel, "_rebuild_called", True)
         panel.render_target_board = lambda: setattr(panel, "_render_called", True)
         panel.update_pair_button_states = lambda: setattr(panel, "_buttons_called", True)
         panel.load_effective_config = lambda: setattr(panel, "_load_effective_config_called", True)
         panel.run_background_task = lambda **kwargs: kwargs["on_success"](kwargs["worker"]())
+        panel.run_read_only_background_task = lambda **kwargs: kwargs["on_success"](kwargs["worker"]())
         return panel
 
     def test_run_visibility_check_soft_handles_visibility_blockers(self) -> None:
@@ -1734,7 +1843,7 @@ class RelayOperatorPanelRuntimeCommandTests(unittest.TestCase):
         panel.run_paired_summary()
 
         self.assertEqual("show-paired-run-summary.ps1", captured.get("script_name"))
-        self.assertEqual({}, captured.get("kwargs"))
+        self.assertEqual({"allow_when_busy": True}, captured.get("kwargs"))
 
     def test_run_prepare_all_continues_past_visibility_blockers(self) -> None:
         panel = self._make_panel()
@@ -1819,6 +1928,37 @@ class RelayOperatorPanelRuntimeCommandTests(unittest.TestCase):
         self.assertIn("[runroot 요약]", panel._captured_output)
         self.assertIn("prepared overall=success", panel._captured_output)
 
+    def test_launch_windows_warns_when_wrapper_path_missing(self) -> None:
+        panel = self._make_panel()
+        panel.launch_windows = RelayOperatorPanel.launch_windows.__get__(panel, RelayOperatorPanel)
+        panel._launcher_wrapper_path = lambda: ""
+        warnings: list[tuple[str, str]] = []
+
+        with mock.patch("relay_operator_panel.messagebox.showwarning", side_effect=lambda title, message: warnings.append((title, message))):
+            panel.launch_windows()
+
+        self.assertEqual(
+            [("런처 없음", "현재 설정에서 LauncherWrapperPath를 찾지 못했습니다.")],
+            warnings,
+        )
+        self.assertEqual("", panel.last_command_var.get())
+
+    def test_launch_windows_warns_when_wrapper_path_is_missing_on_disk(self) -> None:
+        panel = self._make_panel()
+        panel.launch_windows = RelayOperatorPanel.launch_windows.__get__(panel, RelayOperatorPanel)
+        missing_wrapper = str(Path(make_workspace_tempdir("missing-visible-wrapper")) / "visible_launcher.py")
+        panel._launcher_wrapper_path = lambda: missing_wrapper
+        warnings: list[tuple[str, str]] = []
+
+        with mock.patch("relay_operator_panel.messagebox.showwarning", side_effect=lambda title, message: warnings.append((title, message))):
+            panel.launch_windows()
+
+        self.assertEqual(
+            [("런처 없음", f"Launcher wrapper 경로가 없습니다.\n{missing_wrapper}")],
+            warnings,
+        )
+        self.assertEqual("", panel.last_command_var.get())
+
     def test_prepare_run_root_ignores_stale_selected_run_root_when_requesting_new_run(self) -> None:
         panel = self._make_panel()
         panel.effective_data = {
@@ -1888,6 +2028,71 @@ class RelayOperatorPanelRuntimeCommandTests(unittest.TestCase):
         self.assertIn("[runroot 요약]", panel._captured_output)
         self.assertIn("fresh overall=success", panel._captured_output)
         self.assertIn("입력칸 갱신 완료", panel.last_result_var.get())
+
+    def test_prepare_run_root_uses_snapshotted_context_for_summary_when_prepared_root_missing(self) -> None:
+        panel = self._make_panel()
+        context_calls: list[str] = []
+
+        def current_context() -> AppContext:
+            context_calls.append("context")
+            return AppContext(
+                config_path="cfg.psd1",
+                run_root="C:\\runs\\snapshot",
+                pair_id="pair01",
+                target_id="target01",
+            )
+
+        panel._current_context = current_context
+
+        class CommandServiceStub:
+            def __init__(self) -> None:
+                self.commands: list[list[str]] = []
+
+            def build_script_command(
+                self,
+                script_name: str,
+                *,
+                config_path: str = "",
+                run_root: str = "",
+                pair_id: str = "",
+                target_id: str = "",
+                extra: list[str] | None = None,
+            ) -> list[str]:
+                command = [script_name]
+                if config_path:
+                    command += ["-ConfigPath", config_path]
+                if run_root:
+                    command += ["-RunRoot", run_root]
+                if pair_id:
+                    command += ["-PairId", pair_id]
+                if target_id:
+                    command += ["-TargetId", target_id]
+                if extra:
+                    command += list(extra)
+                return command
+
+            def run(self, command: list[str]) -> subprocess.CompletedProcess[str]:
+                self.commands.append(list(command))
+                if command[0] == "tests/Start-PairedExchangeTest.ps1":
+                    return subprocess.CompletedProcess(command, 0, stdout="run root prepared without marker", stderr="")
+                if command[0] == "show-paired-run-summary.ps1":
+                    return subprocess.CompletedProcess(command, 0, stdout="snapshot overall=success", stderr="")
+                raise AssertionError(command)
+
+        panel.command_service = CommandServiceStub()
+
+        panel.prepare_run_root()
+
+        self.assertEqual(["context"], context_calls)
+        self.assertEqual(
+            [
+                ["tests/Start-PairedExchangeTest.ps1", "-ConfigPath", "cfg.psd1", "-IncludePairId", "pair01"],
+                ["show-paired-run-summary.ps1", "-ConfigPath", "cfg.psd1", "-RunRoot", "C:\\runs\\snapshot"],
+            ],
+            panel.command_service.commands,
+        )
+        self.assertIn("snapshot overall=success", panel._captured_output)
+        self.assertEqual("", panel.run_root_var.get())
 
     def test_run_prepare_all_ignores_stale_selected_run_root_for_run_prepare_step(self) -> None:
         panel = self._make_panel()
@@ -1978,6 +2183,90 @@ class RelayOperatorPanelRuntimeCommandTests(unittest.TestCase):
         self.assertIn("fresh-prepared overall=success", panel._captured_output)
         self.assertIn("입력칸 갱신 완료", panel.last_result_var.get())
 
+    def test_run_prepare_all_uses_snapshotted_context_for_summary_when_prepared_root_missing(self) -> None:
+        panel = self._make_panel()
+        panel.panel_state = SimpleNamespace(
+            stages=[
+                SimpleNamespace(key="launch_windows", status_text="완료"),
+                SimpleNamespace(key="attach_windows", status_text="완료"),
+            ]
+        )
+        context_calls: list[str] = []
+
+        def current_context() -> AppContext:
+            context_calls.append("context")
+            return AppContext(
+                config_path="cfg.psd1",
+                run_root="C:\\runs\\snapshot",
+                pair_id="pair01",
+                target_id="target01",
+            )
+
+        panel._current_context = current_context
+        panel.refresh_controller = SimpleNamespace(
+            refresh_runtime=lambda context: RuntimeRefreshResult(
+                relay_status={"Runtime": {"ExpectedTargetCount": 8}, "ContextRunRoot": context.run_root},
+                visibility_status={
+                    "ExpectedTargetCount": 8,
+                    "InjectableCount": 8,
+                    "NonInjectableCount": 0,
+                    "MissingRuntimeCount": 0,
+                    "Targets": [],
+                },
+            )
+        )
+
+        class CommandServiceStub:
+            def __init__(self) -> None:
+                self.commands: list[list[str]] = []
+
+            def build_script_command(
+                self,
+                script_name: str,
+                *,
+                config_path: str = "",
+                run_root: str = "",
+                pair_id: str = "",
+                target_id: str = "",
+                extra: list[str] | None = None,
+            ) -> list[str]:
+                command = [script_name]
+                if config_path:
+                    command += ["-ConfigPath", config_path]
+                if run_root:
+                    command += ["-RunRoot", run_root]
+                if pair_id:
+                    command += ["-PairId", pair_id]
+                if target_id:
+                    command += ["-TargetId", target_id]
+                if extra:
+                    command += list(extra)
+                return command
+
+            def run(self, command: list[str]) -> subprocess.CompletedProcess[str]:
+                self.commands.append(list(command))
+                if command[0] == "tests/Start-PairedExchangeTest.ps1":
+                    return subprocess.CompletedProcess(command, 0, stdout="run root prepared without marker", stderr="")
+                if command[0] == "show-paired-run-summary.ps1":
+                    return subprocess.CompletedProcess(command, 0, stdout="snapshot overall=success", stderr="")
+                raise AssertionError(command)
+
+        panel.command_service = CommandServiceStub()
+
+        panel.run_prepare_all()
+
+        self.assertEqual(["context"], context_calls)
+        self.assertEqual(
+            [
+                ["tests/Start-PairedExchangeTest.ps1", "-ConfigPath", "cfg.psd1", "-IncludePairId", "pair01"],
+                ["show-paired-run-summary.ps1", "-ConfigPath", "cfg.psd1", "-RunRoot", "C:\\runs\\snapshot"],
+            ],
+            panel.command_service.commands,
+        )
+        self.assertEqual("C:\\runs\\snapshot", panel.relay_status_data["ContextRunRoot"])
+        self.assertIn("snapshot overall=success", panel._captured_output)
+        self.assertEqual("", panel.run_root_var.get())
+
     def test_current_run_root_marks_explicit_existing_stale_override_as_stale(self) -> None:
         panel = self._make_panel()
         panel._current_run_root_is_stale_for_actions = RelayOperatorPanel._current_run_root_is_stale_for_actions.__get__(panel, RelayOperatorPanel)
@@ -1989,7 +2278,9 @@ class RelayOperatorPanelRuntimeCommandTests(unittest.TestCase):
                 "StaleRunThresholdSec": 10,
             }
         }
-        with tempfile.TemporaryDirectory() as tmp:
+        tmp_root = Path("_tmp")
+        tmp_root.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=str(tmp_root.resolve())) as tmp:
             old_timestamp = time.time() - 7200
             os.utime(tmp, (old_timestamp, old_timestamp))
             panel.run_root_var.set(tmp)
@@ -2009,7 +2300,9 @@ class RelayOperatorPanelRuntimeCommandTests(unittest.TestCase):
                 "StaleRunThresholdSec": 10,
             }
         }
-        with tempfile.TemporaryDirectory() as tmp:
+        tmp_root = Path("_tmp")
+        tmp_root.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=str(tmp_root.resolve())) as tmp:
             old_timestamp = time.time() - 7200
             os.utime(tmp, (old_timestamp, old_timestamp))
             panel.run_root_var.set(tmp)
@@ -2071,6 +2364,72 @@ class RelayOperatorPanelRuntimeCommandTests(unittest.TestCase):
             self.assertIn("RunRoot 입력칸 갱신 완료", panel._captured_output)
             self.assertIn("[runroot 요약]", panel._captured_output)
             self.assertIn("fresh-explicit overall=success", panel._captured_output)
+
+    def test_prepare_run_root_does_not_reuse_ignored_stale_explicit_run_root_for_summary_fallback(self) -> None:
+        panel = self._make_panel()
+        panel.effective_data = {
+            "RunContext": {
+                "SelectedRunRoot": "C:\\runs\\current",
+                "SelectedRunRootIsStale": False,
+                "StaleRunThresholdSec": 10,
+            }
+        }
+        tmp_root = Path("_tmp")
+        tmp_root.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=str(tmp_root.resolve())) as tmp:
+            old_timestamp = time.time() - 7200
+            os.utime(tmp, (old_timestamp, old_timestamp))
+            panel.run_root_var.set(tmp)
+
+            class CommandServiceStub:
+                def __init__(self) -> None:
+                    self.commands: list[list[str]] = []
+
+                def build_script_command(
+                    self,
+                    script_name: str,
+                    *,
+                    config_path: str = "",
+                    run_root: str = "",
+                    pair_id: str = "",
+                    target_id: str = "",
+                    extra: list[str] | None = None,
+                ) -> list[str]:
+                    command = [script_name]
+                    if config_path:
+                        command += ["-ConfigPath", config_path]
+                    if run_root:
+                        command += ["-RunRoot", run_root]
+                    if pair_id:
+                        command += ["-PairId", pair_id]
+                    if target_id:
+                        command += ["-TargetId", target_id]
+                    if extra:
+                        command += list(extra)
+                    return command
+
+                def run(self, command: list[str]) -> subprocess.CompletedProcess[str]:
+                    self.commands.append(list(command))
+                    if command[0] == "show-paired-run-summary.ps1":
+                        return subprocess.CompletedProcess(command, 0, stdout="selected overall=success", stderr="")
+                    if command[0] != "tests/Start-PairedExchangeTest.ps1":
+                        raise AssertionError(command)
+                    return subprocess.CompletedProcess(command, 0, stdout="run root prepared without marker", stderr="")
+
+            panel.command_service = CommandServiceStub()
+
+            panel.prepare_run_root()
+
+            self.assertEqual(
+                [
+                    ["tests/Start-PairedExchangeTest.ps1", "-ConfigPath", "cfg.psd1", "-IncludePairId", "pair01"],
+                    ["show-paired-run-summary.ps1", "-ConfigPath", "cfg.psd1", "-RunRoot", "C:\\runs\\current"],
+                ],
+                panel.command_service.commands,
+            )
+            self.assertNotIn(tmp, subprocess.list2cmdline(panel.command_service.commands[1]))
+            self.assertIn("IgnoredRunRoot: " + tmp, panel._captured_output)
+            self.assertIn("selected overall=success", panel._captured_output)
 
     def test_reuse_existing_windows_refreshes_bindings_then_attaches_and_refreshes_runtime(self) -> None:
         panel = self._make_panel()
@@ -2351,7 +2710,7 @@ class RelayOperatorPanelRuntimeCommandTests(unittest.TestCase):
             panel.run_prepare_all()
 
         self.assertEqual(
-            [("준비 전체 실행 대기", "준비 전체 실행 차단: pair03는 현재 session partial reuse 범위 밖입니다. active=pair01")],
+            [("창/Attach/입력/RunRoot 준비 대기", "창/Attach/입력/RunRoot 준비 차단: pair03는 현재 session partial reuse 범위 밖입니다. active=pair01")],
             warnings,
         )
         self.assertEqual("", panel.last_command_var.get())
@@ -2415,6 +2774,193 @@ class RelayOperatorPanelRuntimeCommandTests(unittest.TestCase):
         self.assertIn("stdout detail", text)
         self.assertIn("STDERR:", text)
         self.assertIn("stderr detail", text)
+
+    def test_handle_background_success_releases_busy_when_success_callback_raises(self) -> None:
+        panel = self._make_panel()
+        panel._busy = True
+        panel._handle_background_success = RelayOperatorPanel._handle_background_success.__get__(panel, RelayOperatorPanel)
+
+        panel._handle_background_success(
+            None,
+            lambda _result: (_ for _ in ()).throw(ValueError("success callback boom")),
+            "성공",
+            "정상 완료",
+            "실패",
+            "성공 콜백 실패",
+        )
+
+        self.assertFalse(panel._busy)
+        self.assertEqual("실패", panel.operator_status_var.get())
+        self.assertEqual("성공 콜백 실패", panel.operator_hint_var.get())
+        self.assertIn("success callback boom", panel.last_result_var.get())
+        self.assertIn("success callback boom", panel._captured_output)
+
+    def test_run_visibility_check_uses_snapshotted_context_in_worker(self) -> None:
+        panel = self._make_panel()
+        calls: list[str] = []
+
+        def current_context() -> AppContext:
+            calls.append("context")
+            if len(calls) > 2:
+                raise AssertionError("worker should not read panel context again")
+            return AppContext(
+                config_path="cfg.psd1",
+                run_root="C:\\runs\\snap",
+                pair_id="pair01",
+                target_id="target01",
+            )
+
+        panel._current_context = current_context
+        relay_payload = {"Runtime": {"ExpectedTargetCount": 8}}
+        visibility_payload = {
+            "ExpectedTargetCount": 8,
+            "InjectableCount": 8,
+            "NonInjectableCount": 0,
+            "MissingRuntimeCount": 0,
+            "Targets": [],
+        }
+        panel.refresh_controller = SimpleNamespace(
+            refresh_runtime=lambda context: RuntimeRefreshResult(
+                relay_status={**relay_payload, "ContextRunRoot": context.run_root},
+                visibility_status=visibility_payload,
+            )
+        )
+
+        panel.run_visibility_check()
+
+        self.assertEqual(["context", "context"], calls)
+        self.assertEqual("C:\\runs\\snap", panel.relay_status_data["ContextRunRoot"])
+
+    def test_run_to_output_uses_snapshotted_context_in_worker(self) -> None:
+        panel = self._make_panel()
+        calls: list[str] = []
+
+        def current_context() -> AppContext:
+            calls.append("context")
+            if len(calls) > 1:
+                raise AssertionError("worker should not re-read panel context")
+            return AppContext(
+                config_path="cfg.psd1",
+                run_root="C:\\runs\\snap",
+                pair_id="pair02",
+                target_id="target06",
+            )
+
+        panel._current_context = current_context
+        captured: dict[str, object] = {}
+        panel.status_service = SimpleNamespace(
+            run_script=lambda script_name, context, **kwargs: captured.update(
+                {
+                    "script_name": script_name,
+                    "context": context,
+                    "kwargs": kwargs,
+                }
+            )
+            or subprocess.CompletedProcess(["show-effective-config.ps1"], 0, stdout="ok", stderr="")
+        )
+
+        panel.run_to_output("show-effective-config.ps1")
+
+        self.assertEqual(["context"], calls)
+        self.assertEqual("show-effective-config.ps1", captured["script_name"])
+        self.assertEqual("C:\\runs\\snap", captured["context"].run_root)
+        self.assertEqual("pair02", captured["kwargs"]["pair_id_override"])
+        self.assertEqual("target06", captured["kwargs"]["target_id_override"])
+
+    def test_run_to_output_query_actions_write_to_query_channel(self) -> None:
+        panel = self._make_panel()
+        panel.status_service = SimpleNamespace(
+            run_script=lambda script_name, context, **kwargs: subprocess.CompletedProcess(
+                [script_name],
+                0,
+                stdout="query-ok",
+                stderr="",
+            )
+        )
+
+        panel.run_to_output("show-paired-run-summary.ps1", allow_when_busy=True)
+
+        self.assertEqual("query-ok", panel._captured_output)
+        self.assertEqual("마지막 조회: show-paired-run-summary.ps1 완료", panel.last_query_result_var.get())
+
+    def test_set_query_result_appends_and_trims_history_tail(self) -> None:
+        panel = self._make_panel()
+
+        for index in range(7):
+            panel.set_query_result(f"마지막 조회: query-{index} 완료", context=f"pair=pair{index:02d}")
+
+        history = panel.query_history_var.get()
+        self.assertIn("query-6", history)
+        self.assertNotIn("query-0", history)
+        self.assertEqual(5, len(panel.query_history_entries))
+        self.assertEqual(5, len(panel.query_history_records))
+        self.assertEqual("pair=pair06", panel.query_history_records[-1].context)
+
+    def test_refresh_quick_status_when_busy_writes_to_query_channel(self) -> None:
+        panel = self._make_panel()
+        panel._busy = True
+        panel.set_operator_status = lambda *args, **kwargs: setattr(panel, "_operator_status_called", True)
+        panel.refresh_controller = SimpleNamespace(
+            refresh_quick=lambda _context: SimpleNamespace(
+                runtime=SimpleNamespace(
+                    relay_status={"Runtime": {"ExpectedTargetCount": 8}},
+                    visibility_status={"ExpectedTargetCount": 8, "InjectableCount": 8, "NonInjectableCount": 0, "MissingRuntimeCount": 0},
+                ),
+                paired=SimpleNamespace(paired_status={"Watcher": {}}, paired_status_error=""),
+            )
+        )
+
+        panel.refresh_quick_status()
+
+        self.assertIn("빠른 새로고침 완료", panel._captured_output)
+        self.assertIn("마지막 조회: 빠른 새로고침 완료", panel.last_query_result_var.get())
+        self.assertNotIn("_operator_status_called", vars(panel))
+
+    def test_refresh_artifacts_status_uses_artifact_query_context_in_history(self) -> None:
+        panel = self._make_panel()
+        panel._busy = True
+        panel.artifact_run_root_filter_var.set("C:\\runs\\artifact")
+        panel.artifact_pair_filter_var.set("pair02")
+        panel.artifact_target_filter_var.set("target05")
+        panel.artifact_path_kind_var.set("latest zip")
+        panel.artifact_latest_only_var.set(True)
+        panel.artifact_include_missing_var.set(False)
+        panel.refresh_paired_status_only = lambda: None
+        panel.set_operator_status = lambda *args, **kwargs: setattr(panel, "_operator_status_called", True)
+
+        panel.refresh_artifacts_status()
+
+        self.assertIn("artifact-run=artifact", panel.query_history_var.get())
+        self.assertIn("artifact-pair=pair02", panel.query_history_var.get())
+        self.assertIn("artifact-target=target05", panel.query_history_var.get())
+        self.assertIn("path=review_zip", panel.query_history_var.get())
+        self.assertNotIn("_operator_status_called", vars(panel))
+
+    def test_toggle_simple_mode_hides_ops_tabs_but_keeps_result_panel_available(self) -> None:
+        panel = RelayOperatorPanel.__new__(RelayOperatorPanel)
+
+        class NotebookStub:
+            def __init__(self) -> None:
+                self.hidden: list[object] = []
+                self.added: list[tuple[object, str]] = []
+
+            def hide(self, tab: object) -> None:
+                self.hidden.append(tab)
+
+            def add(self, tab: object, *, text: str) -> None:
+                self.added.append((tab, text))
+
+        panel.notebook = NotebookStub()
+        panel.ops_tab = object()
+        panel.snapshots_tab = object()
+        panel.result_notebook = object()
+        panel.simple_mode_var = VarStub(True)
+        panel.set_operator_status = lambda *args, **kwargs: None
+
+        panel.toggle_simple_mode()
+
+        self.assertEqual([panel.ops_tab, panel.snapshots_tab], panel.notebook.hidden)
+        self.assertTrue(hasattr(panel, "result_notebook"))
 
     def test_rebuild_panel_state_passes_panel_runtime_hints_to_aggregator(self) -> None:
         panel = self._make_panel()
@@ -2582,6 +3128,414 @@ class RelayOperatorPanelRuntimeCommandTests(unittest.TestCase):
 
         self.assertEqual("disabled", panel.board_attach_button.state)
 
+    def test_update_pair_button_states_enables_visible_acceptance_buttons_with_manifest_run_root(self) -> None:
+        panel = self._make_panel()
+        panel.update_pair_button_states = RelayOperatorPanel.update_pair_button_states.__get__(panel, RelayOperatorPanel)
+        panel.panel_state = SimpleNamespace(
+            stages=[
+                SimpleNamespace(key="pair_action", action_key="run_selected_pair", enabled=True, detail=""),
+            ]
+        )
+        panel.selected_pair_button = ButtonStub()
+        panel.home_run_pair_button = ButtonStub()
+        panel.home_enable_pair_button = ButtonStub()
+        panel.home_disable_pair_button = ButtonStub()
+        panel.fixed_pair01_button = ButtonStub()
+        panel.home_start_watch_button = ButtonStub()
+        panel.artifact_watch_button = ButtonStub()
+        panel.ops_stop_watch_button = ButtonStub()
+        panel.ops_restart_watch_button = ButtonStub()
+        panel.ops_recover_watch_button = ButtonStub()
+        panel.board_attach_button = ButtonStub()
+        panel.visible_cleanup_dry_button = ButtonStub()
+        panel.visible_cleanup_apply_button = ButtonStub()
+        panel.visible_preflight_button = ButtonStub()
+        panel.visible_post_cleanup_button = ButtonStub()
+        panel.visible_clean_preflight_button = ButtonStub()
+        panel.visible_active_acceptance_button = ButtonStub()
+        panel.visible_confirm_button = ButtonStub()
+        panel.visible_receipt_confirm_button = ButtonStub()
+        panel.visible_receipt_open_button = ButtonStub()
+        panel.visible_receipt_copy_button = ButtonStub()
+        panel._watcher_start_eligibility = lambda: SimpleNamespace(allowed=False, cleanup_allowed=False, message="")
+        panel._watcher_stop_eligibility = lambda: SimpleNamespace(allowed=False)
+        panel.preview_rows = [{"PairId": "pair01", "RoleName": "top", "TargetId": "target01"}]
+
+        run_root = make_workspace_tempdir("visible-buttons-manifest")
+        try:
+            (run_root / "manifest.json").write_text("{}", encoding="utf-8")
+            state_root = run_root / ".state"
+            state_root.mkdir(parents=True, exist_ok=True)
+            (state_root / "live-acceptance-result.json").write_text("{}", encoding="utf-8")
+            panel.run_root_var = VarStub(str(run_root))
+
+            panel.update_pair_button_states()
+        finally:
+            shutil.rmtree(run_root, ignore_errors=True)
+
+        self.assertEqual("normal", panel.visible_cleanup_dry_button.state)
+        self.assertEqual("normal", panel.visible_cleanup_apply_button.state)
+        self.assertEqual("disabled", panel.visible_preflight_button.state)
+        self.assertEqual("disabled", panel.visible_post_cleanup_button.state)
+        self.assertEqual("disabled", panel.visible_clean_preflight_button.state)
+        self.assertEqual("disabled", panel.visible_active_acceptance_button.state)
+        self.assertEqual("normal", panel.visible_confirm_button.state)
+        self.assertEqual("disabled", panel.visible_receipt_confirm_button.state)
+        self.assertEqual("normal", panel.visible_receipt_open_button.state)
+        self.assertEqual("normal", panel.visible_receipt_copy_button.state)
+
+    def test_update_pair_button_states_keeps_confirm_enabled_when_pair_is_disabled(self) -> None:
+        panel = self._make_panel()
+        panel.update_pair_button_states = RelayOperatorPanel.update_pair_button_states.__get__(panel, RelayOperatorPanel)
+        panel.panel_state = SimpleNamespace(
+            stages=[
+                SimpleNamespace(key="pair_action", action_key="enable_pair", enabled=False, detail="pair 활성화 필요"),
+            ]
+        )
+        panel.effective_data["PairActivationSummary"] = [{"PairId": "pair01", "EffectiveEnabled": False, "DisableReason": "manual hold"}]
+        panel.selected_pair_button = ButtonStub()
+        panel.home_run_pair_button = ButtonStub()
+        panel.home_enable_pair_button = ButtonStub()
+        panel.home_disable_pair_button = ButtonStub()
+        panel.fixed_pair01_button = ButtonStub()
+        panel.home_start_watch_button = ButtonStub()
+        panel.artifact_watch_button = ButtonStub()
+        panel.ops_stop_watch_button = ButtonStub()
+        panel.ops_restart_watch_button = ButtonStub()
+        panel.ops_recover_watch_button = ButtonStub()
+        panel.board_attach_button = ButtonStub()
+        panel.visible_cleanup_dry_button = ButtonStub()
+        panel.visible_cleanup_apply_button = ButtonStub()
+        panel.visible_preflight_button = ButtonStub()
+        panel.visible_post_cleanup_button = ButtonStub()
+        panel.visible_clean_preflight_button = ButtonStub()
+        panel.visible_active_acceptance_button = ButtonStub()
+        panel.visible_confirm_button = ButtonStub()
+        panel.visible_receipt_confirm_button = ButtonStub()
+        panel.visible_receipt_open_button = ButtonStub()
+        panel.visible_receipt_copy_button = ButtonStub()
+        panel._watcher_start_eligibility = lambda: SimpleNamespace(allowed=False, cleanup_allowed=False, message="")
+        panel._watcher_stop_eligibility = lambda: SimpleNamespace(allowed=False)
+        panel.preview_rows = [{"PairId": "pair01", "RoleName": "top", "TargetId": "target01"}]
+
+        run_root = make_workspace_tempdir("visible-buttons-disabled-pair")
+        try:
+            (run_root / "manifest.json").write_text("{}", encoding="utf-8")
+            panel.run_root_var = VarStub(str(run_root))
+
+            panel.update_pair_button_states()
+        finally:
+            shutil.rmtree(run_root, ignore_errors=True)
+
+        self.assertEqual("disabled", panel.visible_preflight_button.state)
+        self.assertEqual("disabled", panel.visible_active_acceptance_button.state)
+        self.assertEqual("disabled", panel.visible_clean_preflight_button.state)
+        self.assertEqual("normal", panel.visible_confirm_button.state)
+        self.assertEqual("disabled", panel.visible_receipt_confirm_button.state)
+        self.assertEqual("disabled", panel.visible_receipt_open_button.state)
+        self.assertEqual("normal", panel.visible_receipt_copy_button.state)
+
+    def test_update_pair_button_states_keeps_confirm_enabled_when_pair_is_out_of_partial_scope(self) -> None:
+        panel = self._make_panel()
+        panel.update_pair_button_states = RelayOperatorPanel.update_pair_button_states.__get__(panel, RelayOperatorPanel)
+        panel.panel_state = SimpleNamespace(
+            stages=[
+                SimpleNamespace(key="pair_action", action_key="run_selected_pair", enabled=True, detail=""),
+            ]
+        )
+        panel.relay_status_data = {"Runtime": {"PartialReuse": True, "ActivePairIds": ["pair01"]}}
+        panel.pair_id_var.set("pair03")
+        panel.selected_pair_button = ButtonStub()
+        panel.home_run_pair_button = ButtonStub()
+        panel.home_enable_pair_button = ButtonStub()
+        panel.home_disable_pair_button = ButtonStub()
+        panel.fixed_pair01_button = ButtonStub()
+        panel.home_start_watch_button = ButtonStub()
+        panel.artifact_watch_button = ButtonStub()
+        panel.ops_stop_watch_button = ButtonStub()
+        panel.ops_restart_watch_button = ButtonStub()
+        panel.ops_recover_watch_button = ButtonStub()
+        panel.board_attach_button = ButtonStub()
+        panel.visible_cleanup_dry_button = ButtonStub()
+        panel.visible_cleanup_apply_button = ButtonStub()
+        panel.visible_preflight_button = ButtonStub()
+        panel.visible_post_cleanup_button = ButtonStub()
+        panel.visible_clean_preflight_button = ButtonStub()
+        panel.visible_active_acceptance_button = ButtonStub()
+        panel.visible_confirm_button = ButtonStub()
+        panel.visible_receipt_confirm_button = ButtonStub()
+        panel.visible_receipt_open_button = ButtonStub()
+        panel.visible_receipt_copy_button = ButtonStub()
+        panel._watcher_start_eligibility = lambda: SimpleNamespace(allowed=False, cleanup_allowed=False, message="")
+        panel._watcher_stop_eligibility = lambda: SimpleNamespace(allowed=False)
+        panel.preview_rows = [{"PairId": "pair03", "RoleName": "top", "TargetId": "target07"}]
+
+        run_root = make_workspace_tempdir("visible-buttons-partial-scope")
+        try:
+            (run_root / "manifest.json").write_text("{}", encoding="utf-8")
+            panel.run_root_var = VarStub(str(run_root))
+
+            panel.update_pair_button_states()
+        finally:
+            shutil.rmtree(run_root, ignore_errors=True)
+
+        self.assertEqual("disabled", panel.visible_preflight_button.state)
+        self.assertEqual("disabled", panel.visible_active_acceptance_button.state)
+        self.assertEqual("disabled", panel.visible_clean_preflight_button.state)
+        self.assertEqual("normal", panel.visible_confirm_button.state)
+        self.assertEqual("disabled", panel.visible_receipt_confirm_button.state)
+
+    def test_update_pair_button_states_enables_active_after_cleanup_and_preflight_progress(self) -> None:
+        panel = self._make_panel()
+        panel.update_pair_button_states = RelayOperatorPanel.update_pair_button_states.__get__(panel, RelayOperatorPanel)
+        panel.panel_state = SimpleNamespace(
+            stages=[
+                SimpleNamespace(key="pair_action", action_key="run_selected_pair", enabled=True, detail=""),
+            ]
+        )
+        panel.selected_pair_button = ButtonStub()
+        panel.home_run_pair_button = ButtonStub()
+        panel.home_enable_pair_button = ButtonStub()
+        panel.home_disable_pair_button = ButtonStub()
+        panel.fixed_pair01_button = ButtonStub()
+        panel.home_start_watch_button = ButtonStub()
+        panel.artifact_watch_button = ButtonStub()
+        panel.ops_stop_watch_button = ButtonStub()
+        panel.ops_restart_watch_button = ButtonStub()
+        panel.ops_recover_watch_button = ButtonStub()
+        panel.board_attach_button = ButtonStub()
+        panel.visible_cleanup_dry_button = ButtonStub()
+        panel.visible_cleanup_apply_button = ButtonStub()
+        panel.visible_preflight_button = ButtonStub()
+        panel.visible_post_cleanup_button = ButtonStub()
+        panel.visible_clean_preflight_button = ButtonStub()
+        panel.visible_active_acceptance_button = ButtonStub()
+        panel.visible_confirm_button = ButtonStub()
+        panel.visible_receipt_confirm_button = ButtonStub()
+        panel.visible_receipt_open_button = ButtonStub()
+        panel.visible_receipt_copy_button = ButtonStub()
+        panel._watcher_start_eligibility = lambda: SimpleNamespace(allowed=False, cleanup_allowed=False, message="")
+        panel._watcher_stop_eligibility = lambda: SimpleNamespace(allowed=False)
+        panel.preview_rows = [{"PairId": "pair01", "RoleName": "top", "TargetId": "target01"}]
+
+        run_root = make_workspace_tempdir("visible-buttons-preflight-progress")
+        try:
+            (run_root / "manifest.json").write_text("{}", encoding="utf-8")
+            state_root = run_root / ".state"
+            state_root.mkdir(parents=True, exist_ok=True)
+            (state_root / "live-acceptance-result.json").write_text(
+                json.dumps({"Outcome": {"AcceptanceState": "preflight-passed"}}),
+                encoding="utf-8",
+            )
+            panel.run_root_var = VarStub(str(run_root))
+            scope_key = f"{run_root}::pair01"
+            panel.visible_workflow_progress_by_scope[scope_key] = VisibleAcceptanceWorkflowProgress(
+                cleanup_applied=True,
+                preflight_passed=True,
+            )
+
+            panel.update_pair_button_states()
+        finally:
+            shutil.rmtree(run_root, ignore_errors=True)
+
+        self.assertEqual("normal", panel.visible_preflight_button.state)
+        self.assertEqual("normal", panel.visible_active_acceptance_button.state)
+        self.assertEqual("disabled", panel.visible_post_cleanup_button.state)
+        self.assertEqual("disabled", panel.visible_receipt_confirm_button.state)
+
+    def test_update_pair_button_states_enables_post_cleanup_and_receipt_confirm_after_active_history(self) -> None:
+        panel = self._make_panel()
+        panel.update_pair_button_states = RelayOperatorPanel.update_pair_button_states.__get__(panel, RelayOperatorPanel)
+        panel.panel_state = SimpleNamespace(
+            stages=[
+                SimpleNamespace(key="pair_action", action_key="run_selected_pair", enabled=True, detail=""),
+            ]
+        )
+        panel.selected_pair_button = ButtonStub()
+        panel.home_run_pair_button = ButtonStub()
+        panel.home_enable_pair_button = ButtonStub()
+        panel.home_disable_pair_button = ButtonStub()
+        panel.fixed_pair01_button = ButtonStub()
+        panel.home_start_watch_button = ButtonStub()
+        panel.artifact_watch_button = ButtonStub()
+        panel.ops_stop_watch_button = ButtonStub()
+        panel.ops_restart_watch_button = ButtonStub()
+        panel.ops_recover_watch_button = ButtonStub()
+        panel.board_attach_button = ButtonStub()
+        panel.visible_cleanup_dry_button = ButtonStub()
+        panel.visible_cleanup_apply_button = ButtonStub()
+        panel.visible_preflight_button = ButtonStub()
+        panel.visible_post_cleanup_button = ButtonStub()
+        panel.visible_clean_preflight_button = ButtonStub()
+        panel.visible_active_acceptance_button = ButtonStub()
+        panel.visible_confirm_button = ButtonStub()
+        panel.visible_receipt_confirm_button = ButtonStub()
+        panel.visible_receipt_open_button = ButtonStub()
+        panel.visible_receipt_copy_button = ButtonStub()
+        panel._watcher_start_eligibility = lambda: SimpleNamespace(allowed=False, cleanup_allowed=False, message="")
+        panel._watcher_stop_eligibility = lambda: SimpleNamespace(allowed=False)
+        panel.preview_rows = [{"PairId": "pair01", "RoleName": "top", "TargetId": "target01"}]
+
+        run_root = make_workspace_tempdir("visible-buttons-active-history")
+        try:
+            (run_root / "manifest.json").write_text("{}", encoding="utf-8")
+            state_root = run_root / ".state"
+            state_root.mkdir(parents=True, exist_ok=True)
+            (state_root / "live-acceptance-result.json").write_text(
+                json.dumps(
+                    {
+                        "Stage": "completed",
+                        "Outcome": {"AcceptanceState": "roundtrip-confirmed"},
+                        "PhaseHistory": [
+                            {"Stage": "completed", "AcceptanceState": "roundtrip-confirmed"},
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            panel.run_root_var = VarStub(str(run_root))
+            scope_key = f"{run_root}::pair01"
+            panel.visible_workflow_progress_by_scope[scope_key] = VisibleAcceptanceWorkflowProgress(
+                cleanup_applied=True,
+                preflight_passed=True,
+                active_attempted=True,
+            )
+
+            panel.update_pair_button_states()
+        finally:
+            shutil.rmtree(run_root, ignore_errors=True)
+
+        self.assertEqual("normal", panel.visible_post_cleanup_button.state)
+        self.assertEqual("normal", panel.visible_receipt_confirm_button.state)
+        self.assertEqual("disabled", panel.visible_clean_preflight_button.state)
+        self.assertEqual("normal", panel.visible_confirm_button.state)
+
+    def test_run_visible_acceptance_preflight_requires_cleanup_progress(self) -> None:
+        panel = self._make_panel()
+        panel.run_visible_acceptance_preflight = RelayOperatorPanel.run_visible_acceptance_preflight.__get__(panel, RelayOperatorPanel)
+        panel.preview_rows = [{"PairId": "pair01", "RoleName": "top", "TargetId": "target01"}]
+        warnings: list[tuple[str, str]] = []
+
+        run_root = make_workspace_tempdir("visible-preflight-guard")
+        try:
+            (run_root / "manifest.json").write_text("{}", encoding="utf-8")
+            panel.run_root_var = VarStub(str(run_root))
+            with mock.patch("relay_operator_panel.messagebox.showwarning", side_effect=lambda title, message: warnings.append((title, message))):
+                panel.run_visible_acceptance_preflight()
+        finally:
+            shutil.rmtree(run_root, ignore_errors=True)
+
+        self.assertEqual("", panel.last_command_var.get())
+        self.assertEqual("Visible Acceptance 대기", warnings[0][0])
+        self.assertIn("queue cleanup apply", warnings[0][1])
+
+    def test_run_visible_post_cleanup_requires_active_history(self) -> None:
+        panel = self._make_panel()
+        panel.run_visible_post_cleanup = RelayOperatorPanel.run_visible_post_cleanup.__get__(panel, RelayOperatorPanel)
+        panel.preview_rows = [{"PairId": "pair01", "RoleName": "top", "TargetId": "target01"}]
+        warnings: list[tuple[str, str]] = []
+
+        run_root = make_workspace_tempdir("visible-post-cleanup-guard")
+        try:
+            (run_root / "manifest.json").write_text("{}", encoding="utf-8")
+            panel.run_root_var = VarStub(str(run_root))
+            scope_key = f"{run_root}::pair01"
+            panel.visible_workflow_progress_by_scope[scope_key] = VisibleAcceptanceWorkflowProgress(
+                cleanup_applied=True,
+                preflight_passed=True,
+            )
+            with mock.patch("relay_operator_panel.messagebox.showwarning", side_effect=lambda title, message: warnings.append((title, message))):
+                panel.run_visible_post_cleanup()
+        finally:
+            shutil.rmtree(run_root, ignore_errors=True)
+
+        self.assertEqual("", panel.last_command_var.get())
+        self.assertEqual("Visible Acceptance 대기", warnings[0][0])
+        self.assertIn("active visible acceptance", warnings[0][1])
+
+    def test_run_shared_visible_confirm_ignores_partial_scope_and_executes_with_existing_run_root(self) -> None:
+        panel = self._make_panel()
+        panel._run_shared_visible_confirm = RelayOperatorPanel._run_shared_visible_confirm.__get__(panel, RelayOperatorPanel)
+        panel.run_shared_visible_confirm = RelayOperatorPanel.run_shared_visible_confirm.__get__(panel, RelayOperatorPanel)
+        panel.relay_status_data = {"Runtime": {"PartialReuse": True, "ActivePairIds": ["pair01"]}}
+        panel.pair_id_var.set("pair03")
+        panel.preview_rows = [{"PairId": "pair03", "RoleName": "top", "TargetId": "target07"}]
+        panel._selected_pair_scope_allowed = lambda **kwargs: (_ for _ in ()).throw(AssertionError("scope check should not run"))
+
+        captured: dict[str, object] = {}
+
+        class CommandServiceStub:
+            def build_script_command(
+                self,
+                script_name: str,
+                *,
+                config_path: str = "",
+                run_root: str = "",
+                pair_id: str = "",
+                target_id: str = "",
+                extra: list[str] | None = None,
+            ) -> list[str]:
+                command = [script_name]
+                if config_path:
+                    command += ["-ConfigPath", config_path]
+                if extra:
+                    command += list(extra)
+                captured["command"] = command
+                return command
+
+            def run(self, command: list[str]) -> subprocess.CompletedProcess[str]:
+                payload = {
+                    "Overall": "passed",
+                    "Mode": "shared-visible",
+                    "RunRoot": command[command.index("-RunRoot") + 1],
+                    "PairId": command[command.index("-PairId") + 1],
+                    "SeedTargetId": command[command.index("-SeedTargetId") + 1],
+                    "SummaryLine": "ok",
+                    "Checks": [],
+                }
+                return subprocess.CompletedProcess(command, 0, stdout=json.dumps(payload, ensure_ascii=False), stderr="")
+
+        panel.command_service = CommandServiceStub()
+        panel.refresh_paired_status_only = lambda *args, **kwargs: "refreshed"
+        panel.run_background_task = lambda **kwargs: kwargs["on_success"](kwargs["worker"]())
+
+        run_root = make_workspace_tempdir("visible-shared-confirm")
+        try:
+            (run_root / "manifest.json").write_text("{}", encoding="utf-8")
+            panel.run_root_var = VarStub(str(run_root))
+
+            panel.run_shared_visible_confirm()
+        finally:
+            shutil.rmtree(run_root, ignore_errors=True)
+
+        command = captured["command"]
+        self.assertEqual("tests/Confirm-SharedVisiblePairAcceptance.ps1", command[0])
+        self.assertIn("pair03", command)
+        self.assertIn("target07", command)
+        self.assertIn("shared visible confirm", panel._captured_output)
+
+    def test_handle_dashboard_action_dispatches_visible_acceptance_actions(self) -> None:
+        panel = self._make_panel()
+        panel.handle_dashboard_action = RelayOperatorPanel.handle_dashboard_action.__get__(panel, RelayOperatorPanel)
+        called: list[str] = []
+        panel.run_visible_acceptance_preflight = lambda: called.append("preflight")
+        panel.run_active_visible_acceptance = lambda: called.append("active")
+        panel.run_visible_post_cleanup = lambda: called.append("post-cleanup")
+        panel.run_visible_clean_preflight_recheck = lambda: called.append("clean-preflight")
+        panel.run_shared_visible_confirm = lambda: called.append("confirm")
+        panel.run_visible_receipt_confirm = lambda: called.append("receipt")
+        panel.run_relay_status = lambda: called.append("relay")
+
+        panel.handle_dashboard_action("visible_preflight")
+        panel.handle_dashboard_action("visible_active_acceptance")
+        panel.handle_dashboard_action("visible_post_cleanup")
+        panel.handle_dashboard_action("visible_clean_preflight")
+        panel.handle_dashboard_action("visible_confirm")
+        panel.handle_dashboard_action("visible_receipt_confirm")
+        panel.handle_dashboard_action("run_relay_status")
+
+        self.assertEqual(["preflight", "active", "post-cleanup", "clean-preflight", "confirm", "receipt", "relay"], called)
+
     def test_start_watcher_detached_blocks_when_pair_stage_is_not_ready(self) -> None:
         panel = self._make_panel()
         panel.start_watcher_detached = RelayOperatorPanel.start_watcher_detached.__get__(panel, RelayOperatorPanel)
@@ -2597,7 +3551,7 @@ class RelayOperatorPanelRuntimeCommandTests(unittest.TestCase):
             panel.start_watcher_detached()
 
         self.assertEqual(
-            [("watch 시작 대기", "대기: 현재 세션 RunRoot 준비 후 Pair 실행을 준비합니다.")],
+            [("watch 시작(기본) 대기", "대기: 현재 세션 RunRoot 준비 후 Pair 실행을 준비합니다.")],
             warnings,
         )
 
@@ -2612,6 +3566,161 @@ class RelayOperatorPanelRuntimeCommandTests(unittest.TestCase):
         self.assertFalse(allowed)
         self.assertIn("현재 action RunRoot가 stale입니다.", detail)
         self.assertIn("explicit RunRoot 입력을 비우세요.", detail)
+
+    def test_restart_watcher_routes_non_ok_result_to_background_failure_output(self) -> None:
+        panel = self._make_panel()
+        panel.restart_watcher = RelayOperatorPanel.restart_watcher.__get__(panel, RelayOperatorPanel)
+        panel._watcher_workflow = RelayOperatorPanel._watcher_workflow.__get__(panel, RelayOperatorPanel)
+        panel._apply_watcher_panel_update = RelayOperatorPanel._apply_watcher_panel_update.__get__(panel, RelayOperatorPanel)
+        panel._handle_background_failure = RelayOperatorPanel._handle_background_failure.__get__(panel, RelayOperatorPanel)
+        panel._handle_background_success = RelayOperatorPanel._handle_background_success.__get__(panel, RelayOperatorPanel)
+        panel._format_background_exception = RelayOperatorPanel._format_background_exception.__get__(panel, RelayOperatorPanel)
+        panel.set_idle = RelayOperatorPanel.set_idle.__get__(panel, RelayOperatorPanel)
+        panel.set_operator_status = RelayOperatorPanel.set_operator_status.__get__(panel, RelayOperatorPanel)
+        panel._snapshot_context = RelayOperatorPanel._snapshot_context.__get__(panel, RelayOperatorPanel)
+        panel._busy = True
+        panel.paired_status_data = {"Watcher": {"Status": "running"}}
+
+        class StatusServiceStub:
+            def __init__(self) -> None:
+                self.calls: list[tuple[str, str, str, str]] = []
+
+            def refresh_paired_status(self, context: AppContext, run_root: str | None = None):
+                self.calls.append((context.run_root, context.pair_id, context.target_id, run_root or ""))
+                return {"Watcher": {"Status": "stopped"}}, ""
+
+        class WatcherControllerStub:
+            def stop_eligibility(self, paired_status: dict | None, run_root: str):
+                return SimpleNamespace(allowed=True, warning_codes=[], message="", reason_codes=[], state="running")
+
+            def restart(self, command_service, status_loader, **kwargs):
+                status_loader("C:\\runs\\polled")
+                return SimpleNamespace(
+                    ok=False,
+                    run_root=kwargs["run_root"],
+                    state="stopped",
+                    message="restart failed",
+                    request_id="req-1",
+                    command_text="pwsh restart",
+                    reason_codes=["pending_forward_exists"],
+                    warning_codes=["warn-a"],
+                )
+
+        panel.status_service = StatusServiceStub()
+        panel.watcher_controller = WatcherControllerStub()
+
+        def run_background_task(**kwargs):
+            try:
+                result = kwargs["worker"]()
+            except Exception as exc:
+                panel._handle_background_failure(exc, kwargs["failure_state"], kwargs["failure_hint"], kwargs.get("on_failure"))
+                return
+            panel._handle_background_success(
+                result,
+                kwargs["on_success"],
+                kwargs["success_state"],
+                kwargs["success_hint"],
+                kwargs["failure_state"],
+                kwargs["failure_hint"],
+            )
+
+        panel.run_background_task = run_background_task
+
+        panel.restart_watcher()
+
+        self.assertFalse(panel._busy)
+        self.assertEqual("watch 재시작 실패", panel.operator_status_var.get())
+        self.assertIn("watch 상태, control file, 마지막 명령을 확인하세요.", panel.operator_hint_var.get())
+        self.assertEqual("pwsh restart", panel.last_command_var.get())
+        self.assertIn("watch 재시작 결과", panel._captured_output)
+        self.assertIn("restart failed", panel._captured_output)
+        self.assertIn("Reasons: pending_forward_exists", panel._captured_output)
+        self.assertEqual([("C:\\runs\\current", "pair01", "", "C:\\runs\\polled")], panel.status_service.calls)
+
+    def test_run_prepare_all_does_not_reuse_ignored_stale_explicit_run_root_for_refresh_or_summary(self) -> None:
+        panel = self._make_panel()
+        panel.effective_data = {
+            "RunContext": {
+                "SelectedRunRoot": "C:\\runs\\current",
+                "SelectedRunRootIsStale": False,
+                "StaleRunThresholdSec": 10,
+            }
+        }
+        panel.panel_state = SimpleNamespace(
+            stages=[
+                SimpleNamespace(key="launch_windows", status_text="완료"),
+                SimpleNamespace(key="attach_windows", status_text="완료"),
+            ]
+        )
+        panel.refresh_controller = SimpleNamespace(
+            refresh_runtime=lambda context: RuntimeRefreshResult(
+                relay_status={"Runtime": {"ExpectedTargetCount": 8}, "ContextRunRoot": context.run_root},
+                visibility_status={
+                    "ExpectedTargetCount": 8,
+                    "InjectableCount": 8,
+                    "NonInjectableCount": 0,
+                    "MissingRuntimeCount": 0,
+                    "Targets": [],
+                },
+            )
+        )
+        tmp_root = Path("_tmp")
+        tmp_root.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=str(tmp_root.resolve())) as tmp:
+            old_timestamp = time.time() - 7200
+            os.utime(tmp, (old_timestamp, old_timestamp))
+            panel.run_root_var.set(tmp)
+
+            class CommandServiceStub:
+                def __init__(self) -> None:
+                    self.commands: list[list[str]] = []
+
+                def build_script_command(
+                    self,
+                    script_name: str,
+                    *,
+                    config_path: str = "",
+                    run_root: str = "",
+                    pair_id: str = "",
+                    target_id: str = "",
+                    extra: list[str] | None = None,
+                ) -> list[str]:
+                    command = [script_name]
+                    if config_path:
+                        command += ["-ConfigPath", config_path]
+                    if run_root:
+                        command += ["-RunRoot", run_root]
+                    if pair_id:
+                        command += ["-PairId", pair_id]
+                    if target_id:
+                        command += ["-TargetId", target_id]
+                    if extra:
+                        command += list(extra)
+                    return command
+
+                def run(self, command: list[str]) -> subprocess.CompletedProcess[str]:
+                    self.commands.append(list(command))
+                    if command[0] == "show-paired-run-summary.ps1":
+                        return subprocess.CompletedProcess(command, 0, stdout="selected overall=success", stderr="")
+                    if command[0] != "tests/Start-PairedExchangeTest.ps1":
+                        raise AssertionError(command)
+                    return subprocess.CompletedProcess(command, 0, stdout="run root prepared without marker", stderr="")
+
+            panel.command_service = CommandServiceStub()
+
+            panel.run_prepare_all()
+
+            self.assertEqual(
+                [
+                    ["tests/Start-PairedExchangeTest.ps1", "-ConfigPath", "cfg.psd1", "-IncludePairId", "pair01"],
+                    ["show-paired-run-summary.ps1", "-ConfigPath", "cfg.psd1", "-RunRoot", "C:\\runs\\current"],
+                ],
+                panel.command_service.commands,
+            )
+            self.assertEqual("C:\\runs\\current", panel.relay_status_data["ContextRunRoot"])
+            self.assertNotIn(tmp, subprocess.list2cmdline(panel.command_service.commands[1]))
+            self.assertIn("IgnoredRunRoot: " + tmp, panel._captured_output)
+            self.assertIn("selected overall=success", panel._captured_output)
 
     def test_board_status_text_includes_attach_wait_reason(self) -> None:
         panel = self._make_panel()
@@ -2641,6 +3750,264 @@ class RelayOperatorPanelRuntimeCommandTests(unittest.TestCase):
         self.assertIn("붙이기 비활성: 이전 세션 창 기록만 있습니다.", text)
 
 
+class PanelRuntimeWorkflowServiceTests(unittest.TestCase):
+    def test_run_prepare_all_requires_wrapper_path_for_launch(self) -> None:
+        service = PanelRuntimeWorkflowService(
+            SimpleNamespace(),
+            SimpleNamespace(),
+            SimpleNamespace(refresh_runtime=lambda _context: None),
+        )
+
+        with self.assertRaises(PowerShellError) as cm:
+            service.run_prepare_all(
+                PrepareAllRequest(
+                    context=AppContext(config_path="cfg.psd1", run_root="C:\\runs\\current", pair_id="pair01", target_id=""),
+                    config_path="cfg.psd1",
+                    pair_id="pair01",
+                    explicit_run_root="C:\\runs\\requested",
+                    wrapper_path="",
+                    launch_windows_needed=True,
+                    attach_windows_needed=False,
+                )
+            )
+
+        self.assertIn("LauncherWrapperPath를 찾지 못했습니다.", str(cm.exception))
+
+    def test_run_reuse_returns_runtime_refresh_and_attach_output(self) -> None:
+        reuse_payload = {
+            "Success": True,
+            "Summary": "reuse ok",
+            "Targets": [{"TargetId": "target01", "Matched": True}],
+        }
+        calls: list[tuple[str, object]] = []
+        runtime_result = RuntimeRefreshResult(
+            relay_status={"Runtime": {"ExpectedTargetCount": 8}},
+            visibility_status={"ExpectedTargetCount": 8},
+        )
+
+        class StatusServiceStub:
+            def run_json_script(self, script_name: str, context: AppContext, **kwargs) -> dict:
+                calls.append(("status", script_name, context.run_root, tuple(kwargs.get("extra") or [])))
+                return reuse_payload
+
+        class CommandServiceStub:
+            def build_script_command(self, script_name: str, **kwargs) -> list[str]:
+                calls.append(("build", script_name, kwargs.get("config_path", "")))
+                return [script_name, kwargs.get("config_path", "")]
+
+            def run(self, command: list[str]) -> subprocess.CompletedProcess[str]:
+                calls.append(("run", tuple(command)))
+                return subprocess.CompletedProcess(command, 0, stdout="attach done", stderr="")
+
+        service = PanelRuntimeWorkflowService(
+            CommandServiceStub(),
+            StatusServiceStub(),
+            SimpleNamespace(refresh_runtime=lambda context: calls.append(("refresh", context.run_root)) or runtime_result),
+        )
+
+        result = service.run_reuse(
+            ReuseWindowsRequest(
+                context=AppContext(config_path="cfg.psd1", run_root="C:\\runs\\current", pair_id="pair01", target_id="target01"),
+                config_path="cfg.psd1",
+                reuse_anchor_utc="2026-04-23T00:00:00+00:00",
+                pairs_mode=True,
+            )
+        )
+
+        self.assertEqual(reuse_payload, result.reuse_payload)
+        self.assertEqual("attach done", result.attach_output)
+        self.assertIs(runtime_result, result.runtime_result)
+        self.assertEqual("2026-04-23T00:00:00+00:00", result.reuse_anchor_utc)
+        self.assertEqual(
+            [
+                ("status", "refresh-binding-profile-from-existing.ps1", "C:\\runs\\current", ("-AsJson", "-ReuseMode", "Pairs")),
+                ("build", "attach-targets-from-bindings.ps1", "cfg.psd1"),
+                ("run", ("attach-targets-from-bindings.ps1", "cfg.psd1")),
+                ("refresh", "C:\\runs\\current"),
+            ],
+            calls,
+        )
+
+    def test_run_reuse_raises_powershell_error_with_failure_summary(self) -> None:
+        class StatusServiceStub:
+            def run_json_script(self, script_name: str, context: AppContext, **kwargs) -> dict:
+                return {
+                    "Success": False,
+                    "Summary": "기존 8창 재사용 실패",
+                    "FailureReasons": ["window-missing:target01:no-visible-window"],
+                }
+
+        service = PanelRuntimeWorkflowService(
+            SimpleNamespace(),
+            StatusServiceStub(),
+            SimpleNamespace(refresh_runtime=lambda context: None),
+        )
+
+        with self.assertRaises(PowerShellError) as raised:
+            service.run_reuse(
+                ReuseWindowsRequest(
+                    context=AppContext(config_path="cfg.psd1", run_root="C:\\runs\\current", pair_id="pair01", target_id=""),
+                    config_path="cfg.psd1",
+                    reuse_anchor_utc="2026-04-23T00:00:00+00:00",
+                )
+        )
+
+        self.assertIn("기존 8창 재사용 실패", str(raised.exception))
+        self.assertIn("window-missing:target01:no-visible-window", str(raised.exception))
+        self.assertIn('"success": false', raised.exception.stdout.lower())
+
+    def test_prepare_run_root_prefers_prepared_root_then_requested_then_context_for_summary(self) -> None:
+        recorded_commands: list[tuple[str, str]] = []
+
+        class CommandServiceStub:
+            def build_script_command(self, script_name: str, **kwargs) -> list[str]:
+                return [script_name, kwargs.get("run_root", "")]
+
+            def run(self, command: list[str]) -> subprocess.CompletedProcess[str]:
+                recorded_commands.append((command[0], command[1] if len(command) > 1 else ""))
+                if command[0] == "tests/Start-PairedExchangeTest.ps1":
+                    return subprocess.CompletedProcess(command, 0, stdout="prepared pair test root: C:\\runs\\prepared", stderr="")
+                if command[0] == "show-paired-run-summary.ps1":
+                    return subprocess.CompletedProcess(command, 0, stdout="overall=success", stderr="")
+                raise AssertionError(command)
+
+        service = PanelRuntimeWorkflowService(CommandServiceStub(), SimpleNamespace(), SimpleNamespace())
+        result = service.prepare_run_root(
+            RunRootPrepareRequest(
+                config_path="cfg.psd1",
+                pair_id="pair01",
+                requested_run_root="C:\\runs\\requested",
+                summary_fallback_run_root="C:\\runs\\fallback",
+            )
+        )
+
+        self.assertEqual("C:\\runs\\prepared", result.prepared_run_root)
+        self.assertEqual("C:\\runs\\prepared", result.summary_run_root)
+        self.assertIn("[runroot 요약]", result.summary_text)
+        self.assertEqual(
+            [
+                ("tests/Start-PairedExchangeTest.ps1", "C:\\runs\\requested"),
+                ("show-paired-run-summary.ps1", "C:\\runs\\prepared"),
+            ],
+            recorded_commands,
+        )
+
+    def test_prepare_run_root_uses_requested_or_fallback_summary_run_root_when_prepared_root_missing(self) -> None:
+        class CommandServiceStub:
+            def __init__(self) -> None:
+                self.commands: list[tuple[str, str]] = []
+
+            def build_script_command(self, script_name: str, **kwargs) -> list[str]:
+                return [script_name, kwargs.get("run_root", "")]
+
+            def run(self, command: list[str]) -> subprocess.CompletedProcess[str]:
+                self.commands.append((command[0], command[1] if len(command) > 1 else ""))
+                if command[0] == "tests/Start-PairedExchangeTest.ps1":
+                    return subprocess.CompletedProcess(command, 0, stdout="run root 준비 완료", stderr="")
+                if command[0] == "show-paired-run-summary.ps1":
+                    return subprocess.CompletedProcess(command, 0, stdout="summary ok", stderr="")
+                raise AssertionError(command)
+
+        command_service = CommandServiceStub()
+        service = PanelRuntimeWorkflowService(command_service, SimpleNamespace(), SimpleNamespace())
+
+        requested_result = service.prepare_run_root(
+            RunRootPrepareRequest(
+                config_path="cfg.psd1",
+                pair_id="pair01",
+                requested_run_root="C:\\runs\\requested",
+                summary_fallback_run_root="C:\\runs\\fallback",
+            )
+        )
+        fallback_result = service.prepare_run_root(
+            RunRootPrepareRequest(
+                config_path="cfg.psd1",
+                pair_id="pair01",
+                requested_run_root="",
+                summary_fallback_run_root="C:\\runs\\fallback",
+            )
+        )
+
+        self.assertEqual("C:\\runs\\requested", requested_result.summary_run_root)
+        self.assertEqual("C:\\runs\\fallback", fallback_result.summary_run_root)
+        self.assertEqual(
+            [
+                ("tests/Start-PairedExchangeTest.ps1", "C:\\runs\\requested"),
+                ("show-paired-run-summary.ps1", "C:\\runs\\requested"),
+                ("tests/Start-PairedExchangeTest.ps1", ""),
+                ("show-paired-run-summary.ps1", "C:\\runs\\fallback"),
+            ],
+            command_service.commands,
+        )
+
+    def test_run_prepare_all_preserves_launch_attach_refresh_prepare_sequence(self) -> None:
+        calls: list[tuple[str, object]] = []
+        runtime_result = RuntimeRefreshResult(
+            relay_status={"Runtime": {"ExpectedTargetCount": 8}},
+            visibility_status={"ExpectedTargetCount": 8},
+        )
+
+        class CommandServiceStub:
+            def build_python_command(self, script_path: str) -> list[str]:
+                calls.append(("build_python", script_path))
+                return ["python", script_path]
+
+            def build_script_command(self, script_name: str, **kwargs) -> list[str]:
+                calls.append(("build_script", script_name, kwargs.get("run_root", ""), kwargs.get("config_path", "")))
+                return [script_name, kwargs.get("run_root", "")]
+
+            def run(self, command: list[str]) -> subprocess.CompletedProcess[str]:
+                calls.append(("run", tuple(command)))
+                if command[0] == "python":
+                    return subprocess.CompletedProcess(command, 0, stdout="launcher done", stderr="")
+                if command[0] == "attach-targets-from-bindings.ps1":
+                    return subprocess.CompletedProcess(command, 0, stdout="attach done", stderr="")
+                if command[0] == "tests/Start-PairedExchangeTest.ps1":
+                    return subprocess.CompletedProcess(command, 0, stdout="prepared pair test root: C:\\runs\\prepared", stderr="")
+                if command[0] == "show-paired-run-summary.ps1":
+                    return subprocess.CompletedProcess(command, 0, stdout="overall=success", stderr="")
+                raise AssertionError(command)
+
+        service = PanelRuntimeWorkflowService(
+            CommandServiceStub(),
+            SimpleNamespace(),
+            SimpleNamespace(refresh_runtime=lambda context: calls.append(("refresh", context.run_root)) or runtime_result),
+        )
+
+        result = service.run_prepare_all(
+            PrepareAllRequest(
+                context=AppContext(config_path="cfg.psd1", run_root="C:\\runs\\current", pair_id="pair01", target_id=""),
+                config_path="cfg.psd1",
+                pair_id="pair01",
+                explicit_run_root="C:\\runs\\requested",
+                wrapper_path="visible_launcher.py",
+                launch_windows_needed=True,
+                attach_windows_needed=True,
+            )
+        )
+
+        self.assertEqual("launcher done", result.launcher_output)
+        self.assertEqual("attach done", result.attach_output)
+        self.assertEqual("C:\\runs\\prepared", result.run_root_result.prepared_run_root)
+        self.assertEqual("C:\\runs\\prepared", result.run_root_result.summary_run_root)
+        self.assertIs(runtime_result, result.runtime_result)
+        self.assertTrue(bool(result.window_launch_anchor_utc))
+        self.assertEqual(
+            [
+                ("build_python", "visible_launcher.py"),
+                ("run", ("python", "visible_launcher.py")),
+                ("build_script", "attach-targets-from-bindings.ps1", "", "cfg.psd1"),
+                ("run", ("attach-targets-from-bindings.ps1", "")),
+                ("refresh", "C:\\runs\\current"),
+                ("build_script", "tests/Start-PairedExchangeTest.ps1", "C:\\runs\\requested", "cfg.psd1"),
+                ("run", ("tests/Start-PairedExchangeTest.ps1", "C:\\runs\\requested")),
+                ("build_script", "show-paired-run-summary.ps1", "C:\\runs\\prepared", "cfg.psd1"),
+                ("run", ("show-paired-run-summary.ps1", "C:\\runs\\prepared")),
+            ],
+            calls,
+        )
+
+
 class RelayOperatorPanelMessageSlotTests(unittest.TestCase):
     def _make_panel(self) -> RelayOperatorPanel:
         panel = RelayOperatorPanel.__new__(RelayOperatorPanel)
@@ -2660,8 +4027,14 @@ class RelayOperatorPanelMessageSlotTests(unittest.TestCase):
         panel.preview_rows = [
             {"PairId": "pair01", "RoleName": "top", "TargetId": "target01"},
         ]
+        panel.config_path_var = VarStub("cfg.psd1")
+        panel.run_root_var = VarStub("")
+        panel.effective_data = {"RunContext": {"SelectedRunRoot": "C:\\runs\\current"}}
         panel.pair_id_var = VarStub("pair01")
         panel.target_id_var = VarStub("target01")
+        panel.action_context_source = "controls"
+        panel.inspection_context_source = ""
+        panel.inspection_context_row_index = None
         panel.message_template_var = VarStub("Initial")
         panel.message_scope_label_var = VarStub("글로벌 Prefix")
         panel.message_scope_id_var = VarStub("")
@@ -2680,6 +4053,7 @@ class RelayOperatorPanelMessageSlotTests(unittest.TestCase):
         panel.message_document_version = 0
         panel.message_preview_doc_version = -1
         panel.message_preview_cached_context_key = ""
+        panel.visible_workflow_progress_by_scope = {}
         panel._editor_preview_text = lambda _key: "(preview)"
         panel._editor_final_delivery_text = lambda: "(final-delivery)"
         panel._editor_path_summary_text = lambda: "(path-summary)"
@@ -3076,7 +4450,7 @@ class RelayOperatorPanelMessageSlotTests(unittest.TestCase):
 
         panel.row_tree = RowTreeStub()
         selected_rows: list[str] = []
-        panel.on_row_selected = lambda _event=None: selected_rows.append(panel.preview_rows[int(panel.row_tree.selected)]["TargetId"])
+        panel.on_row_selected = lambda _event=None, **_kwargs: selected_rows.append(panel.preview_rows[int(panel.row_tree.selected)]["TargetId"])
 
         result = panel._sync_preview_selection_with_pair("pair01", target_id="target05")
 
@@ -3105,7 +4479,7 @@ class RelayOperatorPanelMessageSlotTests(unittest.TestCase):
                 return None
 
         panel.row_tree = RowTreeStub()
-        panel.on_row_selected = lambda _event=None: None
+        panel.on_row_selected = lambda _event=None, **_kwargs: None
         panel.render_target_board = lambda: None
         panel.render_message_editor = lambda *, include_side_panels=True: None
         panel.update_pair_button_states = lambda: None
@@ -3115,6 +4489,98 @@ class RelayOperatorPanelMessageSlotTests(unittest.TestCase):
         panel.on_pair_or_target_changed()
 
         self.assertEqual("target05", panel.message_scope_id_var.get())
+
+    def test_on_row_selected_updates_inspection_context_without_overwriting_action_context(self) -> None:
+        panel = self._make_panel()
+        panel.preview_rows = [
+            {"PairId": "pair02", "RoleName": "bottom", "TargetId": "target05"},
+        ]
+
+        class RowTreeStub:
+            def selection(self) -> tuple[str, ...]:
+                return ("0",)
+
+        panel.row_tree = RowTreeStub()
+        panel.details_text = object()
+        panel.initial_text = object()
+        panel.handoff_text = object()
+        panel.plan_text = object()
+        panel.one_time_text = object()
+        panel.render_target_board = lambda: None
+        panel.render_message_editor = lambda: None
+        panel.set_text = lambda widget, value: setattr(panel, "_captured_detail", value) if widget is panel.details_text else None
+        panel.pair_id_var.set("pair01")
+        panel.target_id_var.set("target01")
+
+        panel.on_row_selected()
+
+        self.assertEqual("pair01", panel.pair_id_var.get())
+        self.assertEqual("target01", panel.target_id_var.get())
+        self.assertEqual("pair02", panel.inspection_pair_id)
+        self.assertEqual("target05", panel.inspection_target_id)
+        self.assertEqual("preview-row", panel.inspection_context_source)
+        self.assertEqual(0, panel.inspection_context_row_index)
+        self.assertIn("inspection 선택만 바뀌었습니다.", panel._captured_detail)
+
+    def test_apply_selected_inspection_context_promotes_preview_selection_to_action_context(self) -> None:
+        panel = self._make_panel()
+        panel.inspection_pair_id = "pair02"
+        panel.inspection_target_id = "target05"
+        panel.output_text = object()
+        panel._sync_home_pair_selection = lambda _pair_id: None
+        panel.render_target_board = lambda: None
+        panel.update_pair_button_states = lambda: None
+        panel.rebuild_panel_state = lambda: None
+        panel.set_text = lambda _widget, value: setattr(panel, "_captured_output", value)
+
+        panel.apply_selected_inspection_context()
+
+        self.assertEqual("pair02", panel.pair_id_var.get())
+        self.assertEqual("target05", panel.target_id_var.get())
+        self.assertEqual("inspection-apply", panel.action_context_source)
+        self.assertIn("inspection 실행 기준 반영 완료", panel._captured_output)
+
+    def test_select_target_from_board_updates_inspection_without_overwriting_action_context(self) -> None:
+        panel = self._make_panel()
+        panel.preview_rows = [
+            {"PairId": "pair02", "RoleName": "bottom", "TargetId": "target05"},
+        ]
+
+        class RowTreeStub:
+            def __init__(self) -> None:
+                self.selected: str | None = None
+
+            def selection_set(self, iid: str) -> None:
+                self.selected = iid
+
+        panel.row_tree = RowTreeStub()
+        panel.on_row_selected = lambda _event=None, **_kwargs: None
+        panel.pair_id_var.set("pair01")
+        panel.target_id_var.set("target01")
+
+        panel.select_target_from_board("target05", "pair02")
+
+        self.assertEqual("pair01", panel.pair_id_var.get())
+        self.assertEqual("target01", panel.target_id_var.get())
+        self.assertEqual("pair02", panel.inspection_pair_id)
+        self.assertEqual("target05", panel.inspection_target_id)
+        self.assertEqual("board-target", panel.inspection_context_source)
+        self.assertEqual(0, panel.inspection_context_row_index)
+
+    def test_on_home_pair_selected_does_not_overwrite_action_context(self) -> None:
+        panel = self._make_panel()
+        panel.pair_id_var.set("pair01")
+        panel.target_id_var.set("target01")
+        panel._selected_pair_summary = lambda: SimpleNamespace(pair_id="pair02")
+        panel._home_pair_detail_text = lambda _summary: "pair02 detail"
+        panel.home_pair_detail_var = VarStub("")
+        panel.update_pair_button_states = lambda: None
+
+        panel.on_home_pair_selected()
+
+        self.assertEqual("pair01", panel.pair_id_var.get())
+        self.assertEqual("target01", panel.target_id_var.get())
+        self.assertEqual("pair02 detail", panel.home_pair_detail_var.get())
 
     def test_load_effective_config_keeps_explicit_target_selection_on_refresh(self) -> None:
         panel = RelayOperatorPanel.__new__(RelayOperatorPanel)
@@ -3154,6 +4620,14 @@ class RelayOperatorPanelMessageSlotTests(unittest.TestCase):
         panel.run_root_var = VarStub("")
         panel.pair_id_var = VarStub("pair01")
         panel.target_id_var = VarStub("target05")
+        panel.watcher_service = WatcherService()
+        panel.watcher_controller = WatcherController(panel.watcher_service)
+        panel.watcher_max_forward_var = VarStub("2")
+        panel.watcher_run_duration_var = VarStub("900")
+        panel.watcher_pair_roundtrip_var = VarStub("0")
+        panel.watcher_quick_start_note_var = VarStub("")
+        panel.watcher_current_note_var = VarStub("")
+        panel.watcher_start_note_var = VarStub("")
         panel.message_config_doc = {}
         panel.effective_data = None
         panel.relay_status_data = None
@@ -3173,7 +4647,7 @@ class RelayOperatorPanelMessageSlotTests(unittest.TestCase):
         panel.clear_details = lambda: None
         panel.set_operator_status = lambda *args, **kwargs: None
         selected_rows: list[str] = []
-        panel.on_row_selected = lambda _event=None: selected_rows.append(preview_rows[int(panel.row_tree.selected)]["TargetId"])
+        panel.on_row_selected = lambda _event=None, **_kwargs: selected_rows.append(preview_rows[int(panel.row_tree.selected)]["TargetId"])
 
         panel.load_effective_config()
 
@@ -3200,7 +4674,9 @@ class DashboardAggregatorTests(unittest.TestCase):
 
     def test_build_panel_state_prioritizes_ready_to_forward_before_watcher_restart(self) -> None:
         aggregator = DashboardAggregator()
-        with tempfile.TemporaryDirectory() as tmp:
+        tmp_root = Path("_tmp")
+        tmp_root.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=str(tmp_root.resolve())) as tmp:
             binding_profile = Path(tmp) / "bindings.json"
             binding_profile.write_text(
                 json.dumps({"windows": [{"targetId": f"target{index:02d}"} for index in range(1, 9)]}, ensure_ascii=False),
@@ -3248,7 +4724,9 @@ class DashboardAggregatorTests(unittest.TestCase):
 
     def test_build_panel_state_marks_expected_limit_stop_for_restart(self) -> None:
         aggregator = DashboardAggregator()
-        with tempfile.TemporaryDirectory() as tmp:
+        tmp_root = Path("_tmp")
+        tmp_root.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=str(tmp_root.resolve())) as tmp:
             binding_profile = Path(tmp) / "bindings.json"
             binding_profile.write_text(
                 json.dumps({"windows": [{"targetId": f"target{index:02d}"} for index in range(1, 9)]}, ensure_ascii=False),
@@ -3290,6 +4768,209 @@ class DashboardAggregatorTests(unittest.TestCase):
             )
 
         self.assertTrue(any(issue.title == "watcher 정상 제한 종료" for issue in state.issues))
+
+    def test_build_panel_state_prefers_pair_progress_from_status(self) -> None:
+        aggregator = DashboardAggregator()
+        with tempfile.TemporaryDirectory() as tmp:
+            binding_profile = Path(tmp) / "bindings.json"
+            binding_profile.write_text(
+                json.dumps({"windows": [{"targetId": f"target{index:02d}"} for index in range(1, 9)]}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+
+            state = aggregator.build_panel_state(
+                bundle=DashboardRawBundle(
+                    effective_data={
+                        "RunContext": {
+                            "SelectedRunRoot": "C:\\runs\\current",
+                            "SelectedRunRootSource": "explicit",
+                            "SelectedRunRootIsStale": False,
+                        },
+                        "PairActivationSummary": [{"PairId": "pair01", "EffectiveEnabled": True}],
+                        "OverviewPairs": [{"PairId": "pair01", "TopTargetId": "target01", "BottomTargetId": "target05"}],
+                        "WarningSummary": {},
+                    },
+                    relay_status={
+                        "Lane": {"BindingProfilePath": str(binding_profile)},
+                        "Runtime": {"Exists": True, "UniqueTargetCount": 8, "AttachedCount": 8, "LaunchedCount": 8},
+                        "Router": {"Status": "running", "PendingQueueCount": 0, "QueueCount": 0},
+                        "NextActions": [],
+                    },
+                    visibility_status={
+                        "InjectableCount": 8,
+                        "NonInjectableCount": 0,
+                        "MissingRuntimeCount": 0,
+                        "Targets": [],
+                    },
+                    paired_status={
+                        "Watcher": {"Status": "running"},
+                        "Counts": {"HandoffReadyCount": 0, "ReadyToForwardCount": 0},
+                        "Pairs": [
+                            {
+                                "PairId": "pair01",
+                                "LatestStateSummary": "target01:forwarded, target05:forwarded",
+                                "RoundtripCount": 1,
+                                "ForwardedStateCount": 2,
+                                "HandoffReadyCount": 0,
+                                "CurrentPhase": "partner-running",
+                                "NextExpectedHandoff": "target05 -> target01",
+                                "NextAction": "await-partner-output",
+                                "ProgressDetail": "왕복=1 / forwardedState=2 / 단계=partner-running / 다음=await-partner-output / 예정=target05 -> target01",
+                            }
+                        ],
+                        "Targets": [
+                            {"PairId": "pair01", "TargetId": "target01", "LatestState": "forwarded", "ZipCount": 1, "FailureCount": 0},
+                            {"PairId": "pair01", "TargetId": "target05", "LatestState": "forwarded", "ZipCount": 1, "FailureCount": 0},
+                        ],
+                    },
+                    paired_status_error="",
+                ),
+                selected_pair="pair01",
+            )
+
+        self.assertEqual(1, len(state.pairs))
+        self.assertEqual(1, state.pairs[0].roundtrip_count)
+        self.assertEqual(2, state.pairs[0].forwarded_state_count)
+        self.assertEqual("partner-running", state.pairs[0].current_phase)
+        self.assertEqual("target05 -> target01", state.pairs[0].next_expected_handoff)
+        self.assertEqual("await-partner-output", state.pairs[0].next_action)
+        self.assertIn("단계=partner-running", state.pairs[0].detail)
+        self.assertIn("왕복=1", state.pairs[0].detail)
+
+    def test_build_panel_state_normalizes_pair_phase_aliases(self) -> None:
+        aggregator = DashboardAggregator()
+        with tempfile.TemporaryDirectory() as tmp:
+            binding_profile = Path(tmp) / "bindings.json"
+            binding_profile.write_text(
+                json.dumps({"windows": [{"targetId": f"target{index:02d}"} for index in range(1, 9)]}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+
+            state = aggregator.build_panel_state(
+                bundle=DashboardRawBundle(
+                    effective_data={
+                        "RunContext": {
+                            "SelectedRunRoot": "C:\\runs\\current",
+                            "SelectedRunRootSource": "explicit",
+                            "SelectedRunRootIsStale": False,
+                        },
+                        "PairActivationSummary": [{"PairId": "pair01", "EffectiveEnabled": True}],
+                        "OverviewPairs": [{"PairId": "pair01", "TopTargetId": "target01", "BottomTargetId": "target05"}],
+                        "WarningSummary": {},
+                    },
+                    relay_status={
+                        "Lane": {"BindingProfilePath": str(binding_profile)},
+                        "Runtime": {"Exists": True, "UniqueTargetCount": 8, "AttachedCount": 8, "LaunchedCount": 8},
+                        "Router": {"Status": "running", "PendingQueueCount": 0, "QueueCount": 0},
+                        "NextActions": [],
+                    },
+                    visibility_status={
+                        "InjectableCount": 8,
+                        "NonInjectableCount": 0,
+                        "MissingRuntimeCount": 0,
+                        "Targets": [],
+                    },
+                    paired_status={
+                        "Watcher": {"Status": "running"},
+                        "Counts": {"HandoffReadyCount": 0, "ReadyToForwardCount": 0},
+                        "Pairs": [
+                            {
+                                "PairId": "pair01",
+                                "LatestStateSummary": "target01:ready-to-forward, target05:forwarded",
+                                "RoundtripCount": 1,
+                                "ForwardedStateCount": 2,
+                                "HandoffReadyCount": 1,
+                                "CurrentPhase": "waiting-handoff",
+                                "NextExpectedHandoff": "target01 -> target05",
+                                "NextAction": "handoff-ready",
+                            }
+                        ],
+                        "Targets": [
+                            {"PairId": "pair01", "TargetId": "target01", "LatestState": "ready-to-forward", "ZipCount": 1, "FailureCount": 0},
+                            {"PairId": "pair01", "TargetId": "target05", "LatestState": "forwarded", "ZipCount": 1, "FailureCount": 0},
+                        ],
+                    },
+                    paired_status_error="",
+                ),
+                selected_pair="pair01",
+            )
+
+        self.assertEqual("waiting-partner-handoff", state.pairs[0].current_phase)
+
+    def test_build_panel_state_surfaces_mixed_pair_phase_rows(self) -> None:
+        aggregator = DashboardAggregator()
+        with tempfile.TemporaryDirectory() as tmp:
+            binding_profile = Path(tmp) / "bindings.json"
+            binding_profile.write_text(
+                json.dumps({"windows": [{"targetId": f"target{index:02d}"} for index in range(1, 9)]}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+
+            state = aggregator.build_panel_state(
+                bundle=DashboardRawBundle(
+                    effective_data={
+                        "RunContext": {
+                            "SelectedRunRoot": "C:\\runs\\current",
+                            "SelectedRunRootSource": "explicit",
+                            "SelectedRunRootIsStale": False,
+                        },
+                        "PairActivationSummary": [
+                            {"PairId": "pair01", "EffectiveEnabled": True},
+                            {"PairId": "pair02", "EffectiveEnabled": True},
+                            {"PairId": "pair03", "EffectiveEnabled": True},
+                            {"PairId": "pair04", "EffectiveEnabled": True},
+                        ],
+                        "OverviewPairs": [
+                            {"PairId": "pair01", "TopTargetId": "target01", "BottomTargetId": "target05"},
+                            {"PairId": "pair02", "TopTargetId": "target02", "BottomTargetId": "target06"},
+                            {"PairId": "pair03", "TopTargetId": "target03", "BottomTargetId": "target07"},
+                            {"PairId": "pair04", "TopTargetId": "target04", "BottomTargetId": "target08"},
+                        ],
+                        "WarningSummary": {},
+                    },
+                    relay_status={
+                        "Lane": {"BindingProfilePath": str(binding_profile)},
+                        "Runtime": {"Exists": True, "UniqueTargetCount": 8, "AttachedCount": 8, "LaunchedCount": 8},
+                        "Router": {"Status": "running", "PendingQueueCount": 0, "QueueCount": 0},
+                        "NextActions": [],
+                    },
+                    visibility_status={
+                        "InjectableCount": 8,
+                        "NonInjectableCount": 0,
+                        "MissingRuntimeCount": 0,
+                        "Targets": [],
+                    },
+                    paired_status={
+                        "Watcher": {"Status": "running"},
+                        "Counts": {"HandoffReadyCount": 1, "ReadyToForwardCount": 1},
+                        "Pairs": [
+                            {"PairId": "pair01", "LatestStateSummary": "target01:forwarded, target05:forwarded", "RoundtripCount": 2, "ForwardedStateCount": 4, "CurrentPhase": "paused", "NextAction": "resume-required"},
+                            {"PairId": "pair02", "LatestStateSummary": "target02:forwarded, target06:forwarded", "RoundtripCount": 10, "ForwardedStateCount": 20, "CurrentPhase": "", "ReachedRoundtripLimit": True, "NextAction": "limit-reached"},
+                            {"PairId": "pair03", "LatestStateSummary": "target03:error-present, target07:forwarded", "RoundtripCount": 1, "ForwardedStateCount": 2, "CurrentPhase": "", "NextAction": "manual-review"},
+                            {"PairId": "pair04", "LatestStateSummary": "target04:forwarded, target08:forwarded", "RoundtripCount": 3, "ForwardedStateCount": 6, "CurrentPhase": "partner-running", "NextExpectedHandoff": "target08 -> target04", "NextAction": "await-partner-output"},
+                        ],
+                        "Targets": [
+                            {"PairId": "pair01", "TargetId": "target01", "LatestState": "forwarded", "ZipCount": 1, "FailureCount": 0},
+                            {"PairId": "pair01", "TargetId": "target05", "LatestState": "forwarded", "ZipCount": 1, "FailureCount": 0},
+                            {"PairId": "pair02", "TargetId": "target02", "LatestState": "forwarded", "ZipCount": 1, "FailureCount": 0},
+                            {"PairId": "pair02", "TargetId": "target06", "LatestState": "forwarded", "ZipCount": 1, "FailureCount": 0},
+                            {"PairId": "pair03", "TargetId": "target03", "LatestState": "error-present", "ZipCount": 1, "FailureCount": 1, "ErrorPresent": True},
+                            {"PairId": "pair03", "TargetId": "target07", "LatestState": "forwarded", "ZipCount": 1, "FailureCount": 0},
+                            {"PairId": "pair04", "TargetId": "target04", "LatestState": "forwarded", "ZipCount": 1, "FailureCount": 0},
+                            {"PairId": "pair04", "TargetId": "target08", "LatestState": "forwarded", "ZipCount": 1, "FailureCount": 0},
+                        ],
+                    },
+                    paired_status_error="",
+                ),
+                selected_pair="pair04",
+            )
+
+        pair_map = {pair.pair_id: pair for pair in state.pairs}
+        self.assertEqual("paused", pair_map["pair01"].current_phase)
+        self.assertEqual("limit-reached", pair_map["pair02"].current_phase)
+        self.assertEqual("manual-attention", pair_map["pair03"].current_phase)
+        self.assertEqual("partner-running", pair_map["pair04"].current_phase)
+        self.assertEqual("target08 -> target04", pair_map["pair04"].next_expected_handoff)
 
     def test_build_panel_state_surfaces_ignored_launcher_session_mismatch(self) -> None:
         aggregator = DashboardAggregator()
@@ -3394,6 +5075,93 @@ class DashboardAggregatorTests(unittest.TestCase):
         self.assertIn("ignored=1", router_card.detail)
         self.assertIn("pair 메타 필수값 누락 1", router_card.detail)
         self.assertTrue(any(issue.title == "relay 메타 오류로 ready 무시됨" for issue in state.issues))
+
+    def test_build_panel_state_surfaces_visible_receipt_blockers(self) -> None:
+        aggregator = DashboardAggregator()
+        with tempfile.TemporaryDirectory() as tmp:
+            binding_profile = Path(tmp) / "bindings.json"
+            binding_profile.write_text(
+                json.dumps({"windows": [{"targetId": f"target{index:02d}"} for index in range(1, 9)]}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            receipt_path = Path(tmp) / "live-acceptance-result.json"
+            receipt_path.write_text(
+                json.dumps(
+                    {
+                        "Stage": "preflight-blocked",
+                        "LastUpdatedAt": "2026-04-25T00:45:00+09:00",
+                        "BlockedBy": "foreign-queued-command",
+                        "BlockedTargetId": "target01",
+                        "BlockedRunRoot": "C:\\runs\\foreign-active",
+                        "BlockedPath": "C:\\runtime\\queue\\target01\\processing\\command.json",
+                        "BlockedDetail": "queued command from target05",
+                        "PhaseHistory": [
+                            {"RecordedAt": "2026-04-25T00:44:00+09:00", "Stage": "prepared", "AcceptanceState": ""},
+                            {"RecordedAt": "2026-04-25T00:44:30+09:00", "Stage": "visible-worker-preflight", "AcceptanceState": ""},
+                            {"RecordedAt": "2026-04-25T00:45:00+09:00", "Stage": "preflight-blocked", "AcceptanceState": "error"},
+                        ],
+                        "Outcome": {
+                            "AcceptanceState": "error",
+                            "AcceptanceReason": "preflight blocked",
+                        },
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
+            state = aggregator.build_panel_state(
+                bundle=DashboardRawBundle(
+                    effective_data={
+                        "RunContext": {
+                            "SelectedRunRoot": "C:\\runs\\current",
+                            "SelectedRunRootSource": "explicit",
+                            "SelectedRunRootIsStale": False,
+                        },
+                        "PairActivationSummary": [{"PairId": "pair01", "EffectiveEnabled": True}],
+                        "OverviewPairs": [{"PairId": "pair01", "TopTargetId": "target01", "BottomTargetId": "target05"}],
+                        "WarningSummary": {},
+                    },
+                    relay_status={
+                        "Lane": {"BindingProfilePath": str(binding_profile)},
+                        "Runtime": {"Exists": True, "UniqueTargetCount": 8, "AttachedCount": 8, "LaunchedCount": 8},
+                        "Router": {"Status": "running", "PendingQueueCount": 0, "QueueCount": 0},
+                        "NextActions": [],
+                    },
+                    visibility_status={
+                        "InjectableCount": 8,
+                        "NonInjectableCount": 0,
+                        "MissingRuntimeCount": 0,
+                        "Targets": [],
+                    },
+                    paired_status={
+                        "Watcher": {"Status": "running"},
+                        "Counts": {"HandoffReadyCount": 0, "ReadyToForwardCount": 0},
+                        "Targets": [{"PairId": "pair01", "TargetId": "target01", "LatestState": "forwarded", "ZipCount": 1, "FailureCount": 0}],
+                        "AcceptanceReceipt": {
+                            "Path": str(receipt_path),
+                            "Exists": True,
+                            "AcceptanceState": "error",
+                            "AcceptanceReason": "preflight blocked",
+                        },
+                    },
+                    paired_status_error="",
+                ),
+                selected_pair="pair01",
+            )
+
+        acceptance_card = next(card for card in state.cards if card.key == "acceptance")
+        self.assertEqual("foreign-queued-command", acceptance_card.value)
+        self.assertIn("stage=preflight-blocked", acceptance_card.detail)
+        self.assertIn("target=target01", acceptance_card.detail)
+        self.assertIn("runRoot=C:\\runs\\foreign-active", acceptance_card.detail)
+        self.assertIn("path=C:\\runtime\\queue\\target01\\processing\\command.json", acceptance_card.detail)
+        self.assertIn("queued command from target05", acceptance_card.detail)
+        self.assertIn("history=3", acceptance_card.detail)
+        blocker_issue = next(issue for issue in state.issues if issue.title == "Visible preflight 차단")
+        self.assertEqual("visible_preflight", blocker_issue.action_key)
+        self.assertIn("runRoot=C:\\runs\\foreign-active", blocker_issue.detail)
+        self.assertIn("path=C:\\runtime\\queue\\target01\\processing\\command.json", blocker_issue.detail)
 
     def test_build_panel_state_marks_launch_stage_as_previous_session_when_binding_predates_panel_open(self) -> None:
         aggregator = DashboardAggregator()
@@ -4000,6 +5768,31 @@ class WatcherServiceTests(unittest.TestCase):
         self.assertEqual("stop_requested", status.state)
         self.assertIn("stop_requested_timeout", status.reason_codes)
 
+    def test_get_runtime_status_reports_pause_and_resume_requests(self) -> None:
+        service = WatcherService()
+
+        pause_status = service.get_runtime_status(
+            {
+                "Watcher": {
+                    "Status": "running",
+                    "ControlPendingAction": "pause",
+                }
+            },
+            run_root="C:\\runs\\current",
+        )
+        resume_status = service.get_runtime_status(
+            {
+                "Watcher": {
+                    "Status": "paused",
+                    "ControlPendingAction": "resume",
+                }
+            },
+            run_root="C:\\runs\\current",
+        )
+
+        self.assertEqual("pause_requested", pause_status.state)
+        self.assertEqual("resume_requested", resume_status.state)
+
     def test_get_runtime_status_uses_heartbeat_freshness(self) -> None:
         service = WatcherService()
         status = service.get_runtime_status(
@@ -4112,6 +5905,51 @@ class WatcherServiceTests(unittest.TestCase):
             self.assertTrue(result.ok)
             self.assertFalse(control_path.exists())
 
+    def test_recover_stale_start_blockers_unblocks_followup_start(self) -> None:
+        service = WatcherService()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            control_path = Path(tmp) / ".state" / "watcher-control.json"
+            control_path.parent.mkdir(parents=True, exist_ok=True)
+            control_path.write_text(
+                json.dumps(
+                    {
+                        "SchemaVersion": "1.0.0",
+                        "Action": "stop",
+                        "RunRoot": tmp,
+                        "RequestId": "stale-req",
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+
+            result = service.recover_stale_start_blockers(
+                tmp,
+                {
+                    "Watcher": {
+                        "Status": "stopped",
+                        "ControlPath": str(control_path),
+                        "ControlPendingAction": "stop",
+                        "ControlAgeSeconds": 99,
+                    }
+                },
+            )
+
+            self.assertTrue(result.ok)
+            followup = service.get_start_eligibility(
+                {
+                    "Watcher": {
+                        "Status": "stopped",
+                        "ControlPath": str(control_path),
+                    }
+                },
+                tmp,
+            )
+            self.assertTrue(followup.allowed)
+            self.assertEqual("watch 시작", followup.recommended_action)
+
     def test_request_stop_writes_control_file(self) -> None:
         service = WatcherService()
         paired_status = {"Watcher": {"Status": "running"}, "Counts": {}}
@@ -4125,6 +5963,36 @@ class WatcherServiceTests(unittest.TestCase):
             self.assertTrue(control_path.exists())
             payload = json.loads(control_path.read_text(encoding="utf-8"))
             self.assertEqual("stop", payload["Action"])
+            self.assertEqual(tmp, payload["RunRoot"])
+            self.assertEqual(result.request_id, payload["RequestId"])
+
+    def test_request_pause_writes_control_file(self) -> None:
+        service = WatcherService()
+        paired_status = {"Watcher": {"Status": "running"}, "Counts": {}}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            result = service.request_pause(paired_status, tmp)
+
+            self.assertTrue(result.ok)
+            self.assertEqual("pause_requested", result.state)
+            control_path = Path(tmp) / ".state" / "watcher-control.json"
+            payload = json.loads(control_path.read_text(encoding="utf-8"))
+            self.assertEqual("pause", payload["Action"])
+            self.assertEqual(tmp, payload["RunRoot"])
+            self.assertEqual(result.request_id, payload["RequestId"])
+
+    def test_request_resume_writes_control_file(self) -> None:
+        service = WatcherService()
+        paired_status = {"Watcher": {"Status": "paused"}, "Counts": {}}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            result = service.request_resume(paired_status, tmp)
+
+            self.assertTrue(result.ok)
+            self.assertEqual("resume_requested", result.state)
+            control_path = Path(tmp) / ".state" / "watcher-control.json"
+            payload = json.loads(control_path.read_text(encoding="utf-8"))
+            self.assertEqual("resume", payload["Action"])
             self.assertEqual(tmp, payload["RunRoot"])
             self.assertEqual(result.request_id, payload["RequestId"])
 
@@ -4327,6 +6195,22 @@ class WatcherServiceTests(unittest.TestCase):
         self.assertIn("pending_forward_exists", result.reason_codes)
         self.assertEqual([], command_service.spawned_commands)
 
+    def test_build_start_command_includes_pair_roundtrip_limit(self) -> None:
+        service = WatcherService()
+        command_service = RecordingCommandService()
+
+        command = service.build_start_command(
+            command_service,
+            WatcherStartRequest(
+                config_path="cfg.psd1",
+                run_root="C:\\runs\\current",
+                pair_max_roundtrip_count=10,
+            ),
+        )
+
+        self.assertIn("-PairMaxRoundtripCount", command)
+        self.assertIn("10", command)
+
 
 class WatcherControllerTests(unittest.TestCase):
     def test_diagnostics_includes_parse_errors_and_paths(self) -> None:
@@ -4383,6 +6267,20 @@ class WatcherControllerTests(unittest.TestCase):
         self.assertIsNotNone(recommendation)
         self.assertEqual("focus_ready_to_forward_artifact", recommendation.action_key)
 
+    def test_recommended_action_offers_resume_when_paused(self) -> None:
+        controller = WatcherController(WatcherService())
+
+        recommendation = controller.recommended_action(
+            {
+                "Watcher": {"Status": "paused"},
+                "Counts": {},
+            },
+            "C:\\runs\\current",
+        )
+
+        self.assertIsNotNone(recommendation)
+        self.assertEqual("resume_watcher", recommendation.action_key)
+
     def test_recommended_action_explains_forward_limit_stop(self) -> None:
         controller = WatcherController(WatcherService())
 
@@ -4417,6 +6315,89 @@ class WatcherControllerTests(unittest.TestCase):
         self.assertEqual("start_watcher", recommendation.action_key)
         self.assertIn("2회 forward", recommendation.detail)
 
+    def test_recommended_action_uses_configured_forward_limit(self) -> None:
+        controller = WatcherController(WatcherService())
+
+        recommendation = controller.recommended_action(
+            {
+                "Watcher": {
+                    "Status": "stopped",
+                    "StopCategory": "expected-limit",
+                    "ConfiguredMaxForwardCount": 7,
+                }
+            },
+            "C:\\runs\\current",
+        )
+
+        self.assertIsNotNone(recommendation)
+        self.assertEqual("start_watcher", recommendation.action_key)
+        self.assertIn("7회 forward", recommendation.detail)
+
+    def test_configured_start_request_uses_status_payload(self) -> None:
+        controller = WatcherController(WatcherService())
+
+        request = controller.configured_start_request(
+            {
+                "Watcher": {
+                    "StatusExists": True,
+                    "ConfiguredMaxForwardCount": 0,
+                    "ConfiguredRunDurationSec": 3600,
+                    "ConfiguredMaxRoundtripCount": 10,
+                }
+            },
+            config_path="cfg.psd1",
+            run_root="C:\\runs\\current",
+        )
+
+        self.assertIsNotNone(request)
+        assert request is not None
+        self.assertEqual(0, request.max_forward_count)
+        self.assertEqual(3600, request.run_duration_sec)
+        self.assertEqual(10, request.pair_max_roundtrip_count)
+
+    def test_recommended_action_explains_pair_roundtrip_limit_stop(self) -> None:
+        controller = WatcherController(WatcherService())
+
+        recommendation = controller.recommended_action(
+            {
+                "Watcher": {
+                    "Status": "stopped",
+                    "StatusReason": "pair-roundtrip-limit-reached",
+                    "StopCategory": "expected-limit",
+                    "ConfiguredMaxRoundtripCount": 10,
+                }
+            },
+            "C:\\runs\\current",
+        )
+
+        self.assertIsNotNone(recommendation)
+        self.assertEqual("start_watcher", recommendation.action_key)
+        self.assertIn("10왕복", recommendation.detail)
+        self.assertNotIn("forward", recommendation.detail)
+
+    def test_recommended_action_uses_pair_policy_roundtrip_limit_when_watcher_global_limit_missing(self) -> None:
+        controller = WatcherController(WatcherService())
+
+        recommendation = controller.recommended_action(
+            {
+                "Watcher": {
+                    "Status": "stopped",
+                    "StatusReason": "pair-roundtrip-limit-reached",
+                    "StopCategory": "expected-limit",
+                    "ConfiguredMaxRoundtripCount": 0,
+                },
+                "Pairs": [
+                    {"PairId": "pair01", "ConfiguredMaxRoundtripCount": 1},
+                    {"PairId": "pair02", "PolicyPairMaxRoundtripCount": 1},
+                ],
+            },
+            "C:\\runs\\current",
+        )
+
+        self.assertIsNotNone(recommendation)
+        self.assertEqual("start_watcher", recommendation.action_key)
+        self.assertIn("1왕복", recommendation.detail)
+
     def test_diagnostics_interprets_forward_limit_stop(self) -> None:
         controller = WatcherController(WatcherService())
 
@@ -4433,6 +6414,89 @@ class WatcherControllerTests(unittest.TestCase):
         self.assertIn("StatusInterpretation: 기본 watch 시작 preset의 forward 한도에 도달해 정지했습니다.", diagnostics.details)
         self.assertIn("ContinuousWatchGuidance:", diagnostics.details)
         self.assertIn("forward_limit=2", diagnostics.hint)
+
+    def test_diagnostics_interprets_pair_roundtrip_limit_stop(self) -> None:
+        controller = WatcherController(WatcherService())
+
+        diagnostics = controller.diagnostics(
+            {
+                "Watcher": {
+                    "Status": "stopped",
+                    "StatusReason": "pair-roundtrip-limit-reached",
+                    "StopCategory": "expected-limit",
+                    "ConfiguredMaxRoundtripCount": 10,
+                }
+            },
+            "C:\\runs\\current",
+        )
+
+        self.assertIn("ConfiguredPairRoundtripLimit: pair별 왕복 10회 기준입니다.", diagnostics.details)
+        self.assertIn("StatusInterpretation: watcher가 pair별 왕복 10회 한도에 도달해 정지했습니다.", diagnostics.details)
+        self.assertIn("pair_roundtrip_limit=10", diagnostics.hint)
+        self.assertNotIn("ContinuousWatchGuidance:", diagnostics.details)
+
+    def test_diagnostics_interprets_pair_policy_roundtrip_limit_stop(self) -> None:
+        controller = WatcherController(WatcherService())
+
+        diagnostics = controller.diagnostics(
+            {
+                "Watcher": {
+                    "Status": "stopped",
+                    "StatusReason": "pair-roundtrip-limit-reached",
+                    "StopCategory": "expected-limit",
+                    "ConfiguredMaxRoundtripCount": 0,
+                },
+                "Pairs": [
+                    {"PairId": "pair01", "ConfiguredMaxRoundtripCount": 1},
+                    {"PairId": "pair02", "PolicyPairMaxRoundtripCount": 1},
+                ],
+            },
+            "C:\\runs\\current",
+        )
+
+        self.assertIn("ConfiguredPairRoundtripLimit: pair별 왕복 1회 기준입니다.", diagnostics.details)
+        self.assertIn("StatusInterpretation: watcher가 pair별 왕복 1회 한도에 도달해 정지했습니다.", diagnostics.details)
+        self.assertIn("pair_roundtrip_limit=1", diagnostics.hint)
+
+    def test_diagnostics_surfaces_pause_and_pair_roundtrip_limit(self) -> None:
+        controller = WatcherController(WatcherService())
+
+        diagnostics = controller.diagnostics(
+            {
+                "Watcher": {
+                    "Status": "paused",
+                    "ConfiguredMaxRoundtripCount": 10,
+                }
+            },
+            "C:\\runs\\current",
+        )
+
+        self.assertIn("PauseAllowed: 아니오", diagnostics.details)
+        self.assertIn("ResumeAllowed: 예", diagnostics.details)
+        self.assertIn("ConfiguredPairRoundtripLimit: pair별 왕복 10회 기준입니다.", diagnostics.details)
+        self.assertIn("StatusInterpretation: watcher가 paused 상태", diagnostics.details)
+
+    def test_diagnostics_surfaces_configured_run_duration(self) -> None:
+        controller = WatcherController(WatcherService())
+
+        diagnostics = controller.diagnostics(
+            {
+                "Watcher": {
+                    "StatusExists": True,
+                    "Status": "stopped",
+                    "StatusReason": "run-duration-reached",
+                    "ConfiguredMaxForwardCount": 0,
+                    "ConfiguredRunDurationSec": 3600,
+                    "ConfiguredMaxRoundtripCount": 10,
+                }
+            },
+            "C:\\runs\\current",
+        )
+
+        self.assertIn("ConfiguredRunDurationSec: 3600초", diagnostics.details)
+        self.assertIn("CurrentWatcherPreset: watch 시작 preset: forward 제한 없음 / run 3600초 / pair별 왕복 10회 / headless dispatch", diagnostics.details)
+        self.assertIn("run_limit_sec=3600", diagnostics.hint)
+        self.assertIn("현재 watcher의 run duration 한도에 도달해 정지했습니다.", diagnostics.details)
 
     def test_start_blocks_unreadable_status_file(self) -> None:
         controller = WatcherController(WatcherService())
@@ -4497,6 +6561,191 @@ class WatcherControllerTests(unittest.TestCase):
             self.assertTrue(any("정리했습니다" in note for note in notes))
             self.assertFalse(control_path.exists())
 
+    def test_start_uses_explicit_request_when_provided(self) -> None:
+        controller = WatcherController(WatcherService())
+        command_service = RecordingCommandService()
+
+        result, notes = controller.start(
+            command_service,
+            config_path="cfg.psd1",
+            run_root="C:\\runs\\current",
+            paired_status={"Watcher": {"Status": "stopped"}},
+            request=WatcherStartRequest(
+                config_path="cfg.psd1",
+                run_root="C:\\runs\\current",
+                max_forward_count=0,
+                run_duration_sec=3600,
+                pair_max_roundtrip_count=10,
+            ),
+        )
+
+        self.assertTrue(result.ok)
+        self.assertEqual([], notes)
+        self.assertEqual(1, len(command_service.spawned_commands))
+        command = command_service.spawned_commands[0]
+        self.assertIn("-RunDurationSec", command)
+        self.assertIn("3600", command)
+        self.assertIn("-PairMaxRoundtripCount", command)
+        self.assertIn("10", command)
+        self.assertNotIn("-MaxForwardCount", command)
+
+
+class WatcherWorkflowServiceTests(unittest.TestCase):
+    def test_start_failure_renders_notes_and_diagnostics(self) -> None:
+        class ControllerStub:
+            def start(
+                self,
+                command_service,
+                *,
+                config_path: str,
+                run_root: str,
+                paired_status: dict | None,
+                clear_stale_first: bool = False,
+                request: WatcherStartRequest | None = None,
+            ):
+                return (
+                    SimpleNamespace(
+                        ok=False,
+                        state="stopped",
+                        message="watch start blocked",
+                        reason_codes=["stale_control_file"],
+                        command_text="",
+                    ),
+                    ["stale watcher control 정리 필요"],
+                )
+
+            def diagnostics(self, paired_status: dict | None, run_root: str):
+                return SimpleNamespace(details="watch 진단\nRunRoot: {0}".format(run_root))
+
+            def default_start_request(self, *, config_path: str, run_root: str) -> WatcherStartRequest:
+                return WatcherStartRequest(config_path=config_path, run_root=run_root)
+
+            def describe_start_request(self, request: WatcherStartRequest) -> str:
+                return "preset note"
+
+        service = PanelWatcherWorkflowService(ControllerStub(), object(), object())
+
+        update = service.start(
+            WatcherActionContextSnapshot(
+                config_path="cfg.psd1",
+                run_root="C:\\runs\\current",
+                paired_status={"Watcher": {"Status": "stopped"}},
+            )
+        )
+
+        self.assertFalse(update.ok)
+        self.assertEqual("watcher 시작 실패", update.operator_state)
+        self.assertIn("watch start blocked", update.output_text)
+        self.assertIn("stale watcher control 정리 필요", update.output_text)
+        self.assertIn("watch 진단", update.output_text)
+
+    def test_start_success_renders_explicit_request_summary(self) -> None:
+        class ControllerStub:
+            def start(
+                self,
+                command_service,
+                *,
+                config_path: str,
+                run_root: str,
+                paired_status: dict | None,
+                clear_stale_first: bool = False,
+                request: WatcherStartRequest | None = None,
+            ):
+                return (
+                    SimpleNamespace(
+                        ok=True,
+                        state="starting",
+                        message="watch started",
+                        reason_codes=[],
+                        command_text="pwsh watcher",
+                    ),
+                    [],
+                )
+
+            def diagnostics(self, paired_status: dict | None, run_root: str):
+                return SimpleNamespace(details="watch 진단\nRunRoot: {0}".format(run_root))
+
+            def default_start_request(self, *, config_path: str, run_root: str) -> WatcherStartRequest:
+                return WatcherStartRequest(config_path=config_path, run_root=run_root)
+
+            def describe_start_request(self, request: WatcherStartRequest) -> str:
+                return "watch 시작 preset: forward 제한 없음 / run 3600초 / pair별 왕복 10회 / headless dispatch"
+
+        service = PanelWatcherWorkflowService(ControllerStub(), object(), object())
+        request = WatcherStartRequest(
+            config_path="cfg.psd1",
+            run_root="C:\\runs\\current",
+            max_forward_count=0,
+            run_duration_sec=3600,
+            pair_max_roundtrip_count=10,
+        )
+
+        update = service.start(
+            WatcherActionContextSnapshot(
+                config_path="cfg.psd1",
+                run_root="C:\\runs\\current",
+                paired_status={"Watcher": {"Status": "stopped"}},
+            ),
+            request=request,
+        )
+
+        self.assertTrue(update.ok)
+        self.assertIn("pwsh watcher", update.output_text)
+        self.assertIn("pair별 왕복 10회", update.output_text)
+        self.assertIn("run 3600초", update.output_text)
+        self.assertIn("입력한 watch preset 기준", update.operator_hint)
+
+    def test_restart_uses_snapshotted_context_and_raises_rendered_failure(self) -> None:
+        class StatusServiceStub:
+            def __init__(self) -> None:
+                self.calls: list[tuple[str, str, str, str]] = []
+
+            def refresh_paired_status(self, context: AppContext, run_root: str | None = None):
+                self.calls.append((context.run_root, context.pair_id, context.target_id, run_root or ""))
+                return {"Watcher": {"Status": "stopped"}}, ""
+
+        class ControllerStub:
+            def restart(self, command_service, status_loader, **kwargs):
+                status_loader("C:\\runs\\polled")
+                return SimpleNamespace(
+                    ok=False,
+                    run_root=kwargs["run_root"],
+                    state="stopped",
+                    message="restart failed",
+                    request_id="req-1",
+                    command_text="pwsh restart",
+                    reason_codes=["pending_forward_exists"],
+                    warning_codes=["warn-a"],
+                )
+
+        status_service = StatusServiceStub()
+        service = PanelWatcherWorkflowService(ControllerStub(), object(), status_service)
+
+        with self.assertRaises(WatcherRestartFailure) as raised:
+            service.restart(
+                WatcherRestartRequest(
+                    context=WatcherActionContextSnapshot(
+                        config_path="cfg.psd1",
+                        run_root="C:\\runs\\current",
+                        paired_status={"Watcher": {"Status": "running"}},
+                    ),
+                    app_context=AppContext(
+                        config_path="cfg.psd1",
+                        run_root="C:\\runs\\snap",
+                        pair_id="pair07",
+                        target_id="target03",
+                    ),
+                    poll_interval_sec=0.0,
+                )
+            )
+
+        self.assertEqual([("C:\\runs\\snap", "pair07", "target03", "C:\\runs\\polled")], status_service.calls)
+        self.assertIn("watch 재시작 결과", raised.exception.panel_update.output_text)
+        self.assertIn("RequestId: req-1", raised.exception.panel_update.output_text)
+        self.assertIn("Warnings: warn-a", raised.exception.panel_update.output_text)
+        self.assertIn("Reasons: pending_forward_exists", raised.exception.panel_update.output_text)
+        self.assertEqual("pwsh restart", raised.exception.panel_update.command_text)
+
 
 class RelayOperatorPanelArtifactHardeningTests(unittest.TestCase):
     def _make_panel(self, memory_path: Path) -> RelayOperatorPanel:
@@ -4506,6 +6755,7 @@ class RelayOperatorPanelArtifactHardeningTests(unittest.TestCase):
         panel.artifact_last_sources_by_target = {}
         panel.artifact_last_action_by_target = {}
         panel.artifact_submit_active_targets = set()
+        panel.artifact_run_root_filter_var = VarStub("")
         panel.run_root_var = VarStub("")
         panel.effective_data = {
             "RunContext": {
@@ -4560,6 +6810,103 @@ class RelayOperatorPanelArtifactHardeningTests(unittest.TestCase):
             self.assertIn("parse failed", panel.artifact_source_memory_warning)
             self.assertIn("artifact-source-memory.json", panel.artifact_source_memory_warning)
 
+
+class RelayOperatorPanelWatcherOptionTests(unittest.TestCase):
+    def _make_panel(self, memory_path: Path | None = None) -> RelayOperatorPanel:
+        panel = RelayOperatorPanel.__new__(RelayOperatorPanel)
+        panel.watcher_controller = WatcherController(WatcherService())
+        panel.watcher_max_forward_var = VarStub("2")
+        panel.watcher_run_duration_var = VarStub("900")
+        panel.watcher_pair_roundtrip_var = VarStub("0")
+        panel.watcher_quick_start_note_var = VarStub("")
+        panel.watcher_current_note_var = VarStub("")
+        panel.watcher_start_note_var = VarStub("")
+        panel.paired_status_data = None
+        panel.artifact_source_memory_path = memory_path or Path("artifact-source-memory.json")
+        panel.artifact_source_memory_warning = ""
+        panel.artifact_last_sources_by_target = {}
+        panel.artifact_last_action_by_target = {}
+        panel.artifact_submit_active_targets = set()
+        panel.artifact_run_root_filter_var = VarStub("")
+        panel.config_path_var = VarStub("cfg.psd1")
+        panel.run_root_var = VarStub("")
+        panel.effective_data = {
+            "RunContext": {
+                "SelectedRunRoot": "C:\\runs\\current",
+                "SelectedRunRootIsStale": False,
+            }
+        }
+        return panel
+
+    def test_build_watcher_start_request_from_controls(self) -> None:
+        panel = self._make_panel()
+        panel.watcher_max_forward_var.set("0")
+        panel.watcher_run_duration_var.set("3600")
+        panel.watcher_pair_roundtrip_var.set("10")
+
+        request = panel._build_watcher_start_request_from_controls(
+            config_path="cfg.psd1",
+            run_root="C:\\runs\\current",
+            show_error=False,
+        )
+
+        self.assertIsNotNone(request)
+        assert request is not None
+        self.assertEqual(0, request.max_forward_count)
+        self.assertEqual(3600, request.run_duration_sec)
+        self.assertEqual(10, request.pair_max_roundtrip_count)
+
+    def test_refresh_watcher_start_note_uses_current_controls(self) -> None:
+        panel = self._make_panel()
+        panel.watcher_max_forward_var.set("0")
+        panel.watcher_run_duration_var.set("3600")
+        panel.watcher_pair_roundtrip_var.set("10")
+
+        panel._refresh_watcher_start_note()
+
+        note = panel.watcher_start_note_var.get()
+        self.assertIn("run 3600초", note)
+        self.assertIn("pair별 왕복 10회", note)
+        self.assertIn("0은 해당 제한 없음", note)
+        self.assertIn("다음 시작값:", note)
+
+    def test_refresh_watcher_notes_split_quick_current_and_next(self) -> None:
+        panel = self._make_panel()
+        panel.paired_status_data = {
+            "Watcher": {
+                "StatusExists": True,
+                "Status": "running",
+                "ConfiguredMaxForwardCount": 0,
+                "ConfiguredRunDurationSec": 3600,
+                "ConfiguredMaxRoundtripCount": 10,
+            }
+        }
+
+        panel._refresh_watcher_notes()
+
+        self.assertIn("기본 quick start:", panel.watcher_quick_start_note_var.get())
+        self.assertIn("현재 watcher 값:", panel.watcher_current_note_var.get())
+        self.assertIn("status=running", panel.watcher_current_note_var.get())
+        self.assertIn("다음 시작값:", panel.watcher_start_note_var.get())
+
+    def test_load_watcher_start_options_from_status_uses_bridge_payload(self) -> None:
+        panel = self._make_panel()
+        panel.paired_status_data = {
+            "Watcher": {
+                "StatusExists": True,
+                "ConfiguredMaxForwardCount": 0,
+                "ConfiguredRunDurationSec": 3600,
+                "ConfiguredMaxRoundtripCount": 10,
+            }
+        }
+
+        loaded = panel.load_watcher_start_options_from_status(show_message=False)
+
+        self.assertTrue(loaded)
+        self.assertEqual("0", panel.watcher_max_forward_var.get())
+        self.assertEqual("3600", panel.watcher_run_duration_var.get())
+        self.assertEqual("10", panel.watcher_pair_roundtrip_var.get())
+
     def test_artifact_warning_badges_include_memory_stale_and_fallback_risks(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             panel = self._make_panel(Path(tmp) / "artifact-source-memory.json")
@@ -4580,7 +6927,7 @@ class RelayOperatorPanelArtifactHardeningTests(unittest.TestCase):
             )
 
             self.assertIn("[SOURCE MEMORY WARNING]", badges)
-            self.assertIn("[STALE RUNROOT WARNING]", badges)
+            self.assertIn("[ARTIFACT RUNROOT STALE]", badges)
             self.assertIn("[LEGACY CHECK FALLBACK RISK]", badges)
             self.assertIn("[LEGACY SUBMIT FALLBACK RISK]", badges)
 
@@ -4602,7 +6949,7 @@ class RelayOperatorPanelArtifactHardeningTests(unittest.TestCase):
             ask.assert_called_once()
             self.assertEqual("submit 재실행 확인", ask.call_args.args[0])
 
-    def test_import_selected_external_artifact_requires_extra_confirmation_for_fallback_submit(self) -> None:
+    def test_import_selected_external_artifact_runs_preflight_in_background_before_fallback_submit_confirmation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             panel = self._make_panel(Path(tmp) / "artifact-source-memory.json")
             state = make_artifact_state(
@@ -4615,46 +6962,78 @@ class RelayOperatorPanelArtifactHardeningTests(unittest.TestCase):
             panel.set_text = lambda *_args, **_kwargs: None
             panel.refresh_paired_status_only = lambda *args, **kwargs: None
             panel.on_artifact_row_selected = lambda *args, **kwargs: None
-            panel._selected_artifact_action_context = lambda: (state, "cfg.psd1", "C:\\runs\\current")
+            panel._selected_artifact_action_context = lambda: ArtifactActionContextSnapshot(
+                state=state,
+                config_path="cfg.psd1",
+                run_root="C:\\runs\\current",
+                run_root_is_stale=False,
+            )
             panel._prompt_external_artifact_sources = lambda _state: ("C:\\work\\summary.txt", "C:\\work\\review.zip")
             panel._remember_artifact_sources = lambda *_args, **_kwargs: None
             panel._remember_artifact_action_result = lambda *_args, **_kwargs: None
             panel._confirm_recent_submit_repeat = lambda _target_id: True
             panel._begin_submit_action = lambda _target_id: True
             panel._finish_submit_action = lambda _target_id: None
-            panel._current_run_root_is_stale_for_actions = lambda: False
+            panel._run_root_is_stale = lambda _run_root: False
 
             class CommandServiceStub:
-                def run_json(self, _command: list[str]) -> dict:
-                    return {
-                        "Validation": {"Ok": True, "RequiresOverwrite": False},
-                        "Preflight": {
-                            "SummaryLines": ["ready"],
-                            "DestinationZipPath": "C:\\runs\\current\\pair01\\target01\\reviewfile\\review.zip",
-                        },
-                        "PreImportStatus": {"LatestState": "no-zip"},
-                    }
+                def __init__(self) -> None:
+                    self.commands: list[list[str]] = []
+
+                def run(self, command: list[str]) -> subprocess.CompletedProcess[str]:
+                    self.commands.append(list(command))
+                    if command == ["check-script"]:
+                        return subprocess.CompletedProcess(
+                            command,
+                            0,
+                            stdout=json.dumps(
+                                {
+                                    "Validation": {"Ok": True, "RequiresOverwrite": False},
+                                    "Preflight": {
+                                        "SummaryLines": ["ready"],
+                                        "DestinationZipPath": "C:\\runs\\current\\pair01\\target01\\reviewfile\\review.zip",
+                                    },
+                                    "PreImportStatus": {"LatestState": "no-zip"},
+                                }
+                            ),
+                            stderr="",
+                        )
+                    raise AssertionError(command)
 
             panel.command_service = CommandServiceStub()
 
             def build_action_command(*, wrapper_key: str, **_kwargs):
                 if wrapper_key == "CheckScriptPath":
-                    return (
-                        ["check-script"],
-                        "C:\\legacy\\check-paired-exchange-artifact.ps1",
-                        False,
-                        {"Source": "fallback"},
+                    return ArtifactCommandPlan(
+                        command=("check-script",),
+                        execution_path="C:\\legacy\\check-paired-exchange-artifact.ps1",
+                        used_wrapper=False,
+                        contract_paths={"Source": "fallback"},
                     )
-                return (
-                    ["submit-script"],
-                    "C:\\legacy\\import-paired-exchange-artifact.ps1",
-                    False,
-                    {"Source": "fallback"},
+                return ArtifactCommandPlan(
+                    command=("submit-script",),
+                    execution_path="C:\\legacy\\import-paired-exchange-artifact.ps1",
+                    used_wrapper=False,
+                    contract_paths={"Source": "fallback"},
                 )
 
             panel._build_artifact_action_command = build_action_command
-            background_called = {"value": False}
-            panel.run_background_task = lambda **_kwargs: background_called.__setitem__("value", True)
+            background_states: list[str] = []
+
+            def run_background_task(**kwargs) -> None:
+                background_states.append(kwargs["state"])
+                try:
+                    result = kwargs["worker"]()
+                except Exception as exc:
+                    on_failure = kwargs.get("on_failure")
+                    if on_failure is not None:
+                        on_failure(exc)
+                    raise
+                follow_up = kwargs["on_success"](result)
+                if callable(follow_up):
+                    follow_up()
+
+            panel.run_background_task = run_background_task
 
             with mock.patch(
                 "relay_operator_panel.messagebox.askyesno",
@@ -4662,11 +7041,48 @@ class RelayOperatorPanelArtifactHardeningTests(unittest.TestCase):
             ) as ask, mock.patch("relay_operator_panel.messagebox.showwarning"):
                 panel.import_selected_external_artifact()
 
-            self.assertFalse(background_called["value"])
+            self.assertEqual(["artifact submit 사전검사 중"], background_states)
+            self.assertEqual([["check-script"]], panel.command_service.commands)
             self.assertEqual(
                 ["외부 artifact import", "legacy fallback submit 확인"],
                 [call.args[0] for call in ask.call_args_list],
             )
+
+    def test_check_selected_external_artifact_uses_context_target_for_background_hint(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            panel = self._make_panel(Path(tmp) / "artifact-source-memory.json")
+            state = make_artifact_state(target_id="target05")
+            panel.output_text = object()
+            panel.last_command_var = VarStub("")
+            panel.set_text = lambda *_args, **_kwargs: None
+            panel.on_artifact_row_selected = lambda *args, **kwargs: None
+            panel._selected_artifact_action_context = lambda: ArtifactActionContextSnapshot(
+                state=state,
+                config_path="cfg.psd1",
+                run_root="C:\\runs\\current",
+                run_root_is_stale=False,
+            )
+            panel._prompt_external_artifact_sources = lambda _state: ("C:\\work\\summary.txt", "C:\\work\\review.zip")
+            panel._remember_artifact_sources = lambda *_args, **_kwargs: None
+            panel._record_artifact_action_result = lambda **_kwargs: None
+            panel._build_artifact_action_command = lambda **_kwargs: ArtifactCommandPlan(
+                command=("check-script",),
+                execution_path="C:\\target05\\check-artifact.ps1",
+                used_wrapper=True,
+                contract_paths={"Source": "target-local"},
+            )
+            captured: dict[str, str] = {}
+            panel.run_background_task = lambda **kwargs: captured.update(
+                {
+                    "state": kwargs["state"],
+                    "hint": kwargs["hint"],
+                }
+            )
+
+            panel.check_selected_external_artifact()
+
+            self.assertEqual("artifact check 실행 중", captured["state"])
+            self.assertIn("target05", captured["hint"])
 
     def test_focus_ready_to_forward_artifact_prefers_handoff_ready_state(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -72,6 +72,7 @@ $config = Import-PowerShellDataFile -Path $resolvedConfigPath
 $pairRunRootBase = [string]$config.PairTest.RunRootBase
 $contractRunRoot = Join-Path $pairRunRootBase ('run_contract_show_effective_' + (Get-Date -Format 'yyyyMMdd_HHmmss_fff'))
 $previewOnlyRunRoot = Join-Path $root ('_tmp\show-effective-config\requested_no_manifest_' + (Get-Date -Format 'yyyyMMdd_HHmmss_fff'))
+$latestPreviewRunRoot = Join-Path $pairRunRootBase ('run_preview_only_show_effective_' + (Get-Date -Format 'yyyyMMdd_HHmmss_fff'))
 New-Item -ItemType Directory -Path $previewOnlyRunRoot -Force | Out-Null
 
 & (Join-Path $root 'tests\Start-PairedExchangeTest.ps1') `
@@ -88,7 +89,7 @@ $requestedPreview = Invoke-ShowEffectiveConfig `
 
 Assert-True ($requestedPreview.SchemaVersion -eq '1.0.0') 'SchemaVersion mismatch.'
 Assert-True (-not [string]::IsNullOrWhiteSpace([string]$requestedPreview.GeneratedAt)) 'GeneratedAt missing.'
-Assert-True ($requestedPreview.PairDefinitionSource -eq 'fallback') 'Expected fallback pair definition for preview-only run root.'
+Assert-True ($requestedPreview.PairDefinitionSource -eq 'config') 'Expected config-backed pair definition for preview-only run root.'
 Assert-True ($requestedPreview.RunContext.SelectedRunRootSource -eq 'requested') 'Expected requested run root source.'
 Assert-True ($requestedPreview.RunContext.ManifestExists -eq $false) 'Expected manifest missing for preview-only run root.'
 Assert-True (@($requestedPreview.Warnings).Count -ge 1) 'Expected warnings for preview-only run root.'
@@ -101,6 +102,8 @@ Assert-True ($requestedPreview.PSObject.Properties['OperationalPolicy'] -ne $nul
 Assert-True ($requestedPreview.EvidencePolicy.Recommended -eq $false) 'Expected preview-only run root to be not recommended for evidence.'
 Assert-True (@($requestedPreview.EvidencePolicy.ReasonCodes).Count -ge 1) 'Expected evidence reason codes for preview-only run root.'
 Assert-True (@($requestedPreview.PreviewRows).Count -eq 2) 'Expected 2 preview rows for pair01.'
+Assert-True ([string]$requestedPreview.OverviewPairs[0].SeedTargetId -eq 'target01') 'Expected config-backed seed target for pair01 preview.'
+Assert-True ([string]$requestedPreview.OverviewPairs[0].Policy.PublishContractMode -eq 'strict') 'Expected pair policy metadata in preview overview rows.'
 Assert-True (-not [string]::IsNullOrWhiteSpace([string]$requestedPreview.Config.ConfigHash)) 'ConfigHash missing.'
 Assert-True ([int]$requestedPreview.RequestedFilters.StaleRunThresholdSec -gt 0) 'Expected stale threshold in requested filters.'
 Assert-True ([bool]$requestedPreview.RunContext.SelectedRunRootExists -eq $true) 'Expected selected requested run root to exist.'
@@ -139,6 +142,9 @@ Assert-True ($contractBoth.PSObject.Properties['WarningDetails'] -ne $null) 'Exp
 Assert-True ($contractBoth.EvidencePolicy.Recommended -eq $true) 'Expected prepared manifest-backed run root to be evidence-recommended.'
 Assert-True (@($contractBoth.EvidencePolicy.ReasonCodes).Count -eq 0) 'Expected no evidence reason codes for prepared manifest-backed run root.'
 
+New-Item -ItemType Directory -Path $latestPreviewRunRoot -Force | Out-Null
+[System.IO.File]::WriteAllText((Join-Path $latestPreviewRunRoot 'preview.txt'), 'preview-only')
+
 $contractInitial = Invoke-ShowEffectiveConfig `
     -Root $root `
     -ResolvedConfigPath $resolvedConfigPath `
@@ -172,6 +178,7 @@ $latestExisting = Invoke-ShowEffectiveConfig `
 Assert-True ($latestExisting.RunContext.SelectedRunRootSource -eq 'latest-existing') 'Expected latest-existing run root source when RunRoot is omitted.'
 Assert-True (Test-Path -LiteralPath ([string]$latestExisting.RunContext.SelectedRunRoot)) 'Expected latest-existing run root to exist.'
 Assert-True ([bool]$latestExisting.RunContext.ManifestExists -eq $true) 'Expected latest-existing run root to have manifest.'
+Assert-True ([string]$latestExisting.RunContext.SelectedRunRoot -eq $contractRunRoot) 'Expected latest-existing selection to prefer newest manifest-backed run root over preview-only directories.'
 Assert-True ($latestExisting.RunContext.SelectedRunRootAgeSeconds -ge 0) 'Expected selected run root age seconds.'
 Assert-True ($latestExisting.RunContext.StaleRunThresholdSec -gt 0) 'Expected stale threshold in run context.'
 

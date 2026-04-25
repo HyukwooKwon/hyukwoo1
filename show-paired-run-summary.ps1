@@ -57,21 +57,98 @@ function Read-JsonObjectSafe {
     return ($raw | ConvertFrom-Json)
 }
 
-function Get-OverallState {
+function Test-SuccessAcceptanceState {
+    param([string]$AcceptanceState)
+
+    return ($AcceptanceState -in @('roundtrip-confirmed', 'first-handoff-confirmed'))
+}
+
+function Get-AcceptanceSummary {
     param(
         $AcceptanceReceipt,
         $Status
     )
 
     $acceptanceOutcome = Get-ObjectPropertyValue -Object $AcceptanceReceipt -Name 'Outcome' -DefaultValue $null
-    $acceptanceStage = [string](Get-ObjectPropertyValue -Object $AcceptanceReceipt -Name 'Stage' -DefaultValue '')
-    $acceptanceState = [string](Get-ObjectPropertyValue -Object $acceptanceOutcome -Name 'AcceptanceState' -DefaultValue '')
+    $rawStage = [string](Get-ObjectPropertyValue -Object $AcceptanceReceipt -Name 'Stage' -DefaultValue '')
+    $rawAcceptanceState = if ($null -ne $acceptanceReceipt) { [string](Get-ObjectPropertyValue -Object $acceptanceOutcome -Name 'AcceptanceState' -DefaultValue '') } else { [string]$Status.AcceptanceReceipt.AcceptanceState }
+    $rawAcceptanceReason = if ($null -ne $acceptanceReceipt) { [string](Get-ObjectPropertyValue -Object $acceptanceOutcome -Name 'AcceptanceReason' -DefaultValue '') } else { [string]$Status.AcceptanceReceipt.AcceptanceReason }
+    $rawSeed = Get-ObjectPropertyValue -Object $AcceptanceReceipt -Name 'Seed' -DefaultValue $null
+    $rawSeedFinalState = if ($null -ne $acceptanceReceipt) { [string](Get-ObjectPropertyValue -Object $rawSeed -Name 'FinalState' -DefaultValue '') } else { '' }
+    $rawSeedSubmitState = if ($null -ne $acceptanceReceipt) { [string](Get-ObjectPropertyValue -Object $rawSeed -Name 'SubmitState' -DefaultValue '') } else { '' }
+    $rawSeedOutboxPublished = if ($null -ne $acceptanceReceipt) { [bool](Get-ObjectPropertyValue -Object $rawSeed -Name 'OutboxPublished' -DefaultValue $false) } else { $false }
+
+    $effectiveEntry = $null
+    $phaseHistoryEntries = @((Get-ObjectPropertyValue -Object $AcceptanceReceipt -Name 'PhaseHistory' -DefaultValue @()))
+    for ($index = $phaseHistoryEntries.Count - 1; $index -ge 0; $index--) {
+        $entry = $phaseHistoryEntries[$index]
+        if ($null -eq $entry) {
+            continue
+        }
+
+        $entryState = [string](Get-ObjectPropertyValue -Object $entry -Name 'AcceptanceState' -DefaultValue '')
+        if ([string]::IsNullOrWhiteSpace($entryState) -or $entryState -eq 'preflight-passed') {
+            continue
+        }
+
+        $effectiveEntry = $entry
+        break
+    }
+
+    $effectiveStage = $rawStage
+    $effectiveAcceptanceState = $rawAcceptanceState
+    $effectiveAcceptanceReason = $rawAcceptanceReason
+    $effectiveSeedFinalState = $rawSeedFinalState
+    $effectiveSeedSubmitState = $rawSeedSubmitState
+    $effectiveSeedOutboxPublished = $rawSeedOutboxPublished
+    $effectiveRecordedAt = ''
+    $effectiveSource = 'current-receipt'
+
+    if ($null -ne $effectiveEntry) {
+        $effectiveStage = [string](Get-ObjectPropertyValue -Object $effectiveEntry -Name 'Stage' -DefaultValue $effectiveStage)
+        $effectiveAcceptanceState = [string](Get-ObjectPropertyValue -Object $effectiveEntry -Name 'AcceptanceState' -DefaultValue $effectiveAcceptanceState)
+        $effectiveAcceptanceReason = [string](Get-ObjectPropertyValue -Object $effectiveEntry -Name 'AcceptanceReason' -DefaultValue $effectiveAcceptanceReason)
+        $effectiveSeedFinalState = [string](Get-ObjectPropertyValue -Object $effectiveEntry -Name 'SeedFinalState' -DefaultValue $effectiveSeedFinalState)
+        $effectiveSeedSubmitState = [string](Get-ObjectPropertyValue -Object $effectiveEntry -Name 'SeedSubmitState' -DefaultValue $effectiveSeedSubmitState)
+        $effectiveSeedOutboxPublished = [bool](Get-ObjectPropertyValue -Object $effectiveEntry -Name 'SeedOutboxPublished' -DefaultValue $effectiveSeedOutboxPublished)
+        $effectiveRecordedAt = [string](Get-ObjectPropertyValue -Object $effectiveEntry -Name 'RecordedAt' -DefaultValue '')
+        $effectiveSource = 'phase-history'
+    }
+
+    return [pscustomobject]@{
+        Exists                  = ($null -ne $acceptanceReceipt)
+        Path                    = [string]$Status.AcceptanceReceipt.Path
+        Stage                   = $effectiveStage
+        AcceptanceState         = $effectiveAcceptanceState
+        AcceptanceReason        = $effectiveAcceptanceReason
+        SeedFinalState          = $effectiveSeedFinalState
+        SeedSubmitState         = $effectiveSeedSubmitState
+        SeedOutboxPublished     = $effectiveSeedOutboxPublished
+        CurrentStage            = $rawStage
+        CurrentAcceptanceState  = $rawAcceptanceState
+        CurrentAcceptanceReason = $rawAcceptanceReason
+        CurrentSeedFinalState   = $rawSeedFinalState
+        CurrentSeedSubmitState  = $rawSeedSubmitState
+        CurrentSeedOutboxPublished = $rawSeedOutboxPublished
+        EffectiveRecordedAt     = $effectiveRecordedAt
+        EffectiveSource         = $effectiveSource
+    }
+}
+
+function Get-OverallState {
+    param(
+        $AcceptanceSummary,
+        $Status
+    )
+
+    $acceptanceStage = [string](Get-ObjectPropertyValue -Object $AcceptanceSummary -Name 'Stage' -DefaultValue '')
+    $acceptanceState = [string](Get-ObjectPropertyValue -Object $AcceptanceSummary -Name 'AcceptanceState' -DefaultValue '')
     $failureCount = [int]$Status.Counts.FailureLineCount
     $manualAttentionCount = [int]$Status.Counts.ManualAttentionCount
     $submitUnconfirmedCount = [int]$Status.Counts.SubmitUnconfirmedCount
     $targetUnresponsiveCount = [int]$Status.Counts.TargetUnresponsiveCount
 
-    if ($acceptanceStage -eq 'completed' -and $acceptanceState -in @('roundtrip-confirmed', 'first-handoff-confirmed')) {
+    if ($acceptanceStage -eq 'completed' -and (Test-SuccessAcceptanceState -AcceptanceState $acceptanceState)) {
         return 'success'
     }
 
@@ -101,7 +178,6 @@ $statusParams.AsJson = $true
 
 $status = & (Join-Path $PSScriptRoot 'show-paired-exchange-status.ps1') @statusParams | ConvertFrom-Json
 $acceptanceReceipt = Read-JsonObjectSafe -Path ([string]$status.AcceptanceReceipt.Path)
-$acceptanceOutcome = Get-ObjectPropertyValue -Object $acceptanceReceipt -Name 'Outcome' -DefaultValue $null
 
 $targets = @(
     @($status.Targets) | ForEach-Object {
@@ -127,16 +203,7 @@ $targets = @(
     }
 )
 
-$acceptanceSummary = [pscustomobject]@{
-    Exists            = ($null -ne $acceptanceReceipt)
-    Path              = [string]$status.AcceptanceReceipt.Path
-    Stage             = [string](Get-ObjectPropertyValue -Object $acceptanceReceipt -Name 'Stage' -DefaultValue '')
-    AcceptanceState   = if ($null -ne $acceptanceReceipt) { [string](Get-ObjectPropertyValue -Object $acceptanceOutcome -Name 'AcceptanceState' -DefaultValue '') } else { [string]$status.AcceptanceReceipt.AcceptanceState }
-    AcceptanceReason  = if ($null -ne $acceptanceReceipt) { [string](Get-ObjectPropertyValue -Object $acceptanceOutcome -Name 'AcceptanceReason' -DefaultValue '') } else { [string]$status.AcceptanceReceipt.AcceptanceReason }
-    SeedFinalState    = if ($null -ne $acceptanceReceipt) { [string](Get-ObjectPropertyValue -Object (Get-ObjectPropertyValue -Object $acceptanceReceipt -Name 'Seed' -DefaultValue $null) -Name 'FinalState' -DefaultValue '') } else { '' }
-    SeedSubmitState   = if ($null -ne $acceptanceReceipt) { [string](Get-ObjectPropertyValue -Object (Get-ObjectPropertyValue -Object $acceptanceReceipt -Name 'Seed' -DefaultValue $null) -Name 'SubmitState' -DefaultValue '') } else { '' }
-    SeedOutboxPublished = if ($null -ne $acceptanceReceipt) { [bool](Get-ObjectPropertyValue -Object (Get-ObjectPropertyValue -Object $acceptanceReceipt -Name 'Seed' -DefaultValue $null) -Name 'OutboxPublished' -DefaultValue $false) } else { $false }
-}
+$acceptanceSummary = Get-AcceptanceSummary -AcceptanceReceipt $acceptanceReceipt -Status $status
 
 $watcherSummary = [pscustomobject]@{
     Status        = [string]$status.Watcher.Status
@@ -159,7 +226,7 @@ $countsSummary = [pscustomobject]@{
     ReadyToForwardCount      = [int]$status.Counts.ReadyToForwardCount
 }
 
-$overallState = Get-OverallState -AcceptanceReceipt $acceptanceReceipt -Status $status
+$overallState = Get-OverallState -AcceptanceSummary $acceptanceSummary -Status $status
 $runName = Split-Path -Leaf ([string]$status.RunRoot)
 $summaryLine = '{0} overall={1} acceptance={2} stage={3} watcher={4} forwarded={5} summaries={6} zips={7} failures={8}' -f `
     $runName,

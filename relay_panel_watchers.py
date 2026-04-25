@@ -27,6 +27,7 @@ class WatcherStartRequest:
     use_headless_dispatch: bool = True
     max_forward_count: int = DEFAULT_WATCHER_MAX_FORWARD_COUNT
     run_duration_sec: int = DEFAULT_WATCHER_RUN_DURATION_SEC
+    pair_max_roundtrip_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -155,7 +156,16 @@ class WatcherService:
     def get_runtime_status(self, paired_status: dict | None, run_root: str) -> WatcherRuntimeStatus:
         watcher = ((paired_status or {}).get("Watcher", {}) or {})
         state = str(watcher.get("Status", "stopped") or "stopped")
-        allowed_states = {"running", "stopped", "starting", "stop_requested", "stopping"}
+        allowed_states = {
+            "running",
+            "paused",
+            "stopped",
+            "starting",
+            "pause_requested",
+            "resume_requested",
+            "stop_requested",
+            "stopping",
+        }
         reason_codes: list[str] = []
         control_path = str(watcher.get("ControlPath", "") or self.control_path(run_root))
         control_exists = Path(control_path).exists() if control_path else False
@@ -178,15 +188,27 @@ class WatcherService:
             reason_codes.append("watcher_unknown")
         if state == "running" and control_pending_action == "stop":
             state = "stop_requested"
+        elif state == "running" and control_pending_action == "pause":
+            state = "pause_requested"
+        elif state == "paused" and control_pending_action == "resume":
+            state = "resume_requested"
         if control_parse_error:
             reason_codes.append("control_file_unreadable")
         if status_parse_error:
             reason_codes.append("status_file_unreadable")
         if control_pending_action == "stop" and control_age_seconds is not None and control_age_seconds >= PENDING_STOP_STALE_AFTER_SEC:
             reason_codes.append("stop_requested_timeout")
-        if freshness_age_seconds is not None and state in {"running", "stop_requested", "stopping", "starting"} and freshness_age_seconds >= STATUS_STALE_AFTER_SEC:
+        if freshness_age_seconds is not None and state in {
+            "running",
+            "paused",
+            "pause_requested",
+            "resume_requested",
+            "stop_requested",
+            "stopping",
+            "starting",
+        } and freshness_age_seconds >= STATUS_STALE_AFTER_SEC:
             reason_codes.append("status_file_stale")
-        if state == "stopped" and control_exists and not control_pending_action:
+        if state in {"stopped", "paused"} and control_exists and not control_pending_action:
             reason_codes.append("stale_control_file")
         return WatcherRuntimeStatus(
             run_root=run_root,
@@ -241,7 +263,13 @@ class WatcherService:
         if status.state == "running":
             blocking_codes.append("watcher_already_running")
             recommended_action = recommended_action or "watch 상태 새로고침"
+        if status.state == "paused":
+            blocking_codes.append("watcher_paused")
+            recommended_action = recommended_action or "watch 재개"
         if status.state in {"starting", "stop_requested", "stopping"}:
+            blocking_codes.append("control_pending_action_exists")
+            recommended_action = recommended_action or "watch 진단"
+        if status.state in {"pause_requested", "resume_requested"}:
             blocking_codes.append("control_pending_action_exists")
             recommended_action = recommended_action or "watch 진단"
 
@@ -276,6 +304,8 @@ class WatcherService:
                 message = "오래된 watcher stop/control 흔적이 있어 자동 시작을 막았습니다. 안전 정리 후 다시 시작해야 합니다."
             elif "watcher_already_running" in blocking_codes:
                 message = "현재 RunRoot 기준 watcher가 이미 실행 중입니다."
+            elif "watcher_paused" in blocking_codes:
+                message = "현재 RunRoot 기준 watcher가 paused 상태입니다. 재개 또는 정지 후 다시 시작해야 합니다."
             elif "control_file_unreadable" in blocking_codes or "status_file_unreadable" in blocking_codes:
                 message = self._unreadable_files_message(
                     status,
@@ -335,7 +365,7 @@ class WatcherService:
                     else "stale/unreadable watcher control 또는 status 상태가 있어 watch 제어를 막았습니다."
                 ),
             )
-        if status.state in {"stop_requested", "stopping", "starting"}:
+        if status.state in {"pause_requested", "resume_requested", "stop_requested", "stopping", "starting"}:
             return WatcherStopEligibility(
                 allowed=False,
                 run_root=run_root,
@@ -343,7 +373,7 @@ class WatcherService:
                 reason_codes=["control_already_in_progress"],
                 message="현재 watch 제어가 이미 진행 중입니다.",
             )
-        if status.state != "running":
+        if status.state not in {"running", "paused"}:
             return WatcherStopEligibility(
                 allowed=False,
                 run_root=run_root,
@@ -378,18 +408,158 @@ class WatcherService:
             message=message,
         )
 
-    def request_stop(
+    def get_pause_eligibility(self, paired_status: dict | None, run_root: str) -> WatcherStopEligibility:
+        status = self.get_runtime_status(paired_status, run_root)
+        blocking_reason_codes = {
+            "stale_control_file",
+            "control_file_unreadable",
+            "status_file_unreadable",
+            "stop_requested_timeout",
+            "status_file_stale",
+        }
+        if status.state == "unknown":
+            return WatcherStopEligibility(
+                allowed=False,
+                run_root=run_root,
+                state=status.state,
+                reason_codes=list(status.reason_codes) or ["watcher_unknown"],
+                message="현재 상태가 불명확하여 watch pause 제어를 막았습니다.",
+            )
+        if any(code in status.reason_codes for code in blocking_reason_codes):
+            return WatcherStopEligibility(
+                allowed=False,
+                run_root=run_root,
+                state=status.state,
+                reason_codes=[code for code in status.reason_codes if code in blocking_reason_codes],
+                message=(
+                    self._unreadable_files_message(
+                        status,
+                        "stale/unreadable watcher control 또는 status 상태가 있어 watch pause 제어를 막았습니다.",
+                    )
+                    if any(code in status.reason_codes for code in {"control_file_unreadable", "status_file_unreadable"})
+                    else "stale/unreadable watcher control 또는 status 상태가 있어 watch pause 제어를 막았습니다."
+                ),
+            )
+        if status.state in {"pause_requested", "resume_requested", "stop_requested", "stopping", "starting"}:
+            return WatcherStopEligibility(
+                allowed=False,
+                run_root=run_root,
+                state=status.state,
+                reason_codes=["control_already_in_progress"],
+                message="현재 watch 제어가 이미 진행 중입니다.",
+            )
+        if status.state == "paused":
+            return WatcherStopEligibility(
+                allowed=False,
+                run_root=run_root,
+                state=status.state,
+                reason_codes=["watcher_already_paused"],
+                message="현재 RunRoot 기준 watcher가 이미 paused 상태입니다.",
+            )
+        if status.state != "running":
+            return WatcherStopEligibility(
+                allowed=False,
+                run_root=run_root,
+                state=status.state,
+                reason_codes=["watcher_not_running"],
+                message="현재 RunRoot 기준 watcher가 실행 중이 아닙니다.",
+            )
+        return WatcherStopEligibility(
+            allowed=True,
+            run_root=run_root,
+            state=status.state,
+            message="현재 watch pause를 요청할 수 있습니다.",
+        )
+
+    def get_resume_eligibility(self, paired_status: dict | None, run_root: str) -> WatcherStopEligibility:
+        status = self.get_runtime_status(paired_status, run_root)
+        blocking_reason_codes = {
+            "stale_control_file",
+            "control_file_unreadable",
+            "status_file_unreadable",
+            "stop_requested_timeout",
+            "status_file_stale",
+        }
+        if status.state == "unknown":
+            return WatcherStopEligibility(
+                allowed=False,
+                run_root=run_root,
+                state=status.state,
+                reason_codes=list(status.reason_codes) or ["watcher_unknown"],
+                message="현재 상태가 불명확하여 watch resume 제어를 막았습니다.",
+            )
+        if any(code in status.reason_codes for code in blocking_reason_codes):
+            return WatcherStopEligibility(
+                allowed=False,
+                run_root=run_root,
+                state=status.state,
+                reason_codes=[code for code in status.reason_codes if code in blocking_reason_codes],
+                message=(
+                    self._unreadable_files_message(
+                        status,
+                        "stale/unreadable watcher control 또는 status 상태가 있어 watch resume 제어를 막았습니다.",
+                    )
+                    if any(code in status.reason_codes for code in {"control_file_unreadable", "status_file_unreadable"})
+                    else "stale/unreadable watcher control 또는 status 상태가 있어 watch resume 제어를 막았습니다."
+                ),
+            )
+        if status.state in {"pause_requested", "resume_requested", "stop_requested", "stopping", "starting"}:
+            return WatcherStopEligibility(
+                allowed=False,
+                run_root=run_root,
+                state=status.state,
+                reason_codes=["control_already_in_progress"],
+                message="현재 watch 제어가 이미 진행 중입니다.",
+            )
+        if status.state != "paused":
+            return WatcherStopEligibility(
+                allowed=False,
+                run_root=run_root,
+                state=status.state,
+                reason_codes=["watcher_not_paused"],
+                message="현재 RunRoot 기준 watcher가 paused 상태가 아닙니다.",
+            )
+        return WatcherStopEligibility(
+            allowed=True,
+            run_root=run_root,
+            state=status.state,
+            message="현재 watch resume을 요청할 수 있습니다.",
+        )
+
+    def _request_control_action(
         self,
+        *,
         paired_status: dict | None,
         run_root: str,
-        *,
-        requested_by: str = "relay_operator_panel",
+        action: str,
+        requested_by: str,
+        eligibility: WatcherStopEligibility,
     ) -> WatcherControlResult:
-        eligibility = self.get_stop_eligibility(paired_status, run_root)
+        pending_state_map = {
+            "stop": "stop_requested",
+            "pause": "pause_requested",
+            "resume": "resume_requested",
+        }
+        success_message_map = {
+            "stop": "watch 정지 요청 파일을 기록했습니다. 상태가 stopped로 바뀌는지 확인이 필요합니다.",
+            "pause": "watch pause 요청 파일을 기록했습니다. 상태가 paused로 바뀌는지 확인이 필요합니다.",
+            "resume": "watch resume 요청 파일을 기록했습니다. 상태가 running으로 복귀하는지 확인이 필요합니다.",
+        }
+        already_message_map = {
+            "stop": "이미 watch 정지 요청이 진행 중입니다.",
+            "pause": "이미 watch pause 요청이 진행 중입니다.",
+            "resume": "이미 watch resume 요청이 진행 중입니다.",
+        }
+        file_exists_message_map = {
+            "stop": "이미 watch 정지 요청 파일이 존재합니다.",
+            "pause": "이미 watch pause 요청 파일이 존재합니다.",
+            "resume": "이미 watch resume 요청 파일이 존재합니다.",
+        }
+
         if not eligibility.allowed:
             return WatcherControlResult(
                 ok=False,
-                action="stop",
+                action=action,
                 run_root=run_root,
                 state=eligibility.state,
                 message=eligibility.message,
@@ -398,13 +568,14 @@ class WatcherService:
             )
 
         status = self.get_runtime_status(paired_status, run_root)
-        if status.control_pending_action == "stop" or status.state in {"stop_requested", "stopping"}:
+        pending_state = pending_state_map[action]
+        if status.control_pending_action == action or status.state == pending_state:
             return WatcherControlResult(
                 ok=True,
-                action="stop",
+                action=action,
                 run_root=run_root,
                 state=status.state,
-                message="이미 watch 정지 요청이 진행 중입니다.",
+                message=already_message_map[action],
                 request_id=status.control_pending_request_id,
                 warning_codes=list(eligibility.warning_codes),
             )
@@ -415,34 +586,24 @@ class WatcherService:
                 existing = json.loads(control_path.read_text(encoding="utf-8"))
             except Exception:
                 existing = {}
-            if str(existing.get("Action", "") or "") == "stop":
-                existing_age = status.control_age_seconds
-                if status.state == "stopped":
-                    return WatcherControlResult(
-                        ok=False,
-                        action="stop",
-                        run_root=run_root,
-                        state="stale_control_artifact",
-                        message="watcher는 stopped인데 stop control file이 남아 있습니다. stale control artifact를 먼저 정리해야 합니다.",
-                        request_id=str(existing.get("RequestId", "") or ""),
-                        reason_codes=["stale_control_file"],
-                    )
-                if existing_age is not None and existing_age >= PENDING_STOP_STALE_AFTER_SEC:
-                    return WatcherControlResult(
-                        ok=False,
-                        action="stop",
-                        run_root=run_root,
-                        state="stale_pending_stop",
-                        message="오래된 stop 요청이 남아 있어 새 정지 요청을 막았습니다. stale pending stop을 먼저 정리해야 합니다.",
-                        request_id=str(existing.get("RequestId", "") or ""),
-                        reason_codes=["stop_requested_timeout"],
-                    )
+            existing_action = str(existing.get("Action", "") or "")
+            if existing_action and existing_action != action:
+                return WatcherControlResult(
+                    ok=False,
+                    action=action,
+                    run_root=run_root,
+                    state=status.state,
+                    message="다른 watch 제어 요청이 이미 진행 중입니다.",
+                    request_id=str(existing.get("RequestId", "") or ""),
+                    reason_codes=["control_pending_action_exists"],
+                )
+            if existing_action == action:
                 return WatcherControlResult(
                     ok=True,
-                    action="stop",
+                    action=action,
                     run_root=run_root,
-                    state="stop_requested",
-                    message="이미 watch 정지 요청 파일이 존재합니다.",
+                    state=pending_state,
+                    message=file_exists_message_map[action],
                     request_id=str(existing.get("RequestId", "") or ""),
                     warning_codes=list(eligibility.warning_codes),
                 )
@@ -452,7 +613,7 @@ class WatcherService:
             "SchemaVersion": "1.0.0",
             "RequestedAt": self._now(),
             "RequestedBy": requested_by,
-            "Action": "stop",
+            "Action": action,
             "RunRoot": run_root,
             "RequestId": request_id,
         }
@@ -461,13 +622,61 @@ class WatcherService:
         control_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         return WatcherControlResult(
             ok=True,
-            action="stop",
+            action=action,
             run_root=run_root,
-            state="stop_requested",
-            message="watch 정지 요청 파일을 기록했습니다. 상태가 stopped로 바뀌는지 확인이 필요합니다.",
+            state=pending_state,
+            message=success_message_map[action],
             request_id=request_id,
-            reason_codes=["stop_requested"],
+            reason_codes=[pending_state],
             warning_codes=list(eligibility.warning_codes),
+        )
+
+    def request_stop(
+        self,
+        paired_status: dict | None,
+        run_root: str,
+        *,
+        requested_by: str = "relay_operator_panel",
+    ) -> WatcherControlResult:
+        eligibility = self.get_stop_eligibility(paired_status, run_root)
+        return self._request_control_action(
+            paired_status=paired_status,
+            run_root=run_root,
+            action="stop",
+            requested_by=requested_by,
+            eligibility=eligibility,
+        )
+
+    def request_pause(
+        self,
+        paired_status: dict | None,
+        run_root: str,
+        *,
+        requested_by: str = "relay_operator_panel",
+    ) -> WatcherControlResult:
+        eligibility = self.get_pause_eligibility(paired_status, run_root)
+        return self._request_control_action(
+            paired_status=paired_status,
+            run_root=run_root,
+            action="pause",
+            requested_by=requested_by,
+            eligibility=eligibility,
+        )
+
+    def request_resume(
+        self,
+        paired_status: dict | None,
+        run_root: str,
+        *,
+        requested_by: str = "relay_operator_panel",
+    ) -> WatcherControlResult:
+        eligibility = self.get_resume_eligibility(paired_status, run_root)
+        return self._request_control_action(
+            paired_status=paired_status,
+            run_root=run_root,
+            action="resume",
+            requested_by=requested_by,
+            eligibility=eligibility,
         )
 
     def clear_stale_control_file(self, run_root: str, paired_status: dict | None) -> WatcherControlResult:
@@ -524,6 +733,8 @@ class WatcherService:
             extra += ["-MaxForwardCount", str(request.max_forward_count)]
         if request.run_duration_sec > 0:
             extra += ["-RunDurationSec", str(request.run_duration_sec)]
+        if request.pair_max_roundtrip_count > 0:
+            extra += ["-PairMaxRoundtripCount", str(request.pair_max_roundtrip_count)]
         return command_service.build_script_command(
             "tests/Watch-PairedExchange.ps1",
             config_path=request.config_path,

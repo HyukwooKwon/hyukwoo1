@@ -14,77 +14,7 @@ if ([string]::IsNullOrWhiteSpace($ConfigPath)) {
 
 . (Join-Path $PSScriptRoot '..\router\RuntimeMap.ps1')
 . (Join-Path $PSScriptRoot '..\router\BindingSessionScope.ps1')
-
-function Ensure-WindowApiType {
-    if ('Relay.WindowApi' -as [type]) {
-        return
-    }
-
-    Add-Type @'
-using System;
-using System.Text;
-using System.Runtime.InteropServices;
-
-namespace Relay {
-    public static class WindowApi {
-        public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
-
-        [DllImport("user32.dll")]
-        public static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
-
-        [DllImport("user32.dll")]
-        public static extern bool IsWindowVisible(IntPtr hWnd);
-
-        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
-        public static extern int GetWindowText(IntPtr hWnd, StringBuilder text, int maxCount);
-
-        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
-        public static extern int GetClassName(IntPtr hWnd, StringBuilder className, int maxCount);
-
-        [DllImport("user32.dll")]
-        public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
-    }
-}
-'@
-}
-
-function Get-VisibleWindows {
-    Ensure-WindowApiType
-
-    $windows = New-Object System.Collections.Generic.List[object]
-    [Relay.WindowApi]::EnumWindows({
-        param($hWnd, $lParam)
-
-        if (-not [Relay.WindowApi]::IsWindowVisible($hWnd)) {
-            return $true
-        }
-
-        $windowProcessId = 0
-        [Relay.WindowApi]::GetWindowThreadProcessId($hWnd, [ref]$windowProcessId) | Out-Null
-
-        $sb = [System.Text.StringBuilder]::new(1024)
-        [Relay.WindowApi]::GetWindowText($hWnd, $sb, $sb.Capacity) | Out-Null
-        $title = $sb.ToString()
-
-        if ([string]::IsNullOrWhiteSpace($title)) {
-            return $true
-        }
-
-        $classNameSb = [System.Text.StringBuilder]::new(256)
-        [Relay.WindowApi]::GetClassName($hWnd, $classNameSb, $classNameSb.Capacity) | Out-Null
-
-        $windows.Add([pscustomobject]@{
-            Hwnd      = $hWnd.ToInt64()
-            ProcessId = [int]$windowProcessId
-            Title     = $title
-            ClassName = $classNameSb.ToString()
-        })
-
-        return $true
-    }, [IntPtr]::Zero) | Out-Null
-
-    return $windows
-}
+. (Join-Path $PSScriptRoot 'WindowDiscovery.ps1')
 
 function Get-JsonValue {
     param(

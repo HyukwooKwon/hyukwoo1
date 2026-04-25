@@ -5,6 +5,7 @@
 적용 일자:
 
 - `2026-03-31`
+- `2026-04-25`
 
 현재 이 범위에서 완료로 보는 항목:
 
@@ -25,6 +26,9 @@
 - 외부 repo packaging zip은 source artifact일 뿐이고, panel/wrapper/import submit 전에는 watcher가 target contract를 아직 못 본다는 운영 해석 고정
 - `run-pair01-headless-drill.ps1`, `launch-run-pair01-headless-drill.cmd`, `open-run-pair01-headless-drill.vbs`는 pair01 한 쌍 실제 왕복 성공까지 확인
 - `run-pair02-headless-drill.ps1`, `run-pair03-headless-drill.ps1`, `run-pair04-headless-drill.ps1`는 각 pair 한 쌍 실제 왕복 성공까지 확인
+- shared visible active acceptance + passive confirm + `-RequireVisibleReceipt` closeout이 같은 RunRoot에서 `overall=success`로 닫힘
+- clean preflight recheck가 최신 receipt를 `preflight-passed`로 덮어써도, `show-paired-run-summary.ps1`와 `Confirm-SharedVisiblePairAcceptance.ps1`는 `PhaseHistory`의 마지막 성공 acceptance를 우선 판정함
+- shared lane final closeout clean 기준은 `visible\Cleanup-VisibleWorkerQueue.ps1 -AsJson`의 `Summary.ProtectedRunCount=0`으로 고정
 
 현재 운영 원칙:
 
@@ -53,6 +57,50 @@
 - stale RunRoot 또는 wrapper missing 상황에서 강한 warning badge와 fallback submit 추가 확인이 실제로 보임
 - panel 재실행 후 `_tmp\artifact-source-memory.json`의 최근 source path가 다시 복원됨
 - 위 절차는 새 RunRoot 기준으로 닫고, 예전 RunRoot는 호환 확인 대상이지 기본 acceptance 대상이 아님
+- successful shared visible closeout 기준은 아래 4가지를 함께 만족하는 경우로 고정
+  - `show-paired-run-summary.ps1`가 `overall=success acceptance=roundtrip-confirmed stage=completed`
+  - `tests\Confirm-SharedVisiblePairAcceptance.ps1 -RequireVisibleReceipt`가 `overall=success`
+  - summary/confirm이 latest receipt current state가 아니라 `PhaseHistory`의 마지막 성공 acceptance를 effective result로 읽음
+  - final cleanup dry-run에서 `ProtectedRunCount=0`
+- current receipt가 clean preflight recheck 때문에 `preflight-passed`여도, `PhaseHistory`에 `roundtrip-confirmed` 또는 `first-handoff-confirmed`가 남아 있으면 그 성공 acceptance를 무효화하지 않음
+- baseline success가 이미 닫힌 뒤 shared lane이 foreign active run 때문에 다시 더러워지면, reopen 없이 `foreign run terminal 대기 -> cleanup dry-run/apply -> preflight-only clean pass`만 수행합니다.
+- 이때 목적은 새 acceptance 재실행이 아니라 현재 시점 lane clean 복귀 확인입니다.
+
+visible worker closeout 기준선:
+
+- `2026-04-25` 기준 shared official visible-worker closeout baseline run은 `run_closeout_20260425_r4`
+- 경로:
+  - `pair-test\bottest-live-visible\run_closeout_20260425_r4`
+- baseline evidence 보관 경로:
+  - `evidence\visible_worker_closeout_r4`
+- shared `bottest-live-visible`의 창 제어 SSOT:
+  - launch = `LauncherWrapperPath` wrapper only
+  - reuse = attach-only
+  - `launcher\Start-Targets.ps1`, `launcher\Ensure-Targets.ps1` direct path는 maintenance 전용이며 운영 경로가 아님
+  - 창 종료/재실행/정리는 binding-managed 8개 HWND만 대상으로 한다
+  - 제목(`gptgpt1-dev`, `BotTestLive-Window-*`) 기준 broad close는 shared lane에서 금지한다
+  - sanctioned close/reset 경로는 `launcher\Close-BoundVisibleWindows.ps1` 또는 wrapper의 explicit replace-only 경로다
+- maintenance 예외 절차는 운영 acceptance 본문과 분리한다:
+  - 운영 acceptance에서는 `Start-Targets.ps1`, `Ensure-Targets.ps1`, `Refresh-Targets.ps1`를 직접 실행하지 않는다
+  - 복구가 필요하면 먼저 `Cleanup-VisibleWorkerQueue.ps1` / `-PreflightOnly` / `Confirm-SharedVisiblePairAcceptance.ps1` 로 상태를 진단한다
+  - direct launcher가 꼭 필요하면 별도 maintenance 단계에서만 수행하고, shared acceptance evidence와 섞어 해석하지 않는다
+- baseline 성공 조건:
+  - `target01` 단일 seed로 시작
+  - `PairTest.ExecutionPathMode=visible-worker`를 shared `bottest-live-visible` lane의 SSOT로 사용
+  - 공식 `BotTestLive-Window-01` / `05` 재사용
+  - watcher `Reason=max-forward-count-reached`
+  - watcher `StopCategory=expected-limit`
+  - `ForwardedCount=4`
+  - `DonePresentCount=2`
+  - `ErrorPresentCount=0`
+  - post-cleanup `-ReuseExistingRunRoot -PreflightOnly` clean pass
+- 현재 정식 closeout 경로는 visible worker queue 기반이며, `router/AHK typed REPL`은 manual/fallback 전용
+- reopen 기준:
+  - shared official 재사용 경로에서 `ForwardedStateCount=4` 미달
+  - `DonePresentCount=2` 또는 `ErrorPresentCount=0` 불만족
+  - post-cleanup `Preflight.CheckState=passed` 불만족
+  - timeout 뒤 fresh source-outbox publish가 있었는데 stale error가 다시 남음
+  - stale failure가 done/publish-ready/source-outbox success보다 우선 판정됨
 
 현재 범위에서 의도적으로 하지 않는 것:
 
@@ -70,6 +118,10 @@
 - warning/evidence 정책 변경
 - 1회성 문구 큐의 live consume 규칙 변경
 - pair activation 상태 파일 경로/해석 규칙 변경
+- 같은 shared visible 조건에서 success closeout이 재현되지 않음
+- `PhaseHistory` precedence가 깨져 clean preflight recheck 뒤 summary/confirm이 다시 `failing` 또는 `in-progress`로 후퇴함
+- final cleanup dry-run에서 `ProtectedRunCount=0`인데도 confirm 계열이 실패함
+- foreign protected run blocker가 반복적으로 운영 병목이 되어 구조화된 상태 모델 승격이 필요해짐
 
 운영 반복 검증 기준 문서:
 

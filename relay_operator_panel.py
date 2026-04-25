@@ -11,12 +11,46 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, scrolledtext, simpledialog, ttk
 
 from relay_panel_artifact_controller import ArtifactTabController
+from relay_panel_artifact_workflow import (
+    ArtifactActionContextSnapshot,
+    ArtifactCommandPlan,
+    ArtifactSourceSelection,
+    ArtifactSubmitLaunchRequest,
+    ArtifactSubmitPreflight,
+    build_artifact_action_record,
+)
 from relay_panel_artifacts import ArtifactQuery, ArtifactService, PairArtifactSummary, TargetArtifactState
+from relay_panel_context_helpers import (
+    append_query_history,
+    context_source_label,
+    format_action_context_summary,
+    format_artifact_query_context_summary,
+    format_inspection_context_summary,
+    format_query_context_summary,
+    resolve_inspection_context,
+)
 from relay_panel_home_controller import HomeController
 from relay_panel_message_config import DEFAULT_SLOT_ORDER, MessageConfigService, SCOPED_SLOT_LABELS
 from relay_panel_models import ActionModel, AppContext, DashboardRawBundle, IssueModel, PairSummaryModel, PanelStateModel
+from relay_panel_operator_state import (
+    ActionContextState,
+    ArtifactQueryContextState,
+    InspectionContextState,
+    QueryHistoryRecord,
+    VisibleAcceptanceState,
+    VisibleAcceptanceWorkflowProgress,
+)
 from relay_panel_pair_controller import PairController
 from relay_panel_refresh_controller import PanelRefreshController
+from relay_panel_runtime_workflow import (
+    PanelRuntimeWorkflowService,
+    PrepareAllRequest,
+    ReuseWindowsRequest,
+    RunRootPrepareRequest,
+    build_reuse_failure_summary,
+    extract_prepared_run_root,
+    resolve_run_root_summary_run_root,
+)
 from relay_panel_services import (
     ROOT,
     SNAPSHOT_DIR,
@@ -27,9 +61,25 @@ from relay_panel_services import (
     run_command,
 )
 from relay_panel_state import DashboardAggregator
+from relay_panel_visible_workflow import (
+    VisibleAcceptanceInputs,
+    build_visible_acceptance_state,
+    empty_acceptance_receipt_summary,
+    summarize_acceptance_receipt_payload,
+    visible_workflow_scope_key,
+)
 from relay_panel_watcher_controller import WatcherController
+from relay_panel_watcher_workflow import (
+    PanelWatcherWorkflowService,
+    WatcherActionContextSnapshot,
+    WatcherPanelUpdate,
+    WatcherRestartFailure,
+    WatcherRestartRequest,
+)
 from relay_panel_watchers import (
-    WatcherControlResult,
+    DEFAULT_WATCHER_MAX_FORWARD_COUNT,
+    DEFAULT_WATCHER_RUN_DURATION_SEC,
+    WatcherStartRequest,
     WatcherService,
 )
 
@@ -79,6 +129,22 @@ MESSAGE_FILTER_RESET_POLICY = {
 }
 BOARD_TARGET_FALLBACK = [f"target{index:02d}" for index in range(1, 9)]
 RUN_ROOT_CONTEXT_REFRESH_DEBOUNCE_MS = 250
+READ_ONLY_DASHBOARD_ACTION_KEYS = {
+    "copy_command",
+    "run_relay_status",
+    "run_paired_status",
+}
+READ_ONLY_OPS_BUTTON_LABELS = {
+    "watch 진단",
+    "watch audit 로그",
+    "watch status 파일",
+    "watch control 파일",
+    "릴레이 상태",
+    "페어 상태",
+    "runroot 요약",
+    "Headless 준비 확인",
+    "적용 설정 JSON",
+}
 
 
 class RelayOperatorPanel(tk.Tk):
@@ -93,6 +159,11 @@ class RelayOperatorPanel(tk.Tk):
         self.command_service = CommandService()
         self.status_service = StatusService(self.command_service)
         self.refresh_controller = PanelRefreshController(self.status_service)
+        self.runtime_workflow_service = PanelRuntimeWorkflowService(
+            self.command_service,
+            self.status_service,
+            self.refresh_controller,
+        )
         self.dashboard_aggregator = DashboardAggregator()
         self.artifact_service = ArtifactService()
         self.artifact_controller = ArtifactTabController(self.artifact_service)
@@ -101,12 +172,18 @@ class RelayOperatorPanel(tk.Tk):
         self.message_config_service = MessageConfigService(self.command_service)
         self.watcher_service = WatcherService()
         self.watcher_controller = WatcherController(self.watcher_service)
+        self.watcher_workflow_service = PanelWatcherWorkflowService(
+            self.watcher_controller,
+            self.command_service,
+            self.status_service,
+        )
         self.config_path_var = tk.StringVar(value=self._default_config())
         self.run_root_label_var = tk.StringVar(value="RunRoot")
         self.run_root_var = tk.StringVar()
         self.run_root_status_var = tk.StringVar(value="selected")
         self.pair_id_var = tk.StringVar(value="pair01")
         self.target_id_var = tk.StringVar()
+        self.artifact_run_root_filter_var = tk.StringVar(value="")
         self.artifact_pair_filter_var = tk.StringVar(value="")
         self.artifact_target_filter_var = tk.StringVar(value="")
         self.artifact_path_kind_var = tk.StringVar(value="summary")
@@ -114,14 +191,20 @@ class RelayOperatorPanel(tk.Tk):
         self.artifact_include_missing_var = tk.BooleanVar(value=True)
         self.last_command_var = tk.StringVar(value="")
         self.operator_status_var = tk.StringVar(value="대기 중")
-        self.operator_hint_var = tk.StringVar(value="설정을 고른 뒤 미리보기를 불러오고, Pair를 선택한 다음 선택된 Pair 드릴 실행을 누르세요.")
+        self.operator_hint_var = tk.StringVar(value="설정을 고른 뒤 미리보기를 불러오고, Pair를 선택한 다음 선택 Pair Headless Drill 또는 Visible Acceptance 절차를 진행하세요.")
         self.last_result_var = tk.StringVar(value="마지막 결과: (없음)")
+        self.last_query_result_var = tk.StringVar(value="마지막 조회: (없음)")
+        self.query_history_var = tk.StringVar(value="최근 조회: (없음)")
+        self.mode_banner_var = tk.StringVar(value="MODE: Headless Drill")
+        self.mode_banner_detail_var = tk.StringVar(value="headless drill / transport closure / 진단 기준으로 시작합니다.")
         self.simple_mode_var = tk.BooleanVar(value=False)
         self.home_context_var = tk.StringVar(value="Lane: -")
         self.home_updated_at_var = tk.StringVar(value="마지막 갱신: -")
         self.home_overall_var = tk.StringVar(value="상태: -")
         self.home_overall_detail_var = tk.StringVar(value="안내: 상태를 불러오면 준비 단계와 다음 조치를 여기서 보여줍니다.")
         self.home_pair_detail_var = tk.StringVar(value="Pair 요약을 불러오면 여기서 선택한 pair의 상태를 간단히 보여줍니다.")
+        self.visible_acceptance_status_var = tk.StringVar(value="shared visible 공식 절차 상태를 여기서 확인합니다.")
+        self.visible_acceptance_detail_var = tk.StringVar(value="cleanup -> preflight-only -> active acceptance -> post-cleanup -> confirm")
         self.artifact_status_var = tk.StringVar(value="결과 / 산출물 탭에서 현재 RunRoot 기준 상태를 확인할 수 있습니다.")
         self.artifact_status_base_text = "결과 / 산출물 탭에서 현재 RunRoot 기준 상태를 확인할 수 있습니다."
         self.board_status_var = tk.StringVar(value="8창 보드에서 target별 attach / 입력 가능 / pair 매칭을 한눈에 확인할 수 있습니다.")
@@ -136,6 +219,12 @@ class RelayOperatorPanel(tk.Tk):
         self.message_scope_label_var = tk.StringVar(value="글로벌 Prefix")
         self.message_scope_id_var = tk.StringVar(value="")
         self.message_target_suffix_var = tk.StringVar(value="")
+        self.watcher_max_forward_var = tk.StringVar(value=str(DEFAULT_WATCHER_MAX_FORWARD_COUNT))
+        self.watcher_run_duration_var = tk.StringVar(value=str(DEFAULT_WATCHER_RUN_DURATION_SEC))
+        self.watcher_pair_roundtrip_var = tk.StringVar(value="0")
+        self.watcher_quick_start_note_var = tk.StringVar(value="")
+        self.watcher_current_note_var = tk.StringVar(value="")
+        self.watcher_start_note_var = tk.StringVar(value="")
         self.artifact_source_memory_path = SNAPSHOT_DIR / "artifact-source-memory.json"
         self.artifact_source_memory_warning = ""
 
@@ -170,19 +259,36 @@ class RelayOperatorPanel(tk.Tk):
         self.message_last_rendered_template_name = ""
         self.message_last_rendered_scope_kind = ""
         self.message_last_rendered_scope_id = ""
+        self.inspection_pair_id = ""
+        self.inspection_target_id = ""
+        self.action_context_source = "controls"
+        self.inspection_context_source = ""
+        self.inspection_context_row_index: int | None = None
+        self.query_history_entries: list[str] = []
+        self.query_history_records: list[QueryHistoryRecord] = []
+        self.visible_workflow_progress_by_scope: dict[str, VisibleAcceptanceWorkflowProgress] = {}
         self.message_backup_paths: list[Path] = []
         self.long_task_widgets: list[tk.Widget] = []
+        self.read_only_widgets: set[tk.Widget] = set()
         self.home_card_vars: dict[str, dict[str, tk.StringVar]] = {}
         self.home_stage_vars: dict[str, dict[str, tk.StringVar]] = {}
         self.home_stage_buttons: dict[str, ttk.Button] = {}
         self._busy = False
+        self._mode_banner_label = "MODE: Headless Drill"
+        self._mode_banner_detail = "headless drill / transport closure / 진단 기준으로 시작합니다."
+        self._last_visible_mode_label = "MODE: Active Visible"
+        self._last_visible_mode_detail = "shared visible 공식 절차 기준 preflight / acceptance / cleanup / confirm을 진행합니다."
         self.panel_opened_at_utc = self._utc_now_iso()
         self.window_launch_anchor_utc = self.panel_opened_at_utc
         self.run_root_context_refresh_after_id: str | None = None
         self.run_root_var.trace_add("write", self._on_run_root_value_changed)
+        self.watcher_max_forward_var.trace_add("write", self._on_watcher_start_option_changed)
+        self.watcher_run_duration_var.trace_add("write", self._on_watcher_start_option_changed)
+        self.watcher_pair_roundtrip_var.trace_add("write", self._on_watcher_start_option_changed)
 
         self._load_artifact_source_memory()
         self._build_ui()
+        self._refresh_watcher_notes()
         self.load_effective_config()
 
     def _has_ui_attr(self, name: str) -> bool:
@@ -192,19 +298,338 @@ class RelayOperatorPanel(tk.Tk):
             return False
         return True
 
+    def _register_read_only_widget(self, widget: tk.Widget) -> None:
+        self.read_only_widgets.add(widget)
+
+    def _widget_is_read_only(self, widget: tk.Widget) -> bool:
+        return widget in self.read_only_widgets
+
+    @staticmethod
+    def _dashboard_action_is_read_only(action_key: str) -> bool:
+        return action_key in READ_ONLY_DASHBOARD_ACTION_KEYS
+
     def _default_config(self) -> str:
         presets = existing_config_presets()
         if presets:
             return presets[0]
         return str(ROOT / "config" / "settings.psd1")
 
+    def _on_watcher_start_option_changed(self, *_args) -> None:
+        self._refresh_watcher_start_note()
+
+    def _watcher_quick_start_request(self, *, config_path: str, run_root: str) -> WatcherStartRequest:
+        return self.watcher_controller.default_start_request(
+            config_path=config_path,
+            run_root=run_root,
+        )
+
+    def _watcher_current_request_from_status(
+        self,
+        *,
+        config_path: str,
+        run_root: str,
+    ) -> WatcherStartRequest | None:
+        return self.watcher_controller.configured_start_request(
+            self.paired_status_data,
+            config_path=config_path,
+            run_root=run_root,
+        )
+
+    def _watcher_start_option_int(self, value: str, *, label: str) -> int:
+        text = (value or "").strip()
+        if not text:
+            raise ValueError(f"{label} 값이 비어 있습니다.")
+        try:
+            parsed = int(text)
+        except ValueError as exc:
+            raise ValueError(f"{label} 값은 0 이상의 정수여야 합니다.") from exc
+        if parsed < 0:
+            raise ValueError(f"{label} 값은 0 이상의 정수여야 합니다.")
+        return parsed
+
+    def _watcher_start_option_value(self, name: str, *, default: int) -> str:
+        if not self._has_ui_attr(name):
+            return str(default)
+        try:
+            variable = object.__getattribute__(self, name)
+            return str(variable.get())
+        except (AttributeError, RecursionError, tk.TclError):
+            return str(default)
+
+    def _build_watcher_start_request_from_controls(
+        self,
+        *,
+        config_path: str,
+        run_root: str,
+        show_error: bool,
+    ) -> WatcherStartRequest | None:
+        try:
+            max_forward_count = self._watcher_start_option_int(
+                self._watcher_start_option_value(
+                    "watcher_max_forward_var",
+                    default=DEFAULT_WATCHER_MAX_FORWARD_COUNT,
+                ),
+                label="MaxForwardCount",
+            )
+            run_duration_sec = self._watcher_start_option_int(
+                self._watcher_start_option_value(
+                    "watcher_run_duration_var",
+                    default=DEFAULT_WATCHER_RUN_DURATION_SEC,
+                ),
+                label="RunDurationSec",
+            )
+            pair_max_roundtrip_count = self._watcher_start_option_int(
+                self._watcher_start_option_value(
+                    "watcher_pair_roundtrip_var",
+                    default=0,
+                ),
+                label="PairMaxRoundtripCount",
+            )
+        except ValueError as exc:
+            if show_error:
+                messagebox.showwarning("watch 시작 옵션 오류", str(exc))
+            return None
+
+        return WatcherStartRequest(
+            config_path=config_path,
+            run_root=run_root,
+            use_headless_dispatch=True,
+            max_forward_count=max_forward_count,
+            run_duration_sec=run_duration_sec,
+            pair_max_roundtrip_count=pair_max_roundtrip_count,
+        )
+
+    def _refresh_watcher_start_note(self) -> None:
+        request = self._build_watcher_start_request_from_controls(
+            config_path="",
+            run_root="",
+            show_error=False,
+        )
+        if request is None:
+            self.watcher_start_note_var.set("다음 시작값: watch 시작 옵션 오류, 0 이상의 정수만 입력할 수 있습니다. 0은 제한 없음입니다.")
+            return
+        self.watcher_start_note_var.set(
+            "다음 시작값: " + self.watcher_controller.describe_start_request(request) + " | 0은 해당 제한 없음"
+        )
+
+    def _refresh_watcher_runtime_note(self) -> None:
+        request = self._watcher_current_request_from_status(config_path="", run_root="")
+        watcher = ((self.paired_status_data or {}).get("Watcher", {}) or {})
+        watcher_status = str(watcher.get("Status", "") or "").strip()
+        if request is None:
+            suffix = f" | status={watcher_status}" if watcher_status else ""
+            self.watcher_current_note_var.set("현재 watcher 값: watcher status 파일 없음" + suffix)
+            return
+        status_suffix = f" | status={watcher_status}" if watcher_status else ""
+        self.watcher_current_note_var.set(
+            "현재 watcher 값: " + self.watcher_controller.describe_start_request(request) + status_suffix
+        )
+
+    def _refresh_watcher_quick_start_note(self) -> None:
+        request = self._watcher_quick_start_request(config_path="", run_root="")
+        self.watcher_quick_start_note_var.set(
+            "기본 quick start: " + self.watcher_controller.describe_start_request(request)
+        )
+
+    def _refresh_watcher_notes(self) -> None:
+        self._refresh_watcher_quick_start_note()
+        self._refresh_watcher_runtime_note()
+        self._refresh_watcher_start_note()
+
+    def reset_watcher_start_options(self) -> None:
+        self.watcher_max_forward_var.set(str(DEFAULT_WATCHER_MAX_FORWARD_COUNT))
+        self.watcher_run_duration_var.set(str(DEFAULT_WATCHER_RUN_DURATION_SEC))
+        self.watcher_pair_roundtrip_var.set("0")
+
+    def load_watcher_start_options_from_status(self, *, show_message: bool = True) -> bool:
+        watcher = ((self.paired_status_data or {}).get("Watcher", {}) or {})
+        if not watcher:
+            if show_message:
+                messagebox.showinfo("watch 옵션 불러오기", "현재 paired status에 watcher 정보가 없습니다.")
+            return False
+        request = self._watcher_current_request_from_status(config_path="", run_root="")
+        if request is None:
+            if show_message:
+                messagebox.showinfo("watch 옵션 불러오기", "현재 watcher status 파일이 없어 옵션을 불러올 수 없습니다.")
+            return False
+        self.watcher_max_forward_var.set(str(request.max_forward_count))
+        self.watcher_run_duration_var.set(str(request.run_duration_sec))
+        self.watcher_pair_roundtrip_var.set(str(request.pair_max_roundtrip_count))
+        self._refresh_watcher_runtime_note()
+        if show_message:
+            messagebox.showinfo("watch 옵션 불러오기", "현재 watcher status의 시작 옵션을 입력칸에 반영했습니다.")
+        return True
+
     def _current_context(self) -> AppContext:
-        return AppContext(
+        return self._action_context_state().as_app_context()
+
+    def _action_context_state(self) -> ActionContextState:
+        return ActionContextState(
             config_path=self.config_path_var.get().strip(),
             run_root=self._current_run_root_for_actions(),
             pair_id=self._selected_pair_id(),
             target_id=self.target_id_var.get().strip(),
+            source=str(self.__dict__.get("action_context_source", "") or "controls"),
         )
+
+    def _set_action_context(
+        self,
+        *,
+        pair_id: str | None = None,
+        target_id: str | None = None,
+        run_root: str | None = None,
+        source: str = "",
+    ) -> ActionContextState:
+        if pair_id is not None:
+            self.pair_id_var.set(str(pair_id or "").strip())
+        if target_id is not None:
+            self.target_id_var.set(str(target_id or "").strip())
+        if run_root is not None and self._has_ui_attr("run_root_var"):
+            self.run_root_var.set(str(run_root or "").strip())
+        if source:
+            self.action_context_source = str(source or "").strip()
+        return self._action_context_state()
+
+    def _context_source_label(self, source: str) -> str:
+        return context_source_label(source)
+
+    def _action_context_summary(self, context: ActionContextState | None = None) -> str:
+        action_context = context or self._action_context_state()
+        return format_action_context_summary(action_context)
+
+    def _snapshot_context(
+        self,
+        *,
+        run_root: str | None = None,
+        pair_id: str | None = None,
+        target_id: str | None = None,
+    ) -> AppContext:
+        current = self._current_context()
+        return AppContext(
+            config_path=current.config_path,
+            run_root=current.run_root if run_root is None else run_root,
+            pair_id=current.pair_id if pair_id is None else pair_id,
+            target_id=current.target_id if target_id is None else target_id,
+        )
+
+    def _artifact_query_context_state(self) -> ArtifactQueryContextState:
+        pair_var = self.__dict__.get("artifact_pair_filter_var", None)
+        target_var = self.__dict__.get("artifact_target_filter_var", None)
+        path_kind_var = self.__dict__.get("artifact_path_kind_var", None)
+        latest_only_var = self.__dict__.get("artifact_latest_only_var", None)
+        include_missing_var = self.__dict__.get("artifact_include_missing_var", None)
+        path_kind_label = path_kind_var.get() if path_kind_var is not None and hasattr(path_kind_var, "get") else "summary"
+        return ArtifactQueryContextState(
+            run_root=self._current_run_root_for_artifacts(),
+            pair_id=pair_var.get().strip() if pair_var is not None and hasattr(pair_var, "get") else "",
+            target_id=target_var.get().strip() if target_var is not None and hasattr(target_var, "get") else "",
+            path_kind=ARTIFACT_PATH_LABEL_TO_KIND.get(path_kind_label, path_kind_label),
+            latest_only=bool(latest_only_var.get()) if latest_only_var is not None and hasattr(latest_only_var, "get") else False,
+            include_missing=bool(include_missing_var.get()) if include_missing_var is not None and hasattr(include_missing_var, "get") else True,
+        )
+
+    def _artifact_query_context_summary(self, context: ArtifactQueryContextState | None = None) -> str:
+        artifact_context = context or self._artifact_query_context_state()
+        return format_artifact_query_context_summary(artifact_context)
+
+    def _selected_preview_row_index(self) -> int | None:
+        if not self._has_ui_attr("row_tree"):
+            return None
+        selection_method = getattr(self.row_tree, "selection", None)
+        if selection_method is None:
+            return None
+        selection = selection_method()
+        if not selection:
+            return None
+        try:
+            return int(selection[0])
+        except (TypeError, ValueError):
+            return None
+
+    def _stored_inspection_context_state(self) -> InspectionContextState:
+        row_index = self.__dict__.get("inspection_context_row_index", None)
+        if not isinstance(row_index, int):
+            row_index = None
+        return InspectionContextState(
+            pair_id=str(self.__dict__.get("inspection_pair_id", "") or "").strip(),
+            target_id=str(self.__dict__.get("inspection_target_id", "") or "").strip(),
+            source=str(self.__dict__.get("inspection_context_source", "") or "").strip(),
+            row_index=row_index,
+        )
+
+    def _selected_inspection_context_state(self) -> InspectionContextState:
+        row = self._selected_preview_row() or {}
+        row_index = self._selected_preview_row_index()
+        stored = self._stored_inspection_context_state()
+        fallback_target = ""
+        row_pair_id = str(row.get("PairId", "") or stored.pair_id or "").strip()
+        pair_controller = self.__dict__.get("pair_controller")
+        if row_pair_id and pair_controller is not None:
+            fallback_target = pair_controller.resolve_top_target_for_pair(self.preview_rows, row_pair_id)
+        return resolve_inspection_context(
+            selected_row=row,
+            selected_row_index=row_index,
+            stored=stored,
+            fallback_target_id=fallback_target,
+        )
+
+    def _inspection_context_summary(self, context: InspectionContextState | None = None) -> str:
+        inspection_context = context or self._selected_inspection_context_state()
+        return format_inspection_context_summary(inspection_context)
+
+    def _prepare_run_root_action_context(self, *, ignored_run_root: str = "") -> AppContext:
+        current_context = self._snapshot_context()
+        normalized_ignored = str(ignored_run_root or "").strip()
+        if not normalized_ignored:
+            return current_context
+
+        selected_run_root = ""
+        if self.effective_data:
+            selected_run_root = str(self.effective_data.get("RunContext", {}).get("SelectedRunRoot", "") or "").strip()
+        if selected_run_root and os.path.normcase(os.path.normpath(selected_run_root)) == os.path.normcase(
+            os.path.normpath(normalized_ignored)
+        ):
+            selected_run_root = ""
+
+        return ActionContextState(
+            config_path=current_context.config_path,
+            run_root=selected_run_root,
+            pair_id=current_context.pair_id,
+            target_id=current_context.target_id,
+            source=self._action_context_state().source,
+        ).as_app_context()
+
+    def _runtime_workflow(self) -> PanelRuntimeWorkflowService:
+        service = self.__dict__.get("runtime_workflow_service")
+        if (
+            service is None
+            or getattr(service, "command_service", None) is not self.command_service
+            or getattr(service, "status_service", None) is not self.status_service
+            or getattr(service, "refresh_controller", None) is not self.refresh_controller
+        ):
+            service = PanelRuntimeWorkflowService(
+                self.command_service,
+                self.status_service,
+                self.refresh_controller,
+            )
+            self.runtime_workflow_service = service
+        return service
+
+    def _watcher_workflow(self) -> PanelWatcherWorkflowService:
+        service = self.__dict__.get("watcher_workflow_service")
+        if (
+            service is None
+            or getattr(service, "watcher_controller", None) is not self.watcher_controller
+            or getattr(service, "command_service", None) is not self.command_service
+            or getattr(service, "status_service", None) is not self.status_service
+        ):
+            service = PanelWatcherWorkflowService(
+                self.watcher_controller,
+                self.command_service,
+                self.status_service,
+            )
+            self.watcher_workflow_service = service
+        return service
 
     def _utc_now_iso(self) -> str:
         return datetime.now(timezone.utc).isoformat()
@@ -245,6 +670,38 @@ class RelayOperatorPanel(tk.Tk):
         if self._has_ui_attr("artifact_tree"):
             self.refresh_artifacts_tab()
         self.update_pair_button_states()
+
+    def _set_mode_banner(self, label: str, detail: str) -> None:
+        self._mode_banner_label = label
+        self._mode_banner_detail = detail
+        if self._has_ui_attr("mode_banner_var"):
+            self.mode_banner_var.set(label)
+        if self._has_ui_attr("mode_banner_detail_var"):
+            self.mode_banner_detail_var.set(detail)
+
+    def _set_visible_mode_banner(self, label: str, detail: str) -> None:
+        self._last_visible_mode_label = label
+        self._last_visible_mode_detail = detail
+        self._set_mode_banner(label, detail)
+
+    def on_notebook_tab_changed(self, _event: object | None = None) -> None:
+        notebook = self.__dict__.get("notebook")
+        if notebook is None:
+            return
+        try:
+            selected_tab = notebook.select()
+        except tk.TclError:
+            return
+
+        if self._has_ui_attr("ops_tab") and selected_tab == str(self.ops_tab):
+            self._set_mode_banner("MODE: Headless Drill", "headless drill / transport closure / 진단 중심으로 작업합니다.")
+            return
+        if self._has_ui_attr("visible_acceptance_tab") and selected_tab == str(self.visible_acceptance_tab):
+            self._set_mode_banner(self._last_visible_mode_label, self._last_visible_mode_detail)
+            return
+        if self._has_ui_attr("artifacts_tab") and selected_tab == str(self.artifacts_tab):
+            self._set_mode_banner("MODE: Recovery", "artifact / receipt / watcher evidence 검토 및 복구 중심으로 작업합니다.")
+            return
 
     def destroy(self) -> None:
         self._cancel_pending_ui_callbacks()
@@ -326,9 +783,13 @@ class RelayOperatorPanel(tk.Tk):
         explicit_run_root = self.run_root_var.get().strip()
         action_run_root_uses_override = bool(explicit_run_root and explicit_run_root != selected_run_root)
         action_run_root_snapshot = self._run_root_timing_snapshot(action_run_root)
+        wrapper_path = self._launcher_wrapper_path()
         return {
             "PanelOpenedAtUtc": str(self.__dict__.get("panel_opened_at_utc", "") or ""),
             "WindowLaunchAnchorUtc": str(self.__dict__.get("window_launch_anchor_utc", "") or ""),
+            "WindowLaunchMode": "wrapper" if wrapper_path else "",
+            "WindowReuseMode": "attach-only" if wrapper_path else "",
+            "LauncherWrapperPath": wrapper_path,
             "ActionRunRoot": action_run_root,
             "ActionRunRootUsesOverride": action_run_root_uses_override,
             "ActionRunRootIsStale": self._current_run_root_is_stale_for_actions(),
@@ -387,7 +848,7 @@ class RelayOperatorPanel(tk.Tk):
         return self._stage_action_allowed(
             "pair_action",
             expected_action_key="run_selected_pair",
-            mismatch_message="선택 Pair 실행 전 pair 활성화가 필요합니다.",
+            mismatch_message="선택 Pair Headless Drill 전 pair 활성화가 필요합니다.",
         )
 
     def _runtime_active_pair_ids(self) -> list[str]:
@@ -428,15 +889,17 @@ class RelayOperatorPanel(tk.Tk):
             return False
 
         next_pair = normalized_pairs[0]
-        self.pair_id_var.set(next_pair)
         top_target_id = ""
         if "pair_controller" in self.__dict__ and "preview_rows" in self.__dict__:
             top_target_id = self._resolve_top_target_for_pair(next_pair)
-        if top_target_id:
-            self.target_id_var.set(top_target_id)
+        self._set_action_context(
+            pair_id=next_pair,
+            target_id=top_target_id if top_target_id else self.target_id_var.get().strip(),
+            source="runtime-active-pair",
+        )
         if "home_pair_tree" in self.__dict__:
             self._sync_home_pair_selection(next_pair)
-        if "_sync_preview_selection_with_pair" in self.__dict__ or "row_tree" in self.__dict__:
+        if ("_sync_preview_selection_with_pair" in self.__dict__ or "row_tree" in self.__dict__) and self._selected_preview_row() is None:
             self._sync_preview_selection_with_pair(next_pair, target_id=top_target_id)
         return True
 
@@ -454,7 +917,16 @@ class RelayOperatorPanel(tk.Tk):
             not_ready_message="현재 세션 기준 창 준비 후 붙이기를 다시 시도하세요.",
         )
 
-    def _board_status_text(self, *, items: list[dict[str, str]], selected_target: str, selected_pair: str) -> str:
+    def _board_status_text(
+        self,
+        *,
+        items: list[dict[str, str]],
+        selected_target: str,
+        selected_pair: str,
+        action_pair: str = "",
+        action_target: str = "",
+        inspection_source: str = "",
+    ) -> str:
         attached_count = sum(1 for item in items if item["RuntimePresent"] == "예")
         injectable_count = sum(1 for item in items if item["Injectable"] == "예")
         selected_pair_count = sum(1 for item in items if selected_pair and item["PairId"] == selected_pair)
@@ -466,6 +938,13 @@ class RelayOperatorPanel(tk.Tk):
             selected_pair_count,
             selected_target or "(없음)",
         )
+        if action_pair or action_target:
+            text += " / 실행 기준 {0}/{1}".format(
+                action_pair or "(pair 없음)",
+                action_target or "(target 없음)",
+            )
+        if inspection_source:
+            text += " / inspection source {0}".format(self._context_source_label(inspection_source))
         runtime = (self.relay_status_data or {}).get("Runtime", {}) if self.relay_status_data else {}
         if runtime.get("PartialReuse", False):
             active_pairs = [str(item) for item in (runtime.get("ActivePairIds", []) or []) if str(item)]
@@ -651,21 +1130,7 @@ class RelayOperatorPanel(tk.Tk):
         return "\n".join(lines)
 
     def _reuse_failure_summary(self, payload: dict) -> str:
-        summary = str(payload.get("Summary", "") or "기존 8창 재사용 실패").strip()
-        reasons = payload.get("FailureReasons", []) or []
-        reason_tokens = [str(item).strip() for item in reasons if str(item).strip()]
-        if not reason_tokens:
-            reason_tokens = [str(item).strip() for item in (payload.get("SoftFindings", []) or []) if str(item).strip()]
-        if not reason_tokens:
-            for row in payload.get("Targets", []) or []:
-                if row.get("Matched", True):
-                    continue
-                target_id = str(row.get("TargetId", "") or "?")
-                reason = str(row.get("Reason", "") or "unknown")
-                reason_tokens.append("{0}:{1}".format(target_id, reason))
-        if not reason_tokens:
-            return summary
-        return "{0}: {1}".format(summary, ", ".join(reason_tokens[:4]))
+        return build_reuse_failure_summary(payload)
 
     def _apply_reuse_active_pair_selection(self, payload: dict) -> None:
         active_pairs = [str(item) for item in (payload.get("ActivePairIds", []) or []) if str(item)]
@@ -741,6 +1206,7 @@ class RelayOperatorPanel(tk.Tk):
             self.render_target_board()
             if refresh_artifacts:
                 self.refresh_artifacts_tab()
+            self._refresh_watcher_notes()
             self.update_pair_button_states()
             return
 
@@ -751,6 +1217,7 @@ class RelayOperatorPanel(tk.Tk):
         self.render_target_board()
         if refresh_artifacts:
             self.refresh_artifacts_tab()
+        self._refresh_watcher_notes()
         self.update_pair_button_states()
 
     def refresh_quick_status(self) -> None:
@@ -762,6 +1229,7 @@ class RelayOperatorPanel(tk.Tk):
             self.paired_status_error = quick_result.paired.paired_status_error
             self.rebuild_panel_state()
             self.render_target_board()
+            self._refresh_watcher_notes()
             self.update_pair_button_states()
         except Exception as exc:
             messagebox.showerror("빠른 새로고침 실패", str(exc))
@@ -771,7 +1239,15 @@ class RelayOperatorPanel(tk.Tk):
         result_text = "마지막 결과: 빠른 새로고침 완료"
         if self.paired_status_error:
             result_text += " / pair-status 일부 생략"
-        self.set_operator_status("빠른 새로고침 완료", "relay/visibility/paired 상태만 다시 읽었습니다. 결과 탭 산출물은 건드리지 않았습니다.", result_text)
+        detail = "relay/visibility/paired 상태만 다시 읽었습니다. 결과 탭 산출물은 건드리지 않았습니다."
+        self.set_query_text("\n".join(["빠른 새로고침 완료", detail, result_text]))
+        self.set_query_result(
+            result_text.replace("마지막 결과", "마지막 조회"),
+            context=self._query_context_summary(),
+        )
+        if self._busy:
+            return
+        self.set_operator_status("빠른 새로고침 완료", detail, result_text)
 
     def refresh_artifacts_status(self) -> None:
         try:
@@ -784,7 +1260,15 @@ class RelayOperatorPanel(tk.Tk):
         result_text = "마지막 결과: 결과 / 산출물 새로고침 완료"
         if self.paired_status_error:
             result_text += " / pair-status 일부 생략"
-        self.set_operator_status("결과 새로고침 완료", "현재 RunRoot 기준 paired status와 산출물을 다시 읽었습니다.", result_text)
+        detail = "현재 RunRoot 기준 paired status와 산출물을 다시 읽었습니다."
+        self.set_query_text("\n".join(["결과 / 산출물 새로고침 완료", detail, result_text]))
+        self.set_query_result(
+            result_text.replace("마지막 결과", "마지막 조회"),
+            context=self._artifact_query_context_summary(),
+        )
+        if self._busy:
+            return
+        self.set_operator_status("결과 새로고침 완료", detail, result_text)
 
     def toggle_simple_mode(self) -> None:
         if self.notebook is None:
@@ -794,13 +1278,13 @@ class RelayOperatorPanel(tk.Tk):
                 self.notebook.hide(self.ops_tab)
             if self._has_ui_attr("snapshots_tab"):
                 self.notebook.hide(self.snapshots_tab)
-            self.set_operator_status("간단 모드", "홈, 8창 보드, 설정 편집, 산출물 중심으로 단순화했습니다.")
+            self.set_operator_status("간단 모드", "홈, 8창 보드, 설정 편집, 산출물 중심으로 단순화했습니다. 하단 결과 패널은 계속 유지됩니다.")
         else:
             if self._has_ui_attr("ops_tab"):
                 self.notebook.add(self.ops_tab, text="원문 / 진단")
             if self._has_ui_attr("snapshots_tab"):
                 self.notebook.add(self.snapshots_tab, text="스냅샷")
-            self.set_operator_status("전체 모드", "고급 진단 탭까지 다시 표시했습니다.")
+            self.set_operator_status("전체 모드", "고급 진단 탭까지 다시 표시했습니다. 하단 결과 패널은 계속 유지됩니다.")
 
     def load_message_editor_document(self) -> None:
         config_path = self.config_path_var.get().strip()
@@ -916,6 +1400,19 @@ class RelayOperatorPanel(tk.Tk):
             and self.message_preview_doc_version == self.message_document_version
             and self.message_preview_cached_context_key == self._message_preview_context_signature()
         )
+
+    def _message_editor_save_allowed(self) -> tuple[bool, str]:
+        if not self.message_config_doc:
+            return False, "설정 문서를 먼저 불러오세요."
+        if self._message_editor_has_unsaved_changes() and not self._message_preview_is_fresh():
+            return False, "편집본 preview가 stale입니다. '미리보기 갱신' 후 저장하세요."
+        return True, ""
+
+    def _refresh_message_editor_action_buttons(self) -> None:
+        if not self._has_ui_attr("message_save_button"):
+            return
+        save_allowed, _detail = self._message_editor_save_allowed()
+        self.message_save_button.configure(state="normal" if save_allowed else "disabled")
 
     def _message_impact_summary(self) -> dict[str, object]:
         document = self.message_config_doc or {}
@@ -1118,9 +1615,9 @@ class RelayOperatorPanel(tk.Tk):
     def _message_scope_id_from_context(self, scope_kind: str, document: dict | None = None) -> str:
         document = document or {}
         preview_row = self._editor_context_row() or {}
-        current_pair_id = self.pair_id_var.get().strip() or self._selected_pair_id()
+        current_pair_id = self._selected_inspection_pair_id()
         current_role_name = str(preview_row.get("RoleName", "") or "")
-        current_target_id = self.target_id_var.get().strip() or str(preview_row.get("TargetId", "") or "")
+        current_target_id = self._selected_inspection_target_id() or str(preview_row.get("TargetId", "") or "")
         scope_id_values = self._message_scope_id_values_for_kind(scope_kind, document)
         if scope_kind == "pair-extra" and current_pair_id in scope_id_values:
             return current_pair_id
@@ -1269,8 +1766,8 @@ class RelayOperatorPanel(tk.Tk):
         self.message_editor_status_var.set("보드 선택 문맥 반영: 글로벌 Prefix")
 
     def _editor_context_row(self) -> dict | None:
-        target_id = self.target_id_var.get().strip()
-        pair_id = self.pair_id_var.get().strip()
+        target_id = self._selected_inspection_target_id() or self.target_id_var.get().strip()
+        pair_id = self._selected_inspection_pair_id() or self.pair_id_var.get().strip()
         if target_id:
             for row in self.preview_rows:
                 if row.get("TargetId", "") == target_id:
@@ -1592,6 +2089,7 @@ class RelayOperatorPanel(tk.Tk):
         self.set_text(self.message_one_time_preview_text, "")
         self.set_text(self.message_diff_text, "")
         self.set_text(self.message_backup_text, "")
+        self._refresh_message_editor_action_buttons()
 
     def _build_message_editor_view_state(
         self,
@@ -1847,6 +2345,7 @@ class RelayOperatorPanel(tk.Tk):
         self.message_last_rendered_template_name = str(state["template_name"])
         self.message_last_rendered_scope_kind = str(state["scope_kind"])
         self.message_last_rendered_scope_id = str(state["scope_id"])
+        self._refresh_message_editor_action_buttons()
 
     def render_message_editor(self, *, include_side_panels: bool = True) -> None:
         document = self.message_config_doc
@@ -2436,6 +2935,11 @@ class RelayOperatorPanel(tk.Tk):
         if not self.message_config_doc:
             messagebox.showwarning("설정 없음", "먼저 설정 문서를 불러오세요.")
             return
+        save_allowed, save_detail = self._message_editor_save_allowed()
+        if not save_allowed:
+            messagebox.showwarning("저장 대기", save_detail)
+            self._refresh_message_editor_action_buttons()
+            return
         issues = self.validate_message_editor(show_dialog=False)
         blocking = [item for item in issues if item.get("severity") == "error"]
         warnings = [item for item in issues if item.get("severity") == "warning"]
@@ -2519,10 +3023,19 @@ class RelayOperatorPanel(tk.Tk):
         if not self._has_ui_attr("board_grid"):
             return
         items = self._target_board_items()
-        selected_target = self.target_id_var.get().strip()
-        selected_pair = self._selected_pair_id()
+        selected_target = self._selected_inspection_target_id()
+        selected_pair = self._selected_inspection_pair_id()
+        action_pair = self._selected_pair_id()
+        action_target = self.target_id_var.get().strip()
         self.board_status_var.set(
-            self._board_status_text(items=items, selected_target=selected_target, selected_pair=selected_pair)
+            self._board_status_text(
+                items=items,
+                selected_target=selected_target,
+                selected_pair=selected_pair,
+                action_pair=action_pair,
+                action_target=action_target,
+                inspection_source=self._selected_inspection_context_state().source,
+            )
         )
         self.update_pair_button_states()
 
@@ -2560,35 +3073,55 @@ class RelayOperatorPanel(tk.Tk):
             self.target_board_cells[item["TargetId"]] = {"frame": frame, "item": item}
 
     def select_target_from_board(self, target_id: str, pair_id: str = "") -> None:
-        self.target_id_var.set(target_id)
-        if pair_id:
-            self.pair_id_var.set(pair_id)
+        self._set_inspection_context(
+            pair_id=pair_id or self._stored_inspection_context_state().pair_id,
+            target_id=target_id,
+            source="board-target",
+        )
         role_name = ""
         matched = False
         for index, row in enumerate(self.preview_rows):
             if row.get("TargetId", "") == target_id:
                 role_name = str(row.get("RoleName", "") or "")
+                self._set_inspection_context(
+                    pair_id=pair_id or str(row.get("PairId", "") or "") or self._stored_inspection_context_state().pair_id,
+                    target_id=target_id,
+                    source="board-target",
+                    row_index=index,
+                )
+                self._apply_message_filter_reset_policy("board_target_change")
+                self._apply_editor_context_for_target(
+                    pair_id=pair_id or str(row.get("PairId", "") or "") or self._selected_pair_id(),
+                    role_name=role_name,
+                    target_id=target_id,
+                )
                 self.row_tree.selection_set(str(index))
-                self.on_row_selected()
+                self.on_row_selected(source="board-target")
                 matched = True
                 break
         if not matched:
-            self._sync_preview_selection_with_pair(self._selected_pair_id())
-            self.render_message_editor()
+            if not self._stored_inspection_context_state().pair_id:
+                self._set_inspection_context(pair_id=pair_id or self._selected_pair_id(), target_id=target_id, source="board-target")
             for row in self.preview_rows:
                 if row.get("TargetId", "") == target_id:
                     role_name = str(row.get("RoleName", "") or "")
                     break
-        self._apply_message_filter_reset_policy("board_target_change")
-        self._apply_editor_context_for_target(pair_id=pair_id or self._selected_pair_id(), role_name=role_name, target_id=target_id)
-        self.render_message_editor()
-        if self.notebook is not None and self._has_ui_attr("editor_tab"):
-            self.notebook.select(self.editor_tab)
-        self.rebuild_panel_state()
+            self._apply_message_filter_reset_policy("board_target_change")
+            self._apply_editor_context_for_target(
+                pair_id=self._stored_inspection_context_state().pair_id or self._selected_pair_id(),
+                role_name=role_name,
+                target_id=target_id,
+            )
+            self._sync_message_scope_id_from_context()
+            self.render_target_board()
+            self.render_message_editor()
+            self.update_pair_button_states()
+            self.rebuild_panel_state()
 
     def _build_ui(self) -> None:
         self.columnconfigure(0, weight=1)
         self.rowconfigure(1, weight=1)
+        self.rowconfigure(2, weight=1)
 
         controls = ttk.Frame(self, padding=10)
         controls.grid(row=0, column=0, sticky="ew")
@@ -2624,15 +3157,54 @@ class RelayOperatorPanel(tk.Tk):
         status_frame = ttk.LabelFrame(controls, text="운영 상태", padding=8)
         status_frame.grid(row=3, column=0, columnspan=7, sticky="ew", pady=(10, 0))
         status_frame.columnconfigure(1, weight=1)
-        ttk.Label(status_frame, text="상태").grid(row=0, column=0, sticky="w", padx=(0, 8))
-        ttk.Label(status_frame, textvariable=self.operator_status_var).grid(row=0, column=1, sticky="w")
-        ttk.Label(status_frame, text="안내").grid(row=1, column=0, sticky="nw", padx=(0, 8), pady=(6, 0))
-        ttk.Label(status_frame, textvariable=self.operator_hint_var, wraplength=1100, justify="left").grid(row=1, column=1, sticky="w", pady=(6, 0))
-        ttk.Label(status_frame, textvariable=self.last_result_var, wraplength=1100, justify="left").grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        ttk.Label(status_frame, text="MODE").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        ttk.Label(status_frame, textvariable=self.mode_banner_var, font=("Segoe UI", 10, "bold")).grid(row=0, column=1, sticky="w")
+        ttk.Label(status_frame, textvariable=self.mode_banner_detail_var, wraplength=1100, justify="left").grid(row=1, column=1, sticky="w", pady=(6, 0))
+        ttk.Label(status_frame, text="상태").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=(6, 0))
+        ttk.Label(status_frame, textvariable=self.operator_status_var).grid(row=2, column=1, sticky="w", pady=(6, 0))
+        ttk.Label(status_frame, text="안내").grid(row=3, column=0, sticky="nw", padx=(0, 8), pady=(6, 0))
+        ttk.Label(status_frame, textvariable=self.operator_hint_var, wraplength=1100, justify="left").grid(row=3, column=1, sticky="w", pady=(6, 0))
+        ttk.Label(status_frame, textvariable=self.last_result_var, wraplength=1100, justify="left").grid(row=4, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        ttk.Label(status_frame, textvariable=self.last_query_result_var, wraplength=1100, justify="left").grid(row=5, column=0, columnspan=2, sticky="w", pady=(6, 0))
 
         notebook = ttk.Notebook(self)
         notebook.grid(row=1, column=0, sticky="nsew", padx=10, pady=(0, 10))
+        notebook.bind("<<NotebookTabChanged>>", self.on_notebook_tab_changed)
         self.notebook = notebook
+
+        result_frame = ttk.LabelFrame(self, text="작업 / 조회 결과", padding=8)
+        result_frame.grid(row=2, column=0, sticky="nsew", padx=10, pady=(0, 10))
+        result_frame.columnconfigure(0, weight=1)
+        result_frame.rowconfigure(1, weight=1)
+        result_header = ttk.Frame(result_frame)
+        result_header.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        result_header.columnconfigure(0, weight=1)
+        ttk.Label(
+            result_header,
+            text="작업 출력과 조회 결과는 여기서 계속 표시됩니다. simple mode에서도 숨기지 않습니다.",
+            justify="left",
+        ).grid(row=0, column=0, sticky="w")
+        ttk.Label(
+            result_header,
+            textvariable=self.query_history_var,
+            wraplength=980,
+            justify="left",
+        ).grid(row=1, column=0, sticky="w", pady=(6, 0))
+        self.result_notebook = ttk.Notebook(result_frame)
+        self.result_notebook.grid(row=1, column=0, sticky="nsew")
+        self.ops_result_notebook = self.result_notebook
+        action_output_tab = ttk.Frame(self.result_notebook, padding=6)
+        action_output_tab.columnconfigure(0, weight=1)
+        action_output_tab.rowconfigure(0, weight=1)
+        self.result_notebook.add(action_output_tab, text="작업 출력")
+        self.output_text = scrolledtext.ScrolledText(action_output_tab, wrap="word")
+        self.output_text.grid(row=0, column=0, sticky="nsew")
+        self.query_output_tab = ttk.Frame(self.result_notebook, padding=6)
+        self.query_output_tab.columnconfigure(0, weight=1)
+        self.query_output_tab.rowconfigure(0, weight=1)
+        self.result_notebook.add(self.query_output_tab, text="조회 결과")
+        self.query_output_text = scrolledtext.ScrolledText(self.query_output_tab, wrap="word")
+        self.query_output_text.grid(row=0, column=0, sticky="nsew")
 
         home_tab = ttk.Frame(notebook, padding=10)
         home_tab.columnconfigure(0, weight=1)
@@ -2658,12 +3230,13 @@ class RelayOperatorPanel(tk.Tk):
                 ("router", "라우터"),
                 ("runroot", "RunRoot"),
                 ("warning", "경고"),
+                ("acceptance", "Visible Receipt"),
             ]
         ):
             key, title = key_title
             cards_frame.columnconfigure(idx, weight=1)
             frame = ttk.LabelFrame(cards_frame, text=title, padding=8)
-            frame.grid(row=0, column=idx, sticky="nsew", padx=(0, 8) if idx < 5 else (0, 0))
+            frame.grid(row=0, column=idx, sticky="nsew", padx=(0, 8) if idx < 6 else (0, 0))
             value_var = tk.StringVar(value="-")
             detail_var = tk.StringVar(value="-")
             ttk.Label(frame, textvariable=value_var, font=("Segoe UI", 12, "bold")).grid(row=0, column=0, sticky="w")
@@ -2679,7 +3252,7 @@ class RelayOperatorPanel(tk.Tk):
                 ("attach_windows", "2. 바인딩 attach", "붙이기"),
                 ("check_visibility", "3. 입력 가능 확인", "입력 점검"),
                 ("prepare_run_root", "4. RunRoot 준비", "run 준비"),
-                ("pair_action", "5. Pair 실행 준비", "선택 Pair 실행"),
+                ("pair_action", "5. Headless Drill 준비", "선택 Pair Headless Drill"),
             ]
         ):
             status_var = tk.StringVar(value="상태: -")
@@ -2716,7 +3289,7 @@ class RelayOperatorPanel(tk.Tk):
 
         self.home_pair_tree = ttk.Treeview(
             pair_frame,
-            columns=("pair", "targets", "enabled", "latest", "zip", "fail"),
+            columns=("pair", "targets", "enabled", "latest", "phase", "rt", "next", "zip", "fail"),
             show="headings",
             height=6,
         )
@@ -2724,12 +3297,15 @@ class RelayOperatorPanel(tk.Tk):
             ("pair", "Pair", 90),
             ("targets", "Targets", 180),
             ("enabled", "활성", 70),
-            ("latest", "상태", 200),
+            ("latest", "상태", 180),
+            ("phase", "단계", 150),
+            ("rt", "왕복", 70),
+            ("next", "다음", 150),
             ("zip", "Zip", 70),
             ("fail", "Fail", 70),
         ):
             self.home_pair_tree.heading(column, text=heading)
-            self.home_pair_tree.column(column, width=width, stretch=(column in {"targets", "latest"}))
+            self.home_pair_tree.column(column, width=width, stretch=(column in {"targets", "latest", "phase", "next"}))
         self.home_pair_tree.grid(row=0, column=0, sticky="nsew")
         self.home_pair_tree.bind("<<TreeviewSelect>>", self.on_home_pair_selected)
 
@@ -2738,13 +3314,13 @@ class RelayOperatorPanel(tk.Tk):
         for idx, (label, callback, attr_name) in enumerate(
             [
                 ("선택 Pair 반영", self.apply_selected_home_pair, "home_apply_pair_button"),
-                ("선택 Pair 실행", self.run_selected_pair_drill, "home_run_pair_button"),
+                ("선택 Pair Headless Drill", self.run_selected_pair_drill, "home_run_pair_button"),
                 ("pair 활성화", self.enable_selected_pair, "home_enable_pair_button"),
                 ("pair 비활성화", self.disable_selected_pair, "home_disable_pair_button"),
-                ("watch 시작", self.start_watcher_detached, "home_start_watch_button"),
+                ("watch 시작(기본)", self.start_watcher_detached, "home_start_watch_button"),
                 ("Pair 상태 보기", self.run_paired_status, "home_pair_status_button"),
                 ("runroot 요약", self.run_paired_summary, "home_pair_summary_button"),
-                ("준비 전체 실행", self.run_prepare_all, "home_prepare_all_button"),
+                ("창/Attach/입력/RunRoot 준비", self.run_prepare_all, "home_prepare_all_button"),
                 ("기존 8창 재사용", self.reuse_existing_windows, "home_reuse_windows_button"),
                 ("열린 pair 재사용", self.reuse_active_pairs, "home_reuse_pairs_button"),
             ]
@@ -2752,6 +3328,8 @@ class RelayOperatorPanel(tk.Tk):
             button = ttk.Button(pair_actions, text=label, command=callback)
             button.grid(row=0, column=idx, padx=(0, 8))
             self.long_task_widgets.append(button)
+            if label in {"Pair 상태 보기", "runroot 요약"}:
+                self._register_read_only_widget(button)
             setattr(self, attr_name, button)
         ttk.Label(pair_frame, textvariable=self.home_pair_detail_var, wraplength=1200, justify="left").grid(row=2, column=0, sticky="w", pady=(8, 0))
 
@@ -2770,6 +3348,7 @@ class RelayOperatorPanel(tk.Tk):
         preview_actions.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(10, 0))
         for idx, (label, callback) in enumerate(
             [
+                ("선택 row 실행 기준 반영", self.apply_selected_inspection_context),
                 ("미리보기 JSON 저장", self.save_effective_json),
                 ("선택 행 문구 JSON/TXT 저장", self.export_selected_row_messages),
                 ("대상 폴더 열기", self.open_selected_target_folder),
@@ -2777,7 +3356,10 @@ class RelayOperatorPanel(tk.Tk):
                 ("summary 경로 복사", self.copy_selected_summary_path),
             ]
         ):
-            ttk.Button(preview_actions, text=label, command=callback).grid(row=0, column=idx, padx=(0, 8))
+            button = ttk.Button(preview_actions, text=label, command=callback)
+            button.grid(row=0, column=idx, padx=(0, 8))
+            if label == "선택 row 실행 기준 반영":
+                self.preview_apply_context_button = button
 
         self.row_tree = ttk.Treeview(
             preview_tab,
@@ -2849,6 +3431,7 @@ class RelayOperatorPanel(tk.Tk):
         self.board_quick_refresh_button = ttk.Button(board_actions, text="빠른 새로고침", command=self.refresh_quick_status)
         self.board_quick_refresh_button.grid(row=0, column=0, padx=(0, 8))
         self.long_task_widgets.append(self.board_quick_refresh_button)
+        self._register_read_only_widget(self.board_quick_refresh_button)
         self.board_attach_button = ttk.Button(board_actions, text="붙이기", command=self.attach_windows_from_bindings)
         self.board_attach_button.grid(row=0, column=1, padx=(0, 8))
         self.long_task_widgets.append(self.board_attach_button)
@@ -2861,6 +3444,8 @@ class RelayOperatorPanel(tk.Tk):
         self.board_visibility_button = ttk.Button(board_actions, text="입력 점검", command=self.run_visibility_check)
         self.board_visibility_button.grid(row=0, column=4)
         self.long_task_widgets.append(self.board_visibility_button)
+        self.board_apply_context_button = ttk.Button(board_actions, text="선택 target 반영", command=self.apply_selected_inspection_context)
+        self.board_apply_context_button.grid(row=0, column=5, padx=(8, 0))
 
         board_grid = tk.Frame(board_tab, bg="#f3f4f6")
         board_grid.grid(row=1, column=0, sticky="nsew", pady=(10, 0))
@@ -2887,7 +3472,8 @@ class RelayOperatorPanel(tk.Tk):
         ttk.Button(editor_actions, text="영향 요약", command=self.show_message_impact_summary).grid(row=0, column=4, padx=(0, 8))
         ttk.Button(editor_actions, text="Diff 보기", command=self.show_message_editor_diff).grid(row=0, column=5, padx=(0, 8))
         ttk.Button(editor_actions, text="현재 preview 복사", command=self.copy_current_message_preview).grid(row=0, column=6, padx=(0, 8))
-        ttk.Button(editor_actions, text="저장 + 새로고침", command=self.save_message_editor).grid(row=0, column=7, padx=(0, 8))
+        self.message_save_button = ttk.Button(editor_actions, text="저장 + 새로고침", command=self.save_message_editor)
+        self.message_save_button.grid(row=0, column=7, padx=(0, 8))
         ttk.Button(editor_actions, text="마지막 백업 롤백", command=self.rollback_message_editor).grid(row=0, column=8, padx=(0, 8))
         ttk.Label(editor_actions, textvariable=self.message_editor_status_var, wraplength=520, justify="left").grid(row=0, column=9, sticky="w")
         ttk.Label(editor_actions, textvariable=self.message_preview_status_var, wraplength=1180, justify="left").grid(row=1, column=0, columnspan=10, sticky="w", pady=(8, 0))
@@ -3106,7 +3692,8 @@ class RelayOperatorPanel(tk.Tk):
         artifact_filters.columnconfigure(5, weight=1)
 
         ttk.Label(artifact_filters, text="RunRoot").grid(row=0, column=0, sticky="w", padx=(0, 8))
-        ttk.Entry(artifact_filters, textvariable=self.run_root_var).grid(row=0, column=1, sticky="ew")
+        self.artifact_run_root_entry = ttk.Entry(artifact_filters, textvariable=self.artifact_run_root_filter_var)
+        self.artifact_run_root_entry.grid(row=0, column=1, sticky="ew")
         ttk.Label(artifact_filters, text="Pair 필터").grid(row=0, column=2, sticky="e", padx=(12, 8))
         self.artifact_pair_combo = ttk.Combobox(artifact_filters, textvariable=self.artifact_pair_filter_var, values=[""])
         self.artifact_pair_combo.grid(row=0, column=3, sticky="ew")
@@ -3225,18 +3812,94 @@ class RelayOperatorPanel(tk.Tk):
         self.artifact_details_text = scrolledtext.ScrolledText(artifact_details_frame, wrap="word")
         self.artifact_details_text.grid(row=0, column=0, sticky="nsew")
 
+        visible_tab = ttk.Frame(notebook, padding=10)
+        visible_tab.columnconfigure(0, weight=1)
+        visible_tab.rowconfigure(2, weight=1)
+        notebook.add(visible_tab, text="Visible Acceptance")
+        self.visible_acceptance_tab = visible_tab
+
+        visible_header = ttk.LabelFrame(visible_tab, text="shared visible 공식 절차", padding=8)
+        visible_header.grid(row=0, column=0, sticky="ew")
+        visible_header.columnconfigure(0, weight=1)
+        ttk.Label(visible_header, textvariable=self.visible_acceptance_status_var, font=("Segoe UI", 10, "bold")).grid(row=0, column=0, sticky="w")
+        ttk.Label(visible_header, textvariable=self.visible_acceptance_detail_var, wraplength=1200, justify="left").grid(row=1, column=0, sticky="w", pady=(6, 0))
+        ttk.Label(
+            visible_header,
+            text="Headless Drill과 분리된 운영 절차입니다. active를 못 돌리는 시점이면 confirm만 사용합니다.",
+            wraplength=1200,
+            justify="left",
+        ).grid(row=2, column=0, sticky="w", pady=(6, 0))
+
+        visible_actions = ttk.Frame(visible_tab)
+        visible_actions.grid(row=1, column=0, sticky="ew", pady=(10, 0))
+        visible_actions.columnconfigure(0, weight=1)
+        visible_actions.columnconfigure(1, weight=1)
+
+        visible_gate_frame = ttk.LabelFrame(visible_actions, text="실행 전 게이트", padding=8)
+        visible_gate_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+        for idx, (label, callback, attr_name) in enumerate(
+            [
+                ("queue cleanup dry-run", self.run_visible_queue_cleanup_dry_run, "visible_cleanup_dry_button"),
+                ("queue cleanup apply", self.run_visible_queue_cleanup_apply, "visible_cleanup_apply_button"),
+                ("visible preflight-only", self.run_visible_acceptance_preflight, "visible_preflight_button"),
+                ("post-cleanup", self.run_visible_post_cleanup, "visible_post_cleanup_button"),
+                ("clean preflight recheck", self.run_visible_clean_preflight_recheck, "visible_clean_preflight_button"),
+            ]
+        ):
+            button = ttk.Button(visible_gate_frame, text=label, command=callback)
+            button.grid(row=idx // 3, column=idx % 3, padx=(0, 8), pady=(0, 8), sticky="ew")
+            self.long_task_widgets.append(button)
+            setattr(self, attr_name, button)
+
+        visible_exec_frame = ttk.LabelFrame(visible_actions, text="실행 / 판정", padding=8)
+        visible_exec_frame.grid(row=0, column=1, sticky="nsew")
+        for idx, (label, callback, attr_name) in enumerate(
+            [
+                ("active visible acceptance", self.run_active_visible_acceptance, "visible_active_acceptance_button"),
+                ("shared visible confirm", self.run_shared_visible_confirm, "visible_confirm_button"),
+                ("receipt confirm", self.run_visible_receipt_confirm, "visible_receipt_confirm_button"),
+            ]
+        ):
+            button = ttk.Button(visible_exec_frame, text=label, command=callback)
+            button.grid(row=0, column=idx, padx=(0, 8))
+            self.long_task_widgets.append(button)
+            setattr(self, attr_name, button)
+        ttk.Label(
+            visible_exec_frame,
+            text="confirm은 pair disable 상태에서도 기존 RunRoot / receipt 재검증 용도로 유지됩니다.",
+            wraplength=520,
+            justify="left",
+        ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(8, 0))
+
+        visible_result_frame = ttk.LabelFrame(visible_tab, text="결과 / receipt 요약", padding=6)
+        visible_result_frame.grid(row=2, column=0, sticky="nsew", pady=(10, 0))
+        visible_result_frame.columnconfigure(0, weight=1)
+        visible_result_frame.rowconfigure(1, weight=1)
+        visible_receipt_actions = ttk.Frame(visible_result_frame)
+        visible_receipt_actions.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        self.visible_receipt_open_button = ttk.Button(visible_receipt_actions, text="receipt 열기", command=self.open_visible_receipt_path)
+        self.visible_receipt_open_button.grid(row=0, column=0, padx=(0, 8))
+        self.visible_receipt_copy_button = ttk.Button(visible_receipt_actions, text="receipt 경로 복사", command=self.copy_visible_receipt_path)
+        self.visible_receipt_copy_button.grid(row=0, column=1, padx=(0, 8))
+        self.visible_acceptance_text = scrolledtext.ScrolledText(visible_result_frame, wrap="word")
+        self.visible_acceptance_text.grid(row=1, column=0, sticky="nsew")
+
         ops_tab = ttk.Frame(notebook, padding=10)
         ops_tab.columnconfigure(0, weight=1)
-        ops_tab.rowconfigure(1, weight=1)
-        notebook.add(ops_tab, text="원문 / 진단")
+        ops_tab.rowconfigure(2, weight=1)
+        notebook.add(ops_tab, text="Headless Drill / 진단")
         self.ops_tab = ops_tab
 
         button_row = ttk.Frame(ops_tab)
         button_row.grid(row=0, column=0, sticky="ew")
         for idx, (label, callback) in enumerate(
             [
-                ("pair01 즉시 실행", self.run_fixed_pair01_drill),
-                ("선택된 Pair 드릴 실행", self.run_selected_pair_drill),
+                ("pair01 Headless Drill", self.run_fixed_pair01_drill),
+                ("선택된 Pair Headless Drill 실행", self.run_selected_pair_drill),
+                ("watch 시작(기본)", self.start_watcher_detached),
+                ("watch 시작(입력값)", self.start_watcher_with_options),
+                ("watch 일시중지", self.request_pause_watcher),
+                ("watch 재개", self.request_resume_watcher),
                 ("watch 정지 요청", self.request_stop_watcher),
                 ("watch 재시작", self.restart_watcher),
                 ("watch stale 정리", self.recover_stale_watcher_state),
@@ -3256,10 +3919,20 @@ class RelayOperatorPanel(tk.Tk):
             button = ttk.Button(button_row, text=label, command=callback)
             button.grid(row=0, column=idx, padx=(0, 8))
             self.long_task_widgets.append(button)
-            if label == "pair01 즉시 실행":
+            if label in READ_ONLY_OPS_BUTTON_LABELS:
+                self._register_read_only_widget(button)
+            if label == "pair01 Headless Drill":
                 self.fixed_pair01_button = button
-            elif label == "선택된 Pair 드릴 실행":
+            elif label == "선택된 Pair Headless Drill 실행":
                 self.selected_pair_button = button
+            elif label == "watch 시작(기본)":
+                self.ops_quick_start_watch_button = button
+            elif label == "watch 시작(입력값)":
+                self.ops_start_watch_button = button
+            elif label == "watch 일시중지":
+                self.ops_pause_watch_button = button
+            elif label == "watch 재개":
+                self.ops_resume_watch_button = button
             elif label == "watch 정지 요청":
                 self.ops_stop_watch_button = button
             elif label == "watch 재시작":
@@ -3267,15 +3940,62 @@ class RelayOperatorPanel(tk.Tk):
             elif label == "watch stale 정리":
                 self.ops_recover_watch_button = button
 
+        watcher_options_frame = ttk.LabelFrame(ops_tab, text="watch 시작 / 재시작 입력값", padding=8)
+        watcher_options_frame.grid(row=1, column=0, sticky="ew", pady=(10, 0))
+        for column in range(8):
+            watcher_options_frame.columnconfigure(column, weight=0)
+        watcher_options_frame.columnconfigure(7, weight=1)
+
+        ttk.Label(watcher_options_frame, text="MaxForwardCount").grid(row=0, column=0, sticky="w")
+        ttk.Entry(watcher_options_frame, textvariable=self.watcher_max_forward_var, width=8).grid(row=0, column=1, sticky="w", padx=(6, 12))
+        ttk.Label(watcher_options_frame, text="RunDurationSec").grid(row=0, column=2, sticky="w")
+        ttk.Entry(watcher_options_frame, textvariable=self.watcher_run_duration_var, width=8).grid(row=0, column=3, sticky="w", padx=(6, 12))
+        ttk.Label(watcher_options_frame, text="PairMaxRoundtripCount").grid(row=0, column=4, sticky="w")
+        ttk.Entry(watcher_options_frame, textvariable=self.watcher_pair_roundtrip_var, width=8).grid(row=0, column=5, sticky="w", padx=(6, 12))
+        self.ops_reset_watch_options_button = ttk.Button(
+            watcher_options_frame,
+            text="watch preset 기본값",
+            command=self.reset_watcher_start_options,
+        )
+        self.ops_reset_watch_options_button.grid(row=0, column=6, sticky="w")
+        self.ops_load_watch_options_button = ttk.Button(
+            watcher_options_frame,
+            text="현재 watcher 값 반영",
+            command=self.load_watcher_start_options_from_status,
+        )
+        self.ops_load_watch_options_button.grid(row=0, column=7, sticky="w", padx=(8, 0))
+        ttk.Label(
+            watcher_options_frame,
+            textvariable=self.watcher_quick_start_note_var,
+            wraplength=920,
+            justify="left",
+        ).grid(row=1, column=0, columnspan=8, sticky="w", pady=(8, 0))
+        ttk.Label(
+            watcher_options_frame,
+            textvariable=self.watcher_current_note_var,
+            wraplength=920,
+            justify="left",
+        ).grid(row=2, column=0, columnspan=8, sticky="w", pady=(6, 0))
+        ttk.Label(
+            watcher_options_frame,
+            textvariable=self.watcher_start_note_var,
+            wraplength=920,
+            justify="left",
+        ).grid(row=3, column=0, columnspan=8, sticky="w", pady=(6, 0))
+
         for child in controls.winfo_children():
             if isinstance(child, ttk.Combobox):
                 child.bind("<<ComboboxSelected>>", self.on_pair_or_target_changed)
 
         self.artifact_pair_combo.bind("<<ComboboxSelected>>", self.refresh_artifacts_tab)
         self.artifact_target_combo.bind("<<ComboboxSelected>>", self.refresh_artifacts_tab)
+        self.artifact_run_root_entry.bind("<Return>", self.refresh_artifacts_tab)
 
-        self.output_text = scrolledtext.ScrolledText(ops_tab, wrap="word")
-        self.output_text.grid(row=1, column=0, sticky="nsew", pady=(10, 0))
+        ttk.Label(
+            ops_tab,
+            text="작업 출력과 조회 결과는 하단 공용 패널에서 확인합니다.",
+            justify="left",
+        ).grid(row=2, column=0, sticky="w", pady=(10, 0))
 
         snapshots_tab = ttk.Frame(notebook, padding=10)
         snapshots_tab.columnconfigure(0, weight=1)
@@ -3357,9 +4077,18 @@ class RelayOperatorPanel(tk.Tk):
         if last_result:
             self.last_result_var.set(last_result)
 
+    def _apply_watcher_panel_update(self, update: WatcherPanelUpdate) -> None:
+        if update.command_text:
+            self.last_command_var.set(update.command_text)
+        self.set_text(self.output_text, update.output_text)
+        if update.operator_state or update.operator_hint or update.last_result:
+            self.set_operator_status(update.operator_state, update.operator_hint, update.last_result)
+
     def set_busy(self, state: str, hint: str) -> None:
         self._busy = True
         for widget in self.long_task_widgets:
+            if self._widget_is_read_only(widget):
+                continue
             widget.configure(state="disabled")
         self.set_operator_status(state, hint)
         if self.panel_state:
@@ -3385,6 +4114,7 @@ class RelayOperatorPanel(tk.Tk):
         success_hint: str,
         failure_state: str,
         failure_hint: str,
+        on_failure=None,
     ) -> None:
         if self._busy:
             messagebox.showwarning("작업 중", "다른 작업이 실행 중입니다. 현재 작업이 끝난 뒤 다시 시도하세요.")
@@ -3396,14 +4126,81 @@ class RelayOperatorPanel(tk.Tk):
             try:
                 result = worker()
             except Exception as exc:
-                self.after(0, lambda exc=exc: self._handle_background_failure(exc, failure_state, failure_hint))
+                self.after(0, lambda exc=exc: self._handle_background_failure(exc, failure_state, failure_hint, on_failure))
                 return
 
-            self.after(0, lambda result=result: self._handle_background_success(result, on_success, success_state, success_hint))
+            self.after(
+                0,
+                lambda result=result: self._handle_background_success(
+                    result,
+                    on_success,
+                    success_state,
+                    success_hint,
+                    failure_state,
+                    failure_hint,
+                ),
+            )
 
         threading.Thread(target=runner, daemon=True).start()
 
-    def _handle_background_failure(self, exc: Exception, state: str, hint: str) -> None:
+    def run_read_only_background_task(
+        self,
+        *,
+        label: str,
+        worker,
+        on_success,
+        on_failure=None,
+    ) -> None:
+        def runner() -> None:
+            try:
+                result = worker()
+            except Exception as exc:
+                self.after(0, lambda exc=exc: self._handle_read_only_background_failure(exc, label, on_failure))
+                return
+            self.after(0, lambda result=result: self._handle_read_only_background_success(result, label, on_success))
+
+        threading.Thread(target=runner, daemon=True).start()
+
+    def _handle_background_failure(self, exc: Exception, state: str, hint: str, on_failure=None) -> None:
+        rendered_exc = exc
+        output_text = self._format_background_exception(exc)
+        if on_failure is not None:
+            try:
+                replacement = on_failure(exc)
+                if isinstance(replacement, str) and replacement.strip():
+                    output_text = replacement
+            except Exception as callback_exc:
+                rendered_exc = callback_exc
+                output_text = (
+                    self._format_background_exception(callback_exc)
+                    + "\n\nOriginal Background Error:\n"
+                    + self._format_background_exception(exc)
+                )
+        self.set_text(self.output_text, output_text)
+        self.set_idle(state, hint, f"마지막 결과: 실패 ({rendered_exc})")
+
+    def _handle_read_only_background_failure(self, exc: Exception, label: str, on_failure=None) -> None:
+        rendered_exc = exc
+        output_text = self._format_background_exception(exc)
+        if on_failure is not None:
+            try:
+                replacement = on_failure(exc)
+                if isinstance(replacement, str) and replacement.strip():
+                    output_text = replacement
+            except Exception as callback_exc:
+                rendered_exc = callback_exc
+                output_text = (
+                    self._format_background_exception(callback_exc)
+                    + "\n\nOriginal Background Error:\n"
+                    + self._format_background_exception(exc)
+                )
+        self.set_query_text(output_text)
+        self.set_query_result(
+            f"마지막 조회: {label} 실패 ({rendered_exc})",
+            context=self._query_context_summary(),
+        )
+
+    def _handle_background_follow_up_failure(self, exc: Exception, state: str, hint: str) -> None:
         self.set_text(self.output_text, self._format_background_exception(exc))
         self.set_idle(state, hint, f"마지막 결과: 실패 ({exc})")
 
@@ -3423,15 +4220,92 @@ class RelayOperatorPanel(tk.Tk):
             lines.extend(["", "STDERR:", stderr])
         return "\n".join(lines)
 
-    def _handle_background_success(self, result, on_success, state: str, hint: str) -> None:
-        on_success(result)
-        self.set_idle(state, hint)
+    def _handle_read_only_background_success(self, result, label: str, on_success) -> None:
+        try:
+            on_success(result)
+        except Exception as exc:
+            self.set_query_text(self._format_background_exception(exc))
+            self.set_query_result(
+                f"마지막 조회: {label} 실패 ({exc})",
+                context=self._query_context_summary(),
+            )
+
+    def _handle_background_success(
+        self,
+        result,
+        on_success,
+        state: str,
+        hint: str,
+        failure_state: str,
+        failure_hint: str,
+    ) -> None:
+        idle_state = state
+        idle_hint = hint
+        last_result = ""
+        follow_up = None
+        success = False
+        try:
+            follow_up = on_success(result)
+            success = True
+        except Exception as exc:
+            idle_state = failure_state
+            idle_hint = failure_hint
+            last_result = f"마지막 결과: 실패 ({exc})"
+            self.set_text(self.output_text, self._format_background_exception(exc))
+        finally:
+            self.set_idle(idle_state, idle_hint, last_result)
+
+        if success and callable(follow_up):
+            try:
+                follow_up()
+            except Exception as exc:
+                self._handle_background_follow_up_failure(exc, failure_state, failure_hint)
 
     def _selected_preview_row(self) -> dict | None:
-        selection = self.row_tree.selection()
+        if not self._has_ui_attr("row_tree"):
+            return None
+        selection_method = getattr(self.row_tree, "selection", None)
+        if selection_method is None:
+            return None
+        selection = selection_method()
         if not selection:
             return None
         return self.preview_rows[int(selection[0])]
+
+    def _selected_inspection_context(self) -> tuple[str, str]:
+        inspection_context = self._selected_inspection_context_state()
+        return inspection_context.pair_id, inspection_context.target_id
+
+    def _set_inspection_context(
+        self,
+        *,
+        pair_id: str = "",
+        target_id: str = "",
+        source: str = "",
+        row_index: int | None = None,
+    ) -> InspectionContextState:
+        self.inspection_pair_id = str(pair_id or "").strip()
+        self.inspection_target_id = str(target_id or "").strip()
+        self.inspection_context_source = str(source or "").strip()
+        self.inspection_context_row_index = row_index if isinstance(row_index, int) else None
+        return self._stored_inspection_context_state()
+
+    def _selected_inspection_pair_id(self) -> str:
+        inspection_context = self._selected_inspection_context_state()
+        if inspection_context.pair_id:
+            return inspection_context.pair_id
+        return self._selected_pair_id()
+
+    def _selected_inspection_target_id(self) -> str:
+        return self._selected_inspection_context_state().target_id
+
+    def _inspection_context_differs_from_action(self) -> bool:
+        inspection_context = self._selected_inspection_context_state()
+        action_context = self._action_context_state()
+        return bool(
+            (inspection_context.pair_id and inspection_context.pair_id != action_context.pair_id)
+            or (inspection_context.target_id and inspection_context.target_id != action_context.target_id)
+        )
 
     def _copy_to_clipboard(self, value: str) -> None:
         self.clipboard_clear()
@@ -3483,6 +4357,8 @@ class RelayOperatorPanel(tk.Tk):
 
         selected_pair = self.pair_id_var.get().strip()
         selected_state = self.get_pair_activation_state(selected_pair) if selected_pair else None
+        home_pair_id = self._selected_home_pair_id() if self._has_ui_attr("home_pair_tree") else selected_pair
+        home_selected_state = self.get_pair_activation_state(home_pair_id) if home_pair_id else None
         if self._has_ui_attr("selected_pair_button"):
             enabled, _detail = self._selected_pair_execution_allowed()
             self.selected_pair_button.configure(state="normal" if enabled else "disabled")
@@ -3491,13 +4367,23 @@ class RelayOperatorPanel(tk.Tk):
             enabled, _detail = self._selected_pair_execution_allowed()
             self.home_run_pair_button.configure(state="normal" if enabled else "disabled")
 
+        if self._has_ui_attr("home_apply_pair_button"):
+            enabled = bool(home_pair_id) and home_pair_id != selected_pair
+            self.home_apply_pair_button.configure(state="normal" if enabled else "disabled")
+
         if self._has_ui_attr("home_enable_pair_button"):
-            enabled = bool(selected_pair) and not bool((selected_state or {}).get("EffectiveEnabled", True))
+            enabled = bool(home_pair_id) and not bool((home_selected_state or {}).get("EffectiveEnabled", True))
             self.home_enable_pair_button.configure(state="normal" if enabled else "disabled")
 
         if self._has_ui_attr("home_disable_pair_button"):
-            enabled = bool(selected_pair) and bool((selected_state or {}).get("EffectiveEnabled", True))
+            enabled = bool(home_pair_id) and bool((home_selected_state or {}).get("EffectiveEnabled", True))
             self.home_disable_pair_button.configure(state="normal" if enabled else "disabled")
+
+        inspection_apply_enabled = self._inspection_context_differs_from_action()
+        if self._has_ui_attr("preview_apply_context_button"):
+            self.preview_apply_context_button.configure(state="normal" if inspection_apply_enabled else "disabled")
+        if self._has_ui_attr("board_apply_context_button"):
+            self.board_apply_context_button.configure(state="normal" if inspection_apply_enabled else "disabled")
 
         start_eligibility = self._watcher_start_eligibility()
         stop_eligibility = self._watcher_stop_eligibility()
@@ -3506,6 +4392,10 @@ class RelayOperatorPanel(tk.Tk):
             self.home_start_watch_button.configure(state="normal" if watch_start_allowed else "disabled")
         if self._has_ui_attr("artifact_watch_button"):
             self.artifact_watch_button.configure(state="normal" if watch_start_allowed else "disabled")
+        if self._has_ui_attr("ops_start_watch_button"):
+            self.ops_start_watch_button.configure(state="normal" if watch_start_allowed else "disabled")
+        if self._has_ui_attr("ops_quick_start_watch_button"):
+            self.ops_quick_start_watch_button.configure(state="normal" if watch_start_allowed else "disabled")
         if self._has_ui_attr("ops_stop_watch_button"):
             self.ops_stop_watch_button.configure(state="normal" if stop_eligibility.allowed else "disabled")
         if self._has_ui_attr("ops_restart_watch_button"):
@@ -3513,14 +4403,50 @@ class RelayOperatorPanel(tk.Tk):
             self.ops_restart_watch_button.configure(state="normal" if restart_enabled else "disabled")
         if self._has_ui_attr("ops_recover_watch_button"):
             self.ops_recover_watch_button.configure(state="normal" if start_eligibility.cleanup_allowed else "disabled")
+        if self._has_ui_attr("ops_load_watch_options_button"):
+            watcher = ((self.paired_status_data or {}).get("Watcher", {}) or {})
+            self.ops_load_watch_options_button.configure(state="normal" if watcher else "disabled")
         if self._has_ui_attr("board_attach_button"):
             attach_allowed, _detail = self._attach_action_allowed()
             self.board_attach_button.configure(state="normal" if attach_allowed else "disabled")
 
+        visible_state = self._refresh_visible_acceptance_summary()
+        config_present = visible_state.config_present
+        if self._has_ui_attr("visible_cleanup_dry_button"):
+            self.visible_cleanup_dry_button.configure(state="normal" if config_present else "disabled")
+        if self._has_ui_attr("visible_cleanup_apply_button"):
+            self.visible_cleanup_apply_button.configure(state="normal" if config_present else "disabled")
+        if self._has_ui_attr("visible_preflight_button"):
+            self.visible_preflight_button.configure(state="normal" if visible_state.preflight_enabled else "disabled")
+        if self._has_ui_attr("visible_active_acceptance_button"):
+            self.visible_active_acceptance_button.configure(state="normal" if visible_state.active_enabled else "disabled")
+        if self._has_ui_attr("visible_post_cleanup_button"):
+            self.visible_post_cleanup_button.configure(state="normal" if visible_state.post_cleanup_enabled else "disabled")
+        if self._has_ui_attr("visible_clean_preflight_button"):
+            self.visible_clean_preflight_button.configure(state="normal" if visible_state.clean_preflight_enabled else "disabled")
+        if self._has_ui_attr("visible_confirm_button"):
+            self.visible_confirm_button.configure(state="normal" if visible_state.shared_confirm_enabled else "disabled")
+        if self._has_ui_attr("visible_receipt_confirm_button"):
+            self.visible_receipt_confirm_button.configure(state="normal" if visible_state.receipt_confirm_enabled else "disabled")
+        receipt_path = visible_state.receipt_path.strip() or self._current_visible_receipt_path().strip()
+        if self._has_ui_attr("visible_receipt_open_button"):
+            self.visible_receipt_open_button.configure(state="normal" if (bool(receipt_path) and Path(receipt_path).exists()) else "disabled")
+        if self._has_ui_attr("visible_receipt_copy_button"):
+            self.visible_receipt_copy_button.configure(state="normal" if bool(receipt_path) else "disabled")
+
     def on_pair_or_target_changed(self, _event: object | None = None) -> None:
+        self.action_context_source = "controls"
         selected_pair = self._selected_pair_id()
         selected_target = self.target_id_var.get().strip()
-        self._sync_preview_selection_with_pair(selected_pair, target_id=selected_target)
+        preview_synced = False
+        if self.preview_rows and self._selected_preview_row() is None:
+            preview_synced = self._sync_preview_selection_with_pair(selected_pair, target_id=selected_target)
+        if preview_synced:
+            self._sync_message_scope_id_from_context()
+            self._sync_home_pair_selection(selected_pair)
+            self.update_pair_button_states()
+            self.rebuild_panel_state()
+            return
         self._sync_message_scope_id_from_context()
         self._sync_home_pair_selection(self._selected_pair_id())
         self.render_target_board()
@@ -3603,6 +4529,20 @@ class RelayOperatorPanel(tk.Tk):
         if self.effective_data:
             return self.effective_data.get("RunContext", {}).get("SelectedRunRoot", "") or ""
         return ""
+
+    def _current_run_root_for_artifacts(self) -> str:
+        explicit = self.artifact_run_root_filter_var.get().strip()
+        if explicit:
+            return explicit
+        return self._current_run_root_for_actions()
+
+    def _artifact_run_root_uses_override(self) -> bool:
+        explicit = self.artifact_run_root_filter_var.get().strip()
+        action_run_root = self._current_run_root_for_actions().strip()
+        return bool(explicit and os.path.normcase(os.path.normpath(explicit)) != os.path.normcase(os.path.normpath(action_run_root or explicit)))
+
+    def _current_artifact_run_root_is_stale(self) -> bool:
+        return self._run_root_is_stale(self._current_run_root_for_artifacts())
 
     def export_selected_row_messages(self) -> None:
         row = self._selected_preview_row()
@@ -3687,14 +4627,26 @@ class RelayOperatorPanel(tk.Tk):
     def _selected_pair_id(self) -> str:
         return self.pair_id_var.get().strip() or "pair01"
 
-    def _selected_home_pair_id(self) -> str:
+    def _selected_home_pair_selection(self) -> str:
         selection = self.home_pair_tree.selection()
         if selection:
             return selection[0]
+        return ""
+
+    def _selected_home_pair_id(self) -> str:
+        selection = self._selected_home_pair_selection()
+        if selection:
+            return selection
         return self._selected_pair_id()
 
     def _selected_pair_summary(self) -> PairSummaryModel | None:
         return self.pair_controller.selected_summary(self.panel_state, self._selected_home_pair_id())
+
+    def _home_pair_detail_text(self, summary: PairSummaryModel | None) -> str:
+        detail = self.pair_controller.build_summary_detail(summary)
+        if summary and summary.pair_id != self._selected_pair_id():
+            detail += " / 실행 기준은 현재 선택 Pair를 유지합니다. 이 Pair로 실행하려면 '선택 Pair 반영'을 누르세요."
+        return detail
 
     def _launcher_wrapper_path(self) -> str:
         if self.effective_data:
@@ -3731,10 +4683,7 @@ class RelayOperatorPanel(tk.Tk):
             self.home_pair_tree.see(pair_id)
 
     def _extract_prepared_run_root(self, text: str) -> str:
-        match = re.search(r"prepared pair test root:\s*(.+)", text, flags=re.IGNORECASE)
-        if match:
-            return match.group(1).strip()
-        return ""
+        return extract_prepared_run_root(text)
 
     def _render_action_frame(self, frame: ttk.LabelFrame, actions: list[ActionModel]) -> None:
         for child in frame.winfo_children():
@@ -3757,7 +4706,7 @@ class RelayOperatorPanel(tk.Tk):
                 command=lambda action_key=action.action_key, command_text=action.command_text: self.handle_dashboard_action(action_key, command_text=command_text),
             )
             button.grid(row=0, column=1, rowspan=2, sticky="e", padx=(8, 0))
-            if self._busy:
+            if self._busy and not self._dashboard_action_is_read_only(action.action_key):
                 button.configure(state="disabled")
 
     def _render_issue_frame(self, frame: ttk.LabelFrame, issues: list[IssueModel]) -> None:
@@ -3776,7 +4725,7 @@ class RelayOperatorPanel(tk.Tk):
             ttk.Label(row, text=issue.detail, wraplength=520, justify="left").grid(row=1, column=0, sticky="w")
             button = ttk.Button(row, text=issue.action_label, command=lambda action_key=issue.action_key: self.handle_dashboard_action(action_key))
             button.grid(row=0, column=1, rowspan=2, sticky="e", padx=(8, 0))
-            if self._busy:
+            if self._busy and not self._dashboard_action_is_read_only(issue.action_key):
                 button.configure(state="disabled")
 
     def render_home_dashboard(self) -> None:
@@ -3786,11 +4735,12 @@ class RelayOperatorPanel(tk.Tk):
         config = self.effective_data.get("Config", {})
         run_context = self.effective_data.get("RunContext", {})
         self.home_context_var.set(
-            "Lane: {lane} | Config: {config_path} | Pair: {pair} | RunRoot: {run_root}".format(
+            "Lane: {lane} | Config: {config_path} | RunRoot: {run_root} | 실행: {action_context} | inspection: {inspection_context}".format(
                 lane=config.get("LaneName", "") or "(none)",
                 config_path=config.get("ConfigPath", "") or self.config_path_var.get().strip() or "(none)",
-                pair=self._selected_pair_id(),
                 run_root=self._current_run_root_display_text(),
+                action_context=self._action_context_summary(),
+                inspection_context=self._inspection_context_summary(),
             )
         )
         self.home_updated_at_var.set("마지막 갱신: {0}".format(self.effective_data.get("GeneratedAt", "-")))
@@ -3819,6 +4769,7 @@ class RelayOperatorPanel(tk.Tk):
                 continue
             vars_by_key["value"].set(card.value)
             vars_by_key["detail"].set(card.detail)
+        self._refresh_visible_acceptance_summary()
 
         for stage in self.panel_state.stages:
             vars_by_key = self.home_stage_vars.get(stage.key)
@@ -3835,6 +4786,7 @@ class RelayOperatorPanel(tk.Tk):
 
     def render_home_pair_summaries(self) -> None:
         current_pair = self._selected_pair_id()
+        selected_home_pair = self._selected_home_pair_selection() or current_pair
         for item in self.home_pair_tree.get_children():
             self.home_pair_tree.delete(item)
 
@@ -3852,23 +4804,27 @@ class RelayOperatorPanel(tk.Tk):
                     summary.targets,
                     "예" if summary.enabled else "아니오",
                     summary.latest_state,
+                    summary.current_phase or "-",
+                    summary.roundtrip_count,
+                    summary.next_expected_handoff or summary.next_action or "-",
                     summary.zip_count,
                     summary.failure_count,
                 ),
             )
 
-        self._sync_home_pair_selection(current_pair)
+        self._sync_home_pair_selection(selected_home_pair)
         summary = self._selected_pair_summary()
         if summary:
-            self.home_pair_detail_var.set(self.pair_controller.build_summary_detail(summary))
+            self.home_pair_detail_var.set(self._home_pair_detail_text(summary))
 
     def _artifact_query(self) -> ArtifactQuery:
+        query_context = self._artifact_query_context_state()
         return ArtifactQuery(
-            run_root=self._current_run_root_for_actions(),
-            pair_id=self.artifact_pair_filter_var.get().strip(),
-            target_id=self.artifact_target_filter_var.get().strip(),
-            latest_only=bool(self.artifact_latest_only_var.get()),
-            include_missing=bool(self.artifact_include_missing_var.get()),
+            run_root=query_context.run_root,
+            pair_id=query_context.pair_id,
+            target_id=query_context.target_id,
+            latest_only=query_context.latest_only,
+            include_missing=query_context.include_missing,
         )
 
     def _selected_artifact_state(self) -> TargetArtifactState | None:
@@ -3955,11 +4911,6 @@ class RelayOperatorPanel(tk.Tk):
             self.set_text(self.artifact_summary_text, "")
             self.set_text(self.artifact_details_text, "")
             return
-        if state.pair_id:
-            self.pair_id_var.set(state.pair_id)
-        if state.target_id:
-            self.target_id_var.set(state.target_id)
-        self.render_target_board()
 
         preview = self.artifact_controller.get_preview(self.artifact_states, state.target_id)
         if preview is None:
@@ -3976,7 +4927,15 @@ class RelayOperatorPanel(tk.Tk):
             contract_paths=contract_paths,
         )
         self.set_text(self.artifact_summary_text, preview.summary_text)
+        artifact_run_root = self._current_run_root_for_artifacts()
+        action_run_root = self._current_run_root_for_actions()
         detail_lines = [
+            f"조회 RunRoot: {artifact_run_root or '(없음)'}",
+            f"조회 RunRoot override: {self._artifact_run_root_uses_override()}",
+            f"조회 RunRoot stale 여부: {self._current_artifact_run_root_is_stale()}",
+            f"실행 RunRoot: {action_run_root or '(없음)'}",
+            f"실행 RunRoot stale 여부: {self._current_run_root_is_stale_for_actions()}",
+            "",
             f"제목: {preview.title}",
             f"계약 상태(LatestState): {preview.latest_state}",
             f"표시 상태: {preview.state_label or '(없음)'}",
@@ -4007,7 +4966,6 @@ class RelayOperatorPanel(tk.Tk):
             f"wrapper 경로 출처: {contract_paths.get('Source', '') or '(없음)'}",
             f"check wrapper 존재: {contract_paths.get('CheckScriptPathExists', False)}",
             f"submit wrapper 존재: {contract_paths.get('SubmitScriptPathExists', False)}",
-            f"선택 RunRoot stale 여부: {self._current_run_root_is_stale_for_actions()}",
             f"source memory warning: {self.artifact_source_memory_warning or '(없음)'}",
             f"상태 배지: {' '.join(self._artifact_warning_badges(state=state, contract_paths=contract_paths)) or '(없음)'}",
             "",
@@ -4359,23 +5317,26 @@ class RelayOperatorPanel(tk.Tk):
             return "마지막 결과: stale explicit RunRoot 무시 후 RunRoot 준비 완료"
         return "마지막 결과: RunRoot 준비 완료"
 
-    def _run_root_summary_text(self, run_root: str = "") -> str:
-        summary_run_root = run_root.strip() or self._current_run_root_for_actions()
-        if not summary_run_root:
-            return ""
-        command = self.command_service.build_script_command(
-            "show-paired-run-summary.ps1",
-            config_path=self.config_path_var.get().strip(),
-            run_root=summary_run_root,
+    @staticmethod
+    def _resolve_run_root_summary_run_root(*candidates: str) -> str:
+        return resolve_run_root_summary_run_root(*candidates)
+
+    def _run_root_summary_text_for(self, *, run_root: str, config_path: str) -> str:
+        return self._runtime_workflow().load_run_root_summary_text(
+            run_root=str(run_root or "").strip(),
+            config_path=config_path,
         )
-        try:
-            completed = self.command_service.run(command)
-        except Exception as exc:
-            return f"[runroot 요약]\n요약 불러오기 실패: {exc}"
-        output = completed.stdout.strip() or "(no output)"
-        if completed.stderr.strip():
-            output += "\n\nSTDERR:\n" + completed.stderr.strip()
-        return "[runroot 요약]\n" + output
+
+    def _run_root_summary_text(self, run_root: str = "", *, config_path: str = "") -> str:
+        summary_run_root = self._resolve_run_root_summary_run_root(
+            run_root,
+            self._current_run_root_for_actions(),
+        )
+        summary_config_path = str(config_path or self.config_path_var.get().strip())
+        return self._run_root_summary_text_for(
+            run_root=summary_run_root,
+            config_path=summary_config_path,
+        )
 
     def _requested_run_root_for_prepare(self) -> str:
         if self._prepare_run_root_override_to_ignore():
@@ -4390,8 +5351,10 @@ class RelayOperatorPanel(tk.Tk):
         badges: list[str] = []
         if str(getattr(self, "artifact_source_memory_warning", "") or "").strip():
             badges.append("[SOURCE MEMORY WARNING]")
-        if self._current_run_root_is_stale_for_actions():
-            badges.append("[STALE RUNROOT WARNING]")
+        if self._artifact_run_root_uses_override():
+            badges.append("[ARTIFACT RUNROOT OVERRIDE]")
+        if self._current_artifact_run_root_is_stale():
+            badges.append("[ARTIFACT RUNROOT STALE]")
         if state is not None:
             resolved_contract = contract_paths or self._resolve_artifact_contract_paths(state)
             if not bool(resolved_contract.get("CheckScriptPathExists", False)):
@@ -4520,15 +5483,15 @@ class RelayOperatorPanel(tk.Tk):
         wrapper_key: str,
         fallback_script_name: str,
         extra: list[str],
-    ) -> tuple[list[str], str, bool, dict[str, object]]:
+    ) -> ArtifactCommandPlan:
         contract_paths = self._resolve_artifact_contract_paths(state)
         wrapper_path = str(contract_paths.get(wrapper_key, "") or "").strip()
         if wrapper_path and Path(wrapper_path).exists():
-            return (
-                self.command_service.build_powershell_file_command(wrapper_path, extra=extra),
-                wrapper_path,
-                True,
-                contract_paths,
+            return ArtifactCommandPlan(
+                command=tuple(self.command_service.build_powershell_file_command(wrapper_path, extra=extra)),
+                execution_path=wrapper_path,
+                used_wrapper=True,
+                contract_paths=contract_paths,
             )
 
         command = self.command_service.build_script_command(
@@ -4538,9 +5501,14 @@ class RelayOperatorPanel(tk.Tk):
             target_id=state.target_id,
             extra=extra,
         )
-        return (command, str(ROOT / fallback_script_name), False, contract_paths)
+        return ArtifactCommandPlan(
+            command=tuple(command),
+            execution_path=str(ROOT / fallback_script_name),
+            used_wrapper=False,
+            contract_paths=contract_paths,
+        )
 
-    def _selected_artifact_action_context(self) -> tuple[TargetArtifactState, str, str] | None:
+    def _selected_artifact_action_context(self) -> ArtifactActionContextSnapshot | None:
         state = self._selected_artifact_state()
         if state is None:
             messagebox.showwarning("선택 필요", "target row를 먼저 선택하세요.")
@@ -4551,12 +5519,69 @@ class RelayOperatorPanel(tk.Tk):
             messagebox.showwarning("RunRoot 필요", "artifact 검증/가져오기에는 RunRoot가 필요합니다.")
             return None
 
+        artifact_run_root = self._current_run_root_for_artifacts()
+        if artifact_run_root:
+            normalized_artifact = os.path.normcase(os.path.normpath(artifact_run_root))
+            normalized_action = os.path.normcase(os.path.normpath(run_root))
+            if normalized_artifact != normalized_action:
+                confirmed = messagebox.askyesno(
+                    "Artifact 실행 RunRoot 확인",
+                    "\n".join(
+                        [
+                            "현재 결과 / 산출물 탭은 action RunRoot와 다른 RunRoot를 조회 중입니다.",
+                            "",
+                            f"조회 RunRoot: {artifact_run_root}",
+                            f"실행 RunRoot: {run_root}",
+                            "",
+                            "artifact check/submit은 실행 RunRoot 기준 target folder 계약에 기록됩니다.",
+                            "계속할까요?",
+                        ]
+                    ),
+                    parent=self,
+                )
+                if not confirmed:
+                    return None
+
         config_path = self.config_path_var.get().strip()
         if not config_path:
             messagebox.showwarning("설정 필요", "artifact 검증/가져오기에는 ConfigPath가 필요합니다.")
             return None
 
-        return state, config_path, run_root
+        return ArtifactActionContextSnapshot(
+            state=state,
+            config_path=config_path,
+            run_root=run_root,
+            run_root_is_stale=self._run_root_is_stale(run_root),
+        )
+
+    def _record_artifact_action_result(
+        self,
+        *,
+        action: str,
+        status: str,
+        context: ArtifactActionContextSnapshot,
+        sources: ArtifactSourceSelection,
+        plan: ArtifactCommandPlan,
+        requires_overwrite: bool = False,
+        latest_state: str = "",
+        latest_zip_path: str = "",
+        error: str = "",
+    ) -> None:
+        self._remember_artifact_action_result(
+            context.state.target_id,
+            build_artifact_action_record(
+                action=action,
+                status=status,
+                context=context,
+                sources=sources,
+                plan=plan,
+                recorded_at=datetime.now().isoformat(timespec="seconds"),
+                requires_overwrite=requires_overwrite,
+                latest_state=latest_state,
+                latest_zip_path=latest_zip_path,
+                error=error,
+            ),
+        )
 
     def _prompt_external_artifact_sources(self, state: TargetArtifactState) -> tuple[str, str] | None:
         contract_paths = self._resolve_artifact_contract_paths(state)
@@ -4647,63 +5672,47 @@ class RelayOperatorPanel(tk.Tk):
         context = self._selected_artifact_action_context()
         if context is None:
             return
-        state, config_path, run_root = context
-        selected_sources = self._prompt_external_artifact_sources(state)
+        selected_sources = self._prompt_external_artifact_sources(context.state)
         if selected_sources is None:
             return
-        summary_path, review_zip_path = selected_sources
-        self._remember_artifact_sources(state.target_id, summary_path, review_zip_path)
+        sources = ArtifactSourceSelection(*selected_sources)
+        self._remember_artifact_sources(context.state.target_id, sources.summary_path, sources.review_zip_path)
 
-        command, execution_path, used_wrapper, contract_paths = self._build_artifact_action_command(
-            state=state,
-            config_path=config_path,
-            run_root=run_root,
+        plan = self._build_artifact_action_command(
+            state=context.state,
+            config_path=context.config_path,
+            run_root=context.run_root,
             wrapper_key="CheckScriptPath",
             fallback_script_name="check-paired-exchange-artifact.ps1",
             extra=[
                 "-SummarySourcePath",
-                summary_path,
+                sources.summary_path,
                 "-ReviewZipSourcePath",
-                review_zip_path,
+                sources.review_zip_path,
                 "-AsJson",
             ],
         )
-        self._remember_artifact_action_result(
-            state.target_id,
-            {
-                "Action": "check",
-                "Status": "running",
-                "RecordedAt": datetime.now().isoformat(timespec="seconds"),
-                "UsedWrapper": used_wrapper,
-                "ExecutionPath": execution_path,
-                "SummarySourcePath": summary_path,
-                "ReviewZipSourcePath": review_zip_path,
-                "RunRoot": run_root,
-                "RunRootIsStale": self._current_run_root_is_stale_for_actions(),
-            },
+        self._record_artifact_action_result(
+            action="check",
+            status="running",
+            context=context,
+            sources=sources,
+            plan=plan,
         )
-        self.last_command_var.set(subprocess.list2cmdline(command))
+        self.last_command_var.set(subprocess.list2cmdline(list(plan.command)))
 
         def worker() -> subprocess.CompletedProcess[str]:
-            try:
-                return self.command_service.run(command)
-            except Exception as exc:
-                self._remember_artifact_action_result(
-                    state.target_id,
-                    {
-                        "Action": "check",
-                        "Status": "failed",
-                        "RecordedAt": datetime.now().isoformat(timespec="seconds"),
-                        "UsedWrapper": used_wrapper,
-                        "ExecutionPath": execution_path,
-                        "SummarySourcePath": summary_path,
-                        "ReviewZipSourcePath": review_zip_path,
-                        "RunRoot": run_root,
-                        "RunRootIsStale": self._current_run_root_is_stale_for_actions(),
-                        "Error": str(exc),
-                    },
-                )
-                raise
+            return self.command_service.run(list(plan.command))
+
+        def on_failure(exc: Exception) -> None:
+            self._record_artifact_action_result(
+                action="check",
+                status="failed",
+                context=context,
+                sources=sources,
+                plan=plan,
+                error=str(exc),
+            )
 
         def on_success(completed: subprocess.CompletedProcess[str]) -> None:
             payload = json.loads(completed.stdout)
@@ -4711,32 +5720,27 @@ class RelayOperatorPanel(tk.Tk):
             validation = payload.get("Validation", {}) or {}
             preflight = payload.get("Preflight", {}) or {}
             current_target = payload.get("PreImportStatus", {}) or {}
-            self._remember_artifact_action_result(
-                state.target_id,
-                {
-                    "Action": "check",
-                    "Status": "success",
-                    "RecordedAt": datetime.now().isoformat(timespec="seconds"),
-                    "UsedWrapper": used_wrapper,
-                    "ExecutionPath": execution_path,
-                    "SummarySourcePath": summary_path,
-                    "ReviewZipSourcePath": review_zip_path,
-                    "RunRoot": run_root,
-                    "RunRootIsStale": self._current_run_root_is_stale_for_actions(),
-                    "RequiresOverwrite": bool(validation.get("RequiresOverwrite", False)),
-                    "LatestState": str(preflight.get("CurrentLatestState", "") or current_target.get("LatestState", "") or ""),
-                    "LatestZipPath": str(preflight.get("DestinationZipPath", "") or ""),
-                },
+            latest_state = str(preflight.get("CurrentLatestState", "") or current_target.get("LatestState", "") or "")
+            latest_zip_path = str(preflight.get("DestinationZipPath", "") or "")
+            self._record_artifact_action_result(
+                action="check",
+                status="success",
+                context=context,
+                sources=sources,
+                plan=plan,
+                requires_overwrite=bool(validation.get("RequiresOverwrite", False)),
+                latest_state=latest_state,
+                latest_zip_path=latest_zip_path,
             )
             header_lines = [
                 "artifact check 실행",
-                f"실행 경로: {execution_path}",
-                f"target-local wrapper 사용: {'예' if used_wrapper else '아니오 (root fallback)'}",
-                f"wrapper 경로 출처: {contract_paths.get('Source', '') or '(없음)'}",
+                f"실행 경로: {plan.execution_path}",
+                f"target-local wrapper 사용: {'예' if plan.used_wrapper else '아니오 (root fallback)'}",
+                f"wrapper 경로 출처: {plan.contract_paths.get('Source', '') or '(없음)'}",
             ]
-            if not used_wrapper:
+            if not plan.used_wrapper:
                 header_lines.append("LEGACY FALLBACK WARNING: target-local wrapper 없이 root fallback check를 사용했습니다.")
-            if self._current_run_root_is_stale_for_actions():
+            if context.run_root_is_stale:
                 header_lines.append("주의: 현재 선택된 RunRoot가 stale 표시입니다. 새 wrapper가 없는 예전 run일 수 있습니다.")
             self.set_text(
                 self.output_text,
@@ -4746,176 +5750,258 @@ class RelayOperatorPanel(tk.Tk):
 
         self.run_background_task(
             state="artifact check 실행 중",
-            hint=f"{state.target_id} target-local check wrapper 또는 fallback 검증을 수행 중입니다.",
+            hint=f"{context.state.target_id} target-local check wrapper 또는 fallback 검증을 수행 중입니다.",
             worker=worker,
             on_success=on_success,
             success_state="artifact check 실행 완료",
             success_hint="검증 결과 JSON과 실행 경로를 출력했습니다.",
             failure_state="artifact check 실행 실패",
             failure_hint="선택한 summary/zip 경로, target wrapper 경로, RunRoot 계약을 확인하세요.",
+            on_failure=on_failure,
         )
 
     def import_selected_external_artifact(self) -> None:
         context = self._selected_artifact_action_context()
         if context is None:
             return
-        state, config_path, run_root = context
-        selected_sources = self._prompt_external_artifact_sources(state)
+        selected_sources = self._prompt_external_artifact_sources(context.state)
         if selected_sources is None:
             return
-        summary_path, review_zip_path = selected_sources
-        self._remember_artifact_sources(state.target_id, summary_path, review_zip_path)
-        if not self._confirm_recent_submit_repeat(state.target_id):
+        sources = ArtifactSourceSelection(*selected_sources)
+        self._remember_artifact_sources(context.state.target_id, sources.summary_path, sources.review_zip_path)
+        if not self._confirm_recent_submit_repeat(context.state.target_id):
             return
 
-        check_command, check_execution_path, check_used_wrapper, contract_paths = self._build_artifact_action_command(
-            state=state,
-            config_path=config_path,
-            run_root=run_root,
+        check_plan = self._build_artifact_action_command(
+            state=context.state,
+            config_path=context.config_path,
+            run_root=context.run_root,
             wrapper_key="CheckScriptPath",
             fallback_script_name="check-paired-exchange-artifact.ps1",
             extra=[
                 "-SummarySourcePath",
-                summary_path,
+                sources.summary_path,
                 "-ReviewZipSourcePath",
-                review_zip_path,
+                sources.review_zip_path,
                 "-AsJson",
             ],
         )
-        try:
-            check_payload = self.command_service.run_json(check_command)
-        except Exception as exc:
-            self.set_text(self.output_text, str(exc))
-            messagebox.showwarning("외부 artifact 검증 실패", "선택한 summary/zip 경로와 target 계약을 먼저 확인하세요.", parent=self)
-            return
+        def worker() -> subprocess.CompletedProcess[str]:
+            return self.command_service.run(list(check_plan.command))
 
-        preflight_text = self._format_external_artifact_preflight(check_payload)
-        preflight_header_lines = [
-            "artifact submit 사전검사",
-            f"check 실행 경로: {check_execution_path}",
-            f"target-local wrapper 사용: {'예' if check_used_wrapper else '아니오 (root fallback)'}",
-            f"wrapper 경로 출처: {contract_paths.get('Source', '') or '(없음)'}",
-        ]
-        if not check_used_wrapper:
-            preflight_header_lines.append("LEGACY FALLBACK WARNING: target-local wrapper 없이 root fallback check를 사용했습니다.")
-        if self._current_run_root_is_stale_for_actions():
-            preflight_header_lines.append("주의: 현재 선택된 RunRoot가 stale 표시입니다. 새 wrapper가 없는 예전 run일 수 있습니다.")
-        self.set_text(
-            self.output_text,
-            "\n".join(preflight_header_lines) + "\n\n" + preflight_text + "\n\nJSON\n" + json.dumps(check_payload, ensure_ascii=False, indent=2),
-        )
+        def on_failure(exc: Exception) -> None:
+            self._record_artifact_action_result(
+                action="submit-preflight",
+                status="failed",
+                context=context,
+                sources=sources,
+                plan=check_plan,
+                error=str(exc),
+            )
 
-        validation = check_payload.get("Validation", {}) or {}
-        if not bool(validation.get("Ok", False)):
-            messagebox.showwarning("외부 artifact import 차단", "입력 artifact 검증에 실패했습니다. output 영역의 preflight 결과를 먼저 확인하세요.", parent=self)
-            return
+        def on_success(completed: subprocess.CompletedProcess[str]):
+            check_payload = json.loads(completed.stdout)
+            preflight_text = self._format_external_artifact_preflight(check_payload)
+            validation = check_payload.get("Validation", {}) or {}
+            preflight = check_payload.get("Preflight", {}) or {}
+            current_target = check_payload.get("PreImportStatus", {}) or {}
+            requires_overwrite = bool(validation.get("RequiresOverwrite", False))
+            latest_state = str(preflight.get("CurrentLatestState", "") or current_target.get("LatestState", "") or "")
+            latest_zip_path = str(preflight.get("DestinationZipPath", "") or "")
+            preflight_header_lines = [
+                "artifact submit 사전검사",
+                f"check 실행 경로: {check_plan.execution_path}",
+                f"target-local wrapper 사용: {'예' if check_plan.used_wrapper else '아니오 (root fallback)'}",
+                f"wrapper 경로 출처: {check_plan.contract_paths.get('Source', '') or '(없음)'}",
+            ]
+            if not check_plan.used_wrapper:
+                preflight_header_lines.append("LEGACY FALLBACK WARNING: target-local wrapper 없이 root fallback check를 사용했습니다.")
+            if context.run_root_is_stale:
+                preflight_header_lines.append("주의: 현재 선택된 RunRoot가 stale 표시입니다. 새 wrapper가 없는 예전 run일 수 있습니다.")
+            self.set_text(
+                self.output_text,
+                "\n".join(preflight_header_lines) + "\n\n" + preflight_text + "\n\nJSON\n" + json.dumps(check_payload, ensure_ascii=False, indent=2),
+            )
 
-        requires_overwrite = bool(validation.get("RequiresOverwrite", False))
-        confirm_lines = [
-            f"target: {state.target_id}",
-            f"source summary: {summary_path}",
-            f"source zip: {review_zip_path}",
-            f"check 실행 경로: {check_execution_path}",
-            f"wrapper 사용: {'예' if check_used_wrapper else '아니오 (root fallback)'}",
-            "",
-            preflight_text,
-            "",
-            "현재 RunRoot target folder 계약으로 summary.txt, review zip, done.json, result.json을 기록할까요?",
-        ]
-        if self._current_run_root_is_stale_for_actions():
-            confirm_lines.append("주의: 선택된 RunRoot가 stale 표시입니다. 새 RunRoot로 다시 준비한 wrapper가 아닐 수 있습니다.")
-        if requires_overwrite:
-            confirm_lines.append("이 import는 기존 contract 파일 또는 현재 성공 상태를 덮어씁니다. 계속하려면 overwrite를 명시적으로 승인해야 합니다.")
+            if not bool(validation.get("Ok", False)):
+                self._record_artifact_action_result(
+                    action="submit-preflight",
+                    status="blocked",
+                    context=context,
+                    sources=sources,
+                    plan=check_plan,
+                    requires_overwrite=requires_overwrite,
+                    latest_state=latest_state,
+                    latest_zip_path=latest_zip_path,
+                )
+                messagebox.showwarning("외부 artifact import 차단", "입력 artifact 검증에 실패했습니다. output 영역의 preflight 결과를 먼저 확인하세요.", parent=self)
+                return None
 
-        confirmed = messagebox.askyesno(
-            "외부 artifact import" if not requires_overwrite else "외부 artifact import (overwrite)",
-            "\n".join(confirm_lines),
-            parent=self,
-        )
-        if not confirmed:
-            return
+            self._record_artifact_action_result(
+                action="submit-preflight",
+                status="success",
+                context=context,
+                sources=sources,
+                plan=check_plan,
+                requires_overwrite=requires_overwrite,
+                latest_state=latest_state,
+                latest_zip_path=latest_zip_path,
+            )
 
-        extra = [
-            "-SummarySourcePath", summary_path,
-            "-ReviewZipSourcePath", review_zip_path,
-            "-AsJson",
-        ]
-        if requires_overwrite:
-            extra.append("-Overwrite")
+            confirm_lines = [
+                f"target: {context.state.target_id}",
+                f"source summary: {sources.summary_path}",
+                f"source zip: {sources.review_zip_path}",
+                f"check 실행 경로: {check_plan.execution_path}",
+                f"wrapper 사용: {'예' if check_plan.used_wrapper else '아니오 (root fallback)'}",
+                "",
+                preflight_text,
+                "",
+                "현재 RunRoot target folder 계약으로 summary.txt, review zip, done.json, result.json을 기록할까요?",
+            ]
+            if context.run_root_is_stale:
+                confirm_lines.append("주의: 선택된 RunRoot가 stale 표시입니다. 새 RunRoot로 다시 준비한 wrapper가 아닐 수 있습니다.")
+            if requires_overwrite:
+                confirm_lines.append("이 import는 기존 contract 파일 또는 현재 성공 상태를 덮어씁니다. 계속하려면 overwrite를 명시적으로 승인해야 합니다.")
 
-        command, submit_execution_path, submit_used_wrapper, submit_contract_paths = self._build_artifact_action_command(
-            state=state,
-            config_path=config_path,
-            run_root=run_root,
-            wrapper_key="SubmitScriptPath",
-            fallback_script_name="import-paired-exchange-artifact.ps1",
-            extra=extra,
-        )
-        if not submit_used_wrapper:
-            fallback_confirmed = messagebox.askyesno(
-                "legacy fallback submit 확인",
-                "\n".join(
-                    [
-                        f"{state.target_id} submit이 target-local wrapper 없이 legacy fallback 경로로 실행됩니다.",
-                        f"실행 경로: {submit_execution_path}",
-                        f"wrapper 경로 출처: {submit_contract_paths.get('Source', '') or '(없음)'}",
-                        "이 경로는 예전 RunRoot 호환용입니다. 새 RunRoot를 다시 준비하지 않았다면 혼선 가능성이 큽니다.",
-                        "",
-                        "정말 fallback submit을 계속할까요?",
-                    ]
-                ),
+            confirmed = messagebox.askyesno(
+                "외부 artifact import" if not requires_overwrite else "외부 artifact import (overwrite)",
+                "\n".join(confirm_lines),
                 parent=self,
             )
-            if not fallback_confirmed:
-                return
+            if not confirmed:
+                self._record_artifact_action_result(
+                    action="submit-preflight",
+                    status="cancelled",
+                    context=context,
+                    sources=sources,
+                    plan=check_plan,
+                    requires_overwrite=requires_overwrite,
+                    latest_state=latest_state,
+                    latest_zip_path=latest_zip_path,
+                )
+                return None
 
-        if not self._begin_submit_action(state.target_id):
-            messagebox.showwarning("submit 진행 중", f"{state.target_id} submit이 이미 진행 중입니다.", parent=self)
-            return
+            extra = [
+                "-SummarySourcePath",
+                sources.summary_path,
+                "-ReviewZipSourcePath",
+                sources.review_zip_path,
+                "-AsJson",
+            ]
+            if requires_overwrite:
+                extra.append("-Overwrite")
 
-        self._remember_artifact_action_result(
-            state.target_id,
-            {
-                "Action": "submit",
-                "Status": "running",
-                "RecordedAt": datetime.now().isoformat(timespec="seconds"),
-                "UsedWrapper": submit_used_wrapper,
-                "ExecutionPath": submit_execution_path,
-                "SummarySourcePath": summary_path,
-                "ReviewZipSourcePath": review_zip_path,
-                "RunRoot": run_root,
-                "RunRootIsStale": self._current_run_root_is_stale_for_actions(),
-                "RequiresOverwrite": requires_overwrite,
-                "LatestState": str((check_payload.get("PreImportStatus", {}) or {}).get("LatestState", "") or ""),
-                "LatestZipPath": str((check_payload.get("Preflight", {}) or {}).get("DestinationZipPath", "") or ""),
-            },
+            submit_plan = self._build_artifact_action_command(
+                state=context.state,
+                config_path=context.config_path,
+                run_root=context.run_root,
+                wrapper_key="SubmitScriptPath",
+                fallback_script_name="import-paired-exchange-artifact.ps1",
+                extra=extra,
+            )
+            if not submit_plan.used_wrapper:
+                fallback_confirmed = messagebox.askyesno(
+                    "legacy fallback submit 확인",
+                    "\n".join(
+                        [
+                            f"{context.state.target_id} submit이 target-local wrapper 없이 legacy fallback 경로로 실행됩니다.",
+                            f"실행 경로: {submit_plan.execution_path}",
+                            f"wrapper 경로 출처: {submit_plan.contract_paths.get('Source', '') or '(없음)'}",
+                            "이 경로는 예전 RunRoot 호환용입니다. 새 RunRoot를 다시 준비하지 않았다면 혼선 가능성이 큽니다.",
+                            "",
+                            "정말 fallback submit을 계속할까요?",
+                        ]
+                    ),
+                    parent=self,
+                )
+                if not fallback_confirmed:
+                    self._record_artifact_action_result(
+                        action="submit-preflight",
+                        status="cancelled",
+                        context=context,
+                        sources=sources,
+                        plan=check_plan,
+                        requires_overwrite=requires_overwrite,
+                        latest_state=latest_state,
+                        latest_zip_path=latest_zip_path,
+                    )
+                    return None
+
+            if not self._begin_submit_action(context.state.target_id):
+                self._record_artifact_action_result(
+                    action="submit-preflight",
+                    status="blocked",
+                    context=context,
+                    sources=sources,
+                    plan=check_plan,
+                    requires_overwrite=requires_overwrite,
+                    latest_state=latest_state,
+                    latest_zip_path=latest_zip_path,
+                )
+                messagebox.showwarning("submit 진행 중", f"{context.state.target_id} submit이 이미 진행 중입니다.", parent=self)
+                return None
+
+            launch_request = ArtifactSubmitLaunchRequest(
+                preflight=ArtifactSubmitPreflight(
+                    context=context,
+                    sources=sources,
+                    check_plan=check_plan,
+                    payload=check_payload,
+                    preflight_text=preflight_text,
+                    requires_overwrite=requires_overwrite,
+                    latest_state=latest_state,
+                    latest_zip_path=latest_zip_path,
+                ),
+                submit_plan=submit_plan,
+            )
+            return lambda request=launch_request: self._execute_artifact_submit(request)
+
+        self.run_background_task(
+            state="artifact submit 사전검사 중",
+            hint=f"{context.state.target_id} submit 전 target-local check wrapper 또는 fallback 검증을 수행 중입니다.",
+            worker=worker,
+            on_success=on_success,
+            success_state="artifact submit 사전검사 완료",
+            success_hint="preflight 결과를 확인한 뒤 submit을 이어서 실행할 수 있습니다.",
+            failure_state="artifact submit 사전검사 실패",
+            failure_hint="summary/zip 경로, target wrapper 경로, RunRoot target 계약을 확인하세요.",
+            on_failure=on_failure,
         )
-        self.last_command_var.set(subprocess.list2cmdline(command))
+
+    def _execute_artifact_submit(self, request: ArtifactSubmitLaunchRequest) -> None:
+        context = request.preflight.context
+        sources = request.preflight.sources
+        submit_plan = request.submit_plan
+        requires_overwrite = request.preflight.requires_overwrite
+        self._record_artifact_action_result(
+            action="submit",
+            status="running",
+            context=context,
+            sources=sources,
+            plan=submit_plan,
+            requires_overwrite=requires_overwrite,
+            latest_state=request.preflight.latest_state,
+            latest_zip_path=request.preflight.latest_zip_path,
+        )
+        self.last_command_var.set(subprocess.list2cmdline(list(submit_plan.command)))
 
         def worker() -> subprocess.CompletedProcess[str]:
-            try:
-                return self.command_service.run(command)
-            except Exception as exc:
-                self._remember_artifact_action_result(
-                    state.target_id,
-                    {
-                        "Action": "submit",
-                        "Status": "failed",
-                        "RecordedAt": datetime.now().isoformat(timespec="seconds"),
-                        "UsedWrapper": submit_used_wrapper,
-                        "ExecutionPath": submit_execution_path,
-                        "SummarySourcePath": summary_path,
-                        "ReviewZipSourcePath": review_zip_path,
-                        "RunRoot": run_root,
-                        "RunRootIsStale": self._current_run_root_is_stale_for_actions(),
-                        "RequiresOverwrite": requires_overwrite,
-                        "LatestState": str((check_payload.get("PreImportStatus", {}) or {}).get("LatestState", "") or ""),
-                        "LatestZipPath": str((check_payload.get("Preflight", {}) or {}).get("DestinationZipPath", "") or ""),
-                        "Error": str(exc),
-                    },
-                )
-                self._finish_submit_action(state.target_id)
-                raise
+            return self.command_service.run(list(submit_plan.command))
+
+        def on_failure(exc: Exception) -> None:
+            self._record_artifact_action_result(
+                action="submit",
+                status="failed",
+                context=context,
+                sources=sources,
+                plan=submit_plan,
+                requires_overwrite=requires_overwrite,
+                latest_state=request.preflight.latest_state,
+                latest_zip_path=request.preflight.latest_zip_path,
+                error=str(exc),
+            )
+            self._finish_submit_action(context.state.target_id)
 
         def on_success(completed: subprocess.CompletedProcess[str]) -> None:
             try:
@@ -4923,38 +6009,33 @@ class RelayOperatorPanel(tk.Tk):
                 preflight_text = self._format_external_artifact_preflight(payload)
                 post_import_status = payload.get("PostImportStatus", {}) or {}
                 contract = payload.get("Contract", {}) or {}
-                self._remember_artifact_action_result(
-                    state.target_id,
-                    {
-                        "Action": "submit",
-                        "Status": "success",
-                        "RecordedAt": datetime.now().isoformat(timespec="seconds"),
-                        "UsedWrapper": submit_used_wrapper,
-                        "ExecutionPath": submit_execution_path,
-                        "SummarySourcePath": summary_path,
-                        "ReviewZipSourcePath": review_zip_path,
-                        "RunRoot": run_root,
-                        "RunRootIsStale": self._current_run_root_is_stale_for_actions(),
-                        "RequiresOverwrite": requires_overwrite,
-                        "LatestState": str(post_import_status.get("LatestState", "") or ""),
-                        "LatestZipPath": str(contract.get("DestinationZipPath", "") or contract.get("LatestZipPath", "") or ""),
-                    },
+                latest_state = str(post_import_status.get("LatestState", "") or "")
+                latest_zip_path = str(contract.get("DestinationZipPath", "") or contract.get("LatestZipPath", "") or "")
+                self._record_artifact_action_result(
+                    action="submit",
+                    status="success",
+                    context=context,
+                    sources=sources,
+                    plan=submit_plan,
+                    requires_overwrite=requires_overwrite,
+                    latest_state=latest_state,
+                    latest_zip_path=latest_zip_path,
                 )
                 header_lines = [
                     "artifact submit 실행",
-                    f"submit 실행 경로: {submit_execution_path}",
-                    f"target-local wrapper 사용: {'예' if submit_used_wrapper else '아니오 (root fallback)'}",
-                    f"wrapper 경로 출처: {submit_contract_paths.get('Source', '') or '(없음)'}",
+                    f"submit 실행 경로: {submit_plan.execution_path}",
+                    f"target-local wrapper 사용: {'예' if submit_plan.used_wrapper else '아니오 (root fallback)'}",
+                    f"wrapper 경로 출처: {submit_plan.contract_paths.get('Source', '') or '(없음)'}",
                 ]
-                if not submit_used_wrapper:
+                if not submit_plan.used_wrapper:
                     header_lines.append("LEGACY FALLBACK WARNING: target-local wrapper 없이 root fallback submit을 사용했습니다.")
-                if self._current_run_root_is_stale_for_actions():
+                if context.run_root_is_stale:
                     header_lines.append("주의: 현재 선택된 RunRoot가 stale 표시입니다. 새 RunRoot로 다시 준비한 wrapper가 아닐 수 있습니다.")
                 header_lines.extend(
                     [
                         f"RequiresOverwrite: {requires_overwrite}",
-                        f"계약 LatestState: {post_import_status.get('LatestState', '') or '(없음)'}",
-                        f"LatestZipPath: {contract.get('DestinationZipPath', '') or contract.get('LatestZipPath', '') or '(없음)'}",
+                        f"계약 LatestState: {latest_state or '(없음)'}",
+                        f"LatestZipPath: {latest_zip_path or '(없음)'}",
                     ]
                 )
                 self.set_text(
@@ -4964,37 +6045,70 @@ class RelayOperatorPanel(tk.Tk):
                 self.refresh_paired_status_only()
                 self.on_artifact_row_selected()
             finally:
-                self._finish_submit_action(state.target_id)
+                self._finish_submit_action(context.state.target_id)
 
         self.run_background_task(
             state="artifact submit 실행 중",
-            hint=f"{state.target_id} target-local submit wrapper 또는 fallback import를 실행 중입니다.",
+            hint=f"{context.state.target_id} target-local submit wrapper 또는 fallback import를 실행 중입니다.",
             worker=worker,
             on_success=on_success,
             success_state="artifact submit 실행 완료",
             success_hint="paired status와 결과 탭을 새 산출물 기준으로 다시 읽었습니다.",
             failure_state="artifact submit 실행 실패",
             failure_hint="summary/zip 경로, target wrapper 경로, RunRoot target 계약을 확인하세요.",
+            on_failure=on_failure,
         )
 
     def on_home_pair_selected(self, _event: object | None = None) -> None:
         summary = self._selected_pair_summary()
         if not summary:
-            self.home_pair_detail_var.set(self.pair_controller.build_summary_detail(summary))
+            self.home_pair_detail_var.set(self._home_pair_detail_text(summary))
             return
-        if self.pair_id_var.get().strip() != summary.pair_id:
-            self.pair_id_var.set(summary.pair_id)
-            self.update_pair_button_states()
-            self.rebuild_panel_state()
-        self.home_pair_detail_var.set(self.pair_controller.build_summary_detail(summary))
+        self.home_pair_detail_var.set(self._home_pair_detail_text(summary))
+        self.update_pair_button_states()
 
     def apply_selected_home_pair(self) -> None:
         pair_id = self._selected_home_pair_id()
-        self.pair_id_var.set(pair_id)
-        self._sync_preview_selection_with_pair(pair_id)
+        top_target_id = self._resolve_top_target_for_pair(pair_id)
+        self._set_action_context(
+            pair_id=pair_id,
+            target_id=top_target_id if top_target_id else self.target_id_var.get().strip(),
+            source="home-pair-apply",
+        )
+        self._sync_home_pair_selection(pair_id)
+        self.render_target_board()
         self.update_pair_button_states()
         self.rebuild_panel_state()
         self.set_text(self.output_text, f"선택 Pair 반영 완료:\n{pair_id}")
+
+    def apply_selected_inspection_context(self) -> None:
+        inspection_context = self._selected_inspection_context_state()
+        pair_id = inspection_context.pair_id
+        target_id = inspection_context.target_id
+        if not pair_id and not target_id:
+            messagebox.showwarning("선택 필요", "반영할 preview row 또는 board target을 먼저 선택하세요.")
+            return
+        resolved_target = target_id
+        if target_id:
+            resolved_target = target_id
+        elif pair_id:
+            resolved_target = self._resolve_top_target_for_pair(pair_id)
+        self._set_action_context(
+            pair_id=pair_id if pair_id else None,
+            target_id=resolved_target if resolved_target else None,
+            source="inspection-apply",
+        )
+        self._sync_home_pair_selection(self._selected_pair_id())
+        self.render_target_board()
+        self.update_pair_button_states()
+        self.rebuild_panel_state()
+        self.set_text(
+            self.output_text,
+            "inspection 실행 기준 반영 완료:\nPair={0}\nTarget={1}".format(
+                self._selected_pair_id(),
+                self.target_id_var.get().strip() or "(없음)",
+            ),
+        )
 
     def rebuild_panel_state(self) -> None:
         if not self.effective_data or not self.relay_status_data or not self.visibility_status_data:
@@ -5102,6 +6216,7 @@ class RelayOperatorPanel(tk.Tk):
         self.render_rows(self.preview_rows)
         self._coerce_selected_pair_into_runtime_scope()
         self._sync_message_scope_id_from_context()
+        self._refresh_watcher_notes()
         if self.message_config_doc is None:
             self.load_message_editor_document()
         else:
@@ -5110,12 +6225,14 @@ class RelayOperatorPanel(tk.Tk):
         self.rebuild_panel_state()
         self.refresh_artifacts_tab()
 
-        selected_target = self.target_id_var.get().strip()
-        if self.preview_rows and not self._sync_preview_selection_with_pair(self._selected_pair_id(), target_id=selected_target):
+        selected_target = self._selected_inspection_target_id() or self.target_id_var.get().strip()
+        selected_pair = self._selected_inspection_pair_id() or self._selected_pair_id()
+        if self.preview_rows and not self._sync_preview_selection_with_pair(selected_pair, target_id=selected_target):
             first = self.row_tree.get_children()[0]
             self.row_tree.selection_set(first)
             self.on_row_selected()
         elif not self.preview_rows:
+            self._set_inspection_context(source="")
             self.clear_details()
 
         self.refresh_snapshot_list()
@@ -5207,21 +6324,27 @@ class RelayOperatorPanel(tk.Tk):
                 ),
             )
 
-    def on_row_selected(self, _event: object | None = None) -> None:
+    def on_row_selected(self, _event: object | None = None, *, source: str = "preview-row") -> None:
         selection = self.row_tree.selection()
         if not selection:
             self.clear_details()
             return
         row = self.preview_rows[int(selection[0])]
-        if row.get("PairId", ""):
-            self.pair_id_var.set(row.get("PairId", ""))
-        if row.get("TargetId", ""):
-            self.target_id_var.set(row.get("TargetId", ""))
+        self._set_inspection_context(
+            pair_id=str(row.get("PairId", "") or ""),
+            target_id=str(row.get("TargetId", "") or ""),
+            source=source,
+            row_index=int(selection[0]),
+        )
         self._sync_message_scope_id_from_context()
         self.render_target_board()
         self.render_message_editor()
+        inspection_context = self._selected_inspection_context_state()
         activation = row.get("PairActivation", {}) or {}
+        action_pair = self._selected_pair_id()
+        action_target = self.target_id_var.get().strip()
         details_lines = [
+            f"inspection source: {self._context_source_label(inspection_context.source)}",
             f"Pair: {row.get('PairId', '')}",
             f"역할: {row.get('RoleName', '')}",
             f"대상: {row.get('TargetId', '')}",
@@ -5283,6 +6406,14 @@ class RelayOperatorPanel(tk.Tk):
             "초기 override 출처: " + ", ".join(row.get("Initial", {}).get("AppliedSources", [])),
             "전달 override 출처: " + ", ".join(row.get("Handoff", {}).get("AppliedSources", [])),
         ]
+        if self._inspection_context_differs_from_action():
+            details_lines = [
+                "inspection 선택만 바뀌었습니다. 현재 실행 Pair/Target은 유지 중입니다.",
+                f"실행 Pair: {action_pair or '(없음)'}",
+                f"실행 Target: {action_target or '(없음)'}",
+                "이 row로 실행하려면 '선택 row 실행 기준 반영' 또는 '선택 target 반영'을 누르세요.",
+                "",
+            ] + details_lines
         self.set_text(self.details_text, "\n".join(details_lines))
         self.set_text(self.initial_text, row.get("Initial", {}).get("Preview", ""))
         self.set_text(self.handoff_text, row.get("Handoff", {}).get("Preview", ""))
@@ -5515,9 +6646,12 @@ class RelayOperatorPanel(tk.Tk):
             "prepare_run_root": self.prepare_run_root,
             "run_selected_pair": self.run_selected_pair_drill,
             "enable_pair": self.enable_selected_pair,
+            "run_relay_status": self.run_relay_status,
             "run_paired_status": self.run_paired_status,
             "refresh_quick": self.refresh_quick_status,
             "start_watcher": self.start_watcher_detached,
+            "pause_watcher": self.request_pause_watcher,
+            "resume_watcher": self.request_resume_watcher,
             "stop_watcher": self.request_stop_watcher,
             "restart_watcher": self.restart_watcher,
             "recover_stale_watcher": self.recover_stale_watcher_state,
@@ -5526,6 +6660,12 @@ class RelayOperatorPanel(tk.Tk):
             "open_watcher_audit": self.open_watcher_audit_log,
             "focus_ready_to_forward_artifact": self.focus_ready_to_forward_artifact,
             "start_router": self.start_router_detached,
+            "visible_preflight": self.run_visible_acceptance_preflight,
+            "visible_active_acceptance": self.run_active_visible_acceptance,
+            "visible_post_cleanup": self.run_visible_post_cleanup,
+            "visible_clean_preflight": self.run_visible_clean_preflight_recheck,
+            "visible_confirm": self.run_shared_visible_confirm,
+            "visible_receipt_confirm": self.run_visible_receipt_confirm,
         }
         handled = self.home_controller.dispatch_action(
             action_key,
@@ -5585,7 +6725,7 @@ class RelayOperatorPanel(tk.Tk):
         def on_success(completed: subprocess.CompletedProcess[str]) -> None:
             output = completed.stdout.strip() or f"visible launcher 실행 완료\n{wrapper_path}"
             self.window_launch_anchor_utc = launch_anchor_utc
-            self.set_text(self.output_text, output)
+            self.set_text(self.output_text, "[8창 열기 / wrapper]\n" + output)
             self.load_effective_config()
 
         self.run_background_task(
@@ -5651,51 +6791,32 @@ class RelayOperatorPanel(tk.Tk):
         )
         failure_state = "열린 pair 재사용 실패" if pairs_mode else "기존 8창 재사용 실패"
         failure_hint = "재사용 실패 사유와 출력 JSON을 확인하세요."
+        current_context = self._snapshot_context()
+        workflow = self._runtime_workflow()
 
-        def worker() -> dict:
-            context = self._current_context()
-            refresh_extra = ["-AsJson"]
-            if pairs_mode:
-                refresh_extra += ["-ReuseMode", "Pairs"]
-            reuse_payload = self.status_service.run_json_script(
-                "refresh-binding-profile-from-existing.ps1",
-                context,
-                extra=refresh_extra,
-            )
-            if not reuse_payload.get("Success", False):
-                raise PowerShellError(
-                    self._reuse_failure_summary(reuse_payload),
-                    returncode=1,
-                    stdout=json.dumps(reuse_payload, ensure_ascii=False, indent=2),
-                    stderr="",
+        def worker():
+            return workflow.run_reuse(
+                ReuseWindowsRequest(
+                    context=current_context,
+                    config_path=config_path,
+                    reuse_anchor_utc=reuse_anchor_utc,
+                    pairs_mode=pairs_mode,
                 )
-
-            attach_command = self.command_service.build_script_command(
-                "attach-targets-from-bindings.ps1",
-                config_path=config_path,
             )
-            attach_completed = self.command_service.run(attach_command)
-            runtime_result = self.refresh_controller.refresh_runtime(context)
-            return {
-                "reuse_payload": reuse_payload,
-                "attach_output": attach_completed.stdout.strip() or "binding attach 완료",
-                "runtime_result": runtime_result,
-                "reuse_anchor_utc": reuse_anchor_utc,
-            }
 
-        def on_success(result: dict) -> None:
-            self.window_launch_anchor_utc = str(result.get("reuse_anchor_utc", "") or self.window_launch_anchor_utc)
-            runtime_result = result.get("runtime_result")
+        def on_success(result) -> None:
+            self.window_launch_anchor_utc = str(result.reuse_anchor_utc or self.window_launch_anchor_utc)
+            runtime_result = result.runtime_result
             if runtime_result is not None:
                 self._apply_runtime_refresh_result(runtime_result)
-            reuse_payload = result.get("reuse_payload", {})
+            reuse_payload = result.reuse_payload
             if pairs_mode:
                 self._apply_reuse_active_pair_selection(reuse_payload)
             self.set_text(
                 self.output_text,
                 self._format_reuse_existing_windows_report(
                     reuse_payload,
-                    attach_output=str(result.get("attach_output", "") or ""),
+                    attach_output=str(result.attach_output or ""),
                     runtime_result=runtime_result,
                     operation_label=operation_label,
                 ),
@@ -5726,34 +6847,43 @@ class RelayOperatorPanel(tk.Tk):
 
     def prepare_run_root(self) -> None:
         pair_id = self._selected_pair_id()
+        config_path = self.config_path_var.get().strip()
+        workflow = self._runtime_workflow()
         scope_allowed, scope_detail = self._selected_pair_scope_allowed(action_label="run 준비")
         if not scope_allowed:
             messagebox.showwarning("RunRoot 준비 대기", scope_detail)
             return
         ignored_run_root = self._prepare_run_root_override_to_ignore()
         requested_run_root = self._requested_run_root_for_prepare()
+        current_context = self._prepare_run_root_action_context(ignored_run_root=ignored_run_root)
         command = self.command_service.build_script_command(
             "tests/Start-PairedExchangeTest.ps1",
-            config_path=self.config_path_var.get().strip(),
+            config_path=config_path,
             run_root=requested_run_root,
             extra=["-IncludePairId", pair_id],
         )
         self.last_command_var.set(subprocess.list2cmdline(command))
 
-        def worker() -> subprocess.CompletedProcess[str]:
-            return self.command_service.run(command)
+        def worker():
+            return workflow.prepare_run_root(
+                RunRootPrepareRequest(
+                    config_path=config_path,
+                    pair_id=pair_id,
+                    requested_run_root=requested_run_root,
+                    summary_fallback_run_root=current_context.run_root,
+                )
+            )
 
-        def on_success(completed: subprocess.CompletedProcess[str]) -> None:
-            output = completed.stdout.strip() or "run root 준비 완료"
-            prepared_run_root = self._extract_prepared_run_root(output)
+        def on_success(result) -> None:
+            prepared_run_root = result.prepared_run_root
             if prepared_run_root:
                 self.run_root_var.set(prepared_run_root)
-            summary_text = self._run_root_summary_text(prepared_run_root)
+            summary_text = result.summary_text
             self.set_text(
                 self.output_text,
                 (
                     self._format_run_root_prepare_output(
-                        output=output,
+                        output=result.output,
                         ignored_run_root=ignored_run_root,
                         prepared_run_root=prepared_run_root,
                     )
@@ -5783,110 +6913,760 @@ class RelayOperatorPanel(tk.Tk):
         wrapper_path = self._launcher_wrapper_path()
         config_path = self.config_path_var.get().strip()
         pair_id = self._selected_pair_id()
-        scope_allowed, scope_detail = self._selected_pair_scope_allowed(action_label="준비 전체 실행")
+        scope_allowed, scope_detail = self._selected_pair_scope_allowed(action_label="창/Attach/입력/RunRoot 준비")
         if not scope_allowed:
-            messagebox.showwarning("준비 전체 실행 대기", scope_detail)
+            messagebox.showwarning("창/Attach/입력/RunRoot 준비 대기", scope_detail)
             return
         ignored_run_root = self._prepare_run_root_override_to_ignore()
         explicit_run_root = self._requested_run_root_for_prepare()
+        current_context = self._prepare_run_root_action_context(ignored_run_root=ignored_run_root)
+        stage_map = {stage.key: stage for stage in (self.panel_state.stages if self.panel_state else [])}
+        workflow = self._runtime_workflow()
 
-        def worker() -> dict:
-            lines: list[str] = []
-            prepared_run_root = ""
-            runtime_result = None
-            window_launch_anchor_utc = ""
-            launched_windows = False
-            stages = {stage.key: stage for stage in (self.panel_state.stages if self.panel_state else [])}
-
-            if stages.get("launch_windows") and stages["launch_windows"].status_text != "완료":
-                if not wrapper_path:
-                    raise PowerShellError("LauncherWrapperPath를 찾지 못했습니다.")
-                window_launch_anchor_utc = self._utc_now_iso()
-                completed = self.command_service.run(self.command_service.build_python_command(wrapper_path))
-                launched_windows = True
-                lines.append("[8창 열기]")
-                lines.append(completed.stdout.strip() or "visible launcher 실행 완료")
-                lines.append("")
-
-            if launched_windows or (stages.get("attach_windows") and stages["attach_windows"].status_text != "완료"):
-                attach_command = self.command_service.build_script_command(
-                    "attach-targets-from-bindings.ps1",
+        def worker():
+            return workflow.run_prepare_all(
+                PrepareAllRequest(
+                    context=current_context,
                     config_path=config_path,
-                )
-                completed = self.command_service.run(attach_command)
-                lines.append("[붙이기]")
-                lines.append(completed.stdout.strip() or "binding attach 완료")
-                lines.append("")
-
-            runtime_result = self.refresh_controller.refresh_runtime(self._current_context())
-            lines.append("[입력 점검]")
-            lines.append(
-                self._format_visibility_status_report(
-                    runtime_result.visibility_status,
-                    relay_payload=runtime_result.relay_status,
-                    include_json=False,
+                    pair_id=pair_id,
+                    explicit_run_root=explicit_run_root,
+                    wrapper_path=wrapper_path,
+                    launch_windows_needed=bool(stage_map.get("launch_windows") and stage_map["launch_windows"].status_text != "완료"),
+                    attach_windows_needed=bool(stage_map.get("attach_windows") and stage_map["attach_windows"].status_text != "완료"),
                 )
             )
-            lines.append("")
 
-            runroot_command = self.command_service.build_script_command(
-                "tests/Start-PairedExchangeTest.ps1",
-                config_path=config_path,
-                run_root=explicit_run_root,
-                extra=["-IncludePairId", pair_id],
-            )
-            completed = self.command_service.run(runroot_command)
-            prepared_run_root = self._extract_prepared_run_root(completed.stdout)
-            lines.append("[run 준비]")
-            lines.append(
-                self._format_run_root_prepare_output(
-                    output=completed.stdout.strip() or "run root 준비 완료",
-                    ignored_run_root=ignored_run_root,
-                    prepared_run_root=prepared_run_root,
-                )
-            )
-            summary_text = self._run_root_summary_text(prepared_run_root)
-            if summary_text:
-                lines.append("")
-                lines.append(summary_text)
-            lines.append("")
-
-            return {
-                "output": "\n".join(lines).strip(),
-                "run_root": prepared_run_root,
-                "runtime_result": runtime_result,
-                "window_launch_anchor_utc": window_launch_anchor_utc,
-            }
-
-        def on_success(result: dict) -> None:
-            prepared_run_root = result.get("run_root", "")
-            runtime_result = result.get("runtime_result")
-            launch_anchor_utc = result.get("window_launch_anchor_utc", "")
+        def on_success(result) -> None:
+            prepared_run_root = result.run_root_result.prepared_run_root
+            runtime_result = result.runtime_result
+            launch_anchor_utc = result.window_launch_anchor_utc
             if launch_anchor_utc:
                 self.window_launch_anchor_utc = launch_anchor_utc
             if runtime_result is not None:
                 self._apply_runtime_refresh_result(runtime_result)
             if prepared_run_root:
                 self.run_root_var.set(prepared_run_root)
+            lines: list[str] = []
+            if result.launcher_output:
+                launch_label = "[8창 열기 / {0}]".format(result.window_launch_mode or "wrapper")
+                lines.extend([launch_label, result.launcher_output, ""])
+                if result.wrapper_path:
+                    lines.extend(["WrapperPath: " + result.wrapper_path, ""])
+            if result.attach_output:
+                attach_label = "[붙이기 / {0}]".format(result.window_reuse_mode or "attach-only")
+                lines.extend([attach_label, result.attach_output, ""])
+            lines.extend(
+                [
+                    "[입력 점검]",
+                    self._format_visibility_status_report(
+                        runtime_result.visibility_status,
+                        relay_payload=runtime_result.relay_status,
+                        include_json=False,
+                    ),
+                    "",
+                    "[run 준비]",
+                    self._format_run_root_prepare_output(
+                        output=result.run_root_result.output,
+                        ignored_run_root=ignored_run_root,
+                        prepared_run_root=prepared_run_root,
+                    ),
+                ]
+            )
+            if result.run_root_result.summary_text:
+                lines.extend(["", result.run_root_result.summary_text])
             self.last_result_var.set(
                 self._run_root_prepare_last_result(
                     ignored_run_root=ignored_run_root,
                     prepared_run_root=prepared_run_root,
                 )
             )
-            self.set_text(self.output_text, result.get("output", "준비 전체 실행 완료"))
+            self.set_text(self.output_text, "\n".join(lines).strip() or "창/Attach/입력/RunRoot 준비 완료")
             self.load_effective_config()
 
         self.run_background_task(
-            state="준비 전체 실행 중",
+            state="창/Attach/입력/RunRoot 준비 중",
             hint="창 준비, attach, 입력 점검, run 준비를 순서대로 실행 중입니다.",
             worker=worker,
             on_success=on_success,
-            success_state="준비 전체 실행 완료",
+            success_state="창/Attach/입력/RunRoot 준비 완료",
             success_hint="홈 단계 진행판과 pair 요약을 갱신했습니다.",
-            failure_state="준비 전체 실행 실패",
+            failure_state="창/Attach/입력/RunRoot 준비 실패",
             failure_hint="실패한 단계의 출력과 마지막 명령을 확인하세요.",
         )
+
+    def _set_visible_acceptance_output(self, text: str) -> None:
+        if self._has_ui_attr("visible_acceptance_text"):
+            self.set_text(self.visible_acceptance_text, text)
+        self.set_text(self.output_text, text)
+
+    def _selected_seed_target_for_visible_acceptance(self) -> str:
+        return self._resolve_top_target_for_pair(self._selected_pair_id())
+
+    def _resolve_manifest_run_root_for_visible_acceptance(
+        self,
+        *,
+        action_label: str,
+        allow_stale: bool = False,
+    ) -> tuple[str, str]:
+        run_root = self._current_run_root_for_actions().strip()
+        if not run_root:
+            return "", f"{action_label} 전에 RunRoot 준비가 필요합니다."
+        if not allow_stale and self._run_root_is_stale(run_root):
+            return "", f"{action_label} 전에 stale이 아닌 RunRoot를 다시 준비하세요."
+        manifest_path = Path(run_root) / "manifest.json"
+        if not manifest_path.exists():
+            return "", f"{action_label} 전에 'run 준비'를 먼저 실행해 manifest.json이 있는 RunRoot를 준비하세요."
+        return run_root, ""
+
+    def _acceptance_receipt_summary_from_run_root(self, run_root: str) -> dict[str, str]:
+        run_root = str(run_root or "").strip()
+        if not run_root:
+            return empty_acceptance_receipt_summary()
+        path = Path(run_root) / ".state" / "live-acceptance-result.json"
+        if not path.exists():
+            return empty_acceptance_receipt_summary(path=str(path))
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            return empty_acceptance_receipt_summary(path=str(path), exists=True, parse_error=str(exc))
+        if not isinstance(payload, dict):
+            return empty_acceptance_receipt_summary(path=str(path), exists=True, parse_error="receipt payload must be an object")
+        return summarize_acceptance_receipt_payload(payload, path=str(path))
+
+    def _visible_workflow_scope_key(self, *, run_root: str = "", pair_id: str = "") -> str:
+        return visible_workflow_scope_key(run_root=run_root, pair_id=pair_id)
+
+    def _visible_workflow_progress(self, *, scope_key: str) -> VisibleAcceptanceWorkflowProgress:
+        progress_map = self.__dict__.setdefault("visible_workflow_progress_by_scope", {})
+        progress = progress_map.get(scope_key)
+        if progress is None:
+            progress = VisibleAcceptanceWorkflowProgress()
+            progress_map[scope_key] = progress
+        return progress
+
+    def _record_visible_workflow_progress(self, *, scope_key: str, action: str, **changes: bool) -> VisibleAcceptanceWorkflowProgress:
+        progress = self._visible_workflow_progress(scope_key=scope_key)
+        for key, value in changes.items():
+            if hasattr(progress, key):
+                setattr(progress, key, bool(value))
+        progress.last_action = action
+        progress.last_updated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        return progress
+
+    def _build_visible_acceptance_state(self, *, ignore_pair_scope: bool = False) -> VisibleAcceptanceState:
+        config_present = bool(self.config_path_var.get().strip())
+        pair_id = self._selected_pair_id()
+        seed_target_id = self._selected_seed_target_for_visible_acceptance() if pair_id else ""
+        selected_state = self.get_pair_activation_state(pair_id) if pair_id else None
+        pair_enabled = bool((selected_state or {}).get("EffectiveEnabled", True))
+        if ignore_pair_scope:
+            pair_scope_allowed, pair_scope_detail = True, ""
+        else:
+            pair_scope_allowed, pair_scope_detail = self._selected_pair_scope_allowed(action_label="visible acceptance")
+        action_run_root = self._current_run_root_for_actions().strip()
+        active_run_root, active_run_root_detail = self._resolve_manifest_run_root_for_visible_acceptance(
+            action_label="visible preflight-only",
+            allow_stale=False,
+        )
+        confirm_run_root, confirm_run_root_detail = self._resolve_manifest_run_root_for_visible_acceptance(
+            action_label="shared visible confirm",
+            allow_stale=True,
+        )
+        scope_run_root = confirm_run_root or action_run_root or active_run_root
+        scope_key = self._visible_workflow_scope_key(run_root=scope_run_root, pair_id=pair_id)
+        progress = self._visible_workflow_progress(scope_key=scope_key)
+        receipt = self._acceptance_receipt_summary_from_run_root(scope_run_root) if scope_run_root else empty_acceptance_receipt_summary()
+        return build_visible_acceptance_state(
+            VisibleAcceptanceInputs(
+                config_present=config_present,
+                pair_id=pair_id,
+                seed_target_id=seed_target_id,
+                pair_enabled=pair_enabled,
+                pair_scope_allowed=pair_scope_allowed,
+                pair_scope_detail=pair_scope_detail,
+                action_run_root=action_run_root,
+                active_run_root=active_run_root,
+                active_run_root_detail=active_run_root_detail,
+                confirm_run_root=confirm_run_root,
+                confirm_run_root_detail=confirm_run_root_detail,
+                receipt_summary=receipt,
+                progress=progress,
+                busy=self._busy,
+                last_result_text=self.last_result_var.get() if self._has_ui_attr("last_result_var") else "",
+                disable_reason=str((selected_state or {}).get("DisableReason", "") or ""),
+            )
+        )
+
+    def _refresh_visible_acceptance_summary(self) -> VisibleAcceptanceState:
+        state = self._build_visible_acceptance_state()
+        if self._has_ui_attr("visible_acceptance_status_var"):
+            self.visible_acceptance_status_var.set(state.status_text)
+        if self._has_ui_attr("visible_acceptance_detail_var"):
+            self.visible_acceptance_detail_var.set(state.detail_text)
+        return state
+
+    def _require_visible_acceptance_step(self, action_key: str) -> VisibleAcceptanceState | None:
+        state = self._build_visible_acceptance_state(
+            ignore_pair_scope=action_key in {"visible_confirm", "visible_receipt_confirm"}
+        )
+        allowed = True
+        detail = ""
+        if action_key == "visible_cleanup_dry":
+            allowed = state.config_present
+            detail = "visible cleanup에는 ConfigPath가 필요합니다."
+        elif action_key == "visible_cleanup_apply":
+            allowed = state.config_present
+            detail = "visible cleanup에는 ConfigPath가 필요합니다."
+        elif action_key == "visible_preflight":
+            allowed = state.preflight_enabled
+            detail = state.detail_text
+        elif action_key == "visible_active_acceptance":
+            allowed = state.active_enabled
+            detail = state.detail_text
+        elif action_key == "visible_post_cleanup":
+            allowed = state.post_cleanup_enabled
+            detail = state.detail_text
+        elif action_key == "visible_clean_preflight":
+            allowed = state.clean_preflight_enabled
+            detail = state.detail_text
+        elif action_key == "visible_confirm":
+            allowed = state.shared_confirm_enabled
+            detail = state.detail_text
+        elif action_key == "visible_receipt_confirm":
+            allowed = state.receipt_confirm_enabled
+            detail = state.detail_text
+        if not allowed:
+            messagebox.showwarning("Visible Acceptance 대기", detail or "현재 단계에서는 이 작업을 실행할 수 없습니다.")
+            return None
+        return state
+
+    def _current_visible_receipt_path(self) -> str:
+        receipt = ((self.paired_status_data or {}).get("AcceptanceReceipt", {}) or {})
+        path = str(receipt.get("Path", "") or "").strip()
+        if path:
+            return path
+        run_root = self._current_run_root_for_actions().strip()
+        if not run_root:
+            return ""
+        return str(Path(run_root) / ".state" / "live-acceptance-result.json")
+
+    def open_visible_receipt_path(self) -> None:
+        path = self._current_visible_receipt_path()
+        if not path:
+            messagebox.showwarning("receipt 경로 없음", "현재 RunRoot / paired status 기준 visible receipt 경로를 찾지 못했습니다.")
+            return
+        self._open_path(path, kind="visible receipt")
+
+    def copy_visible_receipt_path(self) -> None:
+        path = self._current_visible_receipt_path()
+        if not path:
+            messagebox.showwarning("receipt 경로 없음", "현재 RunRoot / paired status 기준 visible receipt 경로를 찾지 못했습니다.")
+            return
+        self._copy_to_clipboard(path)
+        self.set_text(self.output_text, f"visible receipt 경로 복사 완료:\n{path}")
+
+    def _format_visible_cleanup_report(self, payload: dict, *, apply: bool, title: str) -> str:
+        summary = payload.get("Summary", {}) or {}
+        protected_items: list[str] = []
+        for row in payload.get("Targets", []) or []:
+            for item in row.get("Items", []) or []:
+                if str(item.get("Action", "") or "") != "keep-protected-run":
+                    continue
+                protected_items.append(
+                    "{target} {bucket} runRoot={run_root} cmd={command_id}".format(
+                        target=str(item.get("TargetId", "") or "(unknown)"),
+                        bucket=str(item.get("Bucket", "") or "(bucket)"),
+                        run_root=str(item.get("RunRoot", "") or "(none)"),
+                        command_id=str(item.get("CommandId", "") or "(none)"),
+                    )
+                )
+        lines = [
+            title,
+            f"Mode: {'apply' if apply else 'dry-run'}",
+            f"KeepRunRoot: {payload.get('KeepRunRoot', '') or '(none)'}",
+            "Foreign={0} Invalid={1} Stale={2} ProtectedRun={3} KeptSameRun={4}".format(
+                int(summary.get("ForeignCount", 0) or 0),
+                int(summary.get("InvalidCount", 0) or 0),
+                int(summary.get("StaleCount", 0) or 0),
+                int(summary.get("ProtectedRunCount", 0) or 0),
+                int(summary.get("KeptSameRunCount", 0) or 0),
+            ),
+            "ArchivedForeign={0} ArchivedInvalid={1} ReclaimedStale={2} ReleasedRunningState={3}".format(
+                int(summary.get("ForeignArchivedCount", 0) or 0),
+                int(summary.get("InvalidMetadataArchivedCount", 0) or 0),
+                int(summary.get("StaleProcessingReclaimedCount", 0) or 0),
+                int(summary.get("ReleasedRunningStateCount", 0) or 0),
+            ),
+        ]
+        if protected_items:
+            lines.extend(["", "Protected runs", *["- " + item for item in protected_items[:6]]])
+        lines.extend(["", "JSON", json.dumps(payload, ensure_ascii=False, indent=2)])
+        return "\n".join(lines)
+
+    def _format_live_acceptance_report(self, payload: dict, *, title: str) -> str:
+        outcome = payload.get("Outcome", {}) or {}
+        preflight = payload.get("Preflight", {}) or {}
+        watcher = payload.get("Watcher", {}) or {}
+        seed = payload.get("Seed", {}) or {}
+        blocked_by = str(payload.get("BlockedBy", "") or preflight.get("BlockedBy", "") or "")
+        blocked_target = str(payload.get("BlockedTargetId", "") or preflight.get("BlockedTargetId", "") or "")
+        blocked_run_root = str(payload.get("BlockedRunRoot", "") or preflight.get("BlockedRunRoot", "") or "")
+        blocked_path = str(payload.get("BlockedPath", "") or preflight.get("BlockedPath", "") or "")
+        blocked_detail = str(payload.get("BlockedDetail", "") or preflight.get("BlockedDetail", "") or "")
+        lines = [
+            title,
+            f"RunRoot: {payload.get('RunRoot', '')}",
+            f"Pair: {payload.get('PairId', '')}",
+            f"SeedTarget: {payload.get('SeedTargetId', '')}",
+            f"Stage: {payload.get('Stage', '')}",
+            f"AcceptanceState: {outcome.get('AcceptanceState', '') or '(없음)'}",
+            f"AcceptanceReason: {outcome.get('AcceptanceReason', '') or '(없음)'}",
+            f"ReceiptPath: {payload.get('ReceiptPath', '') or '(없음)'}",
+            f"LastUpdatedAt: {payload.get('LastUpdatedAt', '') or '(없음)'}",
+        ]
+        if blocked_by:
+            lines.extend(
+                [
+                    f"BlockedBy: {blocked_by}",
+                    f"BlockedTargetId: {blocked_target or '(없음)'}",
+                    f"BlockedRunRoot: {blocked_run_root or '(없음)'}",
+                    f"BlockedPath: {blocked_path or '(없음)'}",
+                    f"BlockedDetail: {blocked_detail or '(없음)'}",
+                ]
+            )
+        phase_history = payload.get("PhaseHistory", [])
+        if isinstance(phase_history, list) and phase_history:
+            lines.append("PhaseHistoryCount: {0}".format(len(phase_history)))
+            lines.append("RecentPhases:")
+            for entry in phase_history[-5:]:
+                if not isinstance(entry, dict):
+                    continue
+                lines.append(
+                    "- {recorded} stage={stage} state={state} blocked={blocked}".format(
+                        recorded=str(entry.get("RecordedAt", "") or "(time)"),
+                        stage=str(entry.get("Stage", "") or "(none)"),
+                        state=str(entry.get("AcceptanceState", "") or "(none)"),
+                        blocked=str(entry.get("BlockedBy", "") or "(none)"),
+                    )
+                )
+        if seed:
+            lines.extend(
+                [
+                    f"SeedFinalState: {seed.get('FinalState', '') or '(없음)'}",
+                    f"SeedSubmitState: {seed.get('SubmitState', '') or '(없음)'}",
+                    f"SeedOutboxPublished: {bool(seed.get('OutboxPublished', False))}",
+                ]
+            )
+        if watcher:
+            lines.append(f"WatcherStatus: {watcher.get('Status', '') or '(없음)'}")
+        lines.extend(["", "JSON", json.dumps(payload, ensure_ascii=False, indent=2)])
+        return "\n".join(lines)
+
+    def _format_visible_confirm_report(self, payload: dict, *, title: str) -> str:
+        checks = payload.get("Checks", []) or []
+        failed_required = [
+            "{0}: {1}".format(str(item.get("Name", "") or "(unknown)"), str(item.get("Summary", "") or ""))
+            for item in checks
+            if bool(item.get("Required", False)) and not bool(item.get("Passed", False))
+        ]
+        lines = [
+            title,
+            f"Overall: {payload.get('Overall', '')}",
+            f"Mode: {payload.get('Mode', '')}",
+            f"RunRoot: {payload.get('RunRoot', '')}",
+            f"Pair: {payload.get('PairId', '')}",
+            f"SeedTarget: {payload.get('SeedTargetId', '')}",
+            f"Summary: {payload.get('SummaryLine', '') or '(없음)'}",
+        ]
+        if failed_required:
+            lines.extend(["", "실패한 required checks:"])
+            lines.extend("- " + item for item in failed_required)
+        else:
+            lines.extend(["", "RequiredChecks: 모두 통과"])
+        lines.extend(["", "JSON", json.dumps(payload, ensure_ascii=False, indent=2)])
+        return "\n".join(lines)
+
+    def _format_live_acceptance_failure_output(self, exc: Exception, *, run_root: str) -> str:
+        lines = [self._format_background_exception(exc)]
+        if run_root:
+            receipt = self._acceptance_receipt_summary_from_run_root(run_root)
+            if receipt.get("Exists", "") == "true":
+                lines.extend(
+                    [
+                        "",
+                        "Receipt",
+                        f"Path: {receipt.get('Path', '')}",
+                        f"Stage: {receipt.get('Stage', '') or '(없음)'}",
+                        f"AcceptanceState: {receipt.get('AcceptanceState', '') or '(없음)'}",
+                        f"AcceptanceReason: {receipt.get('AcceptanceReason', '') or '(없음)'}",
+                        f"LastUpdatedAt: {receipt.get('LastUpdatedAt', '') or '(없음)'}",
+                    ]
+                )
+                if receipt.get("BlockedBy", ""):
+                    lines.extend(
+                        [
+                            f"BlockedBy: {receipt.get('BlockedBy', '')}",
+                            f"BlockedTargetId: {receipt.get('BlockedTargetId', '') or '(없음)'}",
+                            f"BlockedRunRoot: {receipt.get('BlockedRunRoot', '') or '(없음)'}",
+                            f"BlockedPath: {receipt.get('BlockedPath', '') or '(없음)'}",
+                            f"BlockedDetail: {receipt.get('BlockedDetail', '') or '(없음)'}",
+                        ]
+                    )
+                if receipt.get("PhaseHistoryCount", ""):
+                    lines.append(f"PhaseHistoryCount: {receipt.get('PhaseHistoryCount', '')}")
+                if receipt.get("PhaseHistoryTail", ""):
+                    lines.append(f"PhaseHistoryTail: {receipt.get('PhaseHistoryTail', '')}")
+            else:
+                lines.extend(["", "Receipt", f"Path: {receipt.get('Path', '')}", "receipt 파일을 찾지 못했습니다."])
+        return "\n".join(lines)
+
+    def _run_visible_cleanup(
+        self,
+        *,
+        apply: bool,
+        title: str,
+        state_prefix: str,
+        mode_label: str,
+        mode_detail: str,
+    ) -> None:
+        action_key = "visible_post_cleanup" if title == "post-cleanup" else ("visible_cleanup_apply" if apply else "visible_cleanup_dry")
+        visible_state = self._require_visible_acceptance_step(action_key)
+        if visible_state is None:
+            return
+        self._set_visible_mode_banner(mode_label, mode_detail)
+        config_path = self.config_path_var.get().strip()
+        if not config_path:
+            messagebox.showwarning("설정 필요", "visible cleanup에는 ConfigPath가 필요합니다.")
+            return
+
+        extra = ["-AsJson"]
+        keep_run_root = self._current_run_root_for_actions().strip()
+        if keep_run_root and Path(keep_run_root).exists():
+            extra = ["-KeepRunRoot", keep_run_root] + extra
+        if apply:
+            extra = ["-Apply"] + extra
+        command = self.command_service.build_script_command(
+            "visible/Cleanup-VisibleWorkerQueue.ps1",
+            config_path=config_path,
+            extra=extra,
+        )
+        self.last_command_var.set(subprocess.list2cmdline(command))
+
+        def worker() -> subprocess.CompletedProcess[str]:
+            return self.command_service.run(command)
+
+        def on_success(completed: subprocess.CompletedProcess[str]) -> object:
+            payload = json.loads(completed.stdout)
+            if title == "post-cleanup":
+                self._record_visible_workflow_progress(
+                    scope_key=visible_state.scope_key,
+                    action=action_key,
+                    post_cleanup_done=True,
+                )
+            elif apply:
+                self._record_visible_workflow_progress(
+                    scope_key=visible_state.scope_key,
+                    action=action_key,
+                    cleanup_applied=True,
+                    preflight_passed=False,
+                    active_attempted=False,
+                    post_cleanup_done=False,
+                    clean_preflight_passed=False,
+                    shared_confirm_passed=False,
+                    receipt_confirm_passed=False,
+                )
+            self._set_visible_acceptance_output(self._format_visible_cleanup_report(payload, apply=apply, title=title))
+            return self.refresh_quick_status
+
+        self.run_background_task(
+            state=f"{state_prefix} 실행 중",
+            hint="shared visible lane queue / worker 상태를 정리하는 중입니다.",
+            worker=worker,
+            on_success=on_success,
+            success_state=f"{state_prefix} 완료",
+            success_hint="queue/worker 상태와 홈 카드를 다시 읽었습니다.",
+            failure_state=f"{state_prefix} 실패",
+            failure_hint="visible worker queue 상태와 마지막 명령을 확인하세요.",
+        )
+
+    def run_visible_queue_cleanup_dry_run(self) -> None:
+        self._run_visible_cleanup(
+            apply=False,
+            title="visible worker queue cleanup",
+            state_prefix="visible cleanup dry-run",
+            mode_label="MODE: Active Visible",
+            mode_detail="shared visible lane 진입 전 queue / worker 상태를 점검합니다.",
+        )
+
+    def run_visible_queue_cleanup_apply(self) -> None:
+        self._run_visible_cleanup(
+            apply=True,
+            title="visible worker queue cleanup",
+            state_prefix="visible cleanup apply",
+            mode_label="MODE: Active Visible",
+            mode_detail="shared visible lane 진입 전 queue / worker 상태를 정리합니다.",
+        )
+
+    def run_visible_post_cleanup(self) -> None:
+        self._run_visible_cleanup(
+            apply=True,
+            title="post-cleanup",
+            state_prefix="post-cleanup",
+            mode_label="MODE: Recovery",
+            mode_detail="active visible acceptance 이후 queue / worker 상태를 닫는 정리 단계입니다.",
+        )
+
+    def _run_visible_acceptance(
+        self,
+        *,
+        preflight_only: bool,
+        title: str,
+        mode_label: str,
+        mode_detail: str,
+        require_enabled_pair: bool,
+        allow_stale_run_root: bool,
+    ) -> None:
+        action_key = "visible_preflight" if preflight_only else "visible_active_acceptance"
+        if title == "clean preflight recheck":
+            action_key = "visible_clean_preflight"
+        visible_state = self._require_visible_acceptance_step(action_key)
+        if visible_state is None:
+            return
+        self._set_visible_mode_banner(mode_label, mode_detail)
+        pair_scope_allowed, pair_scope_detail = self._selected_pair_scope_allowed(
+            action_label=title
+        )
+        if not pair_scope_allowed:
+            messagebox.showwarning("visible acceptance 대기", pair_scope_detail)
+            return
+
+        config_path = self.config_path_var.get().strip()
+        if not config_path:
+            messagebox.showwarning("설정 필요", "visible acceptance에는 ConfigPath가 필요합니다.")
+            return
+
+        pair_id = self._selected_pair_id()
+        if require_enabled_pair:
+            activation = self.get_pair_activation_state(pair_id)
+            if activation and not bool(activation.get("EffectiveEnabled", True)):
+                messagebox.showwarning("Pair 비활성", f"{pair_id}는 현재 비활성 상태입니다.\n사유: {activation.get('DisableReason', '') or '(none)'}")
+                return
+        seed_target_id = self._selected_seed_target_for_visible_acceptance()
+        if not seed_target_id:
+            messagebox.showwarning("SeedTarget 필요", "선택한 pair의 top target을 해석하지 못했습니다.")
+            return
+
+        run_root, run_root_detail = self._resolve_manifest_run_root_for_visible_acceptance(
+            action_label=title,
+            allow_stale=allow_stale_run_root,
+        )
+        if not run_root:
+            messagebox.showwarning("RunRoot 필요", run_root_detail)
+            return
+
+        extra = [
+            "-RunRoot",
+            run_root,
+            "-PairId",
+            pair_id,
+            "-SeedTargetId",
+            seed_target_id,
+            "-ReuseExistingRunRoot",
+            "-AsJson",
+        ]
+        if preflight_only:
+            extra.append("-PreflightOnly")
+        command = self.command_service.build_script_command(
+            "tests/Run-LiveVisiblePairAcceptance.ps1",
+            config_path=config_path,
+            extra=extra,
+        )
+        self.last_command_var.set(subprocess.list2cmdline(command))
+
+        def worker() -> subprocess.CompletedProcess[str]:
+            return self.command_service.run(command)
+
+        def on_success(completed: subprocess.CompletedProcess[str]) -> object:
+            payload = json.loads(completed.stdout)
+            resolved_run_root = str(payload.get("RunRoot", "") or run_root)
+            if resolved_run_root:
+                self.run_root_var.set(resolved_run_root)
+            outcome = payload.get("Outcome", {}) if isinstance(payload.get("Outcome", {}), dict) else {}
+            acceptance_state = str(outcome.get("AcceptanceState", "") or "")
+            if preflight_only and title == "clean preflight recheck":
+                self._record_visible_workflow_progress(
+                    scope_key=visible_state.scope_key,
+                    action=action_key,
+                    post_cleanup_done=True,
+                    clean_preflight_passed=acceptance_state == "preflight-passed",
+                )
+            elif preflight_only:
+                self._record_visible_workflow_progress(
+                    scope_key=visible_state.scope_key,
+                    action=action_key,
+                    cleanup_applied=True,
+                    preflight_passed=acceptance_state == "preflight-passed",
+                    active_attempted=False,
+                    post_cleanup_done=False,
+                    clean_preflight_passed=False,
+                    shared_confirm_passed=False,
+                    receipt_confirm_passed=False,
+                )
+            else:
+                self._record_visible_workflow_progress(
+                    scope_key=visible_state.scope_key,
+                    action=action_key,
+                    cleanup_applied=True,
+                    preflight_passed=True,
+                    active_attempted=True,
+                    post_cleanup_done=False,
+                    clean_preflight_passed=False,
+                    shared_confirm_passed=False,
+                    receipt_confirm_passed=False,
+                )
+            self._set_visible_acceptance_output(
+                self._format_live_acceptance_report(
+                    payload,
+                    title=title,
+                )
+            )
+            return self.refresh_paired_status_only
+
+        def on_failure(exc: Exception) -> str:
+            self.refresh_paired_status_only(refresh_artifacts=False)
+            text = self._format_live_acceptance_failure_output(exc, run_root=run_root)
+            if self._has_ui_attr("visible_acceptance_text"):
+                self.set_text(self.visible_acceptance_text, text)
+            return text
+
+        state_label = f"{title} 실행 중"
+        success_label = f"{title} 완료"
+        failure_label = f"{title} 실패"
+        self.run_background_task(
+            state=state_label,
+            hint="shared visible 공식 acceptance receipt를 갱신하는 중입니다.",
+            worker=worker,
+            on_success=on_success,
+            success_state=success_label,
+            success_hint="receipt와 paired status를 다시 읽었습니다.",
+            failure_state=failure_label,
+            failure_hint="receipt 경로와 blocked detail을 확인하세요.",
+            on_failure=on_failure,
+        )
+
+    def run_visible_acceptance_preflight(self) -> None:
+        self._run_visible_acceptance(
+            preflight_only=True,
+            title="visible preflight-only",
+            mode_label="MODE: Active Visible",
+            mode_detail="shared visible 공식 절차의 preflight-only 게이트를 실행합니다.",
+            require_enabled_pair=True,
+            allow_stale_run_root=False,
+        )
+
+    def run_active_visible_acceptance(self) -> None:
+        self._run_visible_acceptance(
+            preflight_only=False,
+            title="active visible acceptance",
+            mode_label="MODE: Active Visible",
+            mode_detail="shared visible 공식 창 기준 active acceptance를 실행합니다.",
+            require_enabled_pair=True,
+            allow_stale_run_root=False,
+        )
+
+    def run_visible_clean_preflight_recheck(self) -> None:
+        self._run_visible_acceptance(
+            preflight_only=True,
+            title="clean preflight recheck",
+            mode_label="MODE: Passive Confirm",
+            mode_detail="post-cleanup 이후 clean preflight 재확인으로 lane이 닫혔는지 검증합니다.",
+            require_enabled_pair=False,
+            allow_stale_run_root=True,
+        )
+
+    def _run_shared_visible_confirm(self, *, require_visible_receipt: bool) -> None:
+        action_key = "visible_receipt_confirm" if require_visible_receipt else "visible_confirm"
+        visible_state = self._require_visible_acceptance_step(action_key)
+        if visible_state is None:
+            return
+        self._set_visible_mode_banner(
+            "MODE: Passive Confirm",
+            "기존 RunRoot / receipt 기준으로 shared visible closure를 재검증합니다.",
+        )
+
+        config_path = self.config_path_var.get().strip()
+        if not config_path:
+            messagebox.showwarning("설정 필요", "visible confirm에는 ConfigPath가 필요합니다.")
+            return
+
+        pair_id = self._selected_pair_id()
+        seed_target_id = self._selected_seed_target_for_visible_acceptance()
+        if not seed_target_id:
+            messagebox.showwarning("SeedTarget 필요", "선택한 pair의 top target을 해석하지 못했습니다.")
+            return
+
+        run_root, run_root_detail = self._resolve_manifest_run_root_for_visible_acceptance(
+            action_label="receipt confirm" if require_visible_receipt else "shared visible confirm",
+            allow_stale=True,
+        )
+        if not run_root:
+            messagebox.showwarning("RunRoot 필요", run_root_detail)
+            return
+
+        extra = [
+            "-RunRoot",
+            run_root,
+            "-PairId",
+            pair_id,
+            "-SeedTargetId",
+            seed_target_id,
+            "-AsJson",
+        ]
+        if require_visible_receipt:
+            extra.append("-RequireVisibleReceipt")
+        command = self.command_service.build_script_command(
+            "tests/Confirm-SharedVisiblePairAcceptance.ps1",
+            config_path=config_path,
+            extra=extra,
+        )
+        self.last_command_var.set(subprocess.list2cmdline(command))
+
+        def worker() -> subprocess.CompletedProcess[str]:
+            return self.command_service.run(command)
+
+        def on_success(completed: subprocess.CompletedProcess[str]) -> object:
+            payload = json.loads(completed.stdout)
+            overall = str(payload.get("Overall", "") or "")
+            self._record_visible_workflow_progress(
+                scope_key=visible_state.scope_key,
+                action=action_key,
+                shared_confirm_passed=(not require_visible_receipt and overall == "success"),
+                receipt_confirm_passed=(require_visible_receipt and overall == "success"),
+            )
+            self._set_visible_acceptance_output(
+                self._format_visible_confirm_report(
+                    payload,
+                    title="receipt confirm" if require_visible_receipt else "shared visible confirm",
+                )
+            )
+            return self.refresh_paired_status_only
+
+        self.run_background_task(
+            state="receipt confirm 실행 중" if require_visible_receipt else "shared visible confirm 실행 중",
+            hint="현재 RunRoot의 visible receipt / closure 상태를 재검증하는 중입니다.",
+            worker=worker,
+            on_success=on_success,
+            success_state="receipt confirm 완료" if require_visible_receipt else "shared visible confirm 완료",
+            success_hint="paired status와 receipt 카드를 다시 읽었습니다.",
+            failure_state="receipt confirm 실패" if require_visible_receipt else "shared visible confirm 실패",
+            failure_hint="confirm JSON과 acceptance receipt 상태를 확인하세요.",
+        )
+
+    def run_shared_visible_confirm(self) -> None:
+        self._run_shared_visible_confirm(require_visible_receipt=False)
+
+    def run_visible_receipt_confirm(self) -> None:
+        self._run_shared_visible_confirm(require_visible_receipt=True)
 
     def start_router_detached(self) -> None:
         command = self.command_service.build_script_command(
@@ -5899,20 +7679,37 @@ class RelayOperatorPanel(tk.Tk):
         self.set_operator_status("라우터 시작 요청", "수 초 뒤 빠른 새로고침으로 router/runtime 상태를 다시 확인합니다.", "마지막 결과: router 시작 요청")
         self.after(1500, self.refresh_runtime_status_only)
 
-    def start_watcher_detached(self) -> None:
+    def _start_watcher_detached(self, *, request: WatcherStartRequest | None = None, action_title: str = "watch 시작") -> None:
         run_root = self._current_run_root_for_actions()
         config_path = self.config_path_var.get().strip()
+        current_paired_status = self.paired_status_data
+        workflow = self._watcher_workflow()
         if not run_root:
             messagebox.showwarning("RunRoot 필요", "watcher를 시작하려면 RunRoot가 먼저 준비돼야 합니다.")
             return
         if not config_path:
             messagebox.showwarning("설정 필요", "watcher를 시작하려면 ConfigPath가 필요합니다.")
             return
+        effective_request = request
+        if effective_request is not None and (not effective_request.run_root or not effective_request.config_path):
+            effective_request = WatcherStartRequest(
+                config_path=config_path,
+                run_root=run_root,
+                use_headless_dispatch=effective_request.use_headless_dispatch,
+                max_forward_count=effective_request.max_forward_count,
+                run_duration_sec=effective_request.run_duration_sec,
+                pair_max_roundtrip_count=effective_request.pair_max_roundtrip_count,
+            )
         watch_start_allowed, watch_start_detail = self._watch_start_allowed()
         if not watch_start_allowed:
-            messagebox.showwarning("watch 시작 대기", watch_start_detail)
+            messagebox.showwarning(f"{action_title} 대기", watch_start_detail)
             return
-        start_eligibility = self._watcher_start_eligibility()
+        start_eligibility = self.watcher_controller.start_eligibility(current_paired_status, run_root)
+        action_context = WatcherActionContextSnapshot(
+            config_path=config_path,
+            run_root=run_root,
+            paired_status=current_paired_status,
+        )
         clear_stale_first = False
         if not start_eligibility.allowed and start_eligibility.cleanup_allowed:
             confirmed = messagebox.askyesno(
@@ -5921,80 +7718,71 @@ class RelayOperatorPanel(tk.Tk):
                 parent=self,
             )
             if not confirmed:
-                diagnostics = self.watcher_controller.diagnostics(self.paired_status_data, run_root)
-                self.set_text(self.output_text, diagnostics.details)
+                self.set_text(self.output_text, workflow.build_start_blocked_update(action_context, start_eligibility).output_text)
                 return
             clear_stale_first = True
         elif not start_eligibility.allowed:
+            panel_update = workflow.build_start_blocked_update(action_context, start_eligibility)
             message = start_eligibility.message
             if start_eligibility.recommended_action:
                 message += f"\n권장 조치: {start_eligibility.recommended_action}"
-            messagebox.showwarning("watch 시작 차단", message)
-            self.set_operator_status(
-                "watch 시작 차단",
-                start_eligibility.message,
-                f"마지막 결과: watch 시작 차단 ({','.join(start_eligibility.reason_codes) or start_eligibility.state})",
-            )
-            self.set_text(self.output_text, self.watcher_controller.diagnostics(self.paired_status_data, run_root).details)
+            messagebox.showwarning(f"{action_title} 차단", message)
+            self._apply_watcher_panel_update(panel_update)
             return
 
-        result, notes = self.watcher_controller.start(
-            self.command_service,
+        panel_update = workflow.start(
+            action_context,
+            clear_stale_first=clear_stale_first,
+            request=effective_request,
+        )
+        if not panel_update.ok:
+            messagebox.showerror(f"{action_title} 실패", panel_update.operator_hint)
+            self._apply_watcher_panel_update(panel_update)
+            return
+        self._apply_watcher_panel_update(panel_update)
+        self.after(1500, self.refresh_paired_status_only)
+
+    def start_watcher_detached(self) -> None:
+        run_root = self._current_run_root_for_actions()
+        config_path = self.config_path_var.get().strip()
+        request = self._watcher_quick_start_request(config_path=config_path, run_root=run_root)
+        self._start_watcher_detached(request=request, action_title="watch 시작(기본)")
+
+    def start_watcher_with_options(self) -> None:
+        run_root = self._current_run_root_for_actions()
+        config_path = self.config_path_var.get().strip()
+        if not run_root:
+            messagebox.showwarning("RunRoot 필요", "watch 시작(입력값)에는 RunRoot가 필요합니다.")
+            return
+        if not config_path:
+            messagebox.showwarning("설정 필요", "watch 시작(입력값)에는 ConfigPath가 필요합니다.")
+            return
+        request = self._build_watcher_start_request_from_controls(
             config_path=config_path,
             run_root=run_root,
-            paired_status=self.paired_status_data,
-            clear_stale_first=clear_stale_first,
+            show_error=True,
         )
-        if not result.ok:
-            messagebox.showerror("watcher 시작 실패", result.message)
-            self.set_operator_status("watcher 시작 실패", result.message, f"마지막 결과: watcher 시작 실패 ({','.join(result.reason_codes) or result.state})")
-            diagnostics = self.watcher_controller.diagnostics(self.paired_status_data, run_root)
-            text_lines = ["watch 시작 준비"]
-            if notes:
-                text_lines.extend(notes)
-            text_lines.extend(["", result.message, "", diagnostics.details])
-            self.set_text(self.output_text, "\n".join(text_lines))
+        if request is None:
             return
-        if result.command_text:
-            self.last_command_var.set(result.command_text)
-        base_lines = []
-        if notes:
-            base_lines.extend(notes)
-            base_lines.append("")
-        self.set_text(
-            self.output_text,
-            (
-                "\n".join(base_lines)
-                + ("paired watcher를 별도 프로세스로 시작했습니다.\n\n" if base_lines else "paired watcher를 별도 프로세스로 시작했습니다.\n\n")
-                + (result.command_text or "(command unavailable)")
-                + "\n\n상태: {0}".format(result.message)
-                + "\n"
-                + self.watcher_controller.start_preset_note()
-            ),
-        )
-        self.set_operator_status(
-            "watcher 시작 요청",
-            "수 초 뒤 paired status와 결과 탭을 빠르게 다시 읽습니다. 기본 watch 시작은 제한된 forward/run preset을 사용합니다.",
-            "마지막 결과: watcher 시작 요청",
-        )
-        self.after(1500, self.refresh_paired_status_only)
+        self._start_watcher_detached(request=request, action_title="watch 시작(입력값)")
 
     def recover_stale_watcher_state(self) -> None:
         run_root = self._current_run_root_for_actions()
+        current_paired_status = self.paired_status_data
+        workflow = self._watcher_workflow()
         if not run_root:
             messagebox.showwarning("RunRoot 필요", "watch stale 정리에는 RunRoot가 필요합니다.")
             return
 
-        eligibility = self._watcher_start_eligibility()
+        eligibility = self.watcher_controller.start_eligibility(current_paired_status, run_root)
+        action_context = WatcherActionContextSnapshot(
+            config_path=self.config_path_var.get().strip(),
+            run_root=run_root,
+            paired_status=current_paired_status,
+        )
         if not eligibility.cleanup_allowed:
-            diagnostics = self.watcher_controller.diagnostics(self.paired_status_data, run_root)
             messagebox.showwarning("정리 불가", "현재 상태에서는 안전하게 정리할 stale watcher control이 없습니다.")
-            self.set_operator_status(
-                "watch stale 정리 차단",
-                "현재 상태에서는 stale control 정리를 수행할 수 없습니다.",
-                f"마지막 결과: watch stale 정리 차단 ({','.join(eligibility.reason_codes) or eligibility.state})",
-            )
-            self.set_text(self.output_text, diagnostics.details)
+            self._apply_watcher_panel_update(workflow.build_recover_blocked_update(action_context, eligibility))
             return
 
         confirmed = messagebox.askyesno(
@@ -6005,135 +7793,193 @@ class RelayOperatorPanel(tk.Tk):
         if not confirmed:
             return
 
-        result = self.watcher_controller.recover_start_blockers(self.paired_status_data, run_root)
-        lines = [
-            "watch stale 정리",
-            f"RunRoot: {run_root}",
-            f"상태: {result.state}",
-            f"메시지: {result.message}",
-        ]
-        if result.reason_codes:
-            lines.append("Reasons: " + ", ".join(result.reason_codes))
-        self.set_text(self.output_text, "\n".join(lines))
-        if not result.ok:
-            messagebox.showwarning("정리 실패", result.message)
-            self.set_operator_status(
-                "watch stale 정리 실패",
-                result.message,
-                f"마지막 결과: watch stale 정리 실패 ({','.join(result.reason_codes) or result.state})",
-            )
-            diagnostics = self.watcher_controller.diagnostics(self.paired_status_data, run_root)
-            self.set_text(self.output_text, "\n".join(lines + ["", diagnostics.details]))
+        panel_update = workflow.recover_stale(action_context)
+        if not panel_update.ok:
+            messagebox.showwarning("정리 실패", panel_update.operator_hint)
+            self._apply_watcher_panel_update(panel_update)
             return
 
-        self.set_operator_status("watch stale 정리 완료", result.message, "마지막 결과: watch stale 정리 완료")
+        self._apply_watcher_panel_update(panel_update)
         self.after(300, self.refresh_paired_status_only)
 
     def request_stop_watcher(self) -> None:
         run_root = self._current_run_root_for_actions()
+        current_paired_status = self.paired_status_data
+        workflow = self._watcher_workflow()
         if not run_root:
             messagebox.showwarning("RunRoot 필요", "watch 정지 요청에는 RunRoot가 필요합니다.")
             return
 
-        eligibility = self._watcher_stop_eligibility()
+        eligibility = self.watcher_controller.stop_eligibility(current_paired_status, run_root)
+        action_context = WatcherActionContextSnapshot(
+            config_path=self.config_path_var.get().strip(),
+            run_root=run_root,
+            paired_status=current_paired_status,
+        )
         if not eligibility.allowed:
             messagebox.showwarning("watch 정지 차단", eligibility.message)
-            self.set_operator_status("watch 정지 차단", eligibility.message, f"마지막 결과: watch 정지 차단 ({','.join(eligibility.reason_codes) or eligibility.state})")
-            self.set_text(self.output_text, self.watcher_controller.diagnostics(self.paired_status_data, run_root).details)
+            self._apply_watcher_panel_update(
+                workflow.build_stop_blocked_update(
+                    action_context,
+                    eligibility,
+                    action_label="watch 정지 차단",
+                )
+            )
             return
 
         if eligibility.warning_codes:
-            warning_text = "\n".join(f"- {code}" for code in eligibility.warning_codes)
             confirmed = messagebox.askyesno(
                 "watch 정지 확인",
-                "정지 전 확인이 필요한 상태가 있습니다.\n\n{0}\n\n정말 정지 요청을 기록할까요?".format(warning_text),
+                workflow.stop_confirmation_text(eligibility.warning_codes),
                 parent=self,
             )
             if not confirmed:
                 return
 
-        result = self.watcher_controller.request_stop(self.paired_status_data, run_root)
-        lines = [
-            "watch 정지 요청",
-            f"RunRoot: {run_root}",
-            f"상태: {result.state}",
-            f"메시지: {result.message}",
-        ]
-        if result.request_id:
-            lines.append(f"RequestId: {result.request_id}")
-        if result.warning_codes:
-            lines.append("Warnings: " + ", ".join(result.warning_codes))
-        if result.reason_codes:
-            lines.append("Reasons: " + ", ".join(result.reason_codes))
-        self.set_text(self.output_text, "\n".join(lines))
-
-        if not result.ok:
-            messagebox.showwarning("watch 정지 실패", result.message)
-            self.set_operator_status("watch 정지 실패", result.message, f"마지막 결과: watch 정지 실패 ({','.join(result.reason_codes) or result.state})")
-            self.set_text(self.output_text, "\n".join(lines + ["", self.watcher_controller.diagnostics(self.paired_status_data, run_root).details]))
+        panel_update = workflow.request_stop(action_context)
+        if not panel_update.ok:
+            messagebox.showwarning("watch 정지 실패", panel_update.operator_hint)
+            self._apply_watcher_panel_update(panel_update)
             return
 
-        self.set_operator_status("watch 정지 요청", "control file을 기록했습니다. 수 초 뒤 stopped 상태를 확인합니다.", "마지막 결과: watch 정지 요청")
+        self._apply_watcher_panel_update(panel_update)
+        self.after(1500, self.refresh_paired_status_only)
+
+    def request_pause_watcher(self) -> None:
+        run_root = self._current_run_root_for_actions()
+        current_paired_status = self.paired_status_data
+        workflow = self._watcher_workflow()
+        if not run_root:
+            messagebox.showwarning("RunRoot 필요", "watch pause 요청에는 RunRoot가 필요합니다.")
+            return
+
+        eligibility = self.watcher_controller.pause_eligibility(current_paired_status, run_root)
+        action_context = WatcherActionContextSnapshot(
+            config_path=self.config_path_var.get().strip(),
+            run_root=run_root,
+            paired_status=current_paired_status,
+        )
+        if not eligibility.allowed:
+            messagebox.showwarning("watch pause 차단", eligibility.message)
+            self._apply_watcher_panel_update(
+                workflow.build_stop_blocked_update(
+                    action_context,
+                    eligibility,
+                    action_label="watch pause 차단",
+                )
+            )
+            return
+
+        panel_update = workflow.request_pause(action_context)
+        if not panel_update.ok:
+            messagebox.showwarning("watch pause 실패", panel_update.operator_hint)
+            self._apply_watcher_panel_update(panel_update)
+            return
+
+        self._apply_watcher_panel_update(panel_update)
+        self.after(1500, self.refresh_paired_status_only)
+
+    def request_resume_watcher(self) -> None:
+        run_root = self._current_run_root_for_actions()
+        current_paired_status = self.paired_status_data
+        workflow = self._watcher_workflow()
+        if not run_root:
+            messagebox.showwarning("RunRoot 필요", "watch resume 요청에는 RunRoot가 필요합니다.")
+            return
+
+        eligibility = self.watcher_controller.resume_eligibility(current_paired_status, run_root)
+        action_context = WatcherActionContextSnapshot(
+            config_path=self.config_path_var.get().strip(),
+            run_root=run_root,
+            paired_status=current_paired_status,
+        )
+        if not eligibility.allowed:
+            messagebox.showwarning("watch resume 차단", eligibility.message)
+            self._apply_watcher_panel_update(
+                workflow.build_stop_blocked_update(
+                    action_context,
+                    eligibility,
+                    action_label="watch resume 차단",
+                )
+            )
+            return
+
+        panel_update = workflow.request_resume(action_context)
+        if not panel_update.ok:
+            messagebox.showwarning("watch resume 실패", panel_update.operator_hint)
+            self._apply_watcher_panel_update(panel_update)
+            return
+
+        self._apply_watcher_panel_update(panel_update)
         self.after(1500, self.refresh_paired_status_only)
 
     def restart_watcher(self) -> None:
         run_root = self._current_run_root_for_actions()
         config_path = self.config_path_var.get().strip()
+        current_paired_status = self.paired_status_data
+        workflow = self._watcher_workflow()
         if not run_root:
             messagebox.showwarning("RunRoot 필요", "watch 재시작에는 RunRoot가 필요합니다.")
             return
         if not config_path:
             messagebox.showwarning("설정 필요", "watch 재시작에는 ConfigPath가 필요합니다.")
             return
+        restart_request = self._build_watcher_start_request_from_controls(
+            config_path=config_path,
+            run_root=run_root,
+            show_error=True,
+        )
+        if restart_request is None:
+            return
 
-        eligibility = self._watcher_stop_eligibility()
+        eligibility = self.watcher_controller.stop_eligibility(current_paired_status, run_root)
+        action_context = WatcherActionContextSnapshot(
+            config_path=config_path,
+            run_root=run_root,
+            paired_status=current_paired_status,
+        )
         if not eligibility.allowed:
             messagebox.showwarning("watch 재시작 차단", eligibility.message)
-            self.set_operator_status("watch 재시작 차단", eligibility.message, f"마지막 결과: watch 재시작 차단 ({','.join(eligibility.reason_codes) or eligibility.state})")
-            self.set_text(self.output_text, self.watcher_controller.diagnostics(self.paired_status_data, run_root).details)
+            self._apply_watcher_panel_update(
+                workflow.build_stop_blocked_update(
+                    action_context,
+                    eligibility,
+                    action_label="watch 재시작 차단",
+                )
+            )
             return
 
         if eligibility.warning_codes:
-            warning_text = "\n".join(f"- {code}" for code in eligibility.warning_codes)
             confirmed = messagebox.askyesno(
                 "watch 재시작 확인",
-                "재시작 전 확인이 필요한 상태가 있습니다.\n\n{0}\n\n정지 확인 후 재시작을 진행할까요?".format(warning_text),
+                workflow.restart_confirmation_text(eligibility.warning_codes),
                 parent=self,
             )
             if not confirmed:
                 return
 
-        current_context = self._current_context()
-        current_paired_status = self.paired_status_data
+        current_context = self._snapshot_context(run_root=run_root)
 
-        def status_loader(target_run_root: str):
-            return self.status_service.refresh_paired_status(current_context, run_root=target_run_root)
-
-        def worker() -> WatcherControlResult:
-            return self.watcher_controller.restart(
-                self.command_service,
-                status_loader,
-                config_path=config_path,
-                run_root=run_root,
-                paired_status=current_paired_status,
-                poll_interval_sec=1.0,
+        def worker():
+            return workflow.restart(
+                WatcherRestartRequest(
+                    context=action_context,
+                    app_context=current_context,
+                    poll_interval_sec=1.0,
+                    watcher_request=restart_request,
+                )
             )
 
-        def on_success(result: WatcherControlResult) -> None:
-            if result.command_text:
-                self.last_command_var.set(result.command_text)
-            lines = [
-                "watch 재시작 결과",
-                f"RunRoot: {result.run_root}",
-                f"상태: {result.state}",
-                f"메시지: {result.message}",
-            ]
-            if result.request_id:
-                lines.append(f"RequestId: {result.request_id}")
-            if result.warning_codes:
-                lines.append("Warnings: " + ", ".join(result.warning_codes))
-            self.set_text(self.output_text, "\n".join(lines))
-            self.refresh_paired_status_only()
+        def on_success(result) -> object:
+            self._apply_watcher_panel_update(result.panel_update)
+            return self.refresh_paired_status_only
+
+        def on_failure(exc: Exception) -> str | None:
+            if isinstance(exc, WatcherRestartFailure):
+                if exc.panel_update.command_text:
+                    self.last_command_var.set(exc.panel_update.command_text)
+                return exc.panel_update.output_text
+            return None
 
         self.run_background_task(
             state="watch 재시작 중",
@@ -6144,6 +7990,7 @@ class RelayOperatorPanel(tk.Tk):
             success_hint="paired status와 결과 탭을 새 상태로 다시 읽었습니다.",
             failure_state="watch 재시작 실패",
             failure_hint="watch 상태, control file, 마지막 명령을 확인하세요.",
+            on_failure=on_failure,
         )
 
     def show_watcher_diagnostics(self) -> None:
@@ -6159,6 +8006,19 @@ class RelayOperatorPanel(tk.Tk):
         recommendation = self._watcher_recommendation()
         if recommendation is None:
             messagebox.showinfo("권장 조치 없음", "현재 watcher 진단 기준 권장 조치가 없습니다.")
+            return
+        if recommendation.action_key == "start_watcher":
+            run_root = self._current_run_root_for_actions()
+            config_path = self.config_path_var.get().strip()
+            request = self._watcher_current_request_from_status(
+                config_path=config_path,
+                run_root=run_root,
+            )
+            if request is not None:
+                self.load_watcher_start_options_from_status(show_message=False)
+                self._start_watcher_detached(request=request, action_title="watch 다시 시작(현재값)")
+                return
+            self.start_watcher_detached()
             return
         self.handle_dashboard_action(recommendation.action_key)
 
@@ -6241,24 +8101,68 @@ class RelayOperatorPanel(tk.Tk):
         widget.insert("1.0", value)
         widget.configure(state="disabled")
 
+    def set_query_text(self, value: str) -> None:
+        if self._has_ui_attr("query_output_text"):
+            self.set_text(self.query_output_text, value)
+            if self._has_ui_attr("result_notebook") and self._has_ui_attr("query_output_tab"):
+                try:
+                    self.result_notebook.select(self.query_output_tab)
+                except Exception:
+                    pass
+            return
+        if self._has_ui_attr("output_text"):
+            self.set_text(self.output_text, value)
+
+    def _query_context_summary(self, context: AppContext | None = None) -> str:
+        query_context = context
+        if query_context is None:
+            try:
+                query_context = self._snapshot_context()
+            except Exception:
+                query_context = None
+        return format_query_context_summary(query_context)
+
+    def _append_query_history(self, value: str, *, context: str = "") -> None:
+        current_records = self.__dict__.setdefault("query_history_records", [])
+        if not isinstance(current_records, list):
+            current_records = []
+        next_records, entries = append_query_history(
+            current_records,
+            value=value,
+            context=context,
+        )
+        self.query_history_records = next_records
+        summary_entries = entries
+        entries = self.__dict__.setdefault("query_history_entries", [])
+        entries.clear()
+        entries.extend(summary_entries)
+        if self._has_ui_attr("query_history_var"):
+            self.query_history_var.set("최근 조회: " + " | ".join(entries))
+
+    def set_query_result(self, value: str, *, context: str = "") -> None:
+        if self._has_ui_attr("last_query_result_var"):
+            self.last_query_result_var.set(value)
+        self._append_query_history(value, context=context)
+
     def run_relay_status(self) -> None:
-        self.run_to_output("show-relay-status.ps1")
+        self.run_to_output("show-relay-status.ps1", allow_when_busy=True)
 
     def _resolve_top_target_for_pair(self, pair_id: str) -> str:
         return self.pair_controller.resolve_top_target_for_pair(self.preview_rows, pair_id)
 
     def run_selected_pair_drill(self) -> None:
+        self._set_mode_banner("MODE: Headless Drill", "headless drill / transport closure / 진단 중심으로 작업합니다.")
         pair_id = self.pair_id_var.get().strip()
         if not pair_id:
             messagebox.showwarning("PairId 필요", "PairId 값을 먼저 선택하세요.")
             return
-        scope_allowed, scope_detail = self._selected_pair_scope_allowed(action_label="선택 Pair 실행")
+        scope_allowed, scope_detail = self._selected_pair_scope_allowed(action_label="선택 Pair Headless Drill")
         if not scope_allowed:
-            messagebox.showwarning("Pair 실행 대기", scope_detail)
+            messagebox.showwarning("Headless Drill 대기", scope_detail)
             return
         allowed, detail = self._selected_pair_execution_allowed()
         if not allowed:
-            messagebox.showwarning("Pair 실행 대기", detail)
+            messagebox.showwarning("Headless Drill 대기", detail)
             return
         activation = self.get_pair_activation_state(pair_id)
         if activation and not activation.get("EffectiveEnabled", True):
@@ -6270,19 +8174,25 @@ class RelayOperatorPanel(tk.Tk):
             messagebox.showerror("대상 해석 실패", f"{pair_id}의 top target을 찾지 못했습니다.")
             return
 
+        config_path = self.config_path_var.get().strip()
+        drill_request = self._watcher_quick_start_request(
+            config_path=config_path,
+            run_root=self._current_run_root_for_actions(),
+        )
+
         command = self.command_service.build_powershell_file_command(
             str(ROOT / "run-headless-pair-drill.ps1"),
             extra=[
                 "-ConfigPath",
-                self.config_path_var.get().strip(),
+                config_path,
                 "-PairId",
                 pair_id,
                 "-InitialTargetId",
                 initial_target_id,
                 "-MaxForwardCount",
-                "2",
+                str(drill_request.max_forward_count),
                 "-RunDurationSec",
-                "900",
+                str(drill_request.run_duration_sec),
                 "-AsJson",
             ],
         )
@@ -6299,7 +8209,7 @@ class RelayOperatorPanel(tk.Tk):
             self.run_root_var.set(payload.get("RunRoot", ""))
             observed = payload.get("ObservedCounts", {})
             lines = [
-                "선택된 Pair 드릴 실행 완료",
+                "선택 Pair Headless Drill 완료",
                 f"Pair: {payload.get('PairId', '')}",
                 f"초기 대상: {payload.get('InitialTargetId', '')}",
                 f"RunRoot: {payload.get('RunRoot', '')}",
@@ -6321,7 +8231,8 @@ class RelayOperatorPanel(tk.Tk):
                 lines.extend(
                     [
                         "",
-                        f"이 드릴은 연속 무제한 왕복이 아니라 forward {max_forward_count}회까지만 확인합니다.",
+                        "이 드릴은 watcher 기본 quick start와 같은 forward/run 기준을 사용합니다.",
+                        f"연속 무제한 왕복이 아니라 forward {max_forward_count}회까지만 확인합니다.",
                     ]
                 )
             self.set_text(self.output_text, "\n".join(lines))
@@ -6336,19 +8247,20 @@ class RelayOperatorPanel(tk.Tk):
                 )
             )
 
-        self.set_text(self.output_text, f"선택된 Pair 드릴 실행 중...\npair={pair_id}\ninitial={initial_target_id}")
+        self.set_text(self.output_text, f"선택 Pair Headless Drill 실행 중...\npair={pair_id}\ninitial={initial_target_id}")
         self.run_background_task(
-            state="Pair 드릴 실행 중",
+            state="Headless Drill 실행 중",
             hint=f"{pair_id} 한 쌍을 headless로 실행 중입니다. 완료될 때까지 버튼이 잠깁니다.",
             worker=worker,
             on_success=on_success,
-            success_state="Pair 드릴 완료",
+            success_state="Headless Drill 완료",
             success_hint="RunRoot가 자동 반영됐습니다. 페어 상태나 폴더 열기로 결과를 확인하세요.",
-            failure_state="Pair 드릴 실패",
+            failure_state="Headless Drill 실패",
             failure_hint="출력 영역과 마지막 명령을 확인한 뒤 다시 시도하세요.",
         )
 
     def run_fixed_pair01_drill(self) -> None:
+        self._set_mode_banner("MODE: Headless Drill", "고정된 pair01 기준 headless drill을 실행합니다.")
         activation = self.get_pair_activation_state("pair01")
         if activation and not activation.get("EffectiveEnabled", True):
             messagebox.showwarning("Pair 비활성", f"pair01은 현재 비활성 상태입니다.\n사유: {activation.get('DisableReason', '') or '(none)'}")
@@ -6370,10 +8282,9 @@ class RelayOperatorPanel(tk.Tk):
             drill = payload.get("Drill", {})
             observed = drill.get("ObservedCounts", {})
             self.config_path_var.set(config_path)
-            self.pair_id_var.set("pair01")
-            self.run_root_var.set(payload.get("RunRoot", ""))
+            self._set_action_context(pair_id="pair01", run_root=payload.get("RunRoot", ""), source="pair01-drill")
             lines = [
-                "pair01 즉시 실행 완료",
+                "pair01 Headless Drill 완료",
                 f"Config: {payload.get('ConfigPath', '')}",
                 f"RunRoot: {payload.get('RunRoot', '')}",
                 f"done 개수: {observed.get('DonePresentCount', '')}",
@@ -6394,29 +8305,30 @@ class RelayOperatorPanel(tk.Tk):
                 )
             )
 
-        self.set_text(self.output_text, "pair01 전용 headless 승인 드릴 실행 중...")
+        self.set_text(self.output_text, "pair01 Headless Drill 실행 중...")
         self.run_background_task(
-            state="pair01 즉시 실행 중",
+            state="pair01 Headless Drill 실행 중",
             hint="고정된 visible config와 pair01 설정으로 한 번 왕복 드릴을 실행 중입니다.",
             worker=worker,
             on_success=on_success,
-            success_state="pair01 즉시 실행 완료",
+            success_state="pair01 Headless Drill 완료",
             success_hint="RunRoot와 preview 출력이 자동 반영됐습니다.",
-            failure_state="pair01 즉시 실행 실패",
+            failure_state="pair01 Headless Drill 실패",
             failure_hint="출력 영역과 마지막 명령을 확인하세요.",
         )
 
     def run_paired_status(self) -> None:
-        self.run_to_output("show-paired-exchange-status.ps1")
+        self.run_to_output("show-paired-exchange-status.ps1", allow_when_busy=True)
 
     def run_paired_summary(self) -> None:
-        self.run_to_output("show-paired-run-summary.ps1")
+        self.run_to_output("show-paired-run-summary.ps1", allow_when_busy=True)
 
     def run_visibility_check(self) -> None:
         self.last_command_var.set(self._runtime_refresh_command_preview())
+        current_context = self._snapshot_context()
 
         def worker():
-            return self.refresh_controller.refresh_runtime(self._current_context())
+            return self.refresh_controller.refresh_runtime(current_context)
 
         def on_success(runtime_result) -> None:
             self._apply_runtime_refresh_result(runtime_result)
@@ -6447,10 +8359,19 @@ class RelayOperatorPanel(tk.Tk):
         )
 
     def run_headless_readiness(self) -> None:
-        self.run_to_output("check-headless-exec-readiness.ps1", require_run_root=True)
+        self.run_to_output(
+            "check-headless-exec-readiness.ps1",
+            require_run_root=True,
+            allow_when_busy=True,
+        )
 
     def run_effective_json(self) -> None:
-        self.run_to_output("show-effective-config.ps1", extra=["-AsJson"], require_pair=False)
+        self.run_to_output(
+            "show-effective-config.ps1",
+            extra=["-AsJson"],
+            require_pair=False,
+            allow_when_busy=True,
+        )
 
     def run_to_output(
         self,
@@ -6461,29 +8382,32 @@ class RelayOperatorPanel(tk.Tk):
         require_pair: bool = False,
         refresh_after: bool = False,
         refresh_scope: str = "",
+        allow_when_busy: bool = False,
     ) -> None:
-        if require_run_root and not self.run_root_var.get().strip():
+        current_context = self._snapshot_context()
+        if require_run_root and not current_context.run_root:
             messagebox.showwarning("RunRoot 필요", "RunRoot 값을 먼저 입력하세요.")
             return
-        if require_pair and not self.pair_id_var.get().strip():
+        if require_pair and not current_context.pair_id:
             messagebox.showwarning("PairId 필요", "PairId 값을 먼저 입력하세요.")
             return
 
         def worker() -> subprocess.CompletedProcess[str]:
-            return self.run_script(
+            return self.status_service.run_script(
                 script_name,
+                current_context,
                 extra=extra,
-                run_root_override=self._current_run_root_for_actions(),
-                pair_id_override=self._selected_pair_id(),
-                target_id_override=self.target_id_var.get().strip(),
+                run_root_override=current_context.run_root,
+                pair_id_override=current_context.pair_id,
+                target_id_override=current_context.target_id,
             )
 
         preview_command = self.command_service.build_script_command(
             script_name=script_name,
-            config_path=self.config_path_var.get().strip(),
-            run_root=self._current_run_root_for_actions(),
-            pair_id=self._selected_pair_id(),
-            target_id=self.target_id_var.get().strip(),
+            config_path=current_context.config_path,
+            run_root=current_context.run_root,
+            pair_id=current_context.pair_id,
+            target_id=current_context.target_id,
             extra=extra,
         )
         self.last_command_var.set(subprocess.list2cmdline(preview_command))
@@ -6492,8 +8416,15 @@ class RelayOperatorPanel(tk.Tk):
             output = completed.stdout.strip()
             if completed.stderr.strip():
                 output += ("\n\nSTDERR:\n" + completed.stderr.strip())
-            self.set_text(self.output_text, output or "(no output)")
-            self.last_result_var.set(f"마지막 결과: {script_name} 실행 완료")
+            if allow_when_busy:
+                self.set_query_text(output or "(no output)")
+                self.set_query_result(
+                    f"마지막 조회: {script_name} 완료",
+                    context=self._query_context_summary(current_context),
+                )
+            else:
+                self.set_text(self.output_text, output or "(no output)")
+                self.last_result_var.set(f"마지막 결과: {script_name} 실행 완료")
             if refresh_after:
                 if refresh_scope == "runtime":
                     self.refresh_runtime_status_only()
@@ -6501,6 +8432,18 @@ class RelayOperatorPanel(tk.Tk):
                     self.refresh_paired_status_only()
                 else:
                     self.load_effective_config()
+
+        if allow_when_busy:
+            self.set_query_result(
+                f"마지막 조회: {script_name} 시작",
+                context=self._query_context_summary(current_context),
+            )
+            self.run_read_only_background_task(
+                label=script_name,
+                worker=worker,
+                on_success=on_success,
+            )
+            return
 
         self.run_background_task(
             state=f"{script_name} 실행 중",

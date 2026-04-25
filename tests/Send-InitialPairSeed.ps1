@@ -82,6 +82,7 @@ function Invoke-ProducerReadyFile {
 }
 
 $root = Split-Path -Parent $PSScriptRoot
+. (Join-Path $PSScriptRoot 'PairedExchangeConfig.ps1')
 if ([string]::IsNullOrWhiteSpace($ConfigPath)) {
     $ConfigPath = Join-Path $root 'config\settings.psd1'
 }
@@ -95,6 +96,16 @@ if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
 
 $config = Import-ConfigDataFile -Path $resolvedConfigPath
 $manifest = Read-JsonObject -Path $manifestPath
+$pairTest = Resolve-PairTestConfig -Root $root -ConfigPath $resolvedConfigPath -ManifestPairTest (Get-ConfigValue -Object $manifest -Name 'PairTest' -DefaultValue $null)
+$executionPathMode = [string](Get-ConfigValue -Object $pairTest -Name 'ExecutionPathMode' -DefaultValue $(if ([bool]$pairTest.VisibleWorker.Enabled) { 'visible-worker' } else { 'typed-window' }))
+$visibleWorkerTransport = ($executionPathMode -eq 'visible-worker')
+$typedWindowTransport = ($executionPathMode -eq 'typed-window')
+if (-not $visibleWorkerTransport -and -not $typedWindowTransport) {
+    throw "unsupported PairTest.ExecutionPathMode: $executionPathMode"
+}
+if ($visibleWorkerTransport -and -not [bool]$pairTest.VisibleWorker.Enabled) {
+    throw 'PairTest.ExecutionPathMode is visible-worker but PairTest.VisibleWorker.Enabled is false.'
+}
 $manifestTargets = @($manifest.Targets)
 if ($manifestTargets.Count -eq 0) {
     throw "manifest contains no targets: $manifestPath"
@@ -142,17 +153,47 @@ foreach ($row in $selectedTargets) {
         throw "target relay config not found: $targetKey"
     }
 
-    $producerResult = Invoke-ProducerReadyFile `
-        -Root $root `
-        -ConfigPath $resolvedConfigPath `
-        -TargetKey $targetKey `
-        -TextFilePath $resolvedMessagePath
+    if ($visibleWorkerTransport) {
+        $workerRaw = & (Join-Path $root 'visible\Queue-VisibleWorkerCommand.ps1') `
+            -ConfigPath $resolvedConfigPath `
+            -RunRoot $resolvedRunRoot `
+            -TargetId $targetKey `
+            -PromptFilePath $resolvedMessagePath `
+            -Mode 'seed' `
+            -AsJson
+        $workerResult = $workerRaw | ConvertFrom-Json
 
-    $results += [pscustomobject]@{
-        TargetId      = $targetKey
-        MessagePath   = $resolvedMessagePath
-        ReadyPath     = [string]$producerResult.ReadyPath
-        ProducerOutput = [string]$producerResult.ProducerOutput
+        $results += [pscustomobject]@{
+            TargetId        = $targetKey
+            MessagePath     = $resolvedMessagePath
+            ReadyPath       = [string]$workerResult.CommandPath
+            ProducerOutput  = 'visible-worker-enqueued'
+            TransportMode   = 'visible-worker'
+            CommandId       = [string]$workerResult.CommandId
+            WorkerStarted   = [bool]$workerResult.WorkerStarted
+            WorkerStatusPath = [string]$workerResult.WorkerStatusPath
+        }
+    }
+    elseif ($typedWindowTransport) {
+        $producerResult = Invoke-ProducerReadyFile `
+            -Root $root `
+            -ConfigPath $resolvedConfigPath `
+            -TargetKey $targetKey `
+            -TextFilePath $resolvedMessagePath
+
+        $results += [pscustomobject]@{
+            TargetId       = $targetKey
+            MessagePath    = $resolvedMessagePath
+            ReadyPath      = [string]$producerResult.ReadyPath
+            ProducerOutput = [string]$producerResult.ProducerOutput
+            TransportMode  = 'router-ready-file'
+            CommandId      = ''
+            WorkerStarted  = $false
+            WorkerStatusPath = ''
+        }
+    }
+    else {
+        throw "unsupported PairTest.ExecutionPathMode: $executionPathMode"
     }
 }
 

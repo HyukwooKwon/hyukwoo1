@@ -754,12 +754,34 @@ function Invoke-AhkSend {
     }
 }
 
-function Process-WorkItem {
+function New-WorkItemProcessResult {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$TargetId,
+        [Parameter(Mandatory)][int]$EnterCount,
+        [Parameter(Mandatory)][string[]]$SubmitRetryModes,
+        [Parameter(Mandatory)]$SendResult
+    )
+
+    return [pscustomobject]@{
+        Path             = [string]$Path
+        TargetId         = [string]$TargetId
+        EnterCount       = [int]$EnterCount
+        SubmitRetryModes = @($SubmitRetryModes)
+        DebugLogPath     = [string]$SendResult.DebugLogPath
+        PayloadBytes     = [int]$SendResult.PayloadBytes
+        TextSettleMs     = [int]$SendResult.TextSettleMs
+        BaseTextSettleMs = [int]$SendResult.BaseTextSettleMs
+        ExtraTextSettleMs = [int]$SendResult.ExtraTextSettleMs
+        ExitCode         = [int]$SendResult.ExitCode
+    }
+}
+
+function Get-WorkItemDeliveryContext {
     param(
         [Parameter(Mandatory)]$Config,
         [Parameter(Mandatory)]$Target,
         [Parameter(Mandatory)]$Item,
-        [Parameter(Mandatory)][string]$LogPath,
         [datetime]$RouterStartedAtUtc = [datetime]::MinValue,
         [string]$ExpectedLauncherSessionId = ''
     )
@@ -858,17 +880,170 @@ function Process-WorkItem {
         throw (New-Object System.Exception((New-RelayFailureMessage -Category 'file_invalid' -Message "payload bytes exceeded: $payloadBytes")))
     }
 
-    $submitRetryModes = @(Get-RelayStringListSetting -Config $Config -Name 'SubmitRetryModes' -DefaultValues @('enter'))
-    $sendResult = Invoke-AhkSend -Config $Config -TargetId ([string]$Target.Id) -Payload $payload -EnterCount $enterCount -PayloadLabel ([System.IO.Path]::GetFileName($path))
-    $exitCode = [int]$sendResult.ExitCode
-    Write-RelayLog -Path $LogPath -Level 'info' -Message ("sending target={0} enter={1} submitModes={2} file={3} payloadBytes={4} textSettleMs={5} ahkDebugLog={6}" -f $Target.Id, $enterCount, ($submitRetryModes -join '>'), $path, $sendResult.PayloadBytes, $sendResult.TextSettleMs, $sendResult.DebugLogPath)
-    $category = Get-FailureCategoryFromAhkExitCode -ExitCode $exitCode
+    return [pscustomobject]@{
+        Path             = $path
+        MetadataDocument = $metadataDocument
+        MetadataMessageType = $metadataMessageType
+        Body             = $body
+        FixedSuffix      = $fixedSuffix
+        Payload          = $payload
+        PayloadBytes     = [int]$payloadBytes
+        EnterCount       = [int]$enterCount
+        SubmitRetryModes = @(Get-RelayStringListSetting -Config $Config -Name 'SubmitRetryModes' -DefaultValues @('enter'))
+    }
+}
+
+function Invoke-WorkItemDelivery {
+    param(
+        [Parameter(Mandatory)]$Config,
+        [Parameter(Mandatory)]$Target,
+        [Parameter(Mandatory)]$Context,
+        [Parameter(Mandatory)][string]$LogPath
+    )
+
+    $sendResult = Invoke-AhkSend -Config $Config -TargetId ([string]$Target.Id) -Payload ([string]$Context.Payload) -EnterCount ([int]$Context.EnterCount) -PayloadLabel ([System.IO.Path]::GetFileName([string]$Context.Path))
+    $result = New-WorkItemProcessResult `
+        -Path ([string]$Context.Path) `
+        -TargetId ([string]$Target.Id) `
+        -EnterCount ([int]$Context.EnterCount) `
+        -SubmitRetryModes @($Context.SubmitRetryModes) `
+        -SendResult $sendResult
+
+    Write-RelayLog -Path $LogPath -Level 'info' -Message ("sending target={0} enter={1} submitModes={2} file={3} payloadBytes={4} textSettleMs={5} ahkDebugLog={6}" -f $Target.Id, $result.EnterCount, ($result.SubmitRetryModes -join '>'), $result.Path, $result.PayloadBytes, $result.TextSettleMs, $result.DebugLogPath)
+    $category = Get-FailureCategoryFromAhkExitCode -ExitCode ([int]$result.ExitCode)
 
     if ($category -ne 'success') {
-        throw (New-Object System.Exception((New-RelayFailureMessage -Category $category -Message "AHK exit code: $exitCode debugLog=$($sendResult.DebugLogPath)")))
+        throw (New-Object System.Exception((New-RelayFailureMessage -Category $category -Message "AHK exit code: $($result.ExitCode) debugLog=$($result.DebugLogPath)")))
     }
 
-    Write-RelayLog -Path $LogPath -Level 'info' -Message "input sequence complete target=$($Target.Id) file=$path ahkDebugLog=$($sendResult.DebugLogPath)"
+    Write-RelayLog -Path $LogPath -Level 'info' -Message "input sequence complete target=$($Target.Id) file=$($result.Path) ahkDebugLog=$($result.DebugLogPath)"
+    return $result
+}
+
+function Resolve-WorkItemFailureDisposition {
+    param(
+        [Parameter(Mandatory)][string]$Category,
+        [Parameter(Mandatory)][int]$Attempt,
+        [Parameter(Mandatory)][int]$AttemptsAllowed,
+        [Parameter(Mandatory)][int]$RetryDelayMs
+    )
+
+    $logLevel = if ($Category -in @('window_not_found', 'focus_lost', 'user_active_hold', 'ignored')) { 'warn' } else { 'error' }
+    $result = [ordered]@{
+        LogLevel                = [string]$logLevel
+        ArchiveState            = ''
+        DestinationKey          = ''
+        RetryCurrentItem        = $false
+        DelayBeforeRetryMs      = 0
+        WriteRetryMetadata      = $false
+        WriteIgnoredArchiveMetadata = $false
+    }
+
+    switch ($Category) {
+        'window_not_found' {
+            $result.ArchiveState = 'retry-pending'
+            $result.DestinationKey = 'RetryPendingRoot'
+            $result.WriteRetryMetadata = $true
+        }
+        'focus_lost' {
+            $result.ArchiveState = 'retry-pending'
+            $result.DestinationKey = 'RetryPendingRoot'
+            $result.WriteRetryMetadata = $true
+        }
+        'user_active_hold' {
+            $result.ArchiveState = 'retry-pending'
+            $result.DestinationKey = 'RetryPendingRoot'
+            $result.WriteRetryMetadata = $true
+        }
+        'ignored' {
+            $result.ArchiveState = 'ignored'
+            $result.DestinationKey = 'IgnoredRoot'
+            $result.WriteIgnoredArchiveMetadata = $true
+        }
+        'send_failed' {
+            if ($Attempt -lt $AttemptsAllowed) {
+                $result.RetryCurrentItem = $true
+                $result.DelayBeforeRetryMs = [int]$RetryDelayMs
+            }
+            else {
+                $result.ArchiveState = 'failed'
+                $result.DestinationKey = 'FailedRoot'
+            }
+        }
+        default {
+            $result.ArchiveState = 'failed'
+            $result.DestinationKey = 'FailedRoot'
+        }
+    }
+
+    return [pscustomobject]$result
+}
+
+function Complete-WorkItemFailure {
+    param(
+        [Parameter(Mandatory)]$Disposition,
+        [Parameter(Mandatory)]$Config,
+        [Parameter(Mandatory)]$Target,
+        [Parameter(Mandatory)]$Item,
+        [Parameter(Mandatory)][string]$FailureCategory,
+        [Parameter(Mandatory)][string]$FailureMessage,
+        [Parameter(Mandatory)][int]$Attempt,
+        [Parameter(Mandatory)][string]$LogPath,
+        [Parameter(Mandatory)][string]$IgnoredRoot
+    )
+
+    if ($Disposition.RetryCurrentItem) {
+        Start-Sleep -Milliseconds ([int]$Disposition.DelayBeforeRetryMs)
+        return
+    }
+
+    $destinationRoot = switch ([string]$Disposition.DestinationKey) {
+        'RetryPendingRoot' { [string]$Config.RetryPendingRoot }
+        'FailedRoot' { [string]$Config.FailedRoot }
+        'IgnoredRoot' { [string]$IgnoredRoot }
+        default { '' }
+    }
+
+    if (-not (Test-NonEmptyString $destinationRoot)) {
+        return
+    }
+
+    $archivedPath = Move-MessageToArchive -SourcePath ([string]$Item.Path) -DestinationRoot $destinationRoot -TargetId ([string]$Target.Id)
+    if ($null -eq $archivedPath) {
+        return
+    }
+
+    if ($Disposition.WriteRetryMetadata) {
+        Write-RetryPendingMetadata -RetryPath $archivedPath -FailureCategory $FailureCategory -FailureMessage $FailureMessage -TargetId ([string]$Target.Id) -OriginalPath ([string]$Item.Path) -Attempt $Attempt
+    }
+
+    if ($Disposition.WriteIgnoredArchiveMetadata) {
+        $archiveReason = Resolve-RelayArchiveReason -Message ([string]$FailureMessage)
+        $observedCreatedAtRaw = if ($null -ne $Item.PSObject.Properties['ObservedCreatedAtRaw']) { [string]$Item.ObservedCreatedAtRaw } else { '' }
+        $observedCreatedAtUtc = if ($null -ne $Item.PSObject.Properties['ObservedCreatedAtUtc']) { [string]$Item.ObservedCreatedAtUtc } else { '' }
+        Write-ReadyFileArchiveMetadata `
+            -ReadyFilePath ([string]$archivedPath) `
+            -ArchiveState 'ignored' `
+            -ReasonCode ([string]$archiveReason.Code) `
+            -ReasonDetail ([string]$archiveReason.Detail) `
+            -ObservedCreatedAtRaw $observedCreatedAtRaw `
+            -ObservedCreatedAtUtc $observedCreatedAtUtc | Out-Null
+    }
+
+    Write-RelayLog -Path $LogPath -Level ([string]$Disposition.LogLevel) -Message ("moved to {0}: {1}" -f [string]$Disposition.ArchiveState, $archivedPath)
+}
+
+function Process-WorkItem {
+    param(
+        [Parameter(Mandatory)]$Config,
+        [Parameter(Mandatory)]$Target,
+        [Parameter(Mandatory)]$Item,
+        [Parameter(Mandatory)][string]$LogPath,
+        [datetime]$RouterStartedAtUtc = [datetime]::MinValue,
+        [string]$ExpectedLauncherSessionId = ''
+    )
+    $context = Get-WorkItemDeliveryContext -Config $Config -Target $Target -Item $Item -RouterStartedAtUtc $RouterStartedAtUtc -ExpectedLauncherSessionId $ExpectedLauncherSessionId
+    return (Invoke-WorkItemDelivery -Config $Config -Target $Target -Context $context -LogPath $LogPath)
 }
 
 $config = Get-Config -Path $ConfigPath
@@ -1062,11 +1237,11 @@ try {
 
             try {
                 Write-RelayLog -Path $logPath -Level 'info' -Message "processing attempt=$attempt/$attemptsAllowed target=$($target.Id) file=$($item.Path)"
-                Process-WorkItem -Config $config -Target $target -Item $item -LogPath $logPath -RouterStartedAtUtc $routerStartedAtUtc -ExpectedLauncherSessionId ([string]$launcherContext.LauncherSessionId)
+                $workItemResult = Process-WorkItem -Config $config -Target $target -Item $item -LogPath $logPath -RouterStartedAtUtc $routerStartedAtUtc -ExpectedLauncherSessionId ([string]$launcherContext.LauncherSessionId)
 
                 $processedPath = Move-MessageToArchive -SourcePath ([string]$item.Path) -DestinationRoot ([string]$config.ProcessedRoot) -TargetId ([string]$target.Id)
                 if ($null -ne $processedPath) {
-                    Write-RelayLog -Path $logPath -Level 'info' -Message "moved to processed: $processedPath"
+                    Write-RelayLog -Path $logPath -Level 'info' -Message ("moved to processed: {0} payloadBytes={1} textSettleMs={2}" -f $processedPath, $workItemResult.PayloadBytes, $workItemResult.TextSettleMs)
                 }
 
                 $done = $true
@@ -1075,70 +1250,11 @@ try {
             catch {
                 $failure = Resolve-RelayFailure -Text $_.Exception.Message
                 $lastError = ($failure.Category + ': ' + $failure.Message)
-                $failureLogLevel = if ($failure.Category -in @('window_not_found', 'focus_lost', 'user_active_hold', 'ignored')) { 'warn' } else { 'error' }
-                Write-RelayLog -Path $logPath -Level $failureLogLevel -Message "attempt failed target=$($target.Id) file=$($item.Path) category=$($failure.Category) reason=$($failure.Message)"
-
-                switch ($failure.Category) {
-                    'window_not_found' {
-                        $retryPath = Move-MessageToArchive -SourcePath ([string]$item.Path) -DestinationRoot ([string]$config.RetryPendingRoot) -TargetId ([string]$target.Id)
-                        if ($null -ne $retryPath) {
-                            Write-RetryPendingMetadata -RetryPath $retryPath -FailureCategory $failure.Category -FailureMessage $failure.Message -TargetId ([string]$target.Id) -OriginalPath ([string]$item.Path) -Attempt $attempt
-                            Write-RelayLog -Path $logPath -Level 'warn' -Message "moved to retry-pending: $retryPath"
-                        }
-                        $done = $true
-                    }
-                    'focus_lost' {
-                        $retryPath = Move-MessageToArchive -SourcePath ([string]$item.Path) -DestinationRoot ([string]$config.RetryPendingRoot) -TargetId ([string]$target.Id)
-                        if ($null -ne $retryPath) {
-                            Write-RetryPendingMetadata -RetryPath $retryPath -FailureCategory $failure.Category -FailureMessage $failure.Message -TargetId ([string]$target.Id) -OriginalPath ([string]$item.Path) -Attempt $attempt
-                            Write-RelayLog -Path $logPath -Level 'warn' -Message "moved to retry-pending: $retryPath"
-                        }
-                        $done = $true
-                    }
-                    'user_active_hold' {
-                        $retryPath = Move-MessageToArchive -SourcePath ([string]$item.Path) -DestinationRoot ([string]$config.RetryPendingRoot) -TargetId ([string]$target.Id)
-                        if ($null -ne $retryPath) {
-                            Write-RetryPendingMetadata -RetryPath $retryPath -FailureCategory $failure.Category -FailureMessage $failure.Message -TargetId ([string]$target.Id) -OriginalPath ([string]$item.Path) -Attempt $attempt
-                            Write-RelayLog -Path $logPath -Level 'warn' -Message "moved to retry-pending: $retryPath"
-                        }
-                        $done = $true
-                    }
-                    'ignored' {
-                        $ignoredPath = Move-MessageToArchive -SourcePath ([string]$item.Path) -DestinationRoot $ignoredRoot -TargetId ([string]$target.Id)
-                        if ($null -ne $ignoredPath) {
-                            $archiveReason = Resolve-RelayArchiveReason -Message ([string]$failure.Message)
-                            $observedCreatedAtRaw = if ($null -ne $item.PSObject.Properties['ObservedCreatedAtRaw']) { [string]$item.ObservedCreatedAtRaw } else { '' }
-                            $observedCreatedAtUtc = if ($null -ne $item.PSObject.Properties['ObservedCreatedAtUtc']) { [string]$item.ObservedCreatedAtUtc } else { '' }
-                            Write-ReadyFileArchiveMetadata `
-                                -ReadyFilePath ([string]$ignoredPath) `
-                                -ArchiveState 'ignored' `
-                                -ReasonCode ([string]$archiveReason.Code) `
-                                -ReasonDetail ([string]$archiveReason.Detail) `
-                                -ObservedCreatedAtRaw $observedCreatedAtRaw `
-                                -ObservedCreatedAtUtc $observedCreatedAtUtc | Out-Null
-                            Write-RelayLog -Path $logPath -Level 'warn' -Message "moved to ignored: $ignoredPath"
-                        }
-                        $done = $true
-                    }
-                    'send_failed' {
-                        if ($attempt -lt $attemptsAllowed) {
-                            Start-Sleep -Milliseconds ([int]$config.RetryDelayMs)
-                        }
-                        else {
-                            $failedPath = Move-MessageToArchive -SourcePath ([string]$item.Path) -DestinationRoot ([string]$config.FailedRoot) -TargetId ([string]$target.Id)
-                            if ($null -ne $failedPath) {
-                                Write-RelayLog -Path $logPath -Level 'error' -Message "moved to failed: $failedPath"
-                            }
-                            $done = $true
-                        }
-                    }
-                    default {
-                        $failedPath = Move-MessageToArchive -SourcePath ([string]$item.Path) -DestinationRoot ([string]$config.FailedRoot) -TargetId ([string]$target.Id)
-                        if ($null -ne $failedPath) {
-                            Write-RelayLog -Path $logPath -Level 'error' -Message "moved to failed: $failedPath"
-                        }
-                        $done = $true
-                    }
+                $disposition = Resolve-WorkItemFailureDisposition -Category ([string]$failure.Category) -Attempt $attempt -AttemptsAllowed $attemptsAllowed -RetryDelayMs ([int]$config.RetryDelayMs)
+                Write-RelayLog -Path $logPath -Level ([string]$disposition.LogLevel) -Message "attempt failed target=$($target.Id) file=$($item.Path) category=$($failure.Category) reason=$($failure.Message)"
+                Complete-WorkItemFailure -Disposition $disposition -Config $config -Target $target -Item $item -FailureCategory ([string]$failure.Category) -FailureMessage ([string]$failure.Message) -Attempt $attempt -LogPath $logPath -IgnoredRoot $ignoredRoot
+                if (-not $disposition.RetryCurrentItem) {
+                    $done = $true
                 }
             }
         }

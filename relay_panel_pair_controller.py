@@ -24,6 +24,17 @@ class PairController:
             "{0}: {1}".format(summary.pair_id, summary.detail),
             "lane watcher={0}".format(summary.lane_watcher_status),
         ]
+        if summary.forwarded_state_count > 0:
+            parts.append("forwardedState={0}".format(summary.forwarded_state_count))
+        parts.append("왕복={0}".format(summary.roundtrip_count))
+        if summary.current_phase:
+            parts.append("현재 단계={0}".format(summary.current_phase))
+        if summary.handoff_ready_count > 0:
+            parts.append("handoffReady={0}".format(summary.handoff_ready_count))
+        if summary.next_expected_handoff:
+            parts.append("다음 예정 handoff={0}".format(summary.next_expected_handoff))
+        if summary.next_action:
+            parts.append("다음 자동 동작={0}".format(summary.next_action))
         if reason:
             parts.append("차단 이유={0}".format(reason))
         if action:

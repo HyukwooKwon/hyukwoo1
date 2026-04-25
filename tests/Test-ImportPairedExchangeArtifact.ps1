@@ -201,6 +201,33 @@ Assert-True ($invalidCheck.ExitCode -ne 0) 'missing summary check should fail.'
 $invalidIssues = @($invalidCheck.Json.Validation.Issues | ForEach-Object { [string]$_ })
 Assert-True ('summary-source-missing' -in $invalidIssues) 'missing summary should be reported.'
 
+$invalidZipSourcePath = Join-Path $sourceRoot 'invalid-review.zip'
+[System.IO.File]::WriteAllText($invalidZipSourcePath, 'not a real zip archive', (New-Utf8NoBomEncoding))
+
+$invalidZipCheck = Invoke-PowerShellJson -ScriptPath (Join-Path $root 'check-paired-exchange-artifact.ps1') -Arguments @(
+    '-ConfigPath', $resolvedConfigPath,
+    '-RunRoot', $contractRunRoot,
+    '-TargetId', 'target01',
+    '-SummarySourcePath', $summarySourcePath,
+    '-ReviewZipSourcePath', $invalidZipSourcePath,
+    '-AsJson'
+)
+Assert-True ($invalidZipCheck.ExitCode -ne 0) 'invalid zip check should fail.'
+$invalidZipIssues = @($invalidZipCheck.Json.Validation.Issues | ForEach-Object { [string]$_ })
+Assert-True ('review-zip-source-invalid' -in $invalidZipIssues) 'invalid zip should be reported during check.'
+
+$invalidZipImport = Invoke-PowerShellJson -ScriptPath (Join-Path $root 'import-paired-exchange-artifact.ps1') -Arguments @(
+    '-ConfigPath', $resolvedConfigPath,
+    '-RunRoot', $contractRunRoot,
+    '-TargetId', 'target01',
+    '-SummarySourcePath', $summarySourcePath,
+    '-ReviewZipSourcePath', $invalidZipSourcePath,
+    '-AsJson'
+)
+Assert-True ($invalidZipImport.ExitCode -ne 0) 'invalid zip import should fail.'
+$invalidZipImportIssues = @($invalidZipImport.Json.Validation.Issues | ForEach-Object { [string]$_ })
+Assert-True ('review-zip-source-invalid' -in $invalidZipImportIssues) 'invalid zip should be reported during import.'
+
 $strictRunRoot = Join-Path $pairRunRootBase ('run_contract_import_error_strict_' + (Get-Date -Format 'yyyyMMdd_HHmmss_fff'))
 & (Join-Path $root 'tests\Start-PairedExchangeTest.ps1') `
     -ConfigPath $resolvedConfigPath `

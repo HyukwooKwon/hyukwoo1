@@ -48,6 +48,39 @@ function Get-FileInfoSummary {
     }
 }
 
+function Test-ZipArchiveReadable {
+    param([Parameter(Mandatory)][string]$Path)
+
+    try {
+        Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction SilentlyContinue
+    }
+    catch {
+    }
+
+    try {
+        $archive = [System.IO.Compression.ZipFile]::OpenRead($Path)
+        try {
+            $null = $archive.Entries.Count
+        }
+        finally {
+            if ($null -ne $archive) {
+                $archive.Dispose()
+            }
+        }
+
+        return [pscustomobject]@{
+            Ok = $true
+            ErrorMessage = ''
+        }
+    }
+    catch {
+        return [pscustomobject]@{
+            Ok = $false
+            ErrorMessage = $_.Exception.Message
+        }
+    }
+}
+
 function Resolve-RequestedPath {
     param([Parameter(Mandatory)][string]$Path)
 
@@ -153,23 +186,40 @@ function Test-RemovableStaleError {
     }
 
     $reason = [string](Get-ConfigValue -Object $ErrorDoc -Name 'Reason' -DefaultValue '')
-    if ($reason -notin @('summary-missing-after-exec', 'summary-stale-after-exec', 'zip-missing-after-exec', 'zip-stale-after-exec', 'source-outbox-incomplete-after-exec')) {
+    if ($reason -notin @('codex-exec-timeout', 'summary-missing-after-exec', 'summary-stale-after-exec', 'zip-missing-after-exec', 'zip-stale-after-exec', 'source-outbox-incomplete-after-exec')) {
         return $false
     }
 
+    $errorRequestPath = [string](Get-ConfigValue -Object $ErrorDoc -Name 'RequestPath' -DefaultValue '')
+    $requestMatched = $false
+    if (Test-NonEmptyString $errorRequestPath -or Test-NonEmptyString $RequestPath) {
+        if (-not (Test-NormalizedPathMatch -Left $errorRequestPath -Right $RequestPath)) {
+            return $false
+        }
+        $requestMatched = $true
+    }
+
+    $hasSourceIdentity = $false
     foreach ($pair in @(
-            @([string](Get-ConfigValue -Object $ErrorDoc -Name 'RequestPath' -DefaultValue ''), $RequestPath),
-            @([string](Get-ConfigValue -Object $ErrorDoc -Name 'SummaryPath' -DefaultValue ''), $SummaryPath),
             @([string](Get-ConfigValue -Object $ErrorDoc -Name 'SourceSummaryPath' -DefaultValue ''), $SourceSummaryPath),
             @([string](Get-ConfigValue -Object $ErrorDoc -Name 'SourceReviewZipPath' -DefaultValue ''), $SourceReviewZipPath),
             @([string](Get-ConfigValue -Object $ErrorDoc -Name 'PublishReadyPath' -DefaultValue ''), $PublishReadyPath)
         )) {
-        if (Test-NormalizedPathMatch -Left ([string]$pair[0]) -Right ([string]$pair[1])) {
-            return $true
+        $left = [string]$pair[0]
+        $right = [string]$pair[1]
+        if (Test-NonEmptyString $left -or Test-NonEmptyString $right) {
+            $hasSourceIdentity = $true
+            if (-not (Test-NormalizedPathMatch -Left $left -Right $right)) {
+                return $false
+            }
         }
     }
 
-    return $false
+    if ($hasSourceIdentity) {
+        return $true
+    }
+
+    return $requestMatched
 }
 
 function Get-ExistingContractArtifacts {
@@ -241,6 +291,12 @@ if (-not (Test-Path -LiteralPath $resolvedReviewZipSourcePath -PathType Leaf)) {
 }
 if ([System.IO.Path]::GetExtension($resolvedReviewZipSourcePath) -notin @('.zip', '.ZIP')) {
     $issues.Add('review-zip-source-not-zip')
+}
+elseif (Test-Path -LiteralPath $resolvedReviewZipSourcePath -PathType Leaf) {
+    $reviewZipValidation = Test-ZipArchiveReadable -Path $resolvedReviewZipSourcePath
+    if (-not [bool]$reviewZipValidation.Ok) {
+        $issues.Add('review-zip-source-invalid')
+    }
 }
 if (-not (Test-NonEmptyString $contract.TargetFolder)) {
     $issues.Add('target-folder-missing-from-contract')

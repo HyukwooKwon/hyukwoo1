@@ -122,6 +122,22 @@ function Ensure-Directory {
     }
 }
 
+function Test-ProcessAlive {
+    param([int]$ProcessId)
+
+    if ($ProcessId -le 0) {
+        return $false
+    }
+
+    try {
+        $process = Get-Process -Id $ProcessId -ErrorAction Stop
+        return ($null -ne $process -and -not $process.HasExited)
+    }
+    catch {
+        return $false
+    }
+}
+
 function Load-SeedSendStatusState {
     param([Parameter(Mandatory)][string]$Path)
 
@@ -508,21 +524,12 @@ function Wait-ForOutboxPublish {
         [datetime]$ReferenceTime = [datetime]::MinValue
     )
 
-    if ($TimeoutSeconds -le 0) {
-        return [pscustomobject]@{
-            Published = $false
-            SummaryPath = [string]$TargetRow.SourceSummaryPath
-            ReviewZipPath = [string]$TargetRow.SourceReviewZipPath
-            PublishReadyPath = [string]$TargetRow.PublishReadyPath
-        }
-    }
-
-    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    $deadline = if ($TimeoutSeconds -gt 0) { (Get-Date).AddSeconds($TimeoutSeconds) } else { Get-Date }
     $summaryPath = [string]$TargetRow.SourceSummaryPath
     $reviewZipPath = [string]$TargetRow.SourceReviewZipPath
     $publishReadyPath = [string]$TargetRow.PublishReadyPath
     $publishedArchivePath = [string]$TargetRow.PublishedArchivePath
-    while ((Get-Date) -lt $deadline) {
+    do {
         $hasSummary = (Test-Path -LiteralPath $summaryPath -PathType Leaf)
         $hasReviewZip = (Test-Path -LiteralPath $reviewZipPath -PathType Leaf)
         if ((Test-Path -LiteralPath $summaryPath -PathType Leaf) -and
@@ -552,8 +559,11 @@ function Wait-ForOutboxPublish {
             }
         }
 
+        if ($TimeoutSeconds -le 0) {
+            break
+        }
         Start-Sleep -Milliseconds 500
-    }
+    } while ((Get-Date) -lt $deadline)
 
     return [pscustomobject]@{
         Published = $false
@@ -563,7 +573,251 @@ function Wait-ForOutboxPublish {
     }
 }
 
+function Get-VisibleWorkerDispatchResult {
+    param(
+        [Parameter(Mandatory)]$WaitResult,
+        [Parameter(Mandatory)]$TargetRow,
+        [Parameter(Mandatory)][int]$WaitForPublishSeconds
+    )
+
+    $finalState = [string]$WaitResult.State
+    $processedPath = [string]$WaitResult.Path
+    $processedAt = ''
+    $failedPath = ''
+    $failedAt = ''
+    $retryReason = ''
+    $outboxResult = $null
+
+    if (Test-Path -LiteralPath $processedPath -PathType Leaf) {
+        $processedAt = (Get-Item -LiteralPath $processedPath -ErrorAction Stop).LastWriteTime.ToString('o')
+    }
+
+    switch ([string]$WaitResult.State) {
+        'completed' {
+            $referenceTime = if ($null -ne $WaitResult.StatusData -and (Test-NonEmptyString ([string](Get-ConfigValue -Object $WaitResult.StatusData -Name 'CompletedAt' -DefaultValue '')))) {
+                try { [datetime]::Parse([string](Get-ConfigValue -Object $WaitResult.StatusData -Name 'CompletedAt' -DefaultValue '')) } catch { Get-Date }
+            }
+            else {
+                Get-Date
+            }
+            $outboxResult = Wait-ForOutboxPublish -TargetRow $TargetRow -TimeoutSeconds $WaitForPublishSeconds -ReferenceTime $referenceTime
+            if ($outboxResult.Published) {
+                $finalState = 'publish-detected'
+            }
+            elseif ($WaitForPublishSeconds -gt 0) {
+                $finalState = 'submit-unconfirmed'
+            }
+            break
+        }
+        'failed' {
+            $failedPath = [string]$WaitResult.Path
+            if (Test-Path -LiteralPath $failedPath -PathType Leaf) {
+                $failedAt = (Get-Item -LiteralPath $failedPath -ErrorAction Stop).LastWriteTime.ToString('o')
+            }
+            if ($null -ne $WaitResult.StatusData) {
+                $retryReason = [string](Get-ConfigValue -Object $WaitResult.StatusData -Name 'Reason' -DefaultValue 'visible-worker-failed')
+            }
+            break
+        }
+        'worker-not-ready' {
+            $retryReason = 'visible-worker-not-ready'
+            break
+        }
+        'dispatch-accepted-stale' {
+            $retryReason = 'dispatch-accepted-stale'
+            break
+        }
+        'dispatch-running-stale-no-heartbeat' {
+            $retryReason = 'dispatch-running-stale-no-heartbeat'
+            break
+        }
+        'timeout' {
+            $retryReason = 'visible-worker-dispatch-timeout'
+            break
+        }
+    }
+
+    return [pscustomobject]@{
+        FinalState = $finalState
+        ProcessedPath = $processedPath
+        ProcessedAt = $processedAt
+        FailedPath = $failedPath
+        FailedAt = $failedAt
+        RetryReason = $retryReason
+        OutboxResult = $outboxResult
+    }
+}
+
+function Resolve-VisibleWorkerLateSuccess {
+    param(
+        [Parameter(Mandatory)]$TargetRow,
+        [string]$CurrentFinalState,
+        [string]$CurrentSubmitState,
+        [bool]$CurrentSubmitConfirmed,
+        [string]$CurrentSubmitReason,
+        [string]$DispatchPath,
+        [string]$CommandId
+    )
+
+    $outboxSnapshot = Wait-ForOutboxPublish -TargetRow $TargetRow -TimeoutSeconds 0 -ReferenceTime ([datetime]::MinValue)
+    $dispatchCompleted = $false
+    if ((Test-NonEmptyString $DispatchPath) -and (Test-Path -LiteralPath $DispatchPath -PathType Leaf)) {
+        try {
+            $dispatchDoc = Read-JsonObject -Path $DispatchPath
+            $dispatchCommandId = [string](Get-ConfigValue -Object $dispatchDoc -Name 'CommandId' -DefaultValue '')
+            if ((-not (Test-NonEmptyString $CommandId)) -or ($dispatchCommandId -eq $CommandId)) {
+                $dispatchCompleted = ([string](Get-ConfigValue -Object $dispatchDoc -Name 'State' -DefaultValue '') -eq 'completed')
+            }
+        }
+        catch {
+            $dispatchCompleted = $false
+        }
+    }
+
+    $superseded = $outboxSnapshot.Published -and (-not $CurrentSubmitConfirmed)
+    return [pscustomobject]@{
+        Superseded = $superseded
+        FinalState = if ($superseded) { if ($dispatchCompleted) { 'publish-detected-late' } else { 'publish-detected' } } else { $CurrentFinalState }
+        SubmitState = if ($superseded) { 'confirmed' } else { $CurrentSubmitState }
+        SubmitConfirmed = if ($superseded) { $true } else { $CurrentSubmitConfirmed }
+        SubmitReason = if ($superseded) { if ($dispatchCompleted) { 'outbox-publish-detected-after-dispatch-timeout' } else { 'outbox-publish-detected-late' } } else { $CurrentSubmitReason }
+        OutboxResult = $outboxSnapshot
+    }
+}
+
+function Get-VisibleWorkerDispatchStatusPath {
+    param(
+        [Parameter(Mandatory)][string]$RunRoot,
+        [Parameter(Mandatory)][string]$TargetKey
+    )
+
+    return (Join-Path (Join-Path $RunRoot '.state\headless-dispatch') ("dispatch_{0}.json" -f $TargetKey))
+}
+
+function Get-VisibleWorkerStatusPath {
+    param(
+        [Parameter(Mandatory)]$PairTest,
+        [Parameter(Mandatory)][string]$TargetKey
+    )
+
+    return (Join-Path (Join-Path ([string]$PairTest.VisibleWorker.StatusRoot) 'workers') ("worker_{0}.json" -f $TargetKey))
+}
+
+function Get-IsoTimestampAgeSeconds {
+    param([string]$IsoTimestamp)
+
+    if (-not (Test-NonEmptyString $IsoTimestamp)) {
+        return -1
+    }
+
+    try {
+        $parsed = [datetimeoffset]::Parse($IsoTimestamp)
+    }
+    catch {
+        return -1
+    }
+
+    return [int][math]::Max(0, [math]::Round(((Get-Date).ToUniversalTime() - $parsed.UtcDateTime).TotalSeconds))
+}
+
+function Get-DispatchFreshnessAgeSeconds {
+    param($StatusDoc)
+
+    if ($null -eq $StatusDoc) {
+        return -1
+    }
+
+    $heartbeatAge = Get-IsoTimestampAgeSeconds -IsoTimestamp ([string](Get-ConfigValue -Object $StatusDoc -Name 'HeartbeatAt' -DefaultValue ''))
+    if ($heartbeatAge -ge 0) {
+        return $heartbeatAge
+    }
+
+    return (Get-IsoTimestampAgeSeconds -IsoTimestamp ([string](Get-ConfigValue -Object $StatusDoc -Name 'UpdatedAt' -DefaultValue '')))
+}
+
+function Wait-ForVisibleWorkerDispatch {
+    param(
+        [Parameter(Mandatory)][string]$RunRoot,
+        [Parameter(Mandatory)][string]$TargetKey,
+        [Parameter(Mandatory)][string]$CommandId,
+        [Parameter(Mandatory)][int]$TimeoutSeconds,
+        [Parameter(Mandatory)]$PairTest,
+        [int]$AcceptedStaleSeconds = 15,
+        [int]$RunningStaleSeconds = 30
+    )
+
+    $statusPath = Get-VisibleWorkerDispatchStatusPath -RunRoot $RunRoot -TargetKey $TargetKey
+    $workerStatusPath = Get-VisibleWorkerStatusPath -PairTest $PairTest -TargetKey $TargetKey
+    $deadline = (Get-Date).AddSeconds([math]::Max(1, $TimeoutSeconds))
+    while ((Get-Date) -lt $deadline) {
+        if (Test-Path -LiteralPath $statusPath -PathType Leaf) {
+            try {
+                $statusDoc = Read-JsonObject -Path $statusPath
+            }
+            catch {
+                $statusDoc = $null
+            }
+
+            if ($null -ne $statusDoc -and [string](Get-ConfigValue -Object $statusDoc -Name 'CommandId' -DefaultValue '') -eq $CommandId) {
+                $state = [string](Get-ConfigValue -Object $statusDoc -Name 'State' -DefaultValue '')
+                if ($state -in @('completed', 'failed')) {
+                    return [pscustomobject]@{
+                        State      = $state
+                        Path       = $statusPath
+                        StatusData = $statusDoc
+                    }
+                }
+
+                $workerStatus = $null
+                if (Test-Path -LiteralPath $workerStatusPath -PathType Leaf) {
+                    try {
+                        $workerStatus = Read-JsonObject -Path $workerStatusPath
+                    }
+                    catch {
+                        $workerStatus = $null
+                    }
+                }
+
+                $workerPid = if ($null -ne $workerStatus) { [int](Get-ConfigValue -Object $workerStatus -Name 'WorkerPid' -DefaultValue 0) } else { 0 }
+                $workerAlive = Test-ProcessAlive -ProcessId $workerPid
+                if (-not $workerAlive) {
+                    return [pscustomobject]@{
+                        State      = 'worker-not-ready'
+                        Path       = $statusPath
+                        StatusData = $statusDoc
+                    }
+                }
+
+                $dispatchAgeSeconds = Get-DispatchFreshnessAgeSeconds -StatusDoc $statusDoc
+                if ($state -eq 'accepted' -and $dispatchAgeSeconds -ge $AcceptedStaleSeconds) {
+                    return [pscustomobject]@{
+                        State      = 'dispatch-accepted-stale'
+                        Path       = $statusPath
+                        StatusData = $statusDoc
+                    }
+                }
+                if ($state -eq 'running' -and $dispatchAgeSeconds -ge $RunningStaleSeconds) {
+                    return [pscustomobject]@{
+                        State      = 'dispatch-running-stale-no-heartbeat'
+                        Path       = $statusPath
+                        StatusData = $statusDoc
+                    }
+                }
+            }
+        }
+
+        Start-Sleep -Milliseconds 400
+    }
+
+    return [pscustomobject]@{
+        State      = 'timeout'
+        Path       = $statusPath
+        StatusData = $null
+    }
+}
+
 $root = Split-Path -Parent $PSScriptRoot
+. (Join-Path $PSScriptRoot 'PairedExchangeConfig.ps1')
 if ([string]::IsNullOrWhiteSpace($ConfigPath)) {
     $ConfigPath = Join-Path $root 'config\settings.psd1'
 }
@@ -591,6 +845,18 @@ if ($MaxAttempts -lt 1) {
     $MaxAttempts = 1
 }
 $manifest = Read-JsonObject -Path $manifestPath
+$pairTest = Resolve-PairTestConfig -Root $root -ConfigPath $resolvedConfigPath -ManifestPairTest (Get-ConfigValue -Object $manifest -Name 'PairTest' -DefaultValue $null)
+$executionPathMode = [string](Get-ConfigValue -Object $pairTest -Name 'ExecutionPathMode' -DefaultValue $(if ([bool]$pairTest.VisibleWorker.Enabled) { 'visible-worker' } else { 'typed-window' }))
+$visibleWorkerEnabled = ($executionPathMode -eq 'visible-worker')
+if ($visibleWorkerEnabled -and -not [bool]$pairTest.VisibleWorker.Enabled) {
+    throw 'PairTest.ExecutionPathMode is visible-worker but PairTest.VisibleWorker.Enabled is false.'
+}
+$visibleWorkerDispatchTimeoutSeconds = if ($visibleWorkerEnabled) {
+    [math]::Max(1, [int](Get-ConfigValue -Object $pairTest.VisibleWorker -Name 'DispatchTimeoutSeconds' -DefaultValue ([int]$pairTest.VisibleWorker.CommandTimeoutSeconds)))
+}
+else {
+    0
+}
 $targetRow = Resolve-TargetManifestRow -Manifest $manifest -TargetId $TargetId
 $targetKey = [string]$targetRow.TargetId
 $targetConfig = @($config.Targets | Where-Object { [string]$_.Id -eq $targetKey } | Select-Object -First 1)
@@ -624,11 +890,14 @@ $manualAttentionRequired = $false
 $processedAt = ''
 $failedAt = ''
 $retryPendingAt = ''
+$workerCommandId = ''
+$workerDispatchPath = ''
 
 for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
     $readyPath = ''
     $producerOutput = ''
     $baseName = ''
+    $transportMode = ''
     $requeued = $false
     $retryScheduled = $false
     $attemptedAt = (Get-Date).ToString('o')
@@ -663,6 +932,8 @@ for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
 
         $readyPath = [string]$seedRow[0].ReadyPath
         $producerOutput = [string]$seedRow[0].ProducerOutput
+        $transportMode = [string](Get-ConfigValue -Object $seedRow[0] -Name 'TransportMode' -DefaultValue '')
+        $workerCommandId = [string](Get-ConfigValue -Object $seedRow[0] -Name 'CommandId' -DefaultValue '')
         if (-not (Test-NonEmptyString $readyPath)) {
             throw "seed enqueue returned empty ready path for target: $targetKey output=$producerOutput"
         }
@@ -678,13 +949,33 @@ for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
         break
     }
 
-    $waitResult = Wait-ForMessageTransition `
-        -BaseName $baseName `
-        -InboxRoot $inboxRoot `
-        -ProcessedRoot $processedRoot `
-        -FailedRoot $failedRoot `
-        -RetryPendingRoot $retryPendingRoot `
-        -TimeoutSeconds $WaitForRouterSeconds
+    if ($visibleWorkerEnabled) {
+        if (-not (Test-NonEmptyString $workerCommandId)) {
+            throw "visible worker enqueue returned empty command id for target: $targetKey"
+        }
+
+        $waitResult = Wait-ForVisibleWorkerDispatch `
+            -RunRoot $resolvedRunRoot `
+            -TargetKey $targetKey `
+            -CommandId $workerCommandId `
+            -TimeoutSeconds $visibleWorkerDispatchTimeoutSeconds `
+            -PairTest $pairTest `
+            -AcceptedStaleSeconds ([int]$pairTest.VisibleWorker.DispatchAcceptedStaleSeconds) `
+            -RunningStaleSeconds ([int]$pairTest.VisibleWorker.DispatchRunningStaleSeconds)
+        $workerDispatchPath = [string]$waitResult.Path
+        if ([string]$waitResult.State -in @('accepted', 'running', 'processed', 'retry-pending')) {
+            throw ("Wait-ForVisibleWorkerDispatch returned unexpected non-terminal state for visible-worker mode: {0}" -f [string]$waitResult.State)
+        }
+    }
+    else {
+        $waitResult = Wait-ForMessageTransition `
+            -BaseName $baseName `
+            -InboxRoot $inboxRoot `
+            -ProcessedRoot $processedRoot `
+            -FailedRoot $failedRoot `
+            -RetryPendingRoot $retryPendingRoot `
+            -TimeoutSeconds $WaitForRouterSeconds
+    }
 
     $attemptResults += [pscustomobject]@{
         Attempt = $attempt
@@ -693,29 +984,53 @@ for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
         ReadyBaseName = $baseName
         Requeued = $requeued
         ProducerOutput = $producerOutput
+        TransportMode = if (Test-NonEmptyString $transportMode) { $transportMode } else { if ($visibleWorkerEnabled) { 'visible-worker' } else { 'router-ready-file' } }
+        CommandId = $workerCommandId
         TransitionState = [string]$waitResult.State
         TransitionPath = [string]$waitResult.Path
     }
 
-    switch ([string]$waitResult.State) {
-        'processed' {
-            $finalState = 'processed'
-            $processedPath = [string]$waitResult.Path
-            if (Test-Path -LiteralPath $processedPath -PathType Leaf) {
-                $processedAt = (Get-Item -LiteralPath $processedPath -ErrorAction Stop).LastWriteTime.ToString('o')
+    if ($visibleWorkerEnabled) {
+        $visibleWorkerDispatchResult = Get-VisibleWorkerDispatchResult `
+            -WaitResult $waitResult `
+            -TargetRow $targetRow `
+            -WaitForPublishSeconds $WaitForPublishSeconds
+        $finalState = [string]$visibleWorkerDispatchResult.FinalState
+        $processedPath = [string]$visibleWorkerDispatchResult.ProcessedPath
+        $processedAt = [string]$visibleWorkerDispatchResult.ProcessedAt
+        $failedPath = [string]$visibleWorkerDispatchResult.FailedPath
+        $failedAt = [string]$visibleWorkerDispatchResult.FailedAt
+        $retryReason = [string]$visibleWorkerDispatchResult.RetryReason
+        $outboxResult = $visibleWorkerDispatchResult.OutboxResult
+    }
+    else {
+        switch ([string]$waitResult.State) {
+            'processed' {
+                $finalState = 'processed'
+                $processedPath = [string]$waitResult.Path
+                if (Test-Path -LiteralPath $processedPath -PathType Leaf) {
+                    $processedAt = (Get-Item -LiteralPath $processedPath -ErrorAction Stop).LastWriteTime.ToString('o')
+                }
+                $processedItem = Get-Item -LiteralPath $processedPath -ErrorAction SilentlyContinue
+                $referenceTime = if ($null -ne $processedItem) { $processedItem.LastWriteTime } else { Get-Date }
+                $outboxResult = Wait-ForOutboxPublish -TargetRow $targetRow -TimeoutSeconds $WaitForPublishSeconds -ReferenceTime $referenceTime
+                if ($outboxResult.Published) {
+                    $finalState = 'publish-detected'
+                }
+                elseif ($WaitForPublishSeconds -gt 0) {
+                    $finalState = 'submit-unconfirmed'
+                }
+                break
             }
-            $processedItem = Get-Item -LiteralPath $processedPath -ErrorAction SilentlyContinue
-            $referenceTime = if ($null -ne $processedItem) { $processedItem.LastWriteTime } else { Get-Date }
-            $outboxResult = Wait-ForOutboxPublish -TargetRow $targetRow -TimeoutSeconds $WaitForPublishSeconds -ReferenceTime $referenceTime
-            if ($outboxResult.Published) {
-                $finalState = 'publish-detected'
+            'failed' {
+                $finalState = 'failed'
+                $failedPath = [string]$waitResult.Path
+                if (Test-Path -LiteralPath $failedPath -PathType Leaf) {
+                    $failedAt = (Get-Item -LiteralPath $failedPath -ErrorAction Stop).LastWriteTime.ToString('o')
+                }
+                break
             }
-            elseif ($WaitForPublishSeconds -gt 0) {
-                $finalState = 'submit-unconfirmed'
-            }
-            break
-        }
-        'retry-pending' {
+            'retry-pending' {
             $retryPendingPath = [string]$waitResult.Path
             if (Test-Path -LiteralPath $retryPendingPath -PathType Leaf) {
                 $retryPendingAt = (Get-Item -LiteralPath $retryPendingPath -ErrorAction Stop).LastWriteTime.ToString('o')
@@ -771,18 +1086,11 @@ for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
             $finalState = 'manual_attention_required'
             $manualAttentionRequired = $true
             break
-        }
-        'failed' {
-            $finalState = 'failed'
-            $failedPath = [string]$waitResult.Path
-            if (Test-Path -LiteralPath $failedPath -PathType Leaf) {
-                $failedAt = (Get-Item -LiteralPath $failedPath -ErrorAction Stop).LastWriteTime.ToString('o')
             }
-            break
-        }
-        default {
-            $finalState = [string]$waitResult.State
-            break
+            default {
+                $finalState = [string]$waitResult.State
+                break
+            }
         }
     }
 
@@ -793,7 +1101,11 @@ for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
     break
 }
 
-$routerDispatchState = if (Test-NonEmptyString $processedPath) { 'processed' } else { '' }
+$routerDispatchState = if ($visibleWorkerEnabled) {
+    if (@($attemptResults).Count -gt 0) { [string]$attemptResults[-1].TransitionState } else { '' }
+} else {
+    if (Test-NonEmptyString $processedPath) { 'processed' } else { '' }
+}
 $submitState = ''
 $submitConfirmed = $false
 $submitReason = ''
@@ -804,20 +1116,49 @@ if ($null -ne $outboxResult -and [bool]$outboxResult.Published) {
 }
 elseif ($finalState -eq 'submit-unconfirmed') {
     $submitState = 'unconfirmed'
-    $submitReason = 'no-outbox-publish-within-wait-window'
+    $submitReason = if ($visibleWorkerEnabled) { 'no-outbox-publish-after-visible-worker' } else { 'no-outbox-publish-within-wait-window' }
+}
+elseif ($finalState -in @('timeout', 'worker-not-ready', 'dispatch-accepted-stale', 'dispatch-running-stale-no-heartbeat')) {
+    $submitState = 'unconfirmed'
+    $submitReason = if ($finalState -eq 'timeout' -and $visibleWorkerEnabled) { 'visible-worker-dispatch-timeout' } else { $finalState }
 }
 elseif ($finalState -eq 'processed') {
     $submitState = 'unknown'
     $submitReason = 'router-processed-without-publish-check'
 }
+elseif ($visibleWorkerEnabled -and $finalState -in @('accepted', 'running', 'completed')) {
+    $submitState = 'unknown'
+    $submitReason = 'visible-worker-dispatch-without-publish-check'
+}
 $outboxPublished = if ($null -ne $outboxResult) { [bool]$outboxResult.Published } else { $false }
 $outboxObservedAt = if ($outboxPublished) { (Get-Date).ToString('o') } else { '' }
+$lateVisibleWorkerSuccess = $null
+if ($visibleWorkerEnabled) {
+    $lateVisibleWorkerSuccess = Resolve-VisibleWorkerLateSuccess `
+        -TargetRow $targetRow `
+        -CurrentFinalState $finalState `
+        -CurrentSubmitState $submitState `
+        -CurrentSubmitConfirmed $submitConfirmed `
+        -CurrentSubmitReason $submitReason `
+        -DispatchPath $workerDispatchPath `
+        -CommandId $workerCommandId
+    if ([bool]$lateVisibleWorkerSuccess.Superseded) {
+        $finalState = [string]$lateVisibleWorkerSuccess.FinalState
+        $submitState = [string]$lateVisibleWorkerSuccess.SubmitState
+        $submitConfirmed = [bool]$lateVisibleWorkerSuccess.SubmitConfirmed
+        $submitReason = [string]$lateVisibleWorkerSuccess.SubmitReason
+        $outboxResult = $lateVisibleWorkerSuccess.OutboxResult
+        $outboxPublished = [bool]$outboxResult.Published
+        $outboxObservedAt = if ($outboxPublished) { (Get-Date).ToString('o') } else { '' }
+    }
+}
 $lastReadyPath = if (@($attemptResults).Count -gt 0) { [string]$attemptResults[-1].ReadyPath } else { '' }
 $lastReadyBaseName = if (@($attemptResults).Count -gt 0) { [string]$attemptResults[-1].ReadyBaseName } else { '' }
 
 $result = [pscustomobject]@{
     RunRoot = $resolvedRunRoot
     ConfigPath = $resolvedConfigPath
+    ExecutionPathMode = $executionPathMode
     TargetId = $targetKey
     FinalState = $finalState
     RouterDispatchState = $routerDispatchState
@@ -840,6 +1181,9 @@ $result = [pscustomobject]@{
     SourceReviewZipPath = [string]$targetRow.SourceReviewZipPath
     PublishReadyPath = [string]$targetRow.PublishReadyPath
     OutboxPublished = $outboxPublished
+    CommandId = $workerCommandId
+    DispatchPath = $workerDispatchPath
+    TransportMode = if ($visibleWorkerEnabled) { 'visible-worker' } else { 'router-ready-file' }
     Attempts = @($attemptResults)
 }
 Set-SeedSendStatusEntry -State $seedSendState `

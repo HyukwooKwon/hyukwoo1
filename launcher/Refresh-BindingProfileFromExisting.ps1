@@ -15,6 +15,7 @@ if ([string]::IsNullOrWhiteSpace($ConfigPath)) {
 
 . (Join-Path $PSScriptRoot '..\router\RuntimeMap.ps1')
 . (Join-Path $PSScriptRoot '..\router\BindingRefreshReuseScope.ps1')
+. (Join-Path $PSScriptRoot 'WindowDiscovery.ps1')
 
 $resolvedConfigPath = (Resolve-Path -LiteralPath $ConfigPath).Path
 
@@ -221,99 +222,6 @@ function Get-ConfiguredTargetMetadata {
     return @($orderedTargets.ToArray())
 }
 
-function Ensure-WindowApiType {
-    if ('Relay.WindowApi' -as [type]) {
-        return
-    }
-
-    Add-Type @'
-using System;
-using System.Text;
-using System.Runtime.InteropServices;
-
-namespace Relay {
-    [StructLayout(LayoutKind.Sequential)]
-    public struct RECT {
-        public int Left;
-        public int Top;
-        public int Right;
-        public int Bottom;
-    }
-
-    public static class WindowApi {
-        public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
-
-        [DllImport("user32.dll")]
-        public static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
-
-        [DllImport("user32.dll")]
-        public static extern bool IsWindowVisible(IntPtr hWnd);
-
-        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
-        public static extern int GetWindowText(IntPtr hWnd, StringBuilder text, int maxCount);
-
-        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
-        public static extern int GetClassName(IntPtr hWnd, StringBuilder className, int maxCount);
-
-        [DllImport("user32.dll")]
-        public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
-
-        [DllImport("user32.dll")]
-        public static extern bool GetWindowRect(IntPtr hWnd, out RECT rect);
-    }
-}
-'@
-}
-
-function Get-VisibleWindows {
-    Ensure-WindowApiType
-
-    $windows = New-Object System.Collections.Generic.List[object]
-    [Relay.WindowApi]::EnumWindows({
-        param($hWnd, $lParam)
-
-        if (-not [Relay.WindowApi]::IsWindowVisible($hWnd)) {
-            return $true
-        }
-
-        $windowProcessId = 0
-        [Relay.WindowApi]::GetWindowThreadProcessId($hWnd, [ref]$windowProcessId) | Out-Null
-
-        $titleBuffer = [System.Text.StringBuilder]::new(1024)
-        [Relay.WindowApi]::GetWindowText($hWnd, $titleBuffer, $titleBuffer.Capacity) | Out-Null
-        $title = $titleBuffer.ToString()
-        if ([string]::IsNullOrWhiteSpace($title)) {
-            return $true
-        }
-
-        $classBuffer = [System.Text.StringBuilder]::new(256)
-        [Relay.WindowApi]::GetClassName($hWnd, $classBuffer, $classBuffer.Capacity) | Out-Null
-
-        $rect = [Relay.RECT]::new()
-        $rectValues = @()
-        if ([Relay.WindowApi]::GetWindowRect($hWnd, [ref]$rect)) {
-            $rectValues = @(
-                [int]$rect.Left,
-                [int]$rect.Top,
-                [int]$rect.Right,
-                [int]$rect.Bottom
-            )
-        }
-
-        $windows.Add([pscustomobject]@{
-            Hwnd      = $hWnd.ToInt64()
-            ProcessId = [int]$windowProcessId
-            Title     = $title
-            ClassName = $classBuffer.ToString()
-            Rect      = @($rectValues)
-        })
-
-        return $true
-    }, [IntPtr]::Zero) | Out-Null
-
-    return $windows
-}
-
 function Read-BindingDocument {
     param([Parameter(Mandatory)][string]$Path)
 
@@ -465,7 +373,7 @@ $expectedTargets = @($configuredTargets)
 $expectedTargetIds = @($expectedTargets | ForEach-Object { [string](Get-JsonValue -Object $_ -Name 'target_id' -DefaultValue '') } | Where-Object { Test-NonEmptyString $_ })
 $extraBindingTargetIds = @($bindingByTargetId.Keys | Where-Object { $_ -notin $expectedTargetIds } | Sort-Object)
 $visibleWindows = @(
-    Get-VisibleWindows |
+    Get-VisibleWindows -IncludeRect |
         Where-Object {
             $title = [string]$_.Title
             $className = [string]$_.ClassName

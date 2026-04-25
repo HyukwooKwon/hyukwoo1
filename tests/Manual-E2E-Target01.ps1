@@ -8,6 +8,21 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+function Get-ConfigIntValue {
+    param(
+        [Parameter(Mandatory)]$Config,
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)][int]$DefaultValue
+    )
+
+    $property = $Config.PSObject.Properties[$Name]
+    if ($null -eq $property -or $null -eq $property.Value) {
+        return $DefaultValue
+    }
+
+    return [int]$property.Value
+}
+
 if ([string]::IsNullOrWhiteSpace($ConfigPath)) {
     $ConfigPath = Join-Path $PSScriptRoot '..\config\settings.psd1'
 }
@@ -41,6 +56,11 @@ if ($null -eq $target) {
 
 $payloadPath = Join-Path ([string]$config.LogsRoot) ('manual_e2e_target01_' + [guid]::NewGuid().ToString('N') + '.txt')
 [System.IO.File]::WriteAllText($payloadPath, $Text, [System.Text.UTF8Encoding]::new($false))
+$activateSettleMs = Get-ConfigIntValue -Config $config -Name 'ActivateSettleMs' -DefaultValue 120
+$textSettleMs = Get-ConfigIntValue -Config $config -Name 'TextSettleMs' -DefaultValue 400
+$enterDelayMs = Get-ConfigIntValue -Config $config -Name 'EnterDelayMs' -DefaultValue 150
+$postSubmitDelayMs = Get-ConfigIntValue -Config $config -Name 'PostSubmitDelayMs' -DefaultValue 150
+$submitRetryIntervalMs = Get-ConfigIntValue -Config $config -Name 'SubmitRetryIntervalMs' -DefaultValue 1000
 
 try {
     $proc = Start-Process -FilePath ([string]$config.AhkExePath) -ArgumentList @(
@@ -50,7 +70,12 @@ try {
         '--resolverShell', [string]$config.ResolverShellPath,
         '--file', $payloadPath,
         '--enter', '1',
-        '--timeoutMs', [string]$config.SendTimeoutMs
+        '--timeoutMs', [string]$config.SendTimeoutMs,
+        '--activateSettleMs', [string]$activateSettleMs,
+        '--textSettleMs', [string]$textSettleMs,
+        '--enterDelayMs', [string]$enterDelayMs,
+        '--postSubmitDelayMs', [string]$postSubmitDelayMs,
+        '--submitRetryIntervalMs', [string]$submitRetryIntervalMs
     ) -Wait -PassThru
 
     Write-Host ("target01 hwnd={0} windowPid={1} shellPid={2} resolvedBy={3}" -f $target.Hwnd, $target.WindowPid, $target.ShellPid, $target.ResolvedBy)

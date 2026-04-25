@@ -211,8 +211,26 @@ function Resolve-LatestExistingRunRoot {
         return ''
     }
 
-    $latest = Get-ChildItem -LiteralPath $runRootBase -Directory -ErrorAction SilentlyContinue |
-        Sort-Object LastWriteTimeUtc -Descending |
+    $candidates = @(
+        Get-ChildItem -LiteralPath $runRootBase -Directory -ErrorAction SilentlyContinue |
+            ForEach-Object {
+                $manifestPath = Join-Path $_.FullName 'manifest.json'
+                [pscustomobject]@{
+                    FullName = $_.FullName
+                    LastWriteTimeUtc = $_.LastWriteTimeUtc
+                    HasManifest = [bool](Test-Path -LiteralPath $manifestPath)
+                }
+            }
+    )
+
+    if ($candidates.Count -eq 0) {
+        return ''
+    }
+
+    $latest = $candidates |
+        Sort-Object `
+            @{ Expression = { if ([bool]$_.HasManifest) { 0 } else { 1 } } }, `
+            @{ Expression = { $_.LastWriteTimeUtc }; Descending = $true } |
         Select-Object -First 1
 
     if ($null -eq $latest) {
@@ -278,51 +296,25 @@ function Resolve-DisplayRunContext {
 
 function Resolve-PairDefinitions {
     param(
+        [Parameter(Mandatory)]$PairTest,
         $Manifest = $null,
         [string[]]$RequestedPairIds = @(),
         [string]$RequestedTargetId = ''
     )
 
-    $source = if ($null -ne $Manifest -and $null -ne $Manifest.Pairs -and @($Manifest.Pairs).Count -gt 0) {
-        'manifest'
+    $pairSet = if ($null -ne $Manifest -and $null -ne $Manifest.Pairs -and @($Manifest.Pairs).Count -gt 0) {
+        Resolve-ConfiguredPairDefinitions -Source $Manifest -SourceLabel 'manifest'
     }
     else {
-        'fallback'
-    }
-
-    $pairs = if ($source -eq 'manifest') {
-        @($Manifest.Pairs | ForEach-Object {
-            [pscustomobject]@{
-                PairId = [string]$_.PairId
-                TopTargetId = [string]$_.TopTargetId
-                BottomTargetId = [string]$_.BottomTargetId
-            }
-        })
-    }
-    else {
-        @(
-            [pscustomobject]@{ PairId = 'pair01'; TopTargetId = 'target01'; BottomTargetId = 'target05' }
-            [pscustomobject]@{ PairId = 'pair02'; TopTargetId = 'target02'; BottomTargetId = 'target06' }
-            [pscustomobject]@{ PairId = 'pair03'; TopTargetId = 'target03'; BottomTargetId = 'target07' }
-            [pscustomobject]@{ PairId = 'pair04'; TopTargetId = 'target04'; BottomTargetId = 'target08' }
-        )
-    }
-
-    $selected = @($pairs)
-    $filteredPairIds = @($RequestedPairIds | Where-Object { Test-NonEmptyString $_ } | Sort-Object -Unique)
-    if ($filteredPairIds.Count -gt 0) {
-        $selected = @($selected | Where-Object { [string]$_.PairId -in $filteredPairIds })
-    }
-
-    if (Test-NonEmptyString $RequestedTargetId) {
-        $selected = @($selected | Where-Object {
-            ([string]$_.TopTargetId -eq $RequestedTargetId) -or ([string]$_.BottomTargetId -eq $RequestedTargetId)
-        })
+        [pscustomobject]@{
+            Source = [string](Get-ConfigValue -Object $PairTest -Name 'PairDefinitionSource' -DefaultValue 'fallback')
+            Pairs = @($PairTest.PairDefinitions)
+        }
     }
 
     return [pscustomobject]@{
-        Source = $source
-        Pairs = @($selected)
+        Source = [string]$pairSet.Source
+        Pairs = @(Select-PairDefinitions -PairDefinitions @($pairSet.Pairs) -IncludePairId $RequestedPairIds -TargetId $RequestedTargetId)
     }
 }
 
@@ -962,7 +954,7 @@ else {
     $configPairTest
 }
 
-$pairDefinition = Resolve-PairDefinitions -Manifest $runContext.Manifest -RequestedPairIds $PairId -RequestedTargetId $TargetId
+$pairDefinition = Resolve-PairDefinitions -PairTest $effectivePairTest -Manifest $runContext.Manifest -RequestedPairIds $PairId -RequestedTargetId $TargetId
 $pairs = @($pairDefinition.Pairs)
 if (@($pairs).Count -eq 0) {
     throw 'no matching pair definitions found for the requested filters.'
@@ -987,10 +979,13 @@ else {
 
 $overviewPairs = @(
     $pairs | ForEach-Object {
+        $pairPolicy = Get-PairPolicyForPair -PairTest $effectivePairTest -PairId ([string]$_.PairId)
         [pscustomobject]@{
             PairId = [string]$_.PairId
             TopTargetId = [string]$_.TopTargetId
             BottomTargetId = [string]$_.BottomTargetId
+            SeedTargetId = [string](Get-ConfigValue -Object $pairPolicy -Name 'DefaultSeedTargetId' -DefaultValue ([string]$_.TopTargetId))
+            Policy = $pairPolicy
         }
     }
 )
