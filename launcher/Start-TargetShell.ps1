@@ -61,6 +61,9 @@ function Start-VisibleWorkerBootstrap {
 
     . $pairConfigScript
     $pairTest = Resolve-PairTestConfig -Root $Root -ConfigPath $ResolvedConfigPath
+    if ([string]$pairTest.ExecutionPathMode -ne 'visible-worker') {
+        return
+    }
     if (-not [bool]$pairTest.VisibleWorker.Enabled) {
         return
     }

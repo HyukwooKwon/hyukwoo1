@@ -31,6 +31,10 @@ New-Item -ItemType Directory -Path $testRoot -Force | Out-Null
 $explicitConfigPath = Join-Path $testRoot 'settings.explicit.psd1'
 $explicitConfigText = @"
 @{
+    Targets = @(
+        @{ Id = 'target01'; Folder = '$($testRoot.Replace("'", "''"))\inbox\target01'; WindowTitle = 'VisibleWorkerTarget01'; EnterCount = 1 }
+        @{ Id = 'target05'; Folder = '$($testRoot.Replace("'", "''"))\inbox\target05'; WindowTitle = 'VisibleWorkerTarget05'; EnterCount = 1 }
+    )
     PairTest = @{
         ExecutionPathMode = 'visible-worker'
         AcceptanceProfile = 'smoke'
@@ -69,9 +73,74 @@ Assert-True ([int]$explicitPairTest.VisibleWorker.DispatchAcceptedStaleSeconds -
 Assert-True ([int]$explicitPairTest.VisibleWorker.DispatchRunningStaleSeconds -eq 44) 'explicit running stale threshold should be preserved.'
 Assert-True ([int]$explicitPairTest.VisibleWorker.AcceptanceSeedSoftTimeoutSeconds -eq 66) 'explicit seed soft timeout should be preserved.'
 
+$typedVisibleConfigPath = Join-Path $testRoot 'settings.typed-visible.psd1'
+$typedVisibleConfigText = @"
+@{
+    Targets = @(
+        @{ Id = 'target01'; Folder = '$($testRoot.Replace("'", "''"))\inbox\target01'; WindowTitle = 'VisibleWorkerTarget01'; EnterCount = 1 }
+        @{ Id = 'target05'; Folder = '$($testRoot.Replace("'", "''"))\inbox\target05'; WindowTitle = 'VisibleWorkerTarget05'; EnterCount = 1 }
+    )
+    PairTest = @{
+        ExecutionPathMode = 'typed-window'
+        RequireUserVisibleCellExecution = `$true
+        AllowedWindowVisibilityMethods = @('hwnd')
+        TypedWindow = @{
+            SubmitProbeSeconds = 12
+            SubmitProbePollMs = 750
+            SubmitRetryLimit = 1
+            ProgressCpuDeltaThresholdSeconds = 0.125
+        }
+        VisibleWorker = @{
+            Enabled = `$true
+        }
+    }
+}
+"@
+[System.IO.File]::WriteAllText($typedVisibleConfigPath, $typedVisibleConfigText, (New-Utf8NoBomEncoding))
+
+$typedVisiblePairTest = Resolve-PairTestConfig -Root $root -ConfigPath $typedVisibleConfigPath
+Assert-True ([string]$typedVisiblePairTest.ExecutionPathMode -eq 'typed-window') 'typed-window execution path mode should be preserved.'
+Assert-True ([bool]$typedVisiblePairTest.RequireUserVisibleCellExecution) 'typed-window visible-cell requirement should be preserved.'
+Assert-True (@($typedVisiblePairTest.AllowedWindowVisibilityMethods).Count -eq 1 -and [string]@($typedVisiblePairTest.AllowedWindowVisibilityMethods)[0] -eq 'hwnd') 'allowed window visibility methods should be preserved.'
+Assert-True ([int]$typedVisiblePairTest.TypedWindow.SubmitProbeSeconds -eq 12) 'typed-window submit probe seconds should be preserved.'
+Assert-True ([int]$typedVisiblePairTest.TypedWindow.SubmitProbePollMs -eq 750) 'typed-window submit probe poll milliseconds should be preserved.'
+Assert-True ([int]$typedVisiblePairTest.TypedWindow.SubmitRetryLimit -eq 1) 'typed-window submit retry limit should be preserved.'
+Assert-True ([double]$typedVisiblePairTest.TypedWindow.ProgressCpuDeltaThresholdSeconds -eq 0.125) 'typed-window progress CPU delta threshold should be preserved.'
+
+$invalidConfigPath = Join-Path $testRoot 'settings.invalid-visible-worker.psd1'
+$invalidConfigText = @"
+@{
+    Targets = @(
+        @{ Id = 'target01'; Folder = '$($testRoot.Replace("'", "''"))\inbox\target01'; WindowTitle = 'VisibleWorkerTarget01'; EnterCount = 1 }
+        @{ Id = 'target05'; Folder = '$($testRoot.Replace("'", "''"))\inbox\target05'; WindowTitle = 'VisibleWorkerTarget05'; EnterCount = 1 }
+    )
+    PairTest = @{
+        ExecutionPathMode = 'visible-worker'
+        RequireUserVisibleCellExecution = `$true
+        VisibleWorker = @{
+            Enabled = `$true
+        }
+    }
+}
+"@
+[System.IO.File]::WriteAllText($invalidConfigPath, $invalidConfigText, (New-Utf8NoBomEncoding))
+
+$invalidFailed = $false
+try {
+    $null = Resolve-PairTestConfig -Root $root -ConfigPath $invalidConfigPath
+}
+catch {
+    $invalidFailed = ($_.Exception.Message -like '*RequireUserVisibleCellExecution*typed-window*')
+}
+Assert-True $invalidFailed 'visible-worker execution path should be rejected when user-visible cell execution is required.'
+
 $defaultConfigPath = Join-Path $testRoot 'settings.default.psd1'
 $defaultConfigText = @"
 @{
+    Targets = @(
+        @{ Id = 'target01'; Folder = '$($testRoot.Replace("'", "''"))\inbox\target01'; WindowTitle = 'VisibleWorkerTarget01'; EnterCount = 1 }
+        @{ Id = 'target05'; Folder = '$($testRoot.Replace("'", "''"))\inbox\target05'; WindowTitle = 'VisibleWorkerTarget05'; EnterCount = 1 }
+    )
     PairTest = @{
         HeadlessExec = @{
             MaxRunSeconds = 480
@@ -95,5 +164,9 @@ Assert-True ([int]$defaultPairTest.VisibleWorker.WorkerReadyFreshnessSeconds -eq
 Assert-True ([int]$defaultPairTest.VisibleWorker.DispatchAcceptedStaleSeconds -eq 15) 'default accepted stale threshold should be 15 seconds.'
 Assert-True ([int]$defaultPairTest.VisibleWorker.DispatchRunningStaleSeconds -eq 30) 'default running stale threshold should be 30 seconds.'
 Assert-True ([int]$defaultPairTest.VisibleWorker.AcceptanceSeedSoftTimeoutSeconds -eq 120) 'default seed soft timeout should be 120 seconds.'
+Assert-True ([int]$defaultPairTest.TypedWindow.SubmitProbeSeconds -eq 10) 'default typed-window submit probe seconds should be 10 seconds.'
+Assert-True ([int]$defaultPairTest.TypedWindow.SubmitProbePollMs -eq 1000) 'default typed-window submit probe poll should be 1000 ms.'
+Assert-True ([int]$defaultPairTest.TypedWindow.SubmitRetryLimit -eq 1) 'default typed-window submit retry limit should be 1.'
+Assert-True ([double]$defaultPairTest.TypedWindow.ProgressCpuDeltaThresholdSeconds -eq 0.05) 'default typed-window progress CPU delta threshold should be 0.05.'
 
 Write-Host 'pair-exchange-config visible worker preflight ok'

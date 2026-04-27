@@ -2,7 +2,7 @@
 param(
     [string]$ConfigPath,
     [string]$RunRoot,
-    [string]$PairId = 'pair01',
+    [string]$PairId,
     [string]$InitialTargetId,
     [int]$MaxForwardCount = 2,
     [int]$RunDurationSec = 900,
@@ -27,23 +27,6 @@ function Get-DefaultConfigPath {
     }
 
     return (Join-Path $Root 'config\settings.psd1')
-}
-
-function Get-PairDefinition {
-    param([Parameter(Mandatory)][string]$PairId)
-
-    $pairs = @{
-        pair01 = [pscustomobject]@{ PairId = 'pair01'; TopTargetId = 'target01'; BottomTargetId = 'target05' }
-        pair02 = [pscustomobject]@{ PairId = 'pair02'; TopTargetId = 'target02'; BottomTargetId = 'target06' }
-        pair03 = [pscustomobject]@{ PairId = 'pair03'; TopTargetId = 'target03'; BottomTargetId = 'target07' }
-        pair04 = [pscustomobject]@{ PairId = 'pair04'; TopTargetId = 'target04'; BottomTargetId = 'target08' }
-    }
-
-    if (-not $pairs.ContainsKey($PairId)) {
-        throw "알 수 없는 pair id입니다: $PairId"
-    }
-
-    return $pairs[$PairId]
 }
 
 function Format-CommandLine {
@@ -176,8 +159,12 @@ if (-not (Test-NonEmptyString $ConfigPath)) {
 
 $resolvedConfigPath = (Resolve-Path -LiteralPath $ConfigPath).Path
 $config = Import-PowerShellDataFile -Path $resolvedConfigPath
-$pairDefinition = Get-PairDefinition -PairId $PairId
- $pairActivation = Assert-PairActivationEnabled -Root $root -Config $config -PairId $PairId
+$pairTest = Resolve-PairTestConfig -Root $root -ConfigPath $resolvedConfigPath
+if (-not (Test-NonEmptyString $PairId)) {
+    $PairId = Get-DefaultPairId -PairTest $pairTest
+}
+$pairDefinition = Get-PairDefinition -PairTest $pairTest -PairId $PairId
+$pairActivation = Assert-PairActivationEnabled -Root $root -Config $config -PairId $PairId
 if (-not (Test-NonEmptyString $InitialTargetId)) {
     $InitialTargetId = [string]$pairDefinition.TopTargetId
 }

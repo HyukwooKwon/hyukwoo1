@@ -811,6 +811,28 @@ function Test-SourceOutboxReady {
     )
 
     $paths = Get-SourceOutboxPaths -PairTest $PairTest -Item $Item
+    $requestPath = [string](Get-ConfigValue -Object $Item -Name 'RequestPath' -DefaultValue '')
+    if (-not (Test-NonEmptyString $requestPath)) {
+        $targetFolder = [string](Get-ConfigValue -Object $Item -Name 'TargetFolder' -DefaultValue '')
+        $requestFileName = [string](Get-ConfigValue -Object $PairTest.HeadlessExec -Name 'RequestFileName' -DefaultValue 'request.json')
+        if (Test-NonEmptyString $targetFolder) {
+            $requestPath = Join-Path $targetFolder $requestFileName
+        }
+    }
+    $requestReferenceTicks = 0L
+    if (Test-NonEmptyString $requestPath -and (Test-Path -LiteralPath $requestPath -PathType Leaf)) {
+        try {
+            $requestDoc = Read-JsonDocumentWithStatus -Path $requestPath
+            $requestCreatedAt = if ([bool]$requestDoc.Ok) { [string](Get-ConfigValue -Object $requestDoc.Data -Name 'CreatedAt' -DefaultValue '') } else { '' }
+            $requestReferenceTicks = ConvertTo-UtcTicksOrDefault -IsoTimestamp $requestCreatedAt -DefaultValue 0
+            if ($requestReferenceTicks -le 0) {
+                $requestReferenceTicks = [int64](Get-Item -LiteralPath $requestPath -ErrorAction Stop).LastWriteTimeUtc.Ticks
+            }
+        }
+        catch {
+            $requestReferenceTicks = 0L
+        }
+    }
     $readyPath = [string]$paths.PublishReadyPath
     $readyExists = Test-Path -LiteralPath $readyPath -PathType Leaf
     $readyItem = if ($readyExists) { Get-Item -LiteralPath $readyPath -ErrorAction Stop } else { $null }
@@ -987,6 +1009,47 @@ function Test-SourceOutboxReady {
 
     $summaryItem = Get-Item -LiteralPath $paths.SourceSummaryPath -ErrorAction Stop
     $zipItem = Get-Item -LiteralPath $paths.SourceReviewZipPath -ErrorAction Stop
+    if ($requestReferenceTicks -gt 0) {
+        if ([int64]$summaryItem.LastWriteTimeUtc.Ticks -lt $requestReferenceTicks) {
+            return [pscustomobject]@{
+                MarkerPresent = $true
+                IsReady = $false
+                Reason = 'source-summary-before-request'
+                Paths = $paths
+                Marker = $marker
+                PublishedAt = [string](Get-ConfigValue -Object $marker -Name 'PublishedAt' -DefaultValue '')
+                SummaryItem = $summaryItem
+                ZipItem = $zipItem
+                StateKey = (New-SourceOutboxStateKey -TargetId ([string]$Item.TargetId) -Reason 'source-summary-before-request' -PublishReadyPath $readyPath -PublishReadyTicks ([int64]$readyItem.LastWriteTimeUtc.Ticks) -SummaryTicks ([int64]$summaryItem.LastWriteTimeUtc.Ticks) -ZipTicks ([int64]$zipItem.LastWriteTimeUtc.Ticks))
+            }
+        }
+        if ([int64]$zipItem.LastWriteTimeUtc.Ticks -lt $requestReferenceTicks) {
+            return [pscustomobject]@{
+                MarkerPresent = $true
+                IsReady = $false
+                Reason = 'source-reviewzip-before-request'
+                Paths = $paths
+                Marker = $marker
+                PublishedAt = [string](Get-ConfigValue -Object $marker -Name 'PublishedAt' -DefaultValue '')
+                SummaryItem = $summaryItem
+                ZipItem = $zipItem
+                StateKey = (New-SourceOutboxStateKey -TargetId ([string]$Item.TargetId) -Reason 'source-reviewzip-before-request' -PublishReadyPath $readyPath -PublishReadyTicks ([int64]$readyItem.LastWriteTimeUtc.Ticks) -SummaryTicks ([int64]$summaryItem.LastWriteTimeUtc.Ticks) -ZipTicks ([int64]$zipItem.LastWriteTimeUtc.Ticks))
+            }
+        }
+        if ([int64]$readyItem.LastWriteTimeUtc.Ticks -lt $requestReferenceTicks) {
+            return [pscustomobject]@{
+                MarkerPresent = $true
+                IsReady = $false
+                Reason = 'marker-before-request'
+                Paths = $paths
+                Marker = $marker
+                PublishedAt = [string](Get-ConfigValue -Object $marker -Name 'PublishedAt' -DefaultValue '')
+                SummaryItem = $summaryItem
+                ZipItem = $zipItem
+                StateKey = (New-SourceOutboxStateKey -TargetId ([string]$Item.TargetId) -Reason 'marker-before-request' -PublishReadyPath $readyPath -PublishReadyTicks ([int64]$readyItem.LastWriteTimeUtc.Ticks) -SummaryTicks ([int64]$summaryItem.LastWriteTimeUtc.Ticks) -ZipTicks ([int64]$zipItem.LastWriteTimeUtc.Ticks))
+            }
+        }
+    }
     $zipValidation = Test-ZipArchiveReadable -Path $paths.SourceReviewZipPath
     if (-not [bool]$zipValidation.Ok) {
         return [pscustomobject]@{
@@ -1121,6 +1184,54 @@ function Test-SourceOutboxReady {
         SummaryItem = $summaryItem
         ZipItem = $zipItem
         StateKey = (New-SourceOutboxStateKey -TargetId ([string]$Item.TargetId) -Reason 'ready' -PublishReadyPath $readyPath -PublishReadyTicks ([int64]$readyItem.LastWriteTimeUtc.Ticks) -SummaryTicks ([int64]$summaryItem.LastWriteTimeUtc.Ticks) -ZipTicks ([int64]$zipItem.LastWriteTimeUtc.Ticks))
+    }
+}
+
+function Wait-TypedWindowHandoffLateSuccess {
+    param(
+        [Parameter(Mandatory)]$PairTest,
+        [Parameter(Mandatory)]$Item,
+        [int]$TimeoutSeconds = 30,
+        [int]$PollIntervalMs = 1000
+    )
+
+    $deadline = (Get-Date).AddSeconds([math]::Max(1, $TimeoutSeconds))
+    $lastReadiness = $null
+    $lastActivity = ''
+
+    while ((Get-Date) -lt $deadline) {
+        $lastReadiness = Test-SourceOutboxReady -PairTest $PairTest -Item $Item
+        if ([bool]$lastReadiness.IsReady) {
+            return [pscustomobject]@{
+                Published = $true
+                Reason = 'outbox-publish-detected-late'
+                Readiness = $lastReadiness
+                LastActivity = $lastActivity
+            }
+        }
+
+        $summaryPath = [string](Get-ConfigValue -Object $lastReadiness.Paths -Name 'SummaryPath' -DefaultValue '')
+        $zipPath = [string](Get-ConfigValue -Object $lastReadiness.Paths -Name 'ReviewZipPath' -DefaultValue '')
+        $publishReadyPath = [string](Get-ConfigValue -Object $lastReadiness.Paths -Name 'EffectivePublishReadyPath' -DefaultValue '')
+        foreach ($path in @($summaryPath, $zipPath, $publishReadyPath)) {
+            if (-not (Test-NonEmptyString $path)) {
+                continue
+            }
+
+            if (Test-Path -LiteralPath $path -PathType Leaf) {
+                $lastActivity = (Get-Date).ToString('o')
+                break
+            }
+        }
+
+        Start-Sleep -Milliseconds ([math]::Max(250, $PollIntervalMs))
+    }
+
+    return [pscustomobject]@{
+        Published = $false
+        Reason = if ($null -ne $lastReadiness) { [string]$lastReadiness.Reason } else { 'outbox-publish-timeout' }
+        Readiness = $lastReadiness
+        LastActivity = $lastActivity
     }
 }
 
@@ -1874,10 +1985,22 @@ function Get-HandoffMessageText {
     $summaryFileName = [string]$PairTest.SummaryFileName
     $zipFileName = [System.IO.Path]::GetFileName($ZipPath)
     $resolvedSummaryPath = if (Test-NonEmptyString $SummaryPath) { $SummaryPath } else { '(missing)' }
-    $recipientSourceOutboxPath = Join-Path ([string]$SourceItem.PartnerFolder) ([string]$PairTest.SourceOutboxFolderName)
-    $recipientSourceSummaryPath = Join-Path $recipientSourceOutboxPath ([string]$PairTest.SourceSummaryFileName)
-    $recipientSourceReviewZipPath = Join-Path $recipientSourceOutboxPath ([string]$PairTest.SourceReviewZipFileName)
-    $recipientPublishReadyPath = Join-Path $recipientSourceOutboxPath ([string]$PairTest.PublishReadyFileName)
+    $recipientSourceOutboxPath = [string](Get-ConfigValue -Object $RecipientItem -Name 'SourceOutboxPath' -DefaultValue '')
+    if (-not (Test-NonEmptyString $recipientSourceOutboxPath)) {
+        $recipientSourceOutboxPath = Join-Path ([string]$SourceItem.PartnerFolder) ([string]$PairTest.SourceOutboxFolderName)
+    }
+    $recipientSourceSummaryPath = [string](Get-ConfigValue -Object $RecipientItem -Name 'SourceSummaryPath' -DefaultValue '')
+    if (-not (Test-NonEmptyString $recipientSourceSummaryPath)) {
+        $recipientSourceSummaryPath = Join-Path $recipientSourceOutboxPath ([string]$PairTest.SourceSummaryFileName)
+    }
+    $recipientSourceReviewZipPath = [string](Get-ConfigValue -Object $RecipientItem -Name 'SourceReviewZipPath' -DefaultValue '')
+    if (-not (Test-NonEmptyString $recipientSourceReviewZipPath)) {
+        $recipientSourceReviewZipPath = Join-Path $recipientSourceOutboxPath ([string]$PairTest.SourceReviewZipFileName)
+    }
+    $recipientPublishReadyPath = [string](Get-ConfigValue -Object $RecipientItem -Name 'PublishReadyPath' -DefaultValue '')
+    if (-not (Test-NonEmptyString $recipientPublishReadyPath)) {
+        $recipientPublishReadyPath = Join-Path $recipientSourceOutboxPath ([string]$PairTest.PublishReadyFileName)
+    }
     $availableReviewInputPaths = @()
     foreach ($candidate in @($SummaryPath, $ZipPath)) {
         if (-not (Test-NonEmptyString $candidate)) {
@@ -2449,7 +2572,8 @@ try {
                 throw ("recipient target item not found: {0}" -f [string]$item.PartnerTargetId)
             }
 
-            $pauseBlocksDirectDispatch = $watcherPaused -and ($UseHeadlessDispatch -or -not [bool]$pairTest.VisibleWorker.Enabled)
+            $visibleWorkerTransportActive = (([string]$pairTest.ExecutionPathMode -eq 'visible-worker') -and [bool]$pairTest.VisibleWorker.Enabled)
+            $pauseBlocksDirectDispatch = $watcherPaused -and ($UseHeadlessDispatch -or -not $visibleWorkerTransportActive)
             if ($pauseBlocksDirectDispatch) {
                 continue
             }
@@ -2461,6 +2585,7 @@ try {
                 -RoleName ([string]$recipientItem.RoleName) `
                 -TargetId ([string]$recipientItem.TargetId) `
                 -MessageType 'handoff')
+            $handoffOneTimeItemIds = @($handoffOneTimeItems | ForEach-Object { [string](Get-ConfigValue -Object $_ -Name 'Id' -DefaultValue '') } | Where-Object { Test-NonEmptyString $_ })
             $messageText = Get-HandoffMessageText -PairTest $pairTest -SourceItem $item -RecipientItem $recipientItem -ZipPath $latestZipFile.FullName -SummaryPath $summaryValue -OneTimeItems $handoffOneTimeItems
             $stamp = Get-Date -Format 'yyyyMMdd_HHmmss_fff'
             $messagePath = Join-Path $messageRoot ("handoff_{0}_to_{1}_{2}.txt" -f [string]$item.TargetId, [string]$item.PartnerTargetId, $stamp)
@@ -2488,19 +2613,9 @@ try {
                         -PromptFilePath $messagePath `
                         -LogPath $dispatchLogPath `
                         -StatusRoot $headlessDispatchLogRoot
-
-                    $handoffOneTimeItemIds = @($handoffOneTimeItems | ForEach-Object { [string](Get-ConfigValue -Object $_ -Name 'Id' -DefaultValue '') } | Where-Object { Test-NonEmptyString $_ })
-                    if ($handoffOneTimeItemIds.Count -gt 0) {
-                        [void](Complete-OneTimeQueueItems `
-                            -Root $root `
-                            -Config $config `
-                            -PairId ([string]$item.PairId) `
-                            -ItemIds $handoffOneTimeItemIds `
-                            -IgnoreMissing)
-                    }
                 }
                 else {
-                    if ([bool]$pairTest.VisibleWorker.Enabled) {
+                    if ($visibleWorkerTransportActive) {
                         & (Join-Path $root 'visible\Queue-VisibleWorkerCommand.ps1') `
                             -ConfigPath $resolvedConfigPath `
                             -RunRoot $resolvedRunRoot `
@@ -2509,11 +2624,56 @@ try {
                             -Mode 'handoff' | Out-Null
                     }
                     else {
-                        & (Join-Path $root 'producer-example.ps1') `
+                        $handoffSubmitRaw = & (Join-Path $root 'tests\Send-InitialPairSeedWithRetry.ps1') `
                             -ConfigPath $resolvedConfigPath `
+                            -RunRoot $resolvedRunRoot `
                             -TargetId ([string]$item.PartnerTargetId) `
-                            -TextFilePath $messagePath | Out-Null
+                            -MessageTextFilePath $messagePath `
+                            -WaitForPublishSeconds ([int]$pairTest.SeedOutboxStartTimeoutSeconds) `
+                            -DisallowInlineTypedWindowPrepare `
+                            -AsJson
+                        $handoffSubmitResult = $handoffSubmitRaw | ConvertFrom-Json
+                        $handoffFinalState = [string](Get-ConfigValue -Object $handoffSubmitResult -Name 'FinalState' -DefaultValue '')
+                        $handoffSubmitState = [string](Get-ConfigValue -Object $handoffSubmitResult -Name 'SubmitState' -DefaultValue '')
+                        $handoffSubmitReason = [string](Get-ConfigValue -Object $handoffSubmitResult -Name 'SubmitReason' -DefaultValue '')
+                        $handoffOutboxPublished = [bool](Get-ConfigValue -Object $handoffSubmitResult -Name 'OutboxPublished' -DefaultValue $false)
+                        if (-not $handoffOutboxPublished -and $handoffFinalState -notin @('publish-detected', 'publish-detected-late')) {
+                            $lateHandoffResult = Wait-TypedWindowHandoffLateSuccess `
+                                -PairTest $pairTest `
+                                -Item $recipientItem `
+                                -TimeoutSeconds ([math]::Min([math]::Max(10, [int]$pairTest.SeedOutboxStartTimeoutSeconds), 30)) `
+                                -PollIntervalMs $PollIntervalMs
+                            if ([bool]$lateHandoffResult.Published) {
+                                $handoffOutboxPublished = $true
+                                $handoffFinalState = 'publish-detected-late'
+                                $handoffSubmitState = 'confirmed'
+                                $handoffSubmitReason = [string]$lateHandoffResult.Reason
+                                Write-Host ("typed-window handoff late success {0} -> {1} reason={2}" -f [string]$item.TargetId, [string]$item.PartnerTargetId, $handoffSubmitReason)
+                            }
+                            else {
+                                $lateHandoffReason = [string](Get-ConfigValue -Object $lateHandoffResult -Name 'Reason' -DefaultValue '')
+                                if (Test-NonEmptyString $lateHandoffReason) {
+                                    $handoffSubmitReason = if (Test-NonEmptyString $handoffSubmitReason) {
+                                        ($handoffSubmitReason + '; lateGrace=' + $lateHandoffReason)
+                                    }
+                                    else {
+                                        ('lateGrace=' + $lateHandoffReason)
+                                    }
+                                }
+
+                                throw ("typed-window handoff not confirmed target={0} finalState={1} submitState={2} reason={3}" -f [string]$item.PartnerTargetId, $handoffFinalState, $handoffSubmitState, $handoffSubmitReason)
+                            }
+                        }
                     }
+                }
+
+                if ($handoffOneTimeItemIds.Count -gt 0) {
+                    [void](Complete-OneTimeQueueItems `
+                        -Root $root `
+                        -Config $config `
+                        -PairId ([string]$item.PairId) `
+                        -ItemIds $handoffOneTimeItemIds `
+                        -IgnoreMissing)
                 }
             }
             catch {

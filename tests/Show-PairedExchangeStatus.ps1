@@ -627,6 +627,7 @@ if ([string]::IsNullOrWhiteSpace($ConfigPath)) {
 }
 
 $resolvedConfigPath = (Resolve-Path -LiteralPath $ConfigPath).Path
+$config = Import-PowerShellDataFile -Path $resolvedConfigPath
 $pairTestFromConfig = Resolve-PairTestConfig -Root $root -ConfigPath $resolvedConfigPath
 $resolvedRunRoot = Resolve-PairedRunRoot -Root $root -RequestedRunRoot $RunRoot -PairTest $pairTestFromConfig
 $manifestPath = Join-Path $resolvedRunRoot 'manifest.json'
@@ -637,6 +638,17 @@ if (-not (Test-Path -LiteralPath $manifestPath)) {
 $manifestDoc = Read-JsonDocument -Path $manifestPath -ExpectedShape 'object'
 $manifest = $manifestDoc.Data
 $pairTest = Resolve-PairTestConfig -Root $root -ConfigPath $resolvedConfigPath -ManifestPairTest (Get-ConfigValue -Object $manifest -Name 'PairTest' -DefaultValue $null)
+$pairExecutionPathMode = [string](Get-ConfigValue -Object $pairTest -Name 'ExecutionPathMode' -DefaultValue $(if ([bool]$pairTest.VisibleWorker.Enabled) { 'visible-worker' } else { 'typed-window' }))
+$pairRequireUserVisibleCellExecution = [bool](Get-ConfigValue -Object $pairTest -Name 'RequireUserVisibleCellExecution' -DefaultValue $false)
+$pairAllowedWindowVisibilityMethods = @(Get-StringArray (Get-ConfigValue -Object $pairTest -Name 'AllowedWindowVisibilityMethods' -DefaultValue @('hwnd')))
+if ($pairAllowedWindowVisibilityMethods.Count -eq 0) {
+    $pairAllowedWindowVisibilityMethods = @('hwnd')
+}
+$pairSubmitRetryModes = @(Get-RelaySubmitRetryModes -Config $config)
+$pairSubmitRetrySequenceSummary = Get-RelaySubmitRetrySequenceSummary -Modes $pairSubmitRetryModes
+$pairPrimarySubmitMode = Get-RelayPrimarySubmitMode -Modes $pairSubmitRetryModes
+$pairFinalSubmitMode = Get-RelayFinalSubmitMode -Modes $pairSubmitRetryModes
+$pairSubmitRetryIntervalMs = [int](Get-ConfigValue -Object $config -Name 'SubmitRetryIntervalMs' -DefaultValue 1000)
 $targetItems = if ($null -ne $manifest) { @($manifest.Targets) } else { @() }
 $stateRoot = Join-Path $resolvedRunRoot '.state'
 $forwardedStateDoc = Load-ForwardedState -Path (Join-Path $stateRoot 'forwarded.json')
@@ -821,6 +833,13 @@ foreach ($item in $targetItems | Sort-Object TargetId) {
     $seedSendRawState = [string](Get-ConfigValue -Object $seedSendRow -Name 'FinalState' -DefaultValue '')
     $submitRawState = [string](Get-ConfigValue -Object $seedSendRow -Name 'SubmitState' -DefaultValue '')
     $submitRawReason = [string](Get-ConfigValue -Object $seedSendRow -Name 'SubmitReason' -DefaultValue '')
+    $typedWindowExecutionState = [string](Get-ConfigValue -Object $seedSendRow -Name 'TypedWindowExecutionState' -DefaultValue '')
+    $submitProbeState = [string](Get-ConfigValue -Object $seedSendRow -Name 'SubmitProbeState' -DefaultValue '')
+    $submitProbeElapsedSeconds = [int](Get-ConfigValue -Object $seedSendRow -Name 'SubmitProbeElapsedSeconds' -DefaultValue 0)
+    $submitRetryCount = [int](Get-ConfigValue -Object $seedSendRow -Name 'SubmitRetryCount' -DefaultValue 0)
+    $submitConfirmationSignal = [string](Get-ConfigValue -Object $seedSendRow -Name 'SubmitConfirmationSignal' -DefaultValue '')
+    $typedWindowSessionState = [string](Get-ConfigValue -Object $seedSendRow -Name 'TypedWindowSessionState' -DefaultValue '')
+    $typedWindowLastResetReason = [string](Get-ConfigValue -Object $seedSendRow -Name 'TypedWindowLastResetReason' -DefaultValue '')
     $lateSuccessEvidence = (
         ($null -ne $readinessStatus -and [bool]$readinessStatus.IsReady) -or
         ($latestState -in @('ready-to-forward', 'forwarded')) -or
@@ -836,6 +855,20 @@ foreach ($item in $targetItems | Sort-Object TargetId) {
         $submitReason = if (Test-NonEmptyString $submitRawReason) { ('superseded-late-success:' + $submitRawReason) } else { 'outbox-publish-detected-late' }
         $seedSendSuperseded = $true
     }
+    $seedExecutionPathMode = [string](Get-ConfigValue -Object $seedSendRow -Name 'ExecutionPathMode' -DefaultValue $pairExecutionPathMode)
+    $seedUserVisibleCellExecutionRequired = [bool](Get-ConfigValue -Object $seedSendRow -Name 'UserVisibleCellExecutionRequired' -DefaultValue $pairRequireUserVisibleCellExecution)
+    $seedAllowedWindowVisibilityMethods = @(Get-StringArray (Get-ConfigValue -Object $seedSendRow -Name 'AllowedWindowVisibilityMethods' -DefaultValue @($pairAllowedWindowVisibilityMethods)))
+    if ($seedAllowedWindowVisibilityMethods.Count -eq 0) {
+        $seedAllowedWindowVisibilityMethods = @($pairAllowedWindowVisibilityMethods)
+    }
+    $seedSubmitRetryModes = @(Get-StringArray (Get-ConfigValue -Object $seedSendRow -Name 'SubmitRetryModes' -DefaultValue @($pairSubmitRetryModes)))
+    if ($seedSubmitRetryModes.Count -eq 0) {
+        $seedSubmitRetryModes = @($pairSubmitRetryModes)
+    }
+    $seedSubmitRetrySequenceSummary = [string](Get-ConfigValue -Object $seedSendRow -Name 'SubmitRetrySequenceSummary' -DefaultValue (Get-RelaySubmitRetrySequenceSummary -Modes $seedSubmitRetryModes))
+    $seedPrimarySubmitMode = [string](Get-ConfigValue -Object $seedSendRow -Name 'PrimarySubmitMode' -DefaultValue (Get-RelayPrimarySubmitMode -Modes $seedSubmitRetryModes))
+    $seedFinalSubmitMode = [string](Get-ConfigValue -Object $seedSendRow -Name 'FinalSubmitMode' -DefaultValue (Get-RelayFinalSubmitMode -Modes $seedSubmitRetryModes))
+    $seedSubmitRetryIntervalMs = [int](Get-ConfigValue -Object $seedSendRow -Name 'SubmitRetryIntervalMs' -DefaultValue $pairSubmitRetryIntervalMs)
 
     $targetRows += [pscustomobject]@{
         PairId            = [string]$item.PairId
@@ -891,11 +924,26 @@ foreach ($item in $targetItems | Sort-Object TargetId) {
         SeedBackoffMs     = [int](Get-ConfigValue -Object $seedSendRow -Name 'BackoffMs' -DefaultValue 0)
         SeedRetryReason   = [string](Get-ConfigValue -Object $seedSendRow -Name 'RetryReason' -DefaultValue '')
         ManualAttentionRequired = [bool](Get-ConfigValue -Object $seedSendRow -Name 'ManualAttentionRequired' -DefaultValue $false)
+        ExecutionPathMode = $seedExecutionPathMode
+        UserVisibleCellExecutionRequired = $seedUserVisibleCellExecutionRequired
+        AllowedWindowVisibilityMethods = @($seedAllowedWindowVisibilityMethods)
         SubmitState       = $submitState
         SubmitRawState    = $submitRawState
         SubmitConfirmed   = [bool](Get-ConfigValue -Object $seedSendRow -Name 'SubmitConfirmed' -DefaultValue $false)
         SubmitReason      = $submitReason
         SubmitRawReason   = $submitRawReason
+        TypedWindowExecutionState = $typedWindowExecutionState
+        SubmitProbeState = $submitProbeState
+        SubmitProbeElapsedSeconds = $submitProbeElapsedSeconds
+        SubmitRetryCount = $submitRetryCount
+        SubmitConfirmationSignal = $submitConfirmationSignal
+        TypedWindowSessionState = $typedWindowSessionState
+        TypedWindowLastResetReason = $typedWindowLastResetReason
+        SeedSubmitRetryModes = @($seedSubmitRetryModes)
+        SeedSubmitRetrySequenceSummary = $seedSubmitRetrySequenceSummary
+        SeedPrimarySubmitMode = $seedPrimarySubmitMode
+        SeedFinalSubmitMode = $seedFinalSubmitMode
+        SeedSubmitRetryIntervalMs = $seedSubmitRetryIntervalMs
         ForwardedAt       = $latestForwardedAt
         FailureCount      = $targetFailureCount
         TargetFolder      = $targetFolder
@@ -1082,6 +1130,14 @@ $status = [pscustomobject]@{
         ReviewFolderName  = [string]$pairTest.ReviewFolderName
         MessageFolderName = [string]$pairTest.MessageFolderName
         ReviewZipPattern  = [string]$pairTest.ReviewZipPattern
+        ExecutionPathMode = $pairExecutionPathMode
+        RequireUserVisibleCellExecution = $pairRequireUserVisibleCellExecution
+        AllowedWindowVisibilityMethods = @($pairAllowedWindowVisibilityMethods)
+        SubmitRetryModes = @($pairSubmitRetryModes)
+        SubmitRetrySequenceSummary = $pairSubmitRetrySequenceSummary
+        PrimarySubmitMode = $pairPrimarySubmitMode
+        FinalSubmitMode = $pairFinalSubmitMode
+        SubmitRetryIntervalMs = $pairSubmitRetryIntervalMs
         SeedOutboxStartTimeoutSeconds = [int]$pairTest.SeedOutboxStartTimeoutSeconds
         SeedRetryMaxAttempts = [int]$pairTest.SeedRetryMaxAttempts
         SeedRetryBackoffMs = @($pairTest.SeedRetryBackoffMs)
@@ -1137,6 +1193,9 @@ $status = [pscustomobject]@{
         SeedSendProcessedCount = (@($targetRows | Where-Object { $_.SourceOutboxState -eq 'seed-send-processed' })).Count
         SeedRetryPendingCount = (@($targetRows | Where-Object { $_.SourceOutboxState -eq 'seed-retry-pending' })).Count
         SubmitUnconfirmedCount = (@($targetRows | Where-Object { $_.SourceOutboxState -eq 'submit-unconfirmed' })).Count
+        TypedWindowSubmitUnconfirmedCount = (@($targetRows | Where-Object { $_.SubmitProbeState -eq 'typed-window-submit-unconfirmed' })).Count
+        TypedWindowRetryCount = (@($targetRows | Where-Object { [string]$_.TypedWindowExecutionState -like 'typed-window-retry-*' })).Count
+        TypedWindowStalledCount = (@($targetRows | Where-Object { $_.TypedWindowExecutionState -in @('typed-window-running-no-artifact', 'typed-window-stalled-after-submit') })).Count
         PublishStartedCount = (@($targetRows | Where-Object { $_.SourceOutboxState -eq 'publish-started' })).Count
         TargetUnresponsiveCount = (@($targetRows | Where-Object { $_.SourceOutboxState -eq 'target-unresponsive-after-send' })).Count
         ManualAttentionCount = (@($targetRows | Where-Object { $_.SourceOutboxState -eq 'manual-attention-required' })).Count
@@ -1237,7 +1296,7 @@ $lines.Add(('AcceptanceReceipt: exists={0} state={1} reason={2} updatedAt={3}' -
     $status.AcceptanceReceipt.AcceptanceState,
     $status.AcceptanceReceipt.AcceptanceReason,
     $status.AcceptanceReceipt.LastWriteAt))
-$lines.Add(('Counts: messages={0} summaries={1} done={2} errors={3} supersededErrors={4} zipTargets={5} outboxWaiting={6} seedProcessed={7} seedRetryPending={8} submitUnconfirmed={9} publishStarted={10} unresponsive={11} manualAttention={12} imported={13} handoffReady={14} dispatchRunning={15} dispatchFailed={16} ready={17} forwarded={18} missingSummary={19} staleSummary={20} doneStale={21} noZip={22} failures={23}' -f `
+$lines.Add(('Counts: messages={0} summaries={1} done={2} errors={3} supersededErrors={4} zipTargets={5} outboxWaiting={6} seedProcessed={7} seedRetryPending={8} submitUnconfirmed={9} typedWindowRetry={10} typedWindowStalled={11} publishStarted={12} unresponsive={13} manualAttention={14} imported={15} handoffReady={16} dispatchRunning={17} dispatchFailed={18} ready={19} forwarded={20} missingSummary={21} staleSummary={22} doneStale={23} noZip={24} failures={25}' -f `
     $status.Counts.MessageFiles,
     $status.Counts.SummaryPresentCount,
     $status.Counts.DonePresentCount,
@@ -1248,6 +1307,8 @@ $lines.Add(('Counts: messages={0} summaries={1} done={2} errors={3} supersededEr
     $status.Counts.SeedSendProcessedCount,
     $status.Counts.SeedRetryPendingCount,
     $status.Counts.SubmitUnconfirmedCount,
+    $status.Counts.TypedWindowRetryCount,
+    $status.Counts.TypedWindowStalledCount,
     $status.Counts.PublishStartedCount,
     $status.Counts.TargetUnresponsiveCount,
     $status.Counts.ManualAttentionCount,
@@ -1310,6 +1371,10 @@ $targetTable = ($status.Targets |
         @{ Name = 'Dispatch'; Expression = { $_.DispatchState } },
         @{ Name = 'SeedState'; Expression = { $_.SeedSendState } },
         @{ Name = 'Submit'; Expression = { $_.SubmitState } },
+        @{ Name = 'Probe'; Expression = { $_.SubmitProbeState } },
+        @{ Name = 'TypedWin'; Expression = { $_.TypedWindowExecutionState } },
+        @{ Name = 'Session'; Expression = { $_.TypedWindowSessionState } },
+        @{ Name = 'SubmitModes'; Expression = { $_.SeedSubmitRetrySequenceSummary } },
         SeedAttemptCount, FailureCount |
     Format-Table -AutoSize | Out-String).TrimEnd()
 $lines.Add($targetTable)

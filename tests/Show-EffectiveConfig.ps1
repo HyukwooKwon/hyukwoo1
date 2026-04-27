@@ -308,12 +308,18 @@ function Resolve-PairDefinitions {
     else {
         [pscustomobject]@{
             Source = [string](Get-ConfigValue -Object $PairTest -Name 'PairDefinitionSource' -DefaultValue 'fallback')
+            SourceDetail = [string](Get-ConfigValue -Object $PairTest -Name 'PairDefinitionSourceDetail' -DefaultValue '')
+            Strategy = [string](Get-ConfigValue -Object $PairTest -Name 'PairTopologyStrategy' -DefaultValue (Get-PairTopologyStrategy `
+                        -PairDefinitionSource ([string](Get-ConfigValue -Object $PairTest -Name 'PairDefinitionSource' -DefaultValue 'fallback')) `
+                        -PairDefinitionSourceDetail ([string](Get-ConfigValue -Object $PairTest -Name 'PairDefinitionSourceDetail' -DefaultValue ''))))
             Pairs = @($PairTest.PairDefinitions)
         }
     }
 
     return [pscustomobject]@{
         Source = [string]$pairSet.Source
+        SourceDetail = [string](Get-ConfigValue -Object $pairSet -Name 'SourceDetail' -DefaultValue '')
+        Strategy = [string](Get-ConfigValue -Object $pairSet -Name 'Strategy' -DefaultValue (Get-PairTopologyStrategy -PairDefinitionSource ([string]$pairSet.Source) -PairDefinitionSourceDetail ([string](Get-ConfigValue -Object $pairSet -Name 'SourceDetail' -DefaultValue ''))))
         Pairs = @(Select-PairDefinitions -PairDefinitions @($pairSet.Pairs) -IncludePairId $RequestedPairIds -TargetId $RequestedTargetId)
     }
 }
@@ -732,6 +738,17 @@ function Get-PairTargetRows {
 
     $targetConfigMap = Get-ConfigTargetMap -Config $Config
     $messagesRoot = Join-Path $SelectedRunRoot ([string]$PairTest.MessageFolderName)
+    $executionPathMode = [string](Get-ConfigValue -Object $PairTest -Name 'ExecutionPathMode' -DefaultValue $(if ([bool]$PairTest.VisibleWorker.Enabled) { 'visible-worker' } else { 'typed-window' }))
+    $requireUserVisibleCellExecution = [bool](Get-ConfigValue -Object $PairTest -Name 'RequireUserVisibleCellExecution' -DefaultValue $false)
+    $allowedWindowVisibilityMethods = @(Get-StringArray (Get-ConfigValue -Object $PairTest -Name 'AllowedWindowVisibilityMethods' -DefaultValue @('hwnd')))
+    if ($allowedWindowVisibilityMethods.Count -eq 0) {
+        $allowedWindowVisibilityMethods = @('hwnd')
+    }
+    $submitRetryModes = @(Get-RelaySubmitRetryModes -Config $Config)
+    $submitRetrySequenceSummary = Get-RelaySubmitRetrySequenceSummary -Modes $submitRetryModes
+    $primarySubmitMode = Get-RelayPrimarySubmitMode -Modes $submitRetryModes
+    $finalSubmitMode = Get-RelayFinalSubmitMode -Modes $submitRetryModes
+    $submitRetryIntervalMs = [int](Get-ConfigValue -Object $Config -Name 'SubmitRetryIntervalMs' -DefaultValue 1000)
     $rows = @()
 
     foreach ($pair in @($Pairs)) {
@@ -761,9 +778,56 @@ function Get-PairTargetRows {
             $sourceReviewZipPath = Join-Path $sourceOutboxPath ([string]$PairTest.SourceReviewZipFileName)
             $publishReadyPath = Join-Path $sourceOutboxPath ([string]$PairTest.PublishReadyFileName)
             $publishedArchivePath = Join-Path $sourceOutboxPath ([string]$PairTest.PublishedArchiveFolderName)
+            $requestDocument = $null
+            if (Test-ExistingLiteralPathSafe -Path $requestPath) {
+                try {
+                    $requestDocument = Get-Content -LiteralPath $requestPath -Raw -Encoding UTF8 | ConvertFrom-Json
+                }
+                catch {
+                    $requestDocument = $null
+                }
+            }
+            if ($null -ne $requestDocument) {
+                if (Test-NonEmptyString ([string]$requestDocument.SourceOutboxPath)) {
+                    $sourceOutboxPath = [string]$requestDocument.SourceOutboxPath
+                }
+                if (Test-NonEmptyString ([string]$requestDocument.SourceSummaryPath)) {
+                    $sourceSummaryPath = [string]$requestDocument.SourceSummaryPath
+                }
+                if (Test-NonEmptyString ([string]$requestDocument.SourceReviewZipPath)) {
+                    $sourceReviewZipPath = [string]$requestDocument.SourceReviewZipPath
+                }
+                if (Test-NonEmptyString ([string]$requestDocument.PublishReadyPath)) {
+                    $publishReadyPath = [string]$requestDocument.PublishReadyPath
+                }
+                if (Test-NonEmptyString ([string]$requestDocument.PublishedArchivePath)) {
+                    $publishedArchivePath = [string]$requestDocument.PublishedArchivePath
+                }
+            }
             $partnerSourceOutboxPath = Join-Path $partnerFolder ([string]$PairTest.SourceOutboxFolderName)
             $partnerSourceSummaryPath = Join-Path $partnerSourceOutboxPath ([string]$PairTest.SourceSummaryFileName)
             $partnerSourceReviewZipPath = Join-Path $partnerSourceOutboxPath ([string]$PairTest.SourceReviewZipFileName)
+            $partnerRequestPath = Join-Path $partnerFolder ([string]$PairTest.HeadlessExec.RequestFileName)
+            $partnerRequestDocument = $null
+            if (Test-ExistingLiteralPathSafe -Path $partnerRequestPath) {
+                try {
+                    $partnerRequestDocument = Get-Content -LiteralPath $partnerRequestPath -Raw -Encoding UTF8 | ConvertFrom-Json
+                }
+                catch {
+                    $partnerRequestDocument = $null
+                }
+            }
+            if ($null -ne $partnerRequestDocument) {
+                if (Test-NonEmptyString ([string]$partnerRequestDocument.SourceOutboxPath)) {
+                    $partnerSourceOutboxPath = [string]$partnerRequestDocument.SourceOutboxPath
+                }
+                if (Test-NonEmptyString ([string]$partnerRequestDocument.SourceSummaryPath)) {
+                    $partnerSourceSummaryPath = [string]$partnerRequestDocument.SourceSummaryPath
+                }
+                if (Test-NonEmptyString ([string]$partnerRequestDocument.SourceReviewZipPath)) {
+                    $partnerSourceReviewZipPath = [string]$partnerRequestDocument.SourceReviewZipPath
+                }
+            }
             $availableReviewInputPaths = @()
             foreach ($candidate in @($partnerSourceSummaryPath, $partnerSourceReviewZipPath)) {
                 if (-not (Test-NonEmptyString $candidate)) {
@@ -836,6 +900,14 @@ function Get-PairTargetRows {
                 PartnerTargetFolder = $partnerFolder
                 PairTargetFolder = $targetFolder
                 PartnerFolder = $partnerFolder
+                ExecutionPathMode = $executionPathMode
+                UserVisibleCellExecutionRequired = $requireUserVisibleCellExecution
+                AllowedWindowVisibilityMethods = @($allowedWindowVisibilityMethods)
+                SubmitRetryModes = @($submitRetryModes)
+                SubmitRetrySequenceSummary = $submitRetrySequenceSummary
+                PrimarySubmitMode = $primarySubmitMode
+                FinalSubmitMode = $finalSubmitMode
+                SubmitRetryIntervalMs = $submitRetryIntervalMs
                 ReviewInputFiles = [pscustomobject]@{
                     PartnerSummaryPath = $partnerSourceSummaryPath
                     PartnerReviewZipPath = $partnerSourceReviewZipPath
@@ -1010,7 +1082,7 @@ if (-not [bool]$runContext.ManifestExists) {
     $warningRecords += (New-PolicyWarningRecord -PolicyMap $warningPolicy -Code 'manifest-missing' -Message 'Selected run root does not contain manifest.json. Pair contract preview may be fallback-based.')
 }
 if ([string]$pairDefinition.Source -eq 'fallback') {
-    $warningRecords += (New-PolicyWarningRecord -PolicyMap $warningPolicy -Code 'pair-definition-fallback' -Message 'Pair definitions are using built-in fallback mapping (pair01~04 / target01~08).')
+    $warningRecords += (New-PolicyWarningRecord -PolicyMap $warningPolicy -Code 'pair-definition-fallback' -Message 'Pair definitions are using built-in target-order fallback derived from config Targets.')
 }
 if ($null -ne $runContext.SelectedRunRootAgeSeconds -and $runContext.SelectedRunRootAgeSeconds -ge $StaleRunThresholdSec) {
     $warningRecords += (New-PolicyWarningRecord -PolicyMap $warningPolicy -Code 'runroot-stale' -Message ("Selected run root is older than stale threshold: age={0}s threshold={1}s" -f $runContext.SelectedRunRootAgeSeconds, $StaleRunThresholdSec))
@@ -1020,6 +1092,19 @@ $warningRecords = @($warningRecords | Sort-Object Priority, Code)
 $warningSummary = Get-WarningSummary -WarningRecords $warningRecords
 $temporarySnapshotRoot = Join-Path $root '_tmp'
 $evidenceSnapshotRoot = Join-Path $root 'evidence\effective-config'
+$effectiveExecutionPathMode = [string](Get-ConfigValue -Object $effectivePairTest -Name 'ExecutionPathMode' -DefaultValue $(if ([bool]$effectivePairTest.VisibleWorker.Enabled) { 'visible-worker' } else { 'typed-window' }))
+$effectiveRequireUserVisibleCellExecution = [bool](Get-ConfigValue -Object $effectivePairTest -Name 'RequireUserVisibleCellExecution' -DefaultValue $false)
+$effectiveAllowedWindowVisibilityMethods = @(Get-StringArray (Get-ConfigValue -Object $effectivePairTest -Name 'AllowedWindowVisibilityMethods' -DefaultValue @('hwnd')))
+if ($effectiveAllowedWindowVisibilityMethods.Count -eq 0) {
+    $effectiveAllowedWindowVisibilityMethods = @('hwnd')
+}
+$effectiveSubmitRetryModes = @(Get-RelaySubmitRetryModes -Config $config)
+$effectiveSubmitRetrySequenceSummary = Get-RelaySubmitRetrySequenceSummary -Modes $effectiveSubmitRetryModes
+$effectivePrimarySubmitMode = Get-RelayPrimarySubmitMode -Modes $effectiveSubmitRetryModes
+$effectiveFinalSubmitMode = Get-RelayFinalSubmitMode -Modes $effectiveSubmitRetryModes
+$effectiveSubmitRetryIntervalMs = [int](Get-ConfigValue -Object $config -Name 'SubmitRetryIntervalMs' -DefaultValue 1000)
+$effectiveEnterDelayMs = [int](Get-ConfigValue -Object $config -Name 'EnterDelayMs' -DefaultValue 500)
+$effectivePostSubmitDelayMs = [int](Get-ConfigValue -Object $config -Name 'PostSubmitDelayMs' -DefaultValue 2000)
 $evidenceReasonCodes = @($warningRecords | Where-Object { [bool]$_.BlocksEvidence } | ForEach-Object { [string]$_.Code } | Sort-Object -Unique)
 $evidenceRecommended = ($evidenceReasonCodes.Count -eq 0)
 $operationalPolicy = [pscustomobject]@{
@@ -1041,6 +1126,8 @@ $effectiveConfig = [pscustomobject]@{
     SchemaVersion = '1.0.0'
     GeneratedAt = (Get-Date).ToString('o')
     PairDefinitionSource = [string]$pairDefinition.Source
+    PairDefinitionSourceDetail = [string]$pairDefinition.SourceDetail
+    PairTopologyStrategy = [string]$pairDefinition.Strategy
     Warnings = @($warningRecords | ForEach-Object { [string]$_.Message })
     WarningDetails = @($warningRecords)
     WarningSummary = $warningSummary
@@ -1088,11 +1175,16 @@ $effectiveConfig = [pscustomobject]@{
     PairTest = [pscustomobject]@{
         RunRootBase = [string]$effectivePairTest.RunRootBase
         RunRootPattern = [string]$effectivePairTest.RunRootPattern
+        DefaultPairId = [string]$effectivePairTest.DefaultPairId
+        PairTopologyStrategy = [string]$effectivePairTest.PairTopologyStrategy
         SummaryFileName = [string]$effectivePairTest.SummaryFileName
         ReviewFolderName = [string]$effectivePairTest.ReviewFolderName
         MessageFolderName = [string]$effectivePairTest.MessageFolderName
         ReviewZipPattern = [string]$effectivePairTest.ReviewZipPattern
         SummaryZipMaxSkewSeconds = [double]$effectivePairTest.SummaryZipMaxSkewSeconds
+        ExecutionPathMode = $effectiveExecutionPathMode
+        RequireUserVisibleCellExecution = $effectiveRequireUserVisibleCellExecution
+        AllowedWindowVisibilityMethods = @($effectiveAllowedWindowVisibilityMethods)
         HeadlessExec = [pscustomobject]@{
             Enabled = [bool]$effectivePairTest.HeadlessExec.Enabled
             CodexExecutable = [string]$effectivePairTest.HeadlessExec.CodexExecutable
@@ -1106,6 +1198,15 @@ $effectiveConfig = [pscustomobject]@{
             MaxRunSeconds = [int]$effectivePairTest.HeadlessExec.MaxRunSeconds
             MutexScope = [string]$effectivePairTest.HeadlessExec.MutexScope
         }
+    }
+    Dispatch = [pscustomobject]@{
+        SubmitRetryModes = @($effectiveSubmitRetryModes)
+        SubmitRetrySequenceSummary = $effectiveSubmitRetrySequenceSummary
+        PrimarySubmitMode = $effectivePrimarySubmitMode
+        FinalSubmitMode = $effectiveFinalSubmitMode
+        SubmitRetryIntervalMs = $effectiveSubmitRetryIntervalMs
+        EnterDelayMs = $effectiveEnterDelayMs
+        PostSubmitDelayMs = $effectivePostSubmitDelayMs
     }
     OneTimeQueueSummary = @(
         $pairs | ForEach-Object {
@@ -1132,6 +1233,14 @@ $effectiveConfig = [pscustomobject]@{
                     InboxFolder = [string]$_.InboxFolder
                     PairTargetFolder = [string]$_.PairTargetFolder
                     PartnerFolder = [string]$_.PartnerFolder
+                    ExecutionPathMode = [string]$_.ExecutionPathMode
+                    UserVisibleCellExecutionRequired = [bool]$_.UserVisibleCellExecutionRequired
+                    AllowedWindowVisibilityMethods = @($_.AllowedWindowVisibilityMethods)
+                    SubmitRetryModes = @($_.SubmitRetryModes)
+                    SubmitRetrySequenceSummary = [string]$_.SubmitRetrySequenceSummary
+                    PrimarySubmitMode = [string]$_.PrimarySubmitMode
+                    FinalSubmitMode = [string]$_.FinalSubmitMode
+                    SubmitRetryIntervalMs = [int]$_.SubmitRetryIntervalMs
                     SummaryPath = [string]$_.SummaryPath
                     ReviewFolderPath = [string]$_.ReviewFolderPath
                     WorkFolderPath = [string]$_.WorkFolderPath
@@ -1163,6 +1272,14 @@ $effectiveConfig = [pscustomobject]@{
                     WindowTitle = [string]$_.WindowTitle
                     PairTargetFolder = [string]$_.PairTargetFolder
                     PartnerFolder = [string]$_.PartnerFolder
+                    ExecutionPathMode = [string]$_.ExecutionPathMode
+                    UserVisibleCellExecutionRequired = [bool]$_.UserVisibleCellExecutionRequired
+                    AllowedWindowVisibilityMethods = @($_.AllowedWindowVisibilityMethods)
+                    SubmitRetryModes = @($_.SubmitRetryModes)
+                    SubmitRetrySequenceSummary = [string]$_.SubmitRetrySequenceSummary
+                    PrimarySubmitMode = [string]$_.PrimarySubmitMode
+                    FinalSubmitMode = [string]$_.FinalSubmitMode
+                    SubmitRetryIntervalMs = [int]$_.SubmitRetryIntervalMs
                     SummaryPath = [string]$_.SummaryPath
                     ReviewFolderPath = [string]$_.ReviewFolderPath
                     WorkFolderPath = [string]$_.WorkFolderPath
@@ -1195,6 +1312,14 @@ $effectiveConfig = [pscustomobject]@{
                     InboxFolder = [string]$_.InboxFolder
                     PairTargetFolder = [string]$_.PairTargetFolder
                     PartnerFolder = [string]$_.PartnerFolder
+                    ExecutionPathMode = [string]$_.ExecutionPathMode
+                    UserVisibleCellExecutionRequired = [bool]$_.UserVisibleCellExecutionRequired
+                    AllowedWindowVisibilityMethods = @($_.AllowedWindowVisibilityMethods)
+                    SubmitRetryModes = @($_.SubmitRetryModes)
+                    SubmitRetrySequenceSummary = [string]$_.SubmitRetrySequenceSummary
+                    PrimarySubmitMode = [string]$_.PrimarySubmitMode
+                    FinalSubmitMode = [string]$_.FinalSubmitMode
+                    SubmitRetryIntervalMs = [int]$_.SubmitRetryIntervalMs
                     SummaryPath = [string]$_.SummaryPath
                     ReviewFolderPath = [string]$_.ReviewFolderPath
                     WorkFolderPath = [string]$_.WorkFolderPath
@@ -1250,6 +1375,9 @@ Write-Host ("Latest Existing Run: {0}" -f [string]$effectiveConfig.RunContext.La
 Write-Host ("Next Run Root Preview: {0}" -f [string]$effectiveConfig.RunContext.NextRunRootPreview)
 Write-Host ("Manifest: {0}" -f [string]$effectiveConfig.RunContext.ManifestPath)
 Write-Host ("Pair Definition Source: {0}" -f [string]$effectiveConfig.PairDefinitionSource)
+Write-Host ("Pair Definition Source Detail: {0}" -f [string]$effectiveConfig.PairDefinitionSourceDetail)
+Write-Host ("Pair Topology Strategy: {0}" -f [string]$effectiveConfig.PairTopologyStrategy)
+Write-Host ("Default Pair Id: {0}" -f [string]$effectiveConfig.PairTest.DefaultPairId)
 Write-Host ("Headless Enabled: {0}" -f [bool]$effectiveConfig.PairTest.HeadlessExec.Enabled)
 Write-Host ("Summary File: {0}" -f [string]$effectiveConfig.PairTest.SummaryFileName)
 Write-Host ("Review Folder: {0}" -f [string]$effectiveConfig.PairTest.ReviewFolderName)

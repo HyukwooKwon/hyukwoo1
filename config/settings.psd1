@@ -15,7 +15,7 @@
     ShellPath            = 'pwsh.exe'
     ResolverShellPath    = 'pwsh.exe'
     DefaultEnterCount    = 1
-    DefaultFixedSuffix   = '여기에 고정문구 입력'
+    DefaultFixedSuffix   = $null
     MaxPayloadChars      = 4000
     MaxPayloadBytes      = 12000
     SweepIntervalMs      = 2000

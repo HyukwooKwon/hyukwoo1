@@ -105,6 +105,14 @@ $seedSendPayload = [ordered]@{
             TargetId = 'target01'
             UpdatedAt = (Get-Date).ToString('o')
             FinalState = 'processed'
+            ExecutionPathMode = 'typed-window'
+            UserVisibleCellExecutionRequired = $true
+            AllowedWindowVisibilityMethods = @('hwnd')
+            SubmitRetryModes = @('enter', 'ctrl_enter')
+            SubmitRetrySequenceSummary = 'enter -> ctrl_enter'
+            PrimarySubmitMode = 'enter'
+            FinalSubmitMode = 'ctrl_enter'
+            SubmitRetryIntervalMs = 1000
             AttemptCount = 1
             MaxAttempts = 3
             ProcessedPath = (Join-Path $stateRoot 'dummy-processed.txt')
@@ -143,6 +151,11 @@ $pairedStatusFirst = Invoke-PowerShellJson -ScriptPath (Join-Path $root 'tests\S
 $target01PairedFirst = @($pairedStatusFirst.Json.Targets | Where-Object { [string]$_.TargetId -eq 'target01' } | Select-Object -First 1)[0]
 Assert-True ([string]$target01PairedFirst.SourceOutboxState -eq 'target-unresponsive-after-send') 'paired status should surface target-unresponsive-after-send.'
 Assert-True ([int]$pairedStatusFirst.Json.Counts.TargetUnresponsiveCount -ge 1) 'paired status counts should include target-unresponsive-after-send.'
+Assert-True ([string]$pairedStatusFirst.Json.PairTest.ExecutionPathMode -eq 'typed-window') 'paired status should expose typed-window execution path.'
+Assert-True ([bool]$pairedStatusFirst.Json.PairTest.RequireUserVisibleCellExecution -eq $true) 'paired status should expose visible cell execution requirement.'
+Assert-True ((@($target01PairedFirst.SeedSubmitRetryModes) -join ',') -eq 'enter,ctrl_enter') 'paired status target row should expose submit retry modes.'
+Assert-True ([string]$target01PairedFirst.SeedSubmitRetrySequenceSummary -eq 'enter -> ctrl_enter') 'paired status target row should expose submit retry sequence summary.'
+Assert-True ([string]$target01PairedFirst.ExecutionPathMode -eq 'typed-window') 'paired status target row should expose execution path mode.'
 
 [System.IO.File]::WriteAllText($target01SummaryPath, 'seed lane publish started', (New-Utf8NoBomEncoding))
 

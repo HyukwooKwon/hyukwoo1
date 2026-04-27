@@ -178,11 +178,23 @@ function Get-EffectiveFixedSuffix {
         [Parameter(Mandatory)]$Target
     )
 
+    $placeholderFixedSuffix = '여기에 고정문구 입력'
+
     if ($null -ne $Target.FixedSuffix) {
-        return [string]$Target.FixedSuffix
+        $targetFixedSuffix = [string]$Target.FixedSuffix
+        if ($targetFixedSuffix.Trim() -eq $placeholderFixedSuffix) {
+            return ''
+        }
+
+        return $targetFixedSuffix
     }
 
-    return [string]$Config.DefaultFixedSuffix
+    $defaultFixedSuffix = [string]$Config.DefaultFixedSuffix
+    if ($defaultFixedSuffix.Trim() -eq $placeholderFixedSuffix) {
+        return ''
+    }
+
+    return $defaultFixedSuffix
 }
 
 function Get-EffectiveEnterCount {
@@ -707,6 +719,15 @@ function Invoke-AhkSend {
     $activateSettleMs = Get-RelayTimingSetting -Config $Config -Name 'ActivateSettleMs' -DefaultValue 120
     $textSettle = Get-AdjustedTextSettleSetting -Config $Config -Payload $Payload
     $textSettleMs = [int]$textSettle.EffectiveTextSettleMs
+    $terminalInputMode = 'sendtext'
+    $terminalInputModeValue = $null
+    if (TryGet-RelaySettingValue -Config $Config -Name 'TerminalInputMode' -Value ([ref]$terminalInputModeValue) -AllowNull:$false) {
+        $terminalInputMode = [string]$terminalInputModeValue
+    }
+    if (-not (Test-NonEmptyString $terminalInputMode)) {
+        $terminalInputMode = 'sendtext'
+    }
+    $submitGuardMs = Get-RelayTimingSetting -Config $Config -Name 'SubmitGuardMs' -DefaultValue 0
     $enterDelayMs = Get-RelayTimingSetting -Config $Config -Name 'EnterDelayMs' -DefaultValue 150
     $postSubmitDelayMs = Get-RelayTimingSetting -Config $Config -Name 'PostSubmitDelayMs' -DefaultValue 150
     $submitRetryModes = @(Get-RelayStringListSetting -Config $Config -Name 'SubmitRetryModes' -DefaultValues @('enter'))
@@ -714,8 +735,16 @@ function Invoke-AhkSend {
     $requireActiveBeforeEnter = Get-RelayBooleanSetting -Config $Config -Name 'RequireActiveBeforeEnter' -DefaultValue $true
     $requireUserIdleBeforeSend = Get-RelayBooleanSetting -Config $Config -Name 'RequireUserIdleBeforeSend' -DefaultValue $false
     $minUserIdleBeforeSendMs = Get-RelayTimingSetting -Config $Config -Name 'MinUserIdleBeforeSendMs' -DefaultValue 0
+    $visibleBeaconEnabled = Get-RelayBooleanSetting -Config $Config -Name 'VisibleExecutionBeaconEnabled' -DefaultValue $false
+    $visiblePreHoldMs = Get-RelayTimingSetting -Config $Config -Name 'VisibleExecutionPreHoldMs' -DefaultValue 0
+    $visiblePostHoldMs = Get-RelayTimingSetting -Config $Config -Name 'VisibleExecutionPostHoldMs' -DefaultValue 0
+    $restorePreviousActive = Get-RelayBooleanSetting -Config $Config -Name 'VisibleExecutionRestorePreviousActive' -DefaultValue $true
+    $failOnFocusSteal = Get-RelayBooleanSetting -Config $Config -Name 'VisibleExecutionFailOnFocusSteal' -DefaultValue $false
     $requireActiveBeforeEnterArg = if ($requireActiveBeforeEnter) { '1' } else { '0' }
     $requireUserIdleBeforeSendArg = if ($requireUserIdleBeforeSend) { '1' } else { '0' }
+    $visibleBeaconEnabledArg = if ($visibleBeaconEnabled) { '1' } else { '0' }
+    $restorePreviousActiveArg = if ($restorePreviousActive) { '1' } else { '0' }
+    $failOnFocusStealArg = if ($failOnFocusSteal) { '1' } else { '0' }
 
     try {
         $proc = Start-Process -FilePath ([string]$Config.AhkExePath) -ArgumentList @(
@@ -728,6 +757,8 @@ function Invoke-AhkSend {
             '--timeoutMs', [string]$Config.SendTimeoutMs,
             '--activateSettleMs', [string]$activateSettleMs,
             '--textSettleMs', [string]$textSettleMs,
+            '--inputMode', [string]$terminalInputMode,
+            '--submitGuardMs', [string]$submitGuardMs,
             '--enterDelayMs', [string]$enterDelayMs,
             '--postSubmitDelayMs', [string]$postSubmitDelayMs,
             '--submitModes', ([string]::Join(',', $submitRetryModes)),
@@ -735,6 +766,12 @@ function Invoke-AhkSend {
             '--requireActiveBeforeEnter', $requireActiveBeforeEnterArg,
             '--requireUserIdleBeforeSend', $requireUserIdleBeforeSendArg,
             '--minUserIdleBeforeSendMs', [string]$minUserIdleBeforeSendMs,
+            '--visibleBeaconEnabled', $visibleBeaconEnabledArg,
+            '--visibleLabel', $TargetId,
+            '--visiblePreHoldMs', [string]$visiblePreHoldMs,
+            '--visiblePostHoldMs', [string]$visiblePostHoldMs,
+            '--restorePreviousActive', $restorePreviousActiveArg,
+            '--failOnFocusSteal', $failOnFocusStealArg,
             '--debugLog', $debugLogPath
         ) -Wait -PassThru -WindowStyle Hidden
 
@@ -743,8 +780,15 @@ function Invoke-AhkSend {
             DebugLogPath = $debugLogPath
             PayloadBytes = [int]$textSettle.PayloadBytes
             TextSettleMs = [int]$textSettleMs
+            TerminalInputMode = [string]$terminalInputMode
+            SubmitGuardMs = [int]$submitGuardMs
             BaseTextSettleMs = [int]$textSettle.BaseTextSettleMs
             ExtraTextSettleMs = [int]$textSettle.ExtraTextSettleMs
+            VisibleBeaconEnabled = [bool]$visibleBeaconEnabled
+            VisiblePreHoldMs = [int]$visiblePreHoldMs
+            VisiblePostHoldMs = [int]$visiblePostHoldMs
+            RestorePreviousActive = [bool]$restorePreviousActive
+            FailOnFocusSteal = [bool]$failOnFocusSteal
         }
     }
     finally {
@@ -760,7 +804,8 @@ function New-WorkItemProcessResult {
         [Parameter(Mandatory)][string]$TargetId,
         [Parameter(Mandatory)][int]$EnterCount,
         [Parameter(Mandatory)][string[]]$SubmitRetryModes,
-        [Parameter(Mandatory)]$SendResult
+        [Parameter(Mandatory)]$SendResult,
+        [Parameter(Mandatory)][string]$Payload
     )
 
     return [pscustomobject]@{
@@ -771,10 +816,96 @@ function New-WorkItemProcessResult {
         DebugLogPath     = [string]$SendResult.DebugLogPath
         PayloadBytes     = [int]$SendResult.PayloadBytes
         TextSettleMs     = [int]$SendResult.TextSettleMs
+        TerminalInputMode = [string]$SendResult.TerminalInputMode
+        SubmitGuardMs    = [int]$SendResult.SubmitGuardMs
         BaseTextSettleMs = [int]$SendResult.BaseTextSettleMs
         ExtraTextSettleMs = [int]$SendResult.ExtraTextSettleMs
+        VisibleBeaconEnabled = [bool]$SendResult.VisibleBeaconEnabled
+        VisiblePreHoldMs = [int]$SendResult.VisiblePreHoldMs
+        VisiblePostHoldMs = [int]$SendResult.VisiblePostHoldMs
+        RestorePreviousActive = [bool]$SendResult.RestorePreviousActive
+        FailOnFocusSteal = [bool]$SendResult.FailOnFocusSteal
         ExitCode         = [int]$SendResult.ExitCode
+        Payload          = [string]$Payload
+        PayloadSnapshotPath = ''
+        PayloadSha256    = ''
     }
+}
+
+function Get-ProcessedPayloadSnapshotPath {
+    param([Parameter(Mandatory)][string]$ProcessedPath)
+
+    return ($ProcessedPath + '.payload.txt')
+}
+
+function Get-RelaySha256Hex {
+    param([AllowEmptyString()][string]$Text)
+
+    $utf8 = New-Utf8NoBomEncoding
+    $bytes = $utf8.GetBytes([string]$Text)
+    $sha256 = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $hash = $sha256.ComputeHash($bytes)
+    }
+    finally {
+        $sha256.Dispose()
+    }
+    return ([System.BitConverter]::ToString($hash).Replace('-', '').ToLowerInvariant())
+}
+
+function Write-ProcessedPayloadSnapshot {
+    param(
+        [Parameter(Mandatory)][string]$ProcessedPath,
+        [Parameter(Mandatory)][string]$Payload
+    )
+
+    $snapshotPath = Get-ProcessedPayloadSnapshotPath -ProcessedPath $ProcessedPath
+    [System.IO.File]::WriteAllText($snapshotPath, [string]$Payload, (New-Utf8NoBomEncoding))
+
+    return [pscustomobject]@{
+        Path      = [string]$snapshotPath
+        Sha256    = (Get-RelaySha256Hex -Text $Payload)
+        Bytes     = (New-Utf8NoBomEncoding).GetByteCount([string]$Payload)
+        CreatedAt = (Get-Date).ToString('o')
+    }
+}
+
+function Update-ProcessedDeliveryMetadataWithPayloadSnapshot {
+    param(
+        [Parameter(Mandatory)][string]$ProcessedPath,
+        [Parameter(Mandatory)]$Snapshot
+    )
+
+    $metadataPath = ($ProcessedPath + '.delivery.json')
+    if (-not (Test-Path -LiteralPath $metadataPath -PathType Leaf)) {
+        return
+    }
+
+    $metadataRaw = Get-Content -LiteralPath $metadataPath -Raw -Encoding UTF8
+    $metadata = ConvertFrom-RelayJsonText -Json $metadataRaw
+    if ($null -eq $metadata) {
+        $metadata = [ordered]@{}
+    }
+
+    $payloadSnapshotPath = [string](Get-RelayMetadataPropertyValue -Object $Snapshot -Name 'Path' -DefaultValue '')
+    $payloadSha256 = [string](Get-RelayMetadataPropertyValue -Object $Snapshot -Name 'Sha256' -DefaultValue '')
+    $payloadBytes = [int](Get-RelayMetadataPropertyValue -Object $Snapshot -Name 'Bytes' -DefaultValue 0)
+    $payloadCreatedAt = [string](Get-RelayMetadataPropertyValue -Object $Snapshot -Name 'CreatedAt' -DefaultValue '')
+
+    if ($metadata -is [hashtable]) {
+        $metadata['PayloadSnapshotPath'] = $payloadSnapshotPath
+        $metadata['PayloadSha256'] = $payloadSha256
+        $metadata['PayloadBytes'] = $payloadBytes
+        $metadata['PayloadSnapshotCreatedAt'] = $payloadCreatedAt
+    }
+    else {
+        $metadata | Add-Member -NotePropertyName 'PayloadSnapshotPath' -NotePropertyValue $payloadSnapshotPath -Force
+        $metadata | Add-Member -NotePropertyName 'PayloadSha256' -NotePropertyValue $payloadSha256 -Force
+        $metadata | Add-Member -NotePropertyName 'PayloadBytes' -NotePropertyValue $payloadBytes -Force
+        $metadata | Add-Member -NotePropertyName 'PayloadSnapshotCreatedAt' -NotePropertyValue $payloadCreatedAt -Force
+    }
+
+    Write-RelayMetadataDocument -Path $metadataPath -Metadata $metadata | Out-Null
 }
 
 function Get-WorkItemDeliveryContext {
@@ -907,9 +1038,10 @@ function Invoke-WorkItemDelivery {
         -TargetId ([string]$Target.Id) `
         -EnterCount ([int]$Context.EnterCount) `
         -SubmitRetryModes @($Context.SubmitRetryModes) `
-        -SendResult $sendResult
+        -SendResult $sendResult `
+        -Payload ([string]$Context.Payload)
 
-    Write-RelayLog -Path $LogPath -Level 'info' -Message ("sending target={0} enter={1} submitModes={2} file={3} payloadBytes={4} textSettleMs={5} ahkDebugLog={6}" -f $Target.Id, $result.EnterCount, ($result.SubmitRetryModes -join '>'), $result.Path, $result.PayloadBytes, $result.TextSettleMs, $result.DebugLogPath)
+    Write-RelayLog -Path $LogPath -Level 'info' -Message ("sending target={0} enter={1} submitModes={2} inputMode={3} submitGuardMs={4} visibleBeacon={5} visiblePreHoldMs={6} visiblePostHoldMs={7} restorePreviousActive={8} failOnFocusSteal={9} file={10} payloadBytes={11} textSettleMs={12} ahkDebugLog={13}" -f $Target.Id, $result.EnterCount, ($result.SubmitRetryModes -join '>'), $result.TerminalInputMode, $result.SubmitGuardMs, $result.VisibleBeaconEnabled, $result.VisiblePreHoldMs, $result.VisiblePostHoldMs, $result.RestorePreviousActive, $result.FailOnFocusSteal, $result.Path, $result.PayloadBytes, $result.TextSettleMs, $result.DebugLogPath)
     $category = Get-FailureCategoryFromAhkExitCode -ExitCode ([int]$result.ExitCode)
 
     if ($category -ne 'success') {
@@ -1241,7 +1373,12 @@ try {
 
                 $processedPath = Move-MessageToArchive -SourcePath ([string]$item.Path) -DestinationRoot ([string]$config.ProcessedRoot) -TargetId ([string]$target.Id)
                 if ($null -ne $processedPath) {
+                    $payloadSnapshot = Write-ProcessedPayloadSnapshot -ProcessedPath ([string]$processedPath) -Payload ([string]$workItemResult.Payload)
+                    Update-ProcessedDeliveryMetadataWithPayloadSnapshot -ProcessedPath ([string]$processedPath) -Snapshot $payloadSnapshot
+                    $workItemResult | Add-Member -NotePropertyName 'PayloadSnapshotPath' -NotePropertyValue ([string]$payloadSnapshot.Path) -Force
+                    $workItemResult | Add-Member -NotePropertyName 'PayloadSha256' -NotePropertyValue ([string]$payloadSnapshot.Sha256) -Force
                     Write-RelayLog -Path $logPath -Level 'info' -Message ("moved to processed: {0} payloadBytes={1} textSettleMs={2}" -f $processedPath, $workItemResult.PayloadBytes, $workItemResult.TextSettleMs)
+                    Write-RelayLog -Path $logPath -Level 'info' -Message ("payload snapshot: {0} sha256={1}" -f [string]$payloadSnapshot.Path, [string]$payloadSnapshot.Sha256)
                 }
 
                 $done = $true

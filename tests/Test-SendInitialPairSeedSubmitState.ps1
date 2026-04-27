@@ -41,6 +41,8 @@ $configText = @"
 @{
     MaxPayloadChars = 4000
     MaxPayloadBytes = 12000
+    RuntimeRoot = '$($testRoot.Replace("'", "''"))\runtime'
+    LogsRoot = '$($testRoot.Replace("'", "''"))\logs'
     ProcessedRoot = '$($processedRoot.Replace("'", "''"))'
     FailedRoot = '$($failedRoot.Replace("'", "''"))'
     RetryPendingRoot = '$($retryPendingRoot.Replace("'", "''"))'
@@ -62,6 +64,13 @@ $configText = @"
     )
     PairTest = @{
         RunRootBase = '$($testRoot.Replace("'", "''"))'
+        ExecutionPathMode = 'typed-window'
+        TypedWindow = @{
+            SubmitProbeSeconds = 1
+            SubmitProbePollMs = 200
+            SubmitRetryLimit = 0
+            ProgressCpuDeltaThresholdSeconds = 0.05
+        }
     }
 }
 "@
@@ -130,11 +139,20 @@ finally {
 Assert-True ([string]$result.FinalState -eq 'submit-unconfirmed') 'helper should mark submit-unconfirmed when router processed but no publish evidence appears within wait window.'
 Assert-True ([string]$result.SubmitState -eq 'unconfirmed') 'submit state should be unconfirmed without publish evidence.'
 Assert-True (-not [bool]$result.SubmitConfirmed) 'submit confirmed flag should remain false without publish evidence.'
+Assert-True ([string]$result.SubmitProbeState -eq 'typed-window-submit-unconfirmed') 'typed-window submit probe should mark submit-unconfirmed when no progress is detected.'
+Assert-True ([string]$result.TypedWindowExecutionState -eq 'typed-window-submit-unconfirmed') 'typed-window execution state should record submit-unconfirmed when no progress is detected.'
+Assert-True ([int]$result.SubmitRetryCount -eq 0) 'typed-window no-progress path should not increment retry count when retry limit is zero.'
+Assert-True ([string]$result.TypedWindowSessionState -eq 'recovery-needed') 'typed-window no-progress path should mark the session recovery-needed.'
+Assert-True ([string]$result.TypedWindowLastResetReason -eq 'typed-window-submit-unconfirmed') 'typed-window no-progress path should record the reset reason.'
 
 $seedSendStatusPath = Join-Path $runRoot '.state\seed-send-status.json'
 $seedSendStatus = Get-Content -LiteralPath $seedSendStatusPath -Raw -Encoding UTF8 | ConvertFrom-Json
 $targetStatus = @($seedSendStatus.Targets | Where-Object { [string]$_.TargetId -eq 'target01' } | Select-Object -First 1)[0]
 Assert-True ([string]$targetStatus.FinalState -eq 'submit-unconfirmed') 'persisted seed-send status should record submit-unconfirmed.'
 Assert-True ([string]$targetStatus.SubmitState -eq 'unconfirmed') 'persisted seed-send status should record unconfirmed submit state.'
+Assert-True ([string]$targetStatus.SubmitProbeState -eq 'typed-window-submit-unconfirmed') 'persisted seed-send status should record typed-window submit-unconfirmed probe state.'
+Assert-True ([string]$targetStatus.TypedWindowExecutionState -eq 'typed-window-submit-unconfirmed') 'persisted seed-send status should record typed-window submit-unconfirmed execution state.'
+Assert-True ([string]$targetStatus.TypedWindowSessionState -eq 'recovery-needed') 'persisted seed-send status should record recovery-needed session state.'
+Assert-True ([string]$targetStatus.TypedWindowLastResetReason -eq 'typed-window-submit-unconfirmed') 'persisted seed-send status should record typed-window reset reason.'
 
 Write-Host ('send-initial-pair-seed-submit-state ok: runRoot=' + $runRoot)

@@ -127,7 +127,20 @@
 2. `RunRoot 준비` 또는 `준비 전체 실행` 직후 output에 `[runroot 요약]` 블록이 자동으로 따라붙는지 확인한다.
 3. 첫 줄이 `overall=success acceptance=roundtrip-confirmed stage=completed` 형태인지 확인한다.
 4. `Targets:` 아래 `target01(top)`, `target05(bottom)` 둘 다 `outbox=imported`와 `summary=True`, `zip=1` 이상으로 보이는지 확인한다.
-5. `overall=failing` 또는 `overall=in-progress`면 그다음에만 `show-paired-exchange-status.ps1`와 로그 상세 확인으로 내려간다.
+5. 같은 RunRoot의 `.state\important-summary.txt` 와 `.state\important-summary.json` 이 함께 생성되는지 확인한다.
+6. panel의 `important-summary 열기` 버튼으로 같은 파일이 바로 열리는지 확인한다.
+7. `important-summary.txt` 에 현재 payload preview, contract 경로, `summary.txt / review.zip / publish.ready.json` 생성 여부, 최신 prepare/AHK/router 로그 경로가 같이 보이는지 확인한다.
+8. 같은 파일 상단 `freshness` 블록에 `NewestObservedSignalAt`, `SignalAgeSeconds`, `StaleSummary`뿐 아니라 `NewestProgressSignalAt`, `ProgressSignalAgeSeconds`, `ProgressStale`도 같이 보여 "최근 흔적"과 "실제 relay 진전"을 구분해서 읽을 수 있는지 확인한다.
+즉 `StaleSummary=false` 이고 `ProgressStale=true` 면 "요약은 최신이지만 실제 relay 진전은 오래 멈춘 상태"로 읽는다.
+9. 같은 파일 상단 `operator-focus` 블록에 `AttentionLevel`, `CurrentBottleneck`, `NextExpectedStep`, `RecommendedAction`가 보여 현재 병목과 다음 확인 포인트를 먼저 읽을 수 있는지 확인한다.
+10. 같은 파일의 `recent-events` 블록에 최근 핵심 이벤트 5~8줄이 보여 방금 어디까지 진행됐는지 빠르게 읽히는지 확인한다. JSON 요약에서는 각 event에 `EventClass`, `PairId`, `TargetId`, `IsProgressSignal`가 같이 남는지도 확인한다.
+11. `overall=failing` 또는 `overall=in-progress`면 그다음에만 `show-paired-exchange-status.ps1`와 로그 상세 확인으로 내려간다.
+
+summary 회귀만 한 번에 다시 돌리려면 아래 wrapper를 사용한다.
+
+```powershell
+pwsh -NoProfile -ExecutionPolicy Bypass -File .\tests\Run-ShowPairedRunSummaryRegression.ps1
+```
 
 ### 13. 최종 전달문 / 경로 요약 확인
 

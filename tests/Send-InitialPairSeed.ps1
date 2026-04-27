@@ -3,6 +3,7 @@ param(
     [string]$ConfigPath,
     [Parameter(Mandatory)][string]$RunRoot,
     [string[]]$TargetId,
+    [string]$MessageTextFilePath,
     [switch]$AsJson
 )
 
@@ -136,12 +137,20 @@ foreach ($id in $requestedTargetIds) {
 }
 
 $results = @()
+$resolvedExplicitMessageTextFilePath = ''
+if (Test-NonEmptyString $MessageTextFilePath) {
+    $resolvedExplicitMessageTextFilePath = (Resolve-Path -LiteralPath $MessageTextFilePath).Path
+}
+
 foreach ($row in $selectedTargets) {
     $targetKey = [string]$row.TargetId
-    $messagePath = [string]$row.MessagePath
-    if (-not (Test-NonEmptyString $messagePath) -and (Test-NonEmptyString ([string]$row.RequestPath)) -and (Test-Path -LiteralPath ([string]$row.RequestPath) -PathType Leaf)) {
-        $request = Read-JsonObject -Path ([string]$row.RequestPath)
-        $messagePath = [string]$request.MessagePath
+    $messagePath = $resolvedExplicitMessageTextFilePath
+    if (-not (Test-NonEmptyString $messagePath)) {
+        $messagePath = [string]$row.MessagePath
+        if (-not (Test-NonEmptyString $messagePath) -and (Test-NonEmptyString ([string]$row.RequestPath)) -and (Test-Path -LiteralPath ([string]$row.RequestPath) -PathType Leaf)) {
+            $request = Read-JsonObject -Path ([string]$row.RequestPath)
+            $messagePath = [string]$request.MessagePath
+        }
     }
     if (-not (Test-NonEmptyString $messagePath)) {
         throw "message path missing for target: $targetKey"

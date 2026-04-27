@@ -115,4 +115,38 @@ Assert-ThrowsLike `
     -Pattern 'PairPolicies\.pair99 has no matching PairDefinitions entry' `
     -Message 'unknown pair policy entry should fail fast.'
 
+$invalidDefaultPairConfigPath = Join-Path $tmpRoot 'invalid-default-pair.psd1'
+[System.IO.File]::WriteAllText($invalidDefaultPairConfigPath, @"
+@{
+    PairTest = @{
+        PairDefinitions = @(
+            @{ PairId = 'pair10'; TopTargetId = 'target10'; BottomTargetId = 'target20' }
+        )
+        DefaultPairId = 'pair99'
+    }
+}
+"@, (New-Utf8NoBomEncoding))
+
+Assert-ThrowsLike `
+    -Action { Resolve-PairTestConfig -Root $root -ConfigPath $invalidDefaultPairConfigPath | Out-Null } `
+    -Pattern 'PairTest\.DefaultPairId has no matching PairDefinitions entry' `
+    -Message 'unknown default pair id should fail fast.'
+
+$oddTargetFallbackConfigPath = Join-Path $tmpRoot 'odd-target-fallback.psd1'
+[System.IO.File]::WriteAllText($oddTargetFallbackConfigPath, @"
+@{
+    Targets = @(
+        @{ Id = 'target10'; Folder = 'C:\tmp\target10'; WindowTitle = 'Target10'; EnterCount = 1 }
+        @{ Id = 'target11'; Folder = 'C:\tmp\target11'; WindowTitle = 'Target11'; EnterCount = 1 }
+        @{ Id = 'target12'; Folder = 'C:\tmp\target12'; WindowTitle = 'Target12'; EnterCount = 1 }
+    )
+    PairTest = @{}
+}
+"@, (New-Utf8NoBomEncoding))
+
+Assert-ThrowsLike `
+    -Action { Resolve-PairTestConfig -Root $root -ConfigPath $oddTargetFallbackConfigPath | Out-Null } `
+    -Pattern 'fallback target-order pairing needs an even number of Targets' `
+    -Message 'odd target count should fail fast for target-order fallback pairing.'
+
 Write-Host 'paired exchange config validation ok'

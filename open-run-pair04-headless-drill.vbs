@@ -5,6 +5,6 @@ Set shell = CreateObject("WScript.Shell")
 Set fso = CreateObject("Scripting.FileSystemObject")
 
 root = fso.GetParentFolderName(WScript.ScriptFullName)
-scriptPath = root & "\run-pair04-headless-drill.ps1"
-command = "powershell.exe -NoProfile -ExecutionPolicy Bypass -File """ & scriptPath & """"
+scriptPath = root & "\open-preset-headless-pair-drill.vbs"
+command = "wscript.exe """ & scriptPath & """ ""pair04"""
 shell.Run command, 1, False

@@ -205,7 +205,16 @@ if (Test-MutexHeld -Name $routerMutexName) {
     Wait-ForMutexReleased -MutexName $routerMutexName -TimeoutSeconds $WaitForReleaseSeconds
 }
 
-$tmpRoot = Join-Path $root '_tmp'
+$processLogsRoot = ''
+if ($config.ContainsKey('LogsRoot')) {
+    $processLogsRoot = [string]$config.LogsRoot
+}
+if (Test-NonEmptyString $processLogsRoot) {
+    $tmpRoot = Join-Path (Resolve-FullPath -PathValue $processLogsRoot) 'router-restarts'
+}
+else {
+    $tmpRoot = Join-Path ([System.IO.Path]::GetDirectoryName([string]$routerStatePath)) 'router-restarts'
+}
 if (-not (Test-Path -LiteralPath $tmpRoot -PathType Container)) {
     New-Item -ItemType Directory -Path $tmpRoot -Force | Out-Null
 }

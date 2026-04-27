@@ -36,14 +36,19 @@ $configText = @"
                 SeedTargetId = 'target20'
             }
         )
+        DefaultPairId = 'pair10'
         DefaultSeedWorkRepoRoot = 'defaults\repo'
         DefaultSeedReviewInputSearchRelativePath = 'review-in'
         DefaultSeedReviewInputFilter = '*.review.zip'
+        UseExternalWorkRepoContractPaths = `$true
+        ExternalWorkRepoContractRelativeRoot = '.relay-contract\default-contract'
         DefaultWatcherRunDurationSec = 1800
         DefaultPairMaxRoundtripCount = 8
         PairPolicies = @{
             pair10 = @{
                 DefaultSeedWorkRepoRoot = 'custom\pair10-repo'
+                UseExternalWorkRepoContractPaths = `$false
+                ExternalWorkRepoContractRelativeRoot = '.relay-contract\pair10-contract'
                 DefaultWatcherRunDurationSec = 2400
                 DefaultPairMaxRoundtripCount = 12
                 PublishContractMode = 'relaxed'
@@ -61,10 +66,16 @@ $pair = @(Select-PairDefinitions -PairDefinitions @($pairTest.PairDefinitions) -
 $policy = Get-PairPolicyForPair -PairTest $pairTest -PairId 'pair10'
 
 Assert-True ([string]$pairTest.PairDefinitionSource -eq 'config') 'pair definitions should come from config.'
+Assert-True ([string]$pairTest.PairDefinitionSourceDetail -eq 'config-pair-definitions') 'pair definition source detail should describe config pair definitions.'
+Assert-True ([string]$pairTest.PairTopologyStrategy -eq 'configured') 'pair topology strategy should describe configured pair topology.'
+Assert-True ([string]$pairTest.DefaultPairId -eq 'pair10') 'default pair id should be preserved.'
+Assert-True ((Get-DefaultPairId -PairTest $pairTest) -eq 'pair10') 'default pair helper should respect configured default pair id.'
 Assert-True ([string]$pair.PairId -eq 'pair10') 'pair10 definition should be selectable from config.'
 Assert-True ([string]$pair.SeedTargetId -eq 'target20') 'pair definition should preserve explicit seed target.'
 Assert-True ([string]$policy.DefaultSeedTargetId -eq 'target20') 'pair policy should inherit explicit seed target from pair definition.'
 Assert-True ([string]$policy.DefaultSeedWorkRepoRoot -eq (Join-Path $root 'custom\pair10-repo')) 'pair policy should resolve relative work repo root against repo root.'
+Assert-True (-not [bool]$policy.UseExternalWorkRepoContractPaths) 'pair policy should preserve external contract path override.'
+Assert-True ([string]$policy.ExternalWorkRepoContractRelativeRoot -eq '.relay-contract\pair10-contract') 'pair policy should preserve external contract relative root override.'
 Assert-True ([int]$policy.DefaultWatcherRunDurationSec -eq 2400) 'pair policy should preserve pair watcher run duration override.'
 Assert-True ([int]$policy.DefaultPairMaxRoundtripCount -eq 12) 'pair policy should preserve pair roundtrip override.'
 Assert-True ([string]$policy.PublishContractMode -eq 'relaxed') 'pair policy should preserve publish contract mode.'

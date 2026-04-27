@@ -233,8 +233,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\tests\Confirm-SharedVisibl
 - Windows에서는 `open-relay-operator-panel.vbs` 더블클릭으로 바로 panel을 열 수 있습니다.
 - 런처 체인은 `open-relay-operator-panel.vbs -> launch-relay-operator-panel.cmd -> launch-relay-operator-panel.ps1 -> relay_operator_panel.py`입니다.
 - CMD/VBS 경로는 panel 프로세스 기동까지 확인했고, 실제 버튼 클릭과 시각 배치는 운영자가 Windows 데스크톱에서 확인합니다.
-- pair01 전용 원클릭은 `open-run-pair01-headless-drill.vbs -> run-pair01-headless-drill.ps1` 경로로 실제 한 번 왕복 성공까지 확인했습니다.
-- pair02~04도 같은 형식의 `open-run-pair0X-headless-drill.vbs -> run-pair0X-headless-drill.ps1` 경로를 사용합니다.
+- pair01 preset 원클릭은 `open-run-pair01-headless-drill.vbs -> open-preset-headless-pair-drill.vbs -> launch-preset-headless-pair-drill.cmd -> run-preset-headless-pair-drill.ps1 -PairId pair01` 경로로 실제 한 번 왕복 성공까지 확인했습니다.
+- pair02~04 shortcut도 같은 공통 preset 경로에 `PairId`만 고정해서 사용합니다.
 - 특정 pair를 임시로 막으려면 아래처럼 runtime 상태만 바꿉니다.
 
 ```powershell
@@ -505,18 +505,26 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\invoke-codex-exec-turn.ps1
 - `Pair=pair01`
 - `Run Selected Pair Drill`
 
-pair01 고정 원클릭:
+pair01 preset 원클릭:
 
-- panel 버튼: `pair01 즉시 실행`
+- panel 버튼: `pair01 Preset Drill`
 - VBS 더블클릭: `open-run-pair01-headless-drill.vbs`
 
-CLI 원클릭:
+generic core CLI:
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\run-headless-pair-drill.ps1 -ConfigPath .\config\settings.bottest-live-visible.psd1 -PairId pair01
 ```
 
-pair01 고정 CLI/VBS 원클릭:
+generic preset CLI/VBS:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\run-preset-headless-pair-drill.ps1 -PairId pair01
+cmd /c .\launch-preset-headless-pair-drill.cmd pair01
+wscript .\open-preset-headless-pair-drill.vbs pair01
+```
+
+pair01 shortcut CLI/VBS:
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\run-pair01-headless-drill.ps1

@@ -41,6 +41,8 @@ $configText = @"
 @{
     MaxPayloadChars = 4000
     MaxPayloadBytes = 12000
+    RuntimeRoot = '$($testRoot.Replace("'", "''"))\runtime'
+    LogsRoot = '$($testRoot.Replace("'", "''"))\logs'
     ProcessedRoot = '$($processedRoot.Replace("'", "''"))'
     FailedRoot = '$($failedRoot.Replace("'", "''"))'
     RetryPendingRoot = '$($retryPendingRoot.Replace("'", "''"))'

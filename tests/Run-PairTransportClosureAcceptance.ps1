@@ -2,8 +2,8 @@
 param(
     [string]$ConfigPath,
     [string]$RunRoot,
-    [string]$PairId = 'pair01',
-    [string]$InitialTargetId = 'target01',
+    [string]$PairId,
+    [string]$InitialTargetId,
     [int]$MaxForwardCount = 2,
     [int]$RunDurationSec = 900,
     [switch]$ReuseExistingRunRoot,
@@ -202,12 +202,56 @@ function New-StepResult {
     }
 }
 
+function Resolve-PairTransportClosureSelection {
+    param(
+        [Parameter(Mandatory)][string]$Root,
+        [Parameter(Mandatory)][string]$ConfigPath,
+        [string]$PairId,
+        [string]$InitialTargetId
+    )
+
+    $pairTest = Resolve-PairTestConfig -Root $Root -ConfigPath $ConfigPath
+    if (-not (Test-NonEmptyString $PairId)) {
+        $PairId = Get-DefaultPairId -PairTest $pairTest
+    }
+
+    $pairDefinition = Get-PairDefinition -PairTest $pairTest -PairId $PairId
+    if (-not (Test-NonEmptyString $InitialTargetId)) {
+        $InitialTargetId = if (Test-NonEmptyString ([string]$pairDefinition.SeedTargetId)) {
+            [string]$pairDefinition.SeedTargetId
+        }
+        else {
+            [string]$pairDefinition.TopTargetId
+        }
+    }
+
+    $pairTargetIds = @(
+        [string]$pairDefinition.TopTargetId
+        [string]$pairDefinition.BottomTargetId
+    ) | Where-Object { Test-NonEmptyString $_ } | Select-Object -Unique
+
+    if ([string]$InitialTargetId -notin $pairTargetIds) {
+        throw "initial target does not belong to pair: initial=$InitialTargetId pair=$PairId"
+    }
+
+    return [pscustomobject]@{
+        PairTest        = $pairTest
+        PairId          = [string]$PairId
+        InitialTargetId = [string]$InitialTargetId
+        PairDefinition  = $pairDefinition
+    }
+}
+
 $root = Split-Path -Parent $PSScriptRoot
+. (Join-Path $PSScriptRoot 'PairedExchangeConfig.ps1')
 if (-not (Test-NonEmptyString $ConfigPath)) {
     $ConfigPath = Get-DefaultConfigPath -Root $root
 }
 
 $resolvedConfigPath = (Resolve-Path -LiteralPath $ConfigPath).Path
+$pairSelection = Resolve-PairTransportClosureSelection -Root $root -ConfigPath $resolvedConfigPath -PairId $PairId -InitialTargetId $InitialTargetId
+$PairId = [string]$pairSelection.PairId
+$InitialTargetId = [string]$pairSelection.InitialTargetId
 $steps = @()
 
 $drillSummary = ''

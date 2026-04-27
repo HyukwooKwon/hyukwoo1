@@ -252,6 +252,14 @@ function Get-StringList {
 }
 
 $config = Import-PowerShellDataFile -Path $resolvedConfigPath
+$pairTestConfig = if ($config -is [hashtable] -and $config.ContainsKey('PairTest')) { $config.PairTest } else { $null }
+$allowedInjectionMethods = @('hwnd')
+if ($pairTestConfig -is [hashtable] -and $pairTestConfig.ContainsKey('AllowedWindowVisibilityMethods')) {
+    $configuredMethods = @(Get-StringList -Value $pairTestConfig.AllowedWindowVisibilityMethods)
+    if ($configuredMethods.Count -gt 0) {
+        $allowedInjectionMethods = @($configuredMethods | Sort-Object -Unique)
+    }
+}
 $runtimeDoc = Read-RuntimeItems -Path ([string]$config.RuntimeMapPath)
 $bindingProfileDoc = Read-BindingDocument -Path ([string]$config.BindingProfilePath)
 $bindingScope = Get-BindingSessionScope -Config $config -BindingDocument $bindingProfileDoc
@@ -398,6 +406,8 @@ $status = [pscustomobject]@{
     SoftFindings        = @($bindingScope.SoftFindings)
     RuntimeEntryCount   = @($runtimeDoc.Items).Count
     DuplicateTargetIds  = @($duplicateIds | Sort-Object -Unique)
+    AllowedInjectionMethods = @($allowedInjectionMethods)
+    WindowPidOnlyFallbackDetected = (@($rows | Where-Object { [string]$_.InjectionMethod -eq 'windowPid' }).Count -gt 0)
     InjectableCount     = $injectableCount
     NonInjectableCount  = @($rows | Where-Object { -not $_.Injectable }).Count
     MissingRuntimeCount = $missingRuntimeCount
@@ -423,6 +433,8 @@ else {
         $lines.Add(('Runtime Duplicates: {0}' -f ($status.DuplicateTargetIds -join ', ')))
     }
     $lines.Add(('Injectable: ok={0} fail={1} missingRuntime={2}' -f $status.InjectableCount, $status.NonInjectableCount, $status.MissingRuntimeCount))
+    $lines.Add(('AllowedInjectionMethods: {0}' -f ($status.AllowedInjectionMethods -join ', ')))
+    $lines.Add(('WindowPidOnlyFallbackDetected: {0}' -f [bool]$status.WindowPidOnlyFallbackDetected))
     $lines.Add('')
     $lines.Add('Targets')
     $table = ($status.Targets | Select-Object TargetId, Injectable, InjectionMethod, InjectionReason, RuntimeTitle, RuntimeWindowPid, RuntimeShellPid, ByWindowPidCount, ByShellPidCount, ByTitleCount, MatchTitle | Format-Table -AutoSize | Out-String).TrimEnd()
@@ -430,7 +442,8 @@ else {
     $lines
 }
 
-$hasBlockingIssues = ($status.NonInjectableCount -gt 0 -or $status.MissingRuntimeCount -gt 0 -or $status.DuplicateTargetIds.Count -gt 0 -or (Test-NonEmptyString $status.RuntimeParseError))
+$methodViolations = @($status.Targets | Where-Object { [bool]$_.Injectable -and [string]$_.InjectionMethod -notin $allowedInjectionMethods })
+$hasBlockingIssues = ($status.NonInjectableCount -gt 0 -or $status.MissingRuntimeCount -gt 0 -or $status.DuplicateTargetIds.Count -gt 0 -or (Test-NonEmptyString $status.RuntimeParseError) -or $methodViolations.Count -gt 0)
 if ($hasBlockingIssues) {
     $host.SetShouldExit(1)
     return

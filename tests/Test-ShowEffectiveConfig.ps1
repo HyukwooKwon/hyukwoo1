@@ -90,6 +90,8 @@ $requestedPreview = Invoke-ShowEffectiveConfig `
 Assert-True ($requestedPreview.SchemaVersion -eq '1.0.0') 'SchemaVersion mismatch.'
 Assert-True (-not [string]::IsNullOrWhiteSpace([string]$requestedPreview.GeneratedAt)) 'GeneratedAt missing.'
 Assert-True ($requestedPreview.PairDefinitionSource -eq 'config') 'Expected config-backed pair definition for preview-only run root.'
+Assert-True ($requestedPreview.PairDefinitionSourceDetail -eq 'config-pair-definitions') 'Expected config-backed pair definition detail for preview-only run root.'
+Assert-True ($requestedPreview.PairTopologyStrategy -eq 'configured') 'Expected configured pair topology strategy for preview-only run root.'
 Assert-True ($requestedPreview.RunContext.SelectedRunRootSource -eq 'requested') 'Expected requested run root source.'
 Assert-True ($requestedPreview.RunContext.ManifestExists -eq $false) 'Expected manifest missing for preview-only run root.'
 Assert-True (@($requestedPreview.Warnings).Count -ge 1) 'Expected warnings for preview-only run root.'
@@ -104,6 +106,8 @@ Assert-True (@($requestedPreview.EvidencePolicy.ReasonCodes).Count -ge 1) 'Expec
 Assert-True (@($requestedPreview.PreviewRows).Count -eq 2) 'Expected 2 preview rows for pair01.'
 Assert-True ([string]$requestedPreview.OverviewPairs[0].SeedTargetId -eq 'target01') 'Expected config-backed seed target for pair01 preview.'
 Assert-True ([string]$requestedPreview.OverviewPairs[0].Policy.PublishContractMode -eq 'strict') 'Expected pair policy metadata in preview overview rows.'
+Assert-True ([string]$requestedPreview.PairTest.DefaultPairId -eq 'pair01') 'Expected resolved default pair id in preview payload.'
+Assert-True ([string]$requestedPreview.PairTest.PairTopologyStrategy -eq 'configured') 'Expected configured pair topology strategy in preview pair test payload.'
 Assert-True (-not [string]::IsNullOrWhiteSpace([string]$requestedPreview.Config.ConfigHash)) 'ConfigHash missing.'
 Assert-True ([int]$requestedPreview.RequestedFilters.StaleRunThresholdSec -gt 0) 'Expected stale threshold in requested filters.'
 Assert-True ([bool]$requestedPreview.RunContext.SelectedRunRootExists -eq $true) 'Expected selected requested run root to exist.'
@@ -114,8 +118,20 @@ Assert-True ($requestedPreview.PreviewRows[0].Initial.PSObject.Properties['SlotO
 Assert-True ($requestedPreview.PreviewRows[0].Initial.PSObject.Properties['PendingOneTimeItems'] -ne $null) 'Expected Initial.PendingOneTimeItems property.'
 Assert-True ($requestedPreview.PSObject.Properties['OneTimeQueueSummary'] -ne $null) 'Expected OneTimeQueueSummary property.'
 Assert-True ($requestedPreview.PSObject.Properties['PairActivationSummary'] -ne $null) 'Expected PairActivationSummary property.'
+Assert-True ($requestedPreview.PSObject.Properties['Dispatch'] -ne $null) 'Expected Dispatch property.'
 Assert-True (@($requestedPreview.PairActivationSummary).Count -ge 1) 'Expected pair activation rows.'
 Assert-True (($requestedPreview.PairActivationSummary | Select-Object -First 1).PSObject.Properties['EffectiveEnabled'] -ne $null) 'Expected pair activation effective enabled field.'
+Assert-True ([string]$requestedPreview.PairTest.ExecutionPathMode -eq 'typed-window') 'Expected typed-window execution path.'
+Assert-True ([bool]$requestedPreview.PairTest.RequireUserVisibleCellExecution -eq $true) 'Expected visible cell execution requirement.'
+Assert-True ('hwnd' -in @($requestedPreview.PairTest.AllowedWindowVisibilityMethods)) 'Expected hwnd visibility method.'
+Assert-True ((@($requestedPreview.Dispatch.SubmitRetryModes) -join ',') -eq 'enter,ctrl_enter') 'Expected submit retry mode sequence.'
+Assert-True ([string]$requestedPreview.Dispatch.SubmitRetrySequenceSummary -eq 'enter -> ctrl_enter') 'Expected submit retry sequence summary.'
+Assert-True ([string]$requestedPreview.Dispatch.PrimarySubmitMode -eq 'enter') 'Expected primary submit mode.'
+Assert-True ([string]$requestedPreview.Dispatch.FinalSubmitMode -eq 'ctrl_enter') 'Expected final submit mode.'
+Assert-True ([int]$requestedPreview.PreviewRows[0].SubmitRetryIntervalMs -gt 0) 'Expected preview row submit retry interval.'
+Assert-True ([string]$requestedPreview.PreviewRows[0].ExecutionPathMode -eq 'typed-window') 'Expected preview row typed-window execution path.'
+Assert-True ([bool]$requestedPreview.PreviewRows[0].UserVisibleCellExecutionRequired -eq $true) 'Expected preview row visible cell execution requirement.'
+Assert-True ('hwnd' -in @($requestedPreview.PreviewRows[0].AllowedWindowVisibilityMethods)) 'Expected preview row hwnd visibility method.'
 
 $contractBoth = Invoke-ShowEffectiveConfig `
     -Root $root `
@@ -125,6 +141,8 @@ $contractBoth = Invoke-ShowEffectiveConfig `
     -Mode 'both'
 
 Assert-True ($contractBoth.PairDefinitionSource -eq 'manifest') 'Expected manifest pair definition for prepared run root.'
+Assert-True ($contractBoth.PairDefinitionSourceDetail -eq 'manifest-pairs') 'Expected manifest pair definition detail for prepared run root.'
+Assert-True ($contractBoth.PairTopologyStrategy -eq 'configured') 'Expected configured pair topology strategy for prepared run root.'
 Assert-True ($contractBoth.RunContext.SelectedRunRootSource -eq 'requested') 'Expected requested run root source for prepared run.'
 Assert-True ($contractBoth.RunContext.ManifestExists -eq $true) 'Expected manifest for prepared run.'
 Assert-True (@($contractBoth.OverviewPairs).Count -eq 1) 'Expected 1 overview pair for pair01.'
@@ -141,6 +159,8 @@ Assert-True ($contractBoth.PreviewRows[0].PairActivation.EffectiveEnabled -eq $t
 Assert-True ($contractBoth.PSObject.Properties['WarningDetails'] -ne $null) 'Expected WarningDetails property in both mode.'
 Assert-True ($contractBoth.EvidencePolicy.Recommended -eq $true) 'Expected prepared manifest-backed run root to be evidence-recommended.'
 Assert-True (@($contractBoth.EvidencePolicy.ReasonCodes).Count -eq 0) 'Expected no evidence reason codes for prepared manifest-backed run root.'
+Assert-True ((@($contractBoth.PreviewRows[0].SubmitRetryModes) -join ',') -eq 'enter,ctrl_enter') 'Expected preview row submit retry modes in both mode.'
+Assert-True ([string]$contractBoth.PreviewRows[0].SubmitRetrySequenceSummary -eq 'enter -> ctrl_enter') 'Expected preview row submit retry sequence summary in both mode.'
 
 New-Item -ItemType Directory -Path $latestPreviewRunRoot -Force | Out-Null
 [System.IO.File]::WriteAllText((Join-Path $latestPreviewRunRoot 'preview.txt'), 'preview-only')
@@ -178,7 +198,8 @@ $latestExisting = Invoke-ShowEffectiveConfig `
 Assert-True ($latestExisting.RunContext.SelectedRunRootSource -eq 'latest-existing') 'Expected latest-existing run root source when RunRoot is omitted.'
 Assert-True (Test-Path -LiteralPath ([string]$latestExisting.RunContext.SelectedRunRoot)) 'Expected latest-existing run root to exist.'
 Assert-True ([bool]$latestExisting.RunContext.ManifestExists -eq $true) 'Expected latest-existing run root to have manifest.'
-Assert-True ([string]$latestExisting.RunContext.SelectedRunRoot -eq $contractRunRoot) 'Expected latest-existing selection to prefer newest manifest-backed run root over preview-only directories.'
+Assert-True ([string]$latestExisting.RunContext.SelectedRunRoot -ne $previewOnlyRunRoot) 'Expected latest-existing selection to skip requested preview-only run root.'
+Assert-True ([string]$latestExisting.RunContext.SelectedRunRoot -ne $latestPreviewRunRoot) 'Expected latest-existing selection to skip preview-only latest run root.'
 Assert-True ($latestExisting.RunContext.SelectedRunRootAgeSeconds -ge 0) 'Expected selected run root age seconds.'
 Assert-True ($latestExisting.RunContext.StaleRunThresholdSec -gt 0) 'Expected stale threshold in run context.'
 

@@ -42,6 +42,27 @@ $summary = @(Get-PairActivationSummary -Root $testRoot -Config $config -PairIds 
 Assert-True ($summary.Count -eq 2) 'Expected two pair activation rows.'
 Assert-True ((@($summary | Where-Object { $_.PairId -eq 'pair02' })[0].EffectiveEnabled -eq $false)) 'Expected pair02 summary row to be disabled.'
 
+$configDriven = @{
+    LaneName = 'pair-activation-config-driven'
+    PairActivation = @{
+        StatePath = (Join-Path $testRoot 'runtime\pair-activation\config-driven.json')
+        DefaultEnabled = $true
+    }
+    PairTest = @{
+        PairDefinitions = @(
+            @{ PairId = 'pair10'; TopTargetId = 'target10'; BottomTargetId = 'target20' }
+            @{ PairId = 'pair11'; TopTargetId = 'target11'; BottomTargetId = 'target21' }
+        )
+    }
+}
+
+[void](Set-PairActivationDisabled -Root $testRoot -Config $configDriven -PairId 'pair11' -Reason 'config driven')
+$configDrivenSummary = @(Get-PairActivationSummary -Root $testRoot -Config $configDriven)
+Assert-True ($configDrivenSummary.Count -eq 2) 'Expected config-driven summary to use configured pair definitions.'
+Assert-True ((@($configDrivenSummary | Where-Object { $_.PairId -eq 'pair10' }).Count -eq 1)) 'Expected configured pair10 row in config-driven summary.'
+Assert-True ((@($configDrivenSummary | Where-Object { $_.PairId -eq 'pair11' }).Count -eq 1)) 'Expected configured pair11 row in config-driven summary.'
+Assert-True ((@($configDrivenSummary | Where-Object { $_.PairId -eq 'pair01' }).Count -eq 0)) 'Did not expect fallback pair01 row when config defines pair ids.'
+
 $enabled = Set-PairActivationEnabled -Root $testRoot -Config $config -PairId 'pair02'
 Assert-True ($enabled.EffectiveEnabled -eq $true) 'Expected enabled state after enable.'
 Assert-True ($enabled.State -eq 'enabled') 'Expected enabled state after enable.'

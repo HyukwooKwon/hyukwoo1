@@ -142,6 +142,7 @@ READ_ONLY_OPS_BUTTON_LABELS = {
     "릴레이 상태",
     "페어 상태",
     "runroot 요약",
+    "important-summary 열기",
     "Headless 준비 확인",
     "적용 설정 JSON",
 }
@@ -205,6 +206,8 @@ class RelayOperatorPanel(tk.Tk):
         self.home_pair_detail_var = tk.StringVar(value="Pair 요약을 불러오면 여기서 선택한 pair의 상태를 간단히 보여줍니다.")
         self.visible_acceptance_status_var = tk.StringVar(value="shared visible 공식 절차 상태를 여기서 확인합니다.")
         self.visible_acceptance_detail_var = tk.StringVar(value="cleanup -> preflight-only -> active acceptance -> post-cleanup -> confirm")
+        self.visible_primitive_status_var = tk.StringVar(value="pair primitive 상태를 여기서 확인합니다.")
+        self.visible_primitive_detail_var = tk.StringVar(value="preview/apply -> submit -> publish/handoff 확인을 잘라 점검합니다.")
         self.artifact_status_var = tk.StringVar(value="결과 / 산출물 탭에서 현재 RunRoot 기준 상태를 확인할 수 있습니다.")
         self.artifact_status_base_text = "결과 / 산출물 탭에서 현재 RunRoot 기준 상태를 확인할 수 있습니다."
         self.board_status_var = tk.StringVar(value="8창 보드에서 target별 attach / 입력 가능 / pair 매칭을 한눈에 확인할 수 있습니다.")
@@ -216,6 +219,7 @@ class RelayOperatorPanel(tk.Tk):
         self.message_block_badges_var = tk.StringVar(value="")
         self.message_block_hint_var = tk.StringVar(value="")
         self.message_template_var = tk.StringVar(value="Initial")
+        self.message_template_hint_var = tk.StringVar(value="현재 편집 템플릿: Initial. target-extra는 Initial/Handoff가 각각 따로 저장됩니다.")
         self.message_scope_label_var = tk.StringVar(value="글로벌 Prefix")
         self.message_scope_id_var = tk.StringVar(value="")
         self.message_target_suffix_var = tk.StringVar(value="")
@@ -859,9 +863,9 @@ class RelayOperatorPanel(tk.Tk):
         single = str(raw_value or "").strip()
         return [single] if single else []
 
-    def _selected_pair_scope_allowed(self, *, action_label: str) -> tuple[bool, str]:
-        pair_id = self._selected_pair_id()
-        if not pair_id:
+    def _pair_scope_allowed(self, pair_id: str, *, action_label: str) -> tuple[bool, str]:
+        normalized_pair_id = str(pair_id or "").strip()
+        if not normalized_pair_id:
             return False, "PairId 값을 먼저 선택하세요."
 
         runtime = ((self.relay_status_data or {}).get("Runtime", {}) or {})
@@ -871,13 +875,16 @@ class RelayOperatorPanel(tk.Tk):
         active_pairs = self._runtime_active_pair_ids()
         if not active_pairs:
             return False, f"{action_label} 차단: 현재 partial reuse session의 active pair를 확인하지 못했습니다."
-        if pair_id in active_pairs:
+        if normalized_pair_id in active_pairs:
             return True, ""
         return False, "{0} 차단: {1}는 현재 session partial reuse 범위 밖입니다. active={2}".format(
             action_label,
-            pair_id,
+            normalized_pair_id,
             ", ".join(active_pairs),
         )
+
+    def _selected_pair_scope_allowed(self, *, action_label: str) -> tuple[bool, str]:
+        return self._pair_scope_allowed(self._selected_pair_id(), action_label=action_label)
 
     def _apply_active_pair_selection(self, active_pairs: list[str]) -> bool:
         normalized_pairs = [str(item) for item in active_pairs if str(item)]
@@ -1200,25 +1207,49 @@ class RelayOperatorPanel(tk.Tk):
     def refresh_paired_status_only(self, *, refresh_artifacts: bool = True) -> None:
         run_root = self._current_run_root_for_actions()
         if not run_root:
-            self.paired_status_data = None
-            self.paired_status_error = ""
-            self.rebuild_panel_state()
-            self.render_target_board()
-            if refresh_artifacts:
-                self.refresh_artifacts_tab()
-            self._refresh_watcher_notes()
-            self.update_pair_button_states()
+            self._apply_paired_status_snapshot(None, "", refresh_artifacts=refresh_artifacts)
             return
 
         paired_result = self.refresh_controller.refresh_paired(self._current_context(), run_root=run_root)
-        self.paired_status_data = paired_result.paired_status
-        self.paired_status_error = paired_result.paired_status_error
+        self._apply_paired_status_snapshot(
+            paired_result.paired_status,
+            paired_result.paired_status_error,
+            refresh_artifacts=refresh_artifacts,
+        )
+
+    def _apply_paired_status_snapshot(
+        self,
+        paired_payload: dict | None,
+        paired_error: str,
+        *,
+        refresh_artifacts: bool = True,
+    ) -> None:
+        self.paired_status_data = paired_payload
+        self.paired_status_error = paired_error
         self.rebuild_panel_state()
         self.render_target_board()
         if refresh_artifacts:
             self.refresh_artifacts_tab()
         self._refresh_watcher_notes()
         self.update_pair_button_states()
+
+    def _apply_paired_status_snapshot_from_payload(
+        self,
+        payload: dict | None,
+        *,
+        refresh_artifacts: bool = True,
+    ) -> bool:
+        if not isinstance(payload, dict):
+            return False
+        paired_payload = payload.get("PairedStatusSnapshot", None)
+        if not isinstance(paired_payload, dict):
+            return False
+        self._apply_paired_status_snapshot(
+            paired_payload,
+            "",
+            refresh_artifacts=refresh_artifacts,
+        )
+        return True
 
     def refresh_quick_status(self) -> None:
         try:
@@ -2212,6 +2243,16 @@ class RelayOperatorPanel(tk.Tk):
             scope_kind=scope_kind,
             scope_id=scope_id,
         )
+        template_help_suffix = "target-extra는 Initial/Handoff가 서로 별도 저장됩니다."
+        current_scope_label = MESSAGE_SCOPE_KIND_TO_LABEL.get(scope_kind, scope_kind)
+        current_scope_target = scope_id or "global"
+        template_hint_text = (
+            f"현재 편집 템플릿: {template_name}. "
+            f"현재 범위: {current_scope_label} / {current_scope_target}. "
+            f"{template_help_suffix}"
+        )
+        scope_frame_text = f"편집 문맥 / {template_name}"
+        block_frame_text = f"블록 편집 / {template_name} / {current_scope_label}"
         editor_status_text = (
             f"{template_name} / {MESSAGE_SCOPE_KIND_TO_LABEL.get(scope_kind, scope_kind)} / {scope_id or 'global'} 편집 중"
             if slot_editable and scope_kind in MESSAGE_EDITABLE_SCOPE_KINDS
@@ -2275,14 +2316,22 @@ class RelayOperatorPanel(tk.Tk):
             "validation_text": self._format_message_validation_lines(validation_lines),
             "preview_status_text": preview_status_text,
             "editor_status_text": editor_status_text,
+            "template_hint_text": template_hint_text,
+            "scope_frame_text": scope_frame_text,
+            "block_frame_text": block_frame_text,
         }
 
     def _apply_message_editor_view_state(self, state: dict[str, object]) -> None:
         self.message_scope_label_var.set(str(state["scope_label"]))
         self.message_scope_id_var.set(str(state["scope_id"]))
+        self.message_template_hint_var.set(str(state["template_hint_text"]))
         self.message_scope_id_combo.configure(values=list(state["scope_id_values"]), state=str(state["scope_id_combo_state"]))
         self.target_fixed_combo.configure(values=list(state["target_ids"]))
         self.message_target_suffix_var.set(str(state["selected_target_suffix_id"]))
+        if hasattr(self, "message_editor_scope_frame"):
+            self.message_editor_scope_frame.configure(text=str(state["scope_frame_text"]))
+        if hasattr(self, "message_block_frame"):
+            self.message_block_frame.configure(text=str(state["block_frame_text"]))
 
         self.message_blocks_list.delete(0, "end")
         self.message_block_visible_indexes = list(state["block_visible_indexes"])
@@ -2371,6 +2420,13 @@ class RelayOperatorPanel(tk.Tk):
             self._apply_message_filter_reset_policy("scope_change")
         self.message_selected_slot_key = self._message_slot_key_for_scope()
         self.render_message_editor(include_side_panels=False)
+
+    def set_message_template(self, template_name: str) -> None:
+        normalized = str(template_name or "").strip()
+        if normalized not in {"Initial", "Handoff"}:
+            normalized = "Initial"
+        self.message_template_var.set(normalized)
+        self.on_message_editor_scope_changed()
 
     def on_message_slot_selected(self, _event: object | None = None) -> None:
         template_name = self.message_template_var.get().strip() or "Initial"
@@ -3320,6 +3376,7 @@ class RelayOperatorPanel(tk.Tk):
                 ("watch 시작(기본)", self.start_watcher_detached, "home_start_watch_button"),
                 ("Pair 상태 보기", self.run_paired_status, "home_pair_status_button"),
                 ("runroot 요약", self.run_paired_summary, "home_pair_summary_button"),
+                ("important-summary 열기", self.open_important_summary_text, "home_open_important_summary_button"),
                 ("창/Attach/입력/RunRoot 준비", self.run_prepare_all, "home_prepare_all_button"),
                 ("기존 8창 재사용", self.reuse_existing_windows, "home_reuse_windows_button"),
                 ("열린 pair 재사용", self.reuse_active_pairs, "home_reuse_pairs_button"),
@@ -3328,7 +3385,7 @@ class RelayOperatorPanel(tk.Tk):
             button = ttk.Button(pair_actions, text=label, command=callback)
             button.grid(row=0, column=idx, padx=(0, 8))
             self.long_task_widgets.append(button)
-            if label in {"Pair 상태 보기", "runroot 요약"}:
+            if label in {"Pair 상태 보기", "runroot 요약", "important-summary 열기"}:
                 self._register_read_only_widget(button)
             setattr(self, attr_name, button)
         ttk.Label(pair_frame, textvariable=self.home_pair_detail_var, wraplength=1200, justify="left").grid(row=2, column=0, sticky="w", pady=(8, 0))
@@ -3459,7 +3516,7 @@ class RelayOperatorPanel(tk.Tk):
         editor_tab.columnconfigure(0, weight=2)
         editor_tab.columnconfigure(1, weight=3)
         editor_tab.rowconfigure(1, weight=1)
-        notebook.add(editor_tab, text="고정문구 / 순서 편집")
+        notebook.add(editor_tab, text="Initial/Handoff 문구 편집")
         self.editor_tab = editor_tab
 
         editor_actions = ttk.LabelFrame(editor_tab, text="설정 편집", padding=8)
@@ -3484,17 +3541,26 @@ class RelayOperatorPanel(tk.Tk):
         editor_left.rowconfigure(2, weight=1)
         editor_left.rowconfigure(4, weight=1)
 
-        editor_scope = ttk.LabelFrame(editor_left, text="편집 문맥", padding=8)
+        editor_scope = ttk.LabelFrame(editor_left, text="편집 문맥 / Initial", padding=8)
         editor_scope.grid(row=0, column=0, sticky="ew")
+        self.message_editor_scope_frame = editor_scope
         ttk.Label(editor_scope, text="메시지 종류").grid(row=0, column=0, sticky="w")
-        self.message_template_combo = ttk.Combobox(editor_scope, textvariable=self.message_template_var, values=["Initial", "Handoff"], state="readonly", width=12)
+        self.message_template_combo = ttk.Combobox(editor_scope, textvariable=self.message_template_var, values=["Initial", "Handoff"], state="readonly", width=14)
         self.message_template_combo.grid(row=0, column=1, sticky="w", padx=(8, 16))
-        ttk.Label(editor_scope, text="연동 범위").grid(row=0, column=2, sticky="w")
+        ttk.Button(editor_scope, text="Initial 편집", command=lambda: self.set_message_template("Initial")).grid(row=0, column=2, sticky="w", padx=(0, 6))
+        ttk.Button(editor_scope, text="Handoff 편집", command=lambda: self.set_message_template("Handoff")).grid(row=0, column=3, sticky="w", padx=(0, 16))
+        ttk.Label(editor_scope, text="연동 범위").grid(row=0, column=4, sticky="w")
         self.message_scope_combo = ttk.Combobox(editor_scope, textvariable=self.message_scope_label_var, values=[label for label, _kind in MESSAGE_SCOPE_OPTIONS], state="readonly", width=16)
-        self.message_scope_combo.grid(row=0, column=3, sticky="w", padx=(8, 16))
-        ttk.Label(editor_scope, text="대상 ID").grid(row=0, column=4, sticky="w")
+        self.message_scope_combo.grid(row=0, column=5, sticky="w", padx=(8, 16))
+        ttk.Label(editor_scope, text="대상 ID").grid(row=0, column=6, sticky="w")
         self.message_scope_id_combo = ttk.Combobox(editor_scope, textvariable=self.message_scope_id_var, values=[""], state="readonly", width=16)
-        self.message_scope_id_combo.grid(row=0, column=5, sticky="w", padx=(8, 0))
+        self.message_scope_id_combo.grid(row=0, column=7, sticky="w", padx=(8, 0))
+        ttk.Label(
+            editor_scope,
+            textvariable=self.message_template_hint_var,
+            wraplength=700,
+            justify="left",
+        ).grid(row=1, column=0, columnspan=8, sticky="w", pady=(8, 0))
 
         slot_order_frame = ttk.LabelFrame(editor_left, text="Slot 순서", padding=8)
         slot_order_frame.grid(row=1, column=0, sticky="nsew", pady=(10, 0))
@@ -3509,8 +3575,9 @@ class RelayOperatorPanel(tk.Tk):
         ttk.Button(slot_order_buttons, text="기본값", command=self.reset_message_slot_order).grid(row=2, column=0)
         ttk.Label(slot_order_frame, text="마우스로 끌어 순서를 바꿀 수 있습니다.", justify="left").grid(row=1, column=0, columnspan=2, sticky="w", pady=(8, 0))
 
-        block_frame = ttk.LabelFrame(editor_left, text="블록 편집", padding=8)
+        block_frame = ttk.LabelFrame(editor_left, text="블록 편집 / Initial / 글로벌 Prefix", padding=8)
         block_frame.grid(row=2, column=0, sticky="nsew", pady=(10, 0))
+        self.message_block_frame = block_frame
         block_frame.columnconfigure(0, weight=1)
         block_frame.rowconfigure(2, weight=1)
         block_frame.rowconfigure(3, weight=1)
@@ -3814,7 +3881,7 @@ class RelayOperatorPanel(tk.Tk):
 
         visible_tab = ttk.Frame(notebook, padding=10)
         visible_tab.columnconfigure(0, weight=1)
-        visible_tab.rowconfigure(2, weight=1)
+        visible_tab.rowconfigure(3, weight=1)
         notebook.add(visible_tab, text="Visible Acceptance")
         self.visible_acceptance_tab = visible_tab
 
@@ -3871,8 +3938,49 @@ class RelayOperatorPanel(tk.Tk):
             justify="left",
         ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(8, 0))
 
+        visible_primitive_frame = ttk.LabelFrame(visible_tab, text="pair primitive / 수동 단계", padding=8)
+        visible_primitive_frame.grid(row=2, column=0, sticky="ew", pady=(10, 0))
+        visible_primitive_frame.columnconfigure(0, weight=1)
+        visible_primitive_frame.columnconfigure(1, weight=1)
+        visible_primitive_frame.columnconfigure(2, weight=1)
+        ttk.Label(
+            visible_primitive_frame,
+            textvariable=self.visible_primitive_status_var,
+            font=("Segoe UI", 10, "bold"),
+        ).grid(row=0, column=0, columnspan=3, sticky="w")
+        ttk.Label(
+            visible_primitive_frame,
+            textvariable=self.visible_primitive_detail_var,
+            wraplength=1200,
+            justify="left",
+        ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(6, 0))
+
+        for idx, (label, callback, attr_name) in enumerate(
+            [
+                ("공식 8창 재사용", self.reuse_existing_windows, "visible_primitive_reuse_button"),
+                ("typed-window 입력 점검", self.run_visibility_check, "visible_primitive_visibility_button"),
+                ("편집본 preview 갱신", self.refresh_message_editor_preview, "visible_primitive_preview_refresh_button"),
+                ("고정문구 저장 + 새로고침", self.save_message_editor, "visible_primitive_save_button"),
+                ("선택 target preview 저장", self.export_selected_row_messages, "visible_primitive_export_button"),
+                ("선택 target 1회 submit", self.run_selected_target_seed_submit, "visible_primitive_submit_button"),
+                ("publish 확인", self.inspect_selected_target_publish_status, "visible_primitive_publish_button"),
+                ("상대 target 선택", self.select_partner_target_from_context, "visible_primitive_partner_button"),
+                ("handoff 확인", self.inspect_selected_pair_handoff_status, "visible_primitive_handoff_button"),
+            ]
+        ):
+            button = ttk.Button(visible_primitive_frame, text=label, command=callback)
+            button.grid(row=2 + (idx // 3), column=idx % 3, padx=(0, 8), pady=(8, 0), sticky="ew")
+            self.long_task_widgets.append(button)
+            setattr(self, attr_name, button)
+        ttk.Label(
+            visible_primitive_frame,
+            text="매크로를 대체하지 않습니다. 현재 선택 pair/target 기준으로 preview/apply -> submit -> publish/handoff를 잘라 디버깅하는 보조 버튼입니다.",
+            wraplength=1200,
+            justify="left",
+        ).grid(row=5, column=0, columnspan=3, sticky="w", pady=(8, 0))
+
         visible_result_frame = ttk.LabelFrame(visible_tab, text="결과 / receipt 요약", padding=6)
-        visible_result_frame.grid(row=2, column=0, sticky="nsew", pady=(10, 0))
+        visible_result_frame.grid(row=3, column=0, sticky="nsew", pady=(10, 0))
         visible_result_frame.columnconfigure(0, weight=1)
         visible_result_frame.rowconfigure(1, weight=1)
         visible_receipt_actions = ttk.Frame(visible_result_frame)
@@ -3894,7 +4002,7 @@ class RelayOperatorPanel(tk.Tk):
         button_row.grid(row=0, column=0, sticky="ew")
         for idx, (label, callback) in enumerate(
             [
-                ("pair01 Headless Drill", self.run_fixed_pair01_drill),
+                ("pair01 Preset Drill", self.run_fixed_pair01_drill),
                 ("선택된 Pair Headless Drill 실행", self.run_selected_pair_drill),
                 ("watch 시작(기본)", self.start_watcher_detached),
                 ("watch 시작(입력값)", self.start_watcher_with_options),
@@ -3911,6 +4019,7 @@ class RelayOperatorPanel(tk.Tk):
                 ("릴레이 상태", self.run_relay_status),
                 ("페어 상태", self.run_paired_status),
                 ("runroot 요약", self.run_paired_summary),
+                ("important-summary 열기", self.open_important_summary_text),
                 ("창 입력 가능 확인", self.run_visibility_check),
                 ("Headless 준비 확인", self.run_headless_readiness),
                 ("적용 설정 JSON", self.run_effective_json),
@@ -3921,7 +4030,7 @@ class RelayOperatorPanel(tk.Tk):
             self.long_task_widgets.append(button)
             if label in READ_ONLY_OPS_BUTTON_LABELS:
                 self._register_read_only_widget(button)
-            if label == "pair01 Headless Drill":
+            if label == "pair01 Preset Drill":
                 self.fixed_pair01_button = button
             elif label == "선택된 Pair Headless Drill 실행":
                 self.selected_pair_button = button
@@ -4434,6 +4543,55 @@ class RelayOperatorPanel(tk.Tk):
         if self._has_ui_attr("visible_receipt_copy_button"):
             self.visible_receipt_copy_button.configure(state="normal" if bool(receipt_path) else "disabled")
 
+        primitive_row = self._resolve_visible_primitive_row()
+        primitive_pair_id = str((primitive_row or {}).get("PairId", "") or self._selected_pair_id() or "").strip()
+        primitive_target_id = str((primitive_row or {}).get("TargetId", "") or self.target_id_var.get().strip() or "").strip()
+        primitive_partner_target_id = str((primitive_row or {}).get("PartnerTargetId", "") or "").strip()
+        primitive_scope_allowed, _primitive_scope_detail = self._pair_scope_allowed(
+            primitive_pair_id,
+            action_label="pair primitive",
+        )
+        primitive_active_run_root, _primitive_active_run_root_detail = self._resolve_manifest_run_root_for_visible_acceptance(
+            action_label="pair primitive submit",
+            allow_stale=False,
+        )
+        primitive_confirm_run_root, _primitive_confirm_run_root_detail = self._resolve_manifest_run_root_for_visible_acceptance(
+            action_label="pair primitive 확인",
+            allow_stale=True,
+        )
+        primitive_visibility_row = self._visibility_target_status_row(primitive_target_id) if primitive_target_id else None
+        primitive_injectable = primitive_visibility_row is None or bool(primitive_visibility_row.get("Injectable", False))
+        primitive_context_ready = bool(primitive_row and primitive_pair_id and primitive_target_id)
+        primitive_message_ready = primitive_context_ready and self.__dict__.get("message_config_doc") is not None
+        if self._has_ui_attr("visible_primitive_reuse_button"):
+            self.visible_primitive_reuse_button.configure(state="normal" if config_present else "disabled")
+        if self._has_ui_attr("visible_primitive_visibility_button"):
+            self.visible_primitive_visibility_button.configure(state="normal" if config_present else "disabled")
+        if self._has_ui_attr("visible_primitive_preview_refresh_button"):
+            self.visible_primitive_preview_refresh_button.configure(state="normal" if primitive_message_ready else "disabled")
+        if self._has_ui_attr("visible_primitive_save_button"):
+            self.visible_primitive_save_button.configure(state="normal" if primitive_message_ready else "disabled")
+        if self._has_ui_attr("visible_primitive_export_button"):
+            self.visible_primitive_export_button.configure(state="normal" if (primitive_context_ready and config_present) else "disabled")
+        if self._has_ui_attr("visible_primitive_submit_button"):
+            submit_enabled = (
+                config_present
+                and primitive_context_ready
+                and primitive_scope_allowed
+                and bool(primitive_active_run_root)
+                and primitive_injectable
+            )
+            self.visible_primitive_submit_button.configure(state="normal" if submit_enabled else "disabled")
+        if self._has_ui_attr("visible_primitive_publish_button"):
+            publish_enabled = config_present and primitive_context_ready and bool(primitive_confirm_run_root)
+            self.visible_primitive_publish_button.configure(state="normal" if publish_enabled else "disabled")
+        if self._has_ui_attr("visible_primitive_partner_button"):
+            self.visible_primitive_partner_button.configure(state="normal" if bool(primitive_partner_target_id) else "disabled")
+        if self._has_ui_attr("visible_primitive_handoff_button"):
+            handoff_enabled = config_present and bool(primitive_pair_id) and bool(primitive_confirm_run_root)
+            self.visible_primitive_handoff_button.configure(state="normal" if handoff_enabled else "disabled")
+        self._refresh_visible_primitive_summary()
+
     def on_pair_or_target_changed(self, _event: object | None = None) -> None:
         self.action_context_source = "controls"
         selected_pair = self._selected_pair_id()
@@ -4545,7 +4703,7 @@ class RelayOperatorPanel(tk.Tk):
         return self._run_root_is_stale(self._current_run_root_for_artifacts())
 
     def export_selected_row_messages(self) -> None:
-        row = self._selected_preview_row()
+        row = self._selected_preview_row() or self._resolve_visible_primitive_row()
         if not row:
             messagebox.showwarning("선택 필요", "row를 먼저 선택하세요.")
             return
@@ -4622,6 +4780,629 @@ class RelayOperatorPanel(tk.Tk):
             success_hint="출력 폴더가 열렸습니다. preview 산출물을 바로 확인할 수 있습니다.",
             failure_state="문구 JSON/TXT 저장 실패",
             failure_hint="출력 영역의 오류와 마지막 명령을 확인하세요.",
+        )
+
+    def _resolve_visible_primitive_row(self) -> dict | None:
+        row = self._editor_context_row()
+        if row:
+            return row
+        row = self._selected_preview_row()
+        if row:
+            return row
+        target_id = self._selected_inspection_target_id() or self.target_id_var.get().strip()
+        if target_id:
+            row = self._preview_row_for_target(target_id)
+            if row:
+                return row
+        pair_id = self._selected_pair_id()
+        if pair_id:
+            for candidate in self.preview_rows:
+                if str(candidate.get("PairId", "") or "").strip() == pair_id and str(candidate.get("RoleName", "") or "").strip() == "top":
+                    return candidate
+            for candidate in self.preview_rows:
+                if str(candidate.get("PairId", "") or "").strip() == pair_id:
+                    return candidate
+        return None
+
+    def _require_visible_primitive_row(self, *, action_label: str) -> dict | None:
+        row = self._resolve_visible_primitive_row()
+        if row is not None:
+            return row
+        messagebox.showwarning("대상 선택 필요", f"{action_label} 전에 preview row나 target을 먼저 선택하세요.")
+        return None
+
+    def _paired_target_status_row(self, target_id: str) -> dict | None:
+        normalized_target = str(target_id or "").strip()
+        if not normalized_target:
+            return None
+        rows = (self.paired_status_data or {}).get("Targets", []) or []
+        for row in rows:
+            if str(row.get("TargetId", "") or "").strip() == normalized_target:
+                return row
+        return None
+
+    def _paired_pair_status_row(self, pair_id: str) -> dict | None:
+        normalized_pair = str(pair_id or "").strip()
+        if not normalized_pair:
+            return None
+        rows = (self.paired_status_data or {}).get("Pairs", []) or []
+        for row in rows:
+            if str(row.get("PairId", "") or "").strip() == normalized_pair:
+                return row
+        return None
+
+    def _visibility_target_status_row(self, target_id: str) -> dict | None:
+        normalized_target = str(target_id or "").strip()
+        if not normalized_target:
+            return None
+        rows = (self.visibility_status_data or {}).get("Targets", []) or []
+        for row in rows:
+            if str(row.get("TargetId", "") or "").strip() == normalized_target:
+                return row
+        return None
+
+    def _paired_acceptance_receipt(self) -> dict:
+        return dict(((self.paired_status_data or {}).get("AcceptanceReceipt", {}) or {}))
+
+    def _refresh_visible_primitive_summary(self) -> None:
+        if not self._has_ui_attr("visible_primitive_status_var"):
+            return
+
+        config_present = bool(self.config_path_var.get().strip())
+        row = self._resolve_visible_primitive_row()
+        pair_id = str((row or {}).get("PairId", "") or self._selected_pair_id() or "").strip()
+        target_id = str((row or {}).get("TargetId", "") or self.target_id_var.get().strip() or "").strip()
+        partner_target_id = str((row or {}).get("PartnerTargetId", "") or "").strip()
+        run_root = self._current_run_root_for_actions().strip()
+        scope_allowed, scope_detail = self._pair_scope_allowed(pair_id, action_label="pair primitive")
+        visibility_row = self._visibility_target_status_row(target_id)
+        target_status = self._paired_target_status_row(target_id)
+        pair_status = self._paired_pair_status_row(pair_id)
+
+        if pair_id and target_id:
+            status_text = f"Primitive: {pair_id}/{target_id}"
+            if partner_target_id:
+                status_text += f" -> {partner_target_id}"
+        elif pair_id:
+            status_text = f"Primitive: {pair_id} / target 선택 필요"
+        else:
+            status_text = "Primitive: pair / target 선택 필요"
+
+        detail_parts: list[str] = []
+        if not config_present:
+            detail_parts.append("ConfigPath 필요")
+        if row is None:
+            detail_parts.append("preview row 미선택")
+        if not scope_allowed and scope_detail:
+            detail_parts.append(scope_detail)
+        if run_root:
+            run_root_name = os.path.basename(os.path.normpath(run_root)) or run_root
+            stale_text = " (stale)" if self._run_root_is_stale(run_root) else ""
+            detail_parts.append(f"runRoot={run_root_name}{stale_text}")
+        else:
+            detail_parts.append("runRoot 미선택")
+        if visibility_row:
+            injectable = bool(visibility_row.get("Injectable", False))
+            method = str(visibility_row.get("InjectionMethod", "") or "").strip()
+            reason = str(visibility_row.get("InjectionReason", "") or "").strip()
+            visibility_text = "visible=ok" if injectable else "visible=blocked"
+            if method:
+                visibility_text += f"({method})"
+            if reason and not injectable:
+                visibility_text += f" {reason}"
+            detail_parts.append(visibility_text)
+        else:
+            detail_parts.append("입력 점검 미반영")
+        if target_status:
+            submit_state = str(target_status.get("SubmitState", "") or "").strip() or "(없음)"
+            outbox_state = str(target_status.get("SourceOutboxState", "") or "").strip()
+            outbox_action = str(target_status.get("SourceOutboxNextAction", "") or "").strip()
+            latest_state = str(target_status.get("LatestState", "") or "").strip()
+            detail_parts.append(f"submit={submit_state}")
+            if outbox_state or outbox_action:
+                outbox_text = outbox_state or "(없음)"
+                if outbox_action:
+                    outbox_text += f"/{outbox_action}"
+                detail_parts.append(f"outbox={outbox_text}")
+            if latest_state:
+                detail_parts.append(f"latest={latest_state}")
+        else:
+            detail_parts.append("paired status 미로딩")
+        if pair_status:
+            phase = str(pair_status.get("CurrentPhase", "") or "").strip() or "(phase 없음)"
+            next_action = str(pair_status.get("NextAction", "") or "").strip()
+            handoff_ready = int(pair_status.get("HandoffReadyCount", 0) or 0)
+            forwarded = int(pair_status.get("ForwardedStateCount", 0) or 0)
+            pair_text = f"pair={phase}"
+            if next_action:
+                pair_text += f" / next={next_action}"
+            if handoff_ready or forwarded:
+                pair_text += f" / handoff={handoff_ready} forwarded={forwarded}"
+            detail_parts.append(pair_text)
+
+        self.visible_primitive_status_var.set(status_text)
+        self.visible_primitive_detail_var.set(" / ".join(part for part in detail_parts if part))
+
+    def _format_visible_primitive_target_report(
+        self,
+        *,
+        title: str,
+        row: dict,
+        target_status: dict | None = None,
+        pair_status: dict | None = None,
+        visibility_row: dict | None = None,
+        payload: dict | None = None,
+    ) -> str:
+        lines = [
+            title,
+            f"Pair: {row.get('PairId', '')}",
+            f"Target: {row.get('TargetId', '')}",
+            f"Partner: {row.get('PartnerTargetId', '') or '(없음)'}",
+            f"RunRoot: {self._current_run_root_for_actions() or '(없음)'}",
+        ]
+        if payload:
+            lines.extend(
+                [
+                    f"Primitive: {payload.get('PrimitiveName', '') or '(없음)'}",
+                    f"PrimitiveState: {payload.get('PrimitiveState', '') or '(없음)'}",
+                    f"PrimitiveReason: {payload.get('PrimitiveReason', '') or '(없음)'}",
+                    f"NextPrimitiveAction: {payload.get('NextPrimitiveAction', '') or '(없음)'}",
+                    f"PrimitiveSummary: {payload.get('SummaryLine', '') or '(없음)'}",
+                ]
+            )
+        if visibility_row:
+            lines.extend(
+                [
+                    f"TypedWindowInjectable: {bool(visibility_row.get('Injectable', False))}",
+                    f"TypedWindowMethod: {visibility_row.get('InjectionMethod', '') or '(없음)'}",
+                    f"TypedWindowReason: {visibility_row.get('InjectionReason', '') or '(없음)'}",
+                ]
+            )
+        if payload:
+            lines.extend(
+                [
+                    f"FinalState: {payload.get('FinalState', '') or '(없음)'}",
+                    f"SubmitState: {payload.get('SubmitState', '') or '(없음)'}",
+                    f"ExecutionPathMode: {payload.get('ExecutionPathMode', '') or '(없음)'}",
+                    f"SubmitRetrySequence: {payload.get('SubmitRetrySequenceSummary', '') or '(없음)'}",
+                    f"PrimarySubmitMode: {payload.get('PrimarySubmitMode', '') or '(없음)'}",
+                    f"FinalSubmitMode: {payload.get('FinalSubmitMode', '') or '(없음)'}",
+                    f"SubmitRetryIntervalMs: {payload.get('SubmitRetryIntervalMs', '') or '(없음)'}",
+                    f"OutboxPublished: {bool(payload.get('OutboxPublished', False))}",
+                ]
+            )
+        if target_status:
+            lines.extend(
+                [
+                    f"Paired SubmitState: {target_status.get('SubmitState', '') or '(없음)'}",
+                    f"Paired SubmitReason: {target_status.get('SubmitReason', '') or '(없음)'}",
+                    f"Paired TypedWindowState: {target_status.get('TypedWindowExecutionState', '') or '(없음)'}",
+                    f"Paired SourceOutboxState: {target_status.get('SourceOutboxState', '') or '(없음)'}",
+                    f"Paired SourceOutboxNextAction: {target_status.get('SourceOutboxNextAction', '') or '(없음)'}",
+                    f"Paired LatestState: {target_status.get('LatestState', '') or '(없음)'}",
+                    f"Paired SubmitModes: {target_status.get('SeedSubmitRetrySequenceSummary', '') or '(없음)'}",
+                ]
+            )
+        if pair_status:
+            lines.extend(
+                [
+                    f"Pair CurrentPhase: {pair_status.get('CurrentPhase', '') or '(없음)'}",
+                    f"Pair NextExpectedHandoff: {pair_status.get('NextExpectedHandoff', '') or '(없음)'}",
+                    f"Pair NextAction: {pair_status.get('NextAction', '') or '(없음)'}",
+                    f"Pair HandoffReadyCount: {pair_status.get('HandoffReadyCount', 0) or 0}",
+                    f"Pair ForwardedStateCount: {pair_status.get('ForwardedStateCount', 0) or 0}",
+                ]
+            )
+        watcher = ((self.paired_status_data or {}).get("Watcher", {}) or {})
+        if watcher:
+            lines.append(f"WatcherStatus: {watcher.get('Status', '') or '(없음)'}")
+        receipt = self._paired_acceptance_receipt()
+        if receipt:
+            lines.append(f"AcceptanceReceiptState: {receipt.get('AcceptanceState', '') or '(없음)'}")
+            if receipt.get("BlockedBy", ""):
+                lines.extend(
+                    [
+                        f"BlockedBy: {receipt.get('BlockedBy', '')}",
+                        f"BlockedTargetId: {receipt.get('BlockedTargetId', '') or '(없음)'}",
+                        f"BlockedDetail: {receipt.get('BlockedDetail', '') or '(없음)'}",
+                    ]
+                )
+        if self.paired_status_error:
+            lines.append(f"PairedStatusError: {self.paired_status_error}")
+        if payload:
+            lines.extend(["", "JSON", json.dumps(payload, ensure_ascii=False, indent=2)])
+        return "\n".join(lines)
+
+    def _format_visible_primitive_handoff_report(
+        self,
+        *,
+        title: str,
+        row: dict,
+        current_target_status: dict | None,
+        partner_target_status: dict | None,
+        pair_status: dict | None,
+        payload: dict | None = None,
+    ) -> str:
+        lines = [
+            title,
+            f"Pair: {row.get('PairId', '')}",
+            f"CurrentTarget: {row.get('TargetId', '')}",
+            f"PartnerTarget: {row.get('PartnerTargetId', '') or '(없음)'}",
+            f"RunRoot: {self._current_run_root_for_actions() or '(없음)'}",
+        ]
+        if payload:
+            lines.extend(
+                [
+                    f"Primitive: {payload.get('PrimitiveName', '') or '(없음)'}",
+                    f"PrimitiveState: {payload.get('PrimitiveState', '') or '(없음)'}",
+                    f"PrimitiveReason: {payload.get('PrimitiveReason', '') or '(없음)'}",
+                    f"NextPrimitiveAction: {payload.get('NextPrimitiveAction', '') or '(없음)'}",
+                    f"PrimitiveSummary: {payload.get('SummaryLine', '') or '(없음)'}",
+                ]
+            )
+        if pair_status:
+            lines.extend(
+                [
+                    f"Pair CurrentPhase: {pair_status.get('CurrentPhase', '') or '(없음)'}",
+                    f"Pair NextExpectedHandoff: {pair_status.get('NextExpectedHandoff', '') or '(없음)'}",
+                    f"Pair NextAction: {pair_status.get('NextAction', '') or '(없음)'}",
+                    f"Pair LatestStateSummary: {pair_status.get('LatestStateSummary', '') or '(없음)'}",
+                    f"Pair HandoffReadyCount: {pair_status.get('HandoffReadyCount', 0) or 0}",
+                    f"Pair ForwardedStateCount: {pair_status.get('ForwardedStateCount', 0) or 0}",
+                ]
+            )
+        for label, status in [("Current", current_target_status), ("Partner", partner_target_status)]:
+            if not status:
+                lines.append(f"{label} TargetState: (없음)")
+                continue
+            lines.extend(
+                [
+                    f"{label} SubmitState: {status.get('SubmitState', '') or '(없음)'}",
+                    f"{label} SourceOutboxState: {status.get('SourceOutboxState', '') or '(없음)'}",
+                    f"{label} SourceOutboxNextAction: {status.get('SourceOutboxNextAction', '') or '(없음)'}",
+                    f"{label} LatestState: {status.get('LatestState', '') or '(없음)'}",
+                    f"{label} TypedWindowState: {status.get('TypedWindowExecutionState', '') or '(없음)'}",
+                ]
+            )
+        watcher = ((self.paired_status_data or {}).get("Watcher", {}) or {})
+        if watcher:
+            lines.extend(
+                [
+                    f"WatcherStatus: {watcher.get('Status', '') or '(없음)'}",
+                    f"WatcherForwardedCount: {watcher.get('ForwardedCount', '') or '(없음)'}",
+                ]
+            )
+        receipt = self._paired_acceptance_receipt()
+        if receipt:
+            lines.append(f"AcceptanceReceiptState: {receipt.get('AcceptanceState', '') or '(없음)'}")
+            if receipt.get("BlockedBy", ""):
+                lines.extend(
+                    [
+                        f"BlockedBy: {receipt.get('BlockedBy', '')}",
+                        f"BlockedTargetId: {receipt.get('BlockedTargetId', '') or '(없음)'}",
+                        f"BlockedDetail: {receipt.get('BlockedDetail', '') or '(없음)'}",
+                    ]
+                )
+        if self.paired_status_error:
+            lines.append(f"PairedStatusError: {self.paired_status_error}")
+        if payload:
+            lines.extend(["", "JSON", json.dumps(payload, ensure_ascii=False, indent=2)])
+        return "\n".join(lines)
+
+    def select_partner_target_from_context(self) -> None:
+        row = self._require_visible_primitive_row(action_label="상대 target 선택")
+        if row is None:
+            return
+        partner_target_id = str(row.get("PartnerTargetId", "") or "").strip()
+        if not partner_target_id:
+            messagebox.showwarning("상대 target 없음", "선택된 row에 PartnerTargetId가 없습니다.")
+            return
+        pair_id = str(row.get("PairId", "") or self._selected_pair_id() or "").strip()
+        current_target_id = str(row.get("TargetId", "") or "").strip()
+        self.select_target_from_board(partner_target_id, pair_id)
+        lines = [
+            "상대 target 선택 완료",
+            f"Pair: {pair_id}",
+            f"CurrentTarget: {current_target_id or '(없음)'}",
+            f"PartnerTarget: {partner_target_id}",
+        ]
+        self._set_visible_acceptance_output("\n".join(lines))
+        self.last_result_var.set(f"마지막 결과: pair={pair_id} partner={partner_target_id} 선택")
+
+    def run_selected_target_seed_submit(self) -> None:
+        row = self._require_visible_primitive_row(action_label="선택 target 1회 submit")
+        if row is None:
+            return
+
+        pair_id = str(row.get("PairId", "") or self._selected_pair_id() or "").strip()
+        target_id = str(row.get("TargetId", "") or self.target_id_var.get().strip() or "").strip()
+        if not target_id:
+            messagebox.showwarning("Target 필요", "선택된 row의 target을 해석하지 못했습니다.")
+            return
+
+        config_path = self.config_path_var.get().strip()
+        if not config_path:
+            messagebox.showwarning("설정 필요", "선택 target 1회 submit에는 ConfigPath가 필요합니다.")
+            return
+
+        pair_scope_allowed, pair_scope_detail = self._pair_scope_allowed(pair_id, action_label="선택 target 1회 submit")
+        if not pair_scope_allowed:
+            messagebox.showwarning("선택 target 1회 submit 대기", pair_scope_detail)
+            return
+
+        run_root, run_root_detail = self._resolve_manifest_run_root_for_visible_acceptance(
+            action_label="선택 target 1회 submit",
+            allow_stale=False,
+        )
+        if not run_root:
+            messagebox.showwarning("RunRoot 필요", run_root_detail)
+            return
+
+        visibility_row = self._visibility_target_status_row(target_id)
+        if visibility_row and not bool(visibility_row.get("Injectable", False)):
+            reason = str(visibility_row.get("InjectionReason", "") or "").strip()
+            detail = reason or "typed-window 입력 점검이 아직 통과하지 않았습니다."
+            messagebox.showwarning("typed-window 점검 필요", detail)
+            return
+
+        self._set_action_context(pair_id=pair_id, target_id=target_id, run_root=run_root, source="visible-primitive-submit")
+        command = self.command_service.build_script_command(
+            "tests/Invoke-PairedExchangeOneShotSubmit.ps1",
+            config_path=config_path,
+            run_root=run_root,
+            pair_id=pair_id,
+            target_id=target_id,
+            extra=["-AsJson"],
+        )
+        self.last_command_var.set(subprocess.list2cmdline(command))
+        context = self._snapshot_context(run_root=run_root, pair_id=pair_id, target_id=target_id)
+
+        def worker() -> dict:
+            return self.status_service.run_json_script(
+                "tests/Invoke-PairedExchangeOneShotSubmit.ps1",
+                context,
+                extra=["-AsJson"],
+                run_root_override=run_root,
+                pair_id_override=pair_id,
+                target_id_override=target_id,
+            )
+
+        def on_success(payload: dict) -> None:
+            resolved_run_root = str(payload.get("RunRoot", "") or run_root).strip()
+            if resolved_run_root:
+                self.run_root_var.set(resolved_run_root)
+            if not self._apply_paired_status_snapshot_from_payload(payload, refresh_artifacts=True):
+                self.refresh_paired_status_only(refresh_artifacts=True)
+            target_status = payload.get("PairedTargetStatus", None) if isinstance(payload.get("PairedTargetStatus", None), dict) else self._paired_target_status_row(target_id)
+            pair_status = payload.get("PairStatus", None) if isinstance(payload.get("PairStatus", None), dict) else self._paired_pair_status_row(pair_id)
+            self._set_visible_acceptance_output(
+                self._format_visible_primitive_target_report(
+                    title="선택 target 1회 submit 완료",
+                    row=row,
+                    target_status=target_status,
+                    pair_status=pair_status,
+                    visibility_row=visibility_row,
+                    payload=payload,
+                )
+            )
+            self.last_result_var.set(
+                "마지막 결과: pair={0} target={1} submit={2}".format(
+                    pair_id,
+                    target_id,
+                    payload.get("SubmitState", "") or payload.get("FinalState", "") or "(없음)",
+                )
+            )
+
+        def on_failure(exc: Exception) -> str:
+            self.refresh_paired_status_only(refresh_artifacts=False)
+            lines = [
+                self._format_background_exception(exc),
+                "",
+                f"Pair: {pair_id}",
+                f"Target: {target_id}",
+                f"RunRoot: {run_root}",
+            ]
+            if visibility_row:
+                lines.append(f"TypedWindowReason: {visibility_row.get('InjectionReason', '') or '(없음)'}")
+            return "\n".join(lines)
+
+        self.run_background_task(
+            state="선택 target 1회 submit 실행 중",
+            hint=f"{pair_id}/{target_id} 기준으로 typed-window submit을 한 번 실행합니다.",
+            worker=worker,
+            on_success=on_success,
+            success_state="선택 target 1회 submit 완료",
+            success_hint="paired status와 visible primitive 요약을 갱신했습니다.",
+            failure_state="선택 target 1회 submit 실패",
+            failure_hint="typed-window 점검 상태와 마지막 명령, paired status를 확인하세요.",
+            on_failure=on_failure,
+        )
+
+    def inspect_selected_target_publish_status(self) -> None:
+        row = self._require_visible_primitive_row(action_label="publish 확인")
+        if row is None:
+            return
+
+        pair_id = str(row.get("PairId", "") or self._selected_pair_id() or "").strip()
+        target_id = str(row.get("TargetId", "") or self.target_id_var.get().strip() or "").strip()
+        if not target_id:
+            messagebox.showwarning("Target 필요", "publish 확인 대상 target을 해석하지 못했습니다.")
+            return
+
+        config_path = self.config_path_var.get().strip()
+        if not config_path:
+            messagebox.showwarning("설정 필요", "publish 확인에는 ConfigPath가 필요합니다.")
+            return
+
+        run_root, run_root_detail = self._resolve_manifest_run_root_for_visible_acceptance(
+            action_label="publish 확인",
+            allow_stale=True,
+        )
+        if not run_root:
+            messagebox.showwarning("RunRoot 필요", run_root_detail)
+            return
+
+        self._set_action_context(pair_id=pair_id, target_id=target_id, run_root=run_root, source="visible-primitive-publish")
+        context = self._snapshot_context(run_root=run_root, pair_id=pair_id, target_id=target_id)
+        command = self.command_service.build_script_command(
+            "tests/Confirm-PairedExchangePublishPrimitive.ps1",
+            config_path=config_path,
+            run_root=run_root,
+            pair_id=pair_id,
+            target_id=target_id,
+            extra=["-AsJson"],
+        )
+        self.last_command_var.set(subprocess.list2cmdline(command))
+
+        def worker() -> dict:
+            return self.status_service.run_json_script(
+                "tests/Confirm-PairedExchangePublishPrimitive.ps1",
+                context,
+                extra=["-AsJson"],
+                run_root_override=run_root,
+                pair_id_override=pair_id,
+                target_id_override=target_id,
+            )
+
+        def on_success(payload: dict) -> None:
+            if not self._apply_paired_status_snapshot_from_payload(payload, refresh_artifacts=True):
+                self.refresh_paired_status_only(refresh_artifacts=True)
+            visibility_row = self._visibility_target_status_row(target_id)
+            target_status = payload.get("PairedTargetStatus", None) if isinstance(payload.get("PairedTargetStatus", None), dict) else self._paired_target_status_row(target_id)
+            pair_status = payload.get("PairStatus", None) if isinstance(payload.get("PairStatus", None), dict) else self._paired_pair_status_row(pair_id)
+            self._set_visible_acceptance_output(
+                self._format_visible_primitive_target_report(
+                    title="publish 확인",
+                    row=row,
+                    target_status=target_status,
+                    pair_status=pair_status,
+                    visibility_row=visibility_row,
+                    payload=payload,
+                )
+            )
+            self.last_result_var.set(
+                "마지막 결과: pair={0} target={1} publish={2}".format(
+                    pair_id,
+                    target_id,
+                    payload.get("PrimitiveState", "") or "(없음)",
+                )
+            )
+
+        self.run_background_task(
+            state="publish 확인 중",
+            hint=f"{pair_id}/{target_id} 기준 publish primitive를 실행 중입니다.",
+            worker=worker,
+            on_success=on_success,
+            success_state="publish 확인 완료",
+            success_hint="source-outbox / latest-state / 다음 조치를 primitive wrapper 기준으로 요약했습니다.",
+            failure_state="publish 확인 실패",
+            failure_hint="paired status 로드 오류와 마지막 명령을 확인하세요.",
+        )
+
+    def inspect_selected_pair_handoff_status(self) -> None:
+        row = self._require_visible_primitive_row(action_label="handoff 확인")
+        if row is None:
+            return
+
+        pair_id = str(row.get("PairId", "") or self._selected_pair_id() or "").strip()
+        target_id = str(row.get("TargetId", "") or self.target_id_var.get().strip() or "").strip()
+        partner_target_id = str(row.get("PartnerTargetId", "") or "").strip()
+        if not target_id:
+            messagebox.showwarning("Target 필요", "handoff 확인 대상 target을 해석하지 못했습니다.")
+            return
+        config_path = self.config_path_var.get().strip()
+        if not config_path:
+            messagebox.showwarning("설정 필요", "handoff 확인에는 ConfigPath가 필요합니다.")
+            return
+
+        run_root, run_root_detail = self._resolve_manifest_run_root_for_visible_acceptance(
+            action_label="handoff 확인",
+            allow_stale=True,
+        )
+        if not run_root:
+            messagebox.showwarning("RunRoot 필요", run_root_detail)
+            return
+
+        self._set_action_context(pair_id=pair_id, target_id=target_id, run_root=run_root, source="visible-primitive-handoff")
+        context = self._snapshot_context(run_root=run_root, pair_id=pair_id, target_id=target_id)
+        command = self.command_service.build_script_command(
+            "tests/Confirm-PairedExchangeHandoffPrimitive.ps1",
+            config_path=config_path,
+            run_root=run_root,
+            pair_id=pair_id,
+            target_id=target_id,
+            extra=["-AsJson"],
+        )
+        self.last_command_var.set(subprocess.list2cmdline(command))
+
+        def worker() -> dict:
+            return self.status_service.run_json_script(
+                "tests/Confirm-PairedExchangeHandoffPrimitive.ps1",
+                context,
+                extra=["-AsJson"],
+                run_root_override=run_root,
+                pair_id_override=pair_id,
+                target_id_override=target_id,
+            )
+
+        def on_success(payload: dict) -> None:
+            if not self._apply_paired_status_snapshot_from_payload(payload, refresh_artifacts=True):
+                self.refresh_paired_status_only(refresh_artifacts=True)
+            current_target_status = (
+                payload.get("PairedTargetStatus", None)
+                if isinstance(payload.get("PairedTargetStatus", None), dict)
+                else self._paired_target_status_row(target_id)
+            )
+            partner_target_status = (
+                payload.get("PairedPartnerStatus", None)
+                if isinstance(payload.get("PairedPartnerStatus", None), dict)
+                else self._paired_target_status_row(partner_target_id)
+            )
+            pair_status = (
+                payload.get("PairStatus", None)
+                if isinstance(payload.get("PairStatus", None), dict)
+                else self._paired_pair_status_row(pair_id)
+            )
+            self._set_visible_acceptance_output(
+                self._format_visible_primitive_handoff_report(
+                    title="handoff 확인",
+                    row=row,
+                    current_target_status=current_target_status,
+                    partner_target_status=partner_target_status,
+                    pair_status=pair_status,
+                    payload=payload,
+                )
+            )
+            self.last_result_var.set(
+                "마지막 결과: pair={0} target={1} handoff={2}".format(
+                    pair_id,
+                    target_id,
+                    payload.get("PrimitiveState", "") or "(없음)",
+                )
+            )
+
+        def on_failure(exc: Exception) -> str:
+            self.refresh_paired_status_only(refresh_artifacts=False)
+            lines = [
+                self._format_background_exception(exc),
+                "",
+                f"Pair: {pair_id}",
+                f"Target: {target_id}",
+                f"Partner: {partner_target_id or '(없음)'}",
+                f"RunRoot: {run_root}",
+            ]
+            return "\n".join(lines)
+
+        self.run_background_task(
+            state="handoff 확인 중",
+            hint=f"{pair_id}/{target_id} 기준 handoff primitive를 실행 중입니다.",
+            worker=worker,
+            on_success=on_success,
+            success_state="handoff 확인 완료",
+            success_hint="pair handoff 단계와 현재/상대 target 상태를 wrapper 기준으로 요약했습니다.",
+            failure_state="handoff 확인 실패",
+            failure_hint="paired status 로드 오류와 마지막 명령을 확인하세요.",
+            on_failure=on_failure,
         )
 
     def _selected_pair_id(self) -> str:
@@ -6246,6 +7027,9 @@ class RelayOperatorPanel(tk.Tk):
         config = payload.get("Config", {})
         run_context = payload.get("RunContext", {})
         pair_test = payload.get("PairTest", {})
+        dispatch = payload.get("Dispatch", {})
+        allowed_window_visibility_methods = pair_test.get("AllowedWindowVisibilityMethods", []) or []
+        submit_retry_modes = dispatch.get("SubmitRetryModes", []) or pair_test.get("SubmitRetryModes", []) or []
         lines = [
             "읽기 전용 보기 도구입니다. source of truth는 show-effective-config.ps1 JSON 출력입니다.",
             f"스키마 버전: {payload.get('SchemaVersion', '')}",
@@ -6265,6 +7049,9 @@ class RelayOperatorPanel(tk.Tk):
             f"다음 RunRoot 미리보기: {run_context.get('NextRunRootPreview', '')}",
             f"manifest 경로: {run_context.get('ManifestPath', '')}",
             f"Pair 정의 출처: {payload.get('PairDefinitionSource', '')}",
+            f"Pair 정의 출처 상세: {payload.get('PairDefinitionSourceDetail', '')}",
+            f"Pair topology 전략: {payload.get('PairTopologyStrategy', '')}",
+            f"기본 Pair Id: {pair_test.get('DefaultPairId', '')}",
             f"최고 경고 심각도: {payload.get('WarningSummary', {}).get('HighestSeverity', '')}",
             f"최고 경고 판단: {payload.get('WarningSummary', {}).get('HighestDecision', '')}",
             f"최고 경고 코드: {payload.get('WarningSummary', {}).get('HighestCode', '')}",
@@ -6275,6 +7062,12 @@ class RelayOperatorPanel(tk.Tk):
             f"검토 폴더명: {pair_test.get('ReviewFolderName', '')}",
             f"메시지 폴더명: {pair_test.get('MessageFolderName', '')}",
             f"검토 zip 패턴: {pair_test.get('ReviewZipPattern', '')}",
+            f"실행 경로: {pair_test.get('ExecutionPathMode', '')}",
+            f"visible cell 실행 강제: {pair_test.get('RequireUserVisibleCellExecution', False)}",
+            f"허용 visibility 방법: {', '.join(str(item) for item in allowed_window_visibility_methods) or '(없음)'}",
+            f"submit sequence: {dispatch.get('SubmitRetrySequenceSummary', '') or ' -> '.join(str(item) for item in submit_retry_modes) or '(없음)'}",
+            f"submit primary/final: {dispatch.get('PrimarySubmitMode', '') or '(없음)'} / {dispatch.get('FinalSubmitMode', '') or '(없음)'}",
+            f"submit retry interval ms: {dispatch.get('SubmitRetryIntervalMs', '')}",
             f"Headless 사용 가능: {pair_test.get('HeadlessExec', {}).get('Enabled', False)}",
             f"Headless Codex 실행파일: {pair_test.get('HeadlessExec', {}).get('CodexExecutable', '')}",
             f"미리보기 스냅샷 루트: {payload.get('EvidencePolicy', {}).get('TemporarySnapshotRoot', '')}",
@@ -6343,6 +7136,8 @@ class RelayOperatorPanel(tk.Tk):
         activation = row.get("PairActivation", {}) or {}
         action_pair = self._selected_pair_id()
         action_target = self.target_id_var.get().strip()
+        allowed_window_visibility_methods = row.get("AllowedWindowVisibilityMethods", []) or []
+        submit_retry_modes = row.get("SubmitRetryModes", []) or []
         details_lines = [
             f"inspection source: {self._context_source_label(inspection_context.source)}",
             f"Pair: {row.get('PairId', '')}",
@@ -6355,6 +7150,12 @@ class RelayOperatorPanel(tk.Tk):
             f"비활성 만료시각: {activation.get('DisabledUntil', '') or '(none)'}",
             f"창 제목: {row.get('WindowTitle', '')}",
             f"Inbox 폴더: {row.get('InboxFolder', '')}",
+            f"실행 경로: {row.get('ExecutionPathMode', '')}",
+            f"visible cell 실행 강제: {row.get('UserVisibleCellExecutionRequired', False)}",
+            f"허용 visibility 방법: {', '.join(str(item) for item in allowed_window_visibility_methods) or '(없음)'}",
+            f"submit sequence: {row.get('SubmitRetrySequenceSummary', '') or ' -> '.join(str(item) for item in submit_retry_modes) or '(없음)'}",
+            f"submit primary/final: {row.get('PrimarySubmitMode', '') or '(없음)'} / {row.get('FinalSubmitMode', '') or '(없음)'}",
+            f"submit retry interval ms: {row.get('SubmitRetryIntervalMs', '')}",
             f"Pair 대상 폴더: {row.get('PairTargetFolder', '')}",
             f"상대 폴더: {row.get('PartnerFolder', '')}",
             f"summary 경로: {row.get('SummaryPath', '')}",
@@ -7213,11 +8014,19 @@ class RelayOperatorPanel(tk.Tk):
         blocked_run_root = str(payload.get("BlockedRunRoot", "") or preflight.get("BlockedRunRoot", "") or "")
         blocked_path = str(payload.get("BlockedPath", "") or preflight.get("BlockedPath", "") or "")
         blocked_detail = str(payload.get("BlockedDetail", "") or preflight.get("BlockedDetail", "") or "")
+        allowed_window_visibility_methods = payload.get("AllowedWindowVisibilityMethods", []) or []
         lines = [
             title,
             f"RunRoot: {payload.get('RunRoot', '')}",
             f"Pair: {payload.get('PairId', '')}",
             f"SeedTarget: {payload.get('SeedTargetId', '')}",
+            f"ExecutionPathMode: {payload.get('ExecutionPathMode', '') or '(없음)'}",
+            f"UserVisibleCellExecutionRequired: {payload.get('UserVisibleCellExecutionRequired', False)}",
+            f"AllowedWindowVisibilityMethods: {', '.join(str(item) for item in allowed_window_visibility_methods) or '(없음)'}",
+            f"SubmitRetrySequence: {payload.get('SubmitRetrySequenceSummary', '') or '(없음)'}",
+            f"SubmitPrimaryMode: {payload.get('PrimarySubmitMode', '') or '(없음)'}",
+            f"SubmitFinalMode: {payload.get('FinalSubmitMode', '') or '(없음)'}",
+            f"SubmitRetryIntervalMs: {payload.get('SubmitRetryIntervalMs', '') or '(없음)'}",
             f"Stage: {payload.get('Stage', '')}",
             f"AcceptanceState: {outcome.get('AcceptanceState', '') or '(없음)'}",
             f"AcceptanceReason: {outcome.get('AcceptanceReason', '') or '(없음)'}",
@@ -7254,6 +8063,11 @@ class RelayOperatorPanel(tk.Tk):
                 [
                     f"SeedFinalState: {seed.get('FinalState', '') or '(없음)'}",
                     f"SeedSubmitState: {seed.get('SubmitState', '') or '(없음)'}",
+                    f"SeedExecutionPathMode: {seed.get('ExecutionPathMode', '') or '(없음)'}",
+                    f"SeedSubmitRetrySequence: {seed.get('SubmitRetrySequenceSummary', '') or '(없음)'}",
+                    f"SeedPrimarySubmitMode: {seed.get('PrimarySubmitMode', '') or '(없음)'}",
+                    f"SeedFinalSubmitMode: {seed.get('FinalSubmitMode', '') or '(없음)'}",
+                    f"SeedSubmitRetryIntervalMs: {seed.get('SubmitRetryIntervalMs', '') or '(없음)'}",
                     f"SeedOutboxPublished: {bool(seed.get('OutboxPublished', False))}",
                 ]
             )
@@ -8260,7 +9074,7 @@ class RelayOperatorPanel(tk.Tk):
         )
 
     def run_fixed_pair01_drill(self) -> None:
-        self._set_mode_banner("MODE: Headless Drill", "고정된 pair01 기준 headless drill을 실행합니다.")
+        self._set_mode_banner("MODE: Headless Drill", "pair01 preset shortcut 기준 headless drill을 실행합니다.")
         activation = self.get_pair_activation_state("pair01")
         if activation and not activation.get("EffectiveEnabled", True):
             messagebox.showwarning("Pair 비활성", f"pair01은 현재 비활성 상태입니다.\n사유: {activation.get('DisableReason', '') or '(none)'}")
@@ -8268,8 +9082,8 @@ class RelayOperatorPanel(tk.Tk):
 
         config_path = str(ROOT / "config" / "settings.bottest-live-visible.psd1")
         command = self.command_service.build_powershell_file_command(
-            str(ROOT / "run-pair01-headless-drill.ps1"),
-            extra=["-AsJson"],
+            str(ROOT / "run-preset-headless-pair-drill.ps1"),
+            extra=["-PairId", "pair01", "-AsJson"],
         )
 
         self.last_command_var.set(subprocess.list2cmdline(command))
@@ -8282,9 +9096,9 @@ class RelayOperatorPanel(tk.Tk):
             drill = payload.get("Drill", {})
             observed = drill.get("ObservedCounts", {})
             self.config_path_var.set(config_path)
-            self._set_action_context(pair_id="pair01", run_root=payload.get("RunRoot", ""), source="pair01-drill")
+            self._set_action_context(pair_id="pair01", run_root=payload.get("RunRoot", ""), source="pair01-preset-drill")
             lines = [
-                "pair01 Headless Drill 완료",
+                "pair01 Preset Drill 완료",
                 f"Config: {payload.get('ConfigPath', '')}",
                 f"RunRoot: {payload.get('RunRoot', '')}",
                 f"done 개수: {observed.get('DonePresentCount', '')}",
@@ -8305,15 +9119,15 @@ class RelayOperatorPanel(tk.Tk):
                 )
             )
 
-        self.set_text(self.output_text, "pair01 Headless Drill 실행 중...")
+        self.set_text(self.output_text, "pair01 Preset Drill 실행 중...")
         self.run_background_task(
-            state="pair01 Headless Drill 실행 중",
-            hint="고정된 visible config와 pair01 설정으로 한 번 왕복 드릴을 실행 중입니다.",
+            state="pair01 Preset Drill 실행 중",
+            hint="preset shortcut이 generic preset runner를 통해 pair01 한 번 왕복 드릴을 실행 중입니다.",
             worker=worker,
             on_success=on_success,
-            success_state="pair01 Headless Drill 완료",
+            success_state="pair01 Preset Drill 완료",
             success_hint="RunRoot와 preview 출력이 자동 반영됐습니다.",
-            failure_state="pair01 Headless Drill 실패",
+            failure_state="pair01 Preset Drill 실패",
             failure_hint="출력 영역과 마지막 명령을 확인하세요.",
         )
 
@@ -8322,6 +9136,26 @@ class RelayOperatorPanel(tk.Tk):
 
     def run_paired_summary(self) -> None:
         self.run_to_output("show-paired-run-summary.ps1", allow_when_busy=True)
+
+    def _important_summary_path(self, file_name: str = "important-summary.txt") -> str:
+        run_root = self._current_run_root_for_actions()
+        if not run_root:
+            return ""
+        return str(Path(run_root) / ".state" / file_name)
+
+    def open_important_summary_text(self) -> None:
+        path_value = self._important_summary_path()
+        if not path_value:
+            messagebox.showwarning("RunRoot 필요", "RunRoot 값을 먼저 입력하거나 선택하세요.")
+            return
+        if not Path(path_value).exists():
+            messagebox.showwarning(
+                "important-summary 없음",
+                "먼저 runroot 요약을 실행해 important-summary.txt를 생성하세요.\n" + path_value,
+            )
+            return
+        self._open_path(path_value, kind="important-summary.txt")
+        self.set_text(self.output_text, f"important-summary 열기:\n{path_value}")
 
     def run_visibility_check(self) -> None:
         self.last_command_var.set(self._runtime_refresh_command_preview())

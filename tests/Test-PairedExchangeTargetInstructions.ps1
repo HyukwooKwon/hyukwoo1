@@ -38,17 +38,53 @@ function Compose-RelayPayloadPreview {
     return ($normalizedBody + "`r`n`r`n" + $normalizedSuffix)
 }
 
+function Get-EffectiveRelayPayloadPreviewFixedSuffix {
+    param(
+        [Parameter(Mandatory)]$Config,
+        [Parameter(Mandatory)]$Target
+    )
+
+    $placeholderFixedSuffix = '여기에 고정문구 입력'
+    if ($null -ne $Target.FixedSuffix) {
+        $targetFixedSuffix = [string]$Target.FixedSuffix
+        if ($targetFixedSuffix.Trim() -eq $placeholderFixedSuffix) {
+            return ''
+        }
+
+        return $targetFixedSuffix
+    }
+
+    $defaultFixedSuffix = [string]$Config.DefaultFixedSuffix
+    if ($defaultFixedSuffix.Trim() -eq $placeholderFixedSuffix) {
+        return ''
+    }
+
+    return $defaultFixedSuffix
+}
+
 $root = Split-Path -Parent $PSScriptRoot
 if ([string]::IsNullOrWhiteSpace($ConfigPath)) {
     $ConfigPath = Join-Path $root 'config\settings.bottest-live-visible.psd1'
 }
 
-$resolvedConfigPath = (Resolve-Path -LiteralPath $ConfigPath).Path
+$baseConfigPath = (Resolve-Path -LiteralPath $ConfigPath).Path
+$tempWorkRepoRoot = Join-Path 'C:\dev\python\_relay-test-fixtures' ('paired-exchange-target-instructions-' + [guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Path $tempWorkRepoRoot -Force | Out-Null
+$seedReviewInputPath = Join-Path $tempWorkRepoRoot 'reviewfile\seed-review-input.txt'
+New-Item -ItemType Directory -Path (Split-Path -Parent $seedReviewInputPath) -Force | Out-Null
+'fixture seed review input' | Set-Content -LiteralPath $seedReviewInputPath -Encoding UTF8
+$externalizedConfigPath = Join-Path $tempWorkRepoRoot '.relay-config\bottest-live-visible\settings.externalized.psd1'
+& (Join-Path $root 'tests\Write-ExternalizedRelayConfig.ps1') `
+    -BaseConfigPath $baseConfigPath `
+    -WorkRepoRoot $tempWorkRepoRoot `
+    -OutputConfigPath $externalizedConfigPath `
+    -ReviewInputPath $seedReviewInputPath | Out-Null
+
+$resolvedConfigPath = (Resolve-Path -LiteralPath $externalizedConfigPath).Path
 $config = Import-PowerShellDataFile -Path $resolvedConfigPath
 $pairRunRootBase = [string]$config.PairTest.RunRootBase
 $contractRunRoot = Join-Path $pairRunRootBase ('run_contract_target_instructions_' + (Get-Date -Format 'yyyyMMdd_HHmmss_fff'))
-$seedWorkRepoRoot = $root
-$seedReviewInputPath = Join-Path $root 'tests\Test-PairedExchangeTargetInstructions.ps1'
+$seedWorkRepoRoot = $tempWorkRepoRoot
 $seedTaskText = '검토파일내용을 확인 후 프로젝트에 맞는 부분만 선별 적용하세요.'
 
 & (Join-Path $root 'tests\Start-PairedExchangeTest.ps1') `
@@ -86,7 +122,9 @@ $partnerManifestTarget = $partnerManifestTarget[0]
 $expectedSummaryPath = Join-Path $targetRoot 'summary.txt'
 $expectedReviewFolderPath = Join-Path $targetRoot 'reviewfile'
 $expectedWorkFolderPath = Join-Path $targetRoot 'work'
-$expectedSourceOutboxPath = Join-Path $targetRoot 'source-outbox'
+$expectedContractRoot = Join-Path $tempWorkRepoRoot (Join-Path '.relay-contract\bottest-live-visible' ((Split-Path -Leaf $contractRunRoot) + '\pair01\target01'))
+$expectedPartnerContractRoot = Join-Path $tempWorkRepoRoot (Join-Path '.relay-contract\bottest-live-visible' ((Split-Path -Leaf $contractRunRoot) + '\pair01\target05'))
+$expectedSourceOutboxPath = Join-Path $expectedContractRoot 'source-outbox'
 $expectedSourceSummaryPath = Join-Path $expectedSourceOutboxPath 'summary.txt'
 $expectedSourceReviewZipPath = Join-Path $expectedSourceOutboxPath 'review.zip'
 $expectedPublishReadyPath = Join-Path $expectedSourceOutboxPath 'publish.ready.json'
@@ -136,6 +174,8 @@ Assert-True ([string]$manifestTarget.SourceSummaryPath -eq $expectedSourceSummar
 Assert-True ([string]$manifestTarget.SourceReviewZipPath -eq $expectedSourceReviewZipPath) 'manifest target row should echo SourceReviewZipPath.'
 Assert-True ([string]$manifestTarget.PublishReadyPath -eq $expectedPublishReadyPath) 'manifest target row should echo PublishReadyPath.'
 Assert-True ([string]$manifestTarget.PublishedArchivePath -eq $expectedPublishedArchivePath) 'manifest target row should echo PublishedArchivePath.'
+Assert-True ([string]$manifestTarget.ContractPathMode -eq 'external-workrepo') 'manifest target row should mark external contract mode.'
+Assert-True ([string]$manifestTarget.ContractRootPath -eq $expectedContractRoot) 'manifest target row should echo external contract root.'
 Assert-True ([bool]$manifestTarget.SeedEnabled) 'manifest target row should mark seed-enabled target.'
 Assert-True ([string]$manifestTarget.SeedTargetId -eq 'target01') 'manifest target row should echo SeedTargetId.'
 Assert-True ([string]$manifestTarget.InitialRoleMode -eq 'seed') 'manifest target row should echo seed role mode.'
@@ -171,7 +211,7 @@ Assert-True ($instructions.Contains('자동 publish가 실패하거나 legacy Ru
 
 $relayTarget = @($config.Targets | Where-Object { [string]$_.Id -eq 'target01' } | Select-Object -First 1)
 Assert-True ($relayTarget.Count -eq 1) 'relay config target01 row should exist.'
-$fixedSuffix = if ($null -ne $relayTarget[0].FixedSuffix) { [string]$relayTarget[0].FixedSuffix } else { '' }
+$fixedSuffix = Get-EffectiveRelayPayloadPreviewFixedSuffix -Config $config -Target $relayTarget[0]
 $payloadPreview = Compose-RelayPayloadPreview -Body $messageText -FixedSuffix $fixedSuffix
 $payloadBytes = [System.Text.UTF8Encoding]::new($false).GetByteCount($payloadPreview)
 $partnerPayloadPreview = Compose-RelayPayloadPreview -Body $partnerMessageText -FixedSuffix $fixedSuffix
@@ -192,15 +232,15 @@ Assert-True ($payloadBytes -lt [int]$config.MaxPayloadBytes) 'message payload sh
 Assert-True (-not [bool]$partnerRequest.SeedEnabled) 'partner request should not be seed-enabled.'
 Assert-True ([string]$partnerRequest.SeedTargetId -eq 'target01') 'partner request should still record the shared SeedTargetId.'
 Assert-True ([string]$partnerRequest.InitialRoleMode -eq 'handoff_wait') 'partner request should use handoff-wait mode.'
-Assert-True ([string]$partnerRequest.WorkRepoRoot -eq '') 'partner request should not carry WorkRepoRoot.'
+Assert-True ([string]$partnerRequest.WorkRepoRoot -eq $seedWorkRepoRoot) 'partner request should carry the external WorkRepoRoot for explicit contract paths.'
 Assert-True ([string]$partnerRequest.ReviewInputPath -eq '') 'partner request should not carry ReviewInputPath.'
 Assert-True ([string]$partnerRequest.SeedTaskText -eq '') 'partner request should not carry SeedTaskText.'
 Assert-True (-not [bool]$partnerManifestTarget.SeedEnabled) 'partner manifest row should not be seed-enabled.'
 Assert-True ([string]$partnerManifestTarget.InitialRoleMode -eq 'handoff_wait') 'partner manifest row should use handoff-wait mode.'
 Assert-True ($partnerInstructions.Contains('mode: handoff-wait')) 'partner instructions should use handoff-wait mode.'
 Assert-True ($partnerInstructions.Contains('partner handoff message가 오기 전까지 작업을 시작하지 마세요.')) 'partner instructions should explicitly wait for handoff.'
-Assert-True (-not $partnerInstructions.Contains("WorkRepoRoot: $seedWorkRepoRoot")) 'partner instructions should not include seed WorkRepoRoot.'
 Assert-True (-not $partnerInstructions.Contains("ReviewInputPath: $seedReviewInputPath")) 'partner instructions should not include seed ReviewInputPath.'
+Assert-True ($partnerInstructions.Contains("SourceOutboxPath: $(Join-Path $expectedPartnerContractRoot 'source-outbox')")) 'partner instructions should point to external contract outbox.'
 Assert-True ($partnerMessageText.Contains('[handoff-wait]')) 'partner initial message should be a handoff-wait notice.'
 Assert-True ($partnerMessageText.Contains('partner handoff message가 오기 전까지 작업을 시작하지 마세요.')) 'partner initial message should tell the target to wait.'
 Assert-True (-not $partnerMessageText.Contains($seedTaskText)) 'partner initial message should not include the seed task text.'

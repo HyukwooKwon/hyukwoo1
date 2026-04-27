@@ -8,6 +8,7 @@ from pathlib import Path
 
 
 _WORKSPACE_TEMP_ROOT = Path("_tmp") / "test-temp"
+_EXTERNAL_TEMP_ROOT = Path(os.environ.get("LOCALAPPDATA", tempfile.gettempdir())) / "hyukwoo1-test-temp"
 _ORIGINAL_TEMPORARY_DIRECTORY = tempfile.TemporaryDirectory
 _TEMPFILE_CONFIGURED = False
 
@@ -21,6 +22,38 @@ class WorkspaceTemporaryDirectory:
         ignore_cleanup_errors: bool = False,
     ) -> None:
         root = Path(dir) if dir is not None else _WORKSPACE_TEMP_ROOT
+        root.mkdir(parents=True, exist_ok=True)
+        prefix_text = prefix if prefix is not None else "tmp"
+        suffix_text = suffix if suffix is not None else ""
+        while True:
+            candidate = root / f"{prefix_text}{uuid.uuid4().hex[:10]}{suffix_text}"
+            if candidate.exists():
+                continue
+            candidate.mkdir(parents=True, exist_ok=False)
+            self.name = str(candidate.resolve())
+            break
+        self._ignore_cleanup_errors = ignore_cleanup_errors
+
+    def __enter__(self) -> str:
+        return self.name
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.cleanup()
+        return None
+
+    def cleanup(self) -> None:
+        shutil.rmtree(self.name, ignore_errors=True)
+
+
+class ExternalTemporaryDirectory:
+    def __init__(
+        self,
+        suffix: str | None = None,
+        prefix: str | None = None,
+        dir: str | os.PathLike[str] | None = None,
+        ignore_cleanup_errors: bool = False,
+    ) -> None:
+        root = Path(dir) if dir is not None else _EXTERNAL_TEMP_ROOT
         root.mkdir(parents=True, exist_ok=True)
         prefix_text = prefix if prefix is not None else "tmp"
         suffix_text = suffix if suffix is not None else ""

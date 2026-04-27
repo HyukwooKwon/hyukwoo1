@@ -30,6 +30,11 @@ Assert-True (@($closeoutFunction).Count -eq 1) 'Get-CloseoutStatus function shou
 
 Invoke-Expression $closeoutFunction[0].Extent.Text
 
+$nullStatusPending = Get-CloseoutStatus -Status $null -AcceptanceForwardedStateCount 2 -CloseoutForwardedStateCount 4 -ExpectedDonePresentCount 2
+Assert-True (-not [bool]$nullStatusPending.Satisfied) 'Closeout should remain pending when no paired status snapshot is available yet.'
+Assert-True ([int]$nullStatusPending.ObservedForwardedStateCount -eq 0) 'Closeout should treat missing paired status as zero forwarded states.'
+Assert-True ([string]$nullStatusPending.Status -eq 'pending') 'Closeout should remain pending when paired status is missing.'
+
 $statusMissingDone = [pscustomobject]@{
     Counts = [pscustomobject]@{
         ForwardedStateCount = 4

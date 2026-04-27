@@ -64,7 +64,7 @@
         DefaultEnabled = $true
         StatePath = 'C:\dev\python\hyukwoo\hyukwoo1\runtime\pair-activation\bottest-live-visible.json'
     }
-    DefaultFixedSuffix = '여기에 고정문구 입력'
+    DefaultFixedSuffix = $null
     SendTimeoutMs = 5000
 
     ActivateSettleMs = 250
@@ -73,14 +73,25 @@
 
     TextSettlePerKbMs = 350
 
-    TextSettleMaxMs = 5000
+    TextSettleMaxMs = 9000
+
+    TerminalInputMode = 'paste'
+
+    SubmitGuardMs = 2500
 
     EnterDelayMs = 900
 
     PostSubmitDelayMs = 900
 
+    SubmitRetryModes = @('enter')
+
     SubmitRetryIntervalMs = 1800
-    WindowLookupRetryCount = 1
+    VisibleExecutionBeaconEnabled = $true
+    VisibleExecutionPreHoldMs = 1500
+    VisibleExecutionPostHoldMs = 1500
+    VisibleExecutionRestorePreviousActive = $false
+    VisibleExecutionFailOnFocusSteal = $true
+    WindowLookupRetryCount = 1
     LauncherWrapperPath = 'C:\Users\USER\s_8windows_left_monitor_codex_visible.py'
     WindowLaunch = @{
         LauncherMode = 'wrapper'
@@ -117,8 +128,27 @@
     FailedRoot = 'C:\dev\python\hyukwoo\hyukwoo1\failed\bottest-live-visible'
     ShellPath = 'powershell.exe'
     PairTest = @{
-        ExecutionPathMode = 'visible-worker'
+        ExecutionPathMode = 'typed-window'
+        RequireUserVisibleCellExecution = $true
+        AllowedWindowVisibilityMethods = @('hwnd')
         AcceptanceProfile = 'smoke'
+        RequireExternalSeedWorkRepo = $true
+        DefaultSeedWorkRepoRoot = 'C:\dev\python\relay-workrepo-visible-smoke'
+        DefaultSeedReviewInputPath = 'C:\dev\python\relay-workrepo-visible-smoke\reviewfile\seed_review_input_latest.zip'
+        DefaultSeedReviewInputSearchRelativePath = 'reviewfile'
+        DefaultSeedReviewInputFilter = '*.zip'
+        DefaultSeedReviewInputRequireSingleCandidate = $false
+        UseExternalWorkRepoRunRoot = $true
+        RequireExternalRunRoot = $true
+        ExternalWorkRepoRunRootRelativeRoot = '.relay-runs\bottest-live-visible'
+        UseExternalWorkRepoContractPaths = $true
+        ExternalWorkRepoContractRelativeRoot = '.relay-contract\bottest-live-visible'
+        TypedWindow = @{
+            SubmitProbeSeconds = 10
+            SubmitProbePollMs = 1000
+            SubmitRetryLimit = 1
+            ProgressCpuDeltaThresholdSeconds = 0.05
+        }
         SmokeSeedTaskText = @'
 현재 run은 acceptance smoke 테스트입니다.
 실제 프로젝트 전반을 깊게 수정하려 하지 말고, 현재 run 계약만 만족하는 최소 산출물만 만드세요.
@@ -273,6 +303,9 @@ summary.txt 에는 간단한 smoke 결과 2~4줄만 적고, review.zip 에는 sm
 
             pair01 = @{
                 DefaultSeedTargetId = 'target01'
+                UseExternalWorkRepoRunRoot = $true
+                RequireExternalRunRoot = $true
+                UseExternalWorkRepoContractPaths = $true
                 PublishContractMode = 'strict'
                 RecoveryPolicy = 'manual-review'
                 PauseAllowed = $true
@@ -280,6 +313,9 @@ summary.txt 에는 간단한 smoke 결과 2~4줄만 적고, review.zip 에는 sm
 
             pair02 = @{
                 DefaultSeedTargetId = 'target02'
+                UseExternalWorkRepoRunRoot = $true
+                RequireExternalRunRoot = $true
+                UseExternalWorkRepoContractPaths = $true
                 PublishContractMode = 'strict'
                 RecoveryPolicy = 'manual-review'
                 PauseAllowed = $true
@@ -287,6 +323,9 @@ summary.txt 에는 간단한 smoke 결과 2~4줄만 적고, review.zip 에는 sm
 
             pair03 = @{
                 DefaultSeedTargetId = 'target03'
+                UseExternalWorkRepoRunRoot = $true
+                RequireExternalRunRoot = $true
+                UseExternalWorkRepoContractPaths = $true
                 PublishContractMode = 'strict'
                 RecoveryPolicy = 'manual-review'
                 PauseAllowed = $true
@@ -294,6 +333,9 @@ summary.txt 에는 간단한 smoke 결과 2~4줄만 적고, review.zip 에는 sm
 
             pair04 = @{
                 DefaultSeedTargetId = 'target04'
+                UseExternalWorkRepoRunRoot = $true
+                RequireExternalRunRoot = $true
+                UseExternalWorkRepoContractPaths = $true
                 PublishContractMode = 'strict'
                 RecoveryPolicy = 'manual-review'
                 PauseAllowed = $true
@@ -367,7 +409,7 @@ summary.txt 에는 간단한 smoke 결과 2~4줄만 적고, review.zip 에는 sm
                 )
             }
         }
-        RunRootBase = 'C:\dev\python\hyukwoo\hyukwoo1\pair-test\bottest-live-visible'
+        RunRootBase = 'C:\dev\python\relay-workrepo-visible-smoke\.relay-runs\bottest-live-visible'
         PairOverrides = @{
             pair04 = @{
                 InitialExtraBlocks = @(

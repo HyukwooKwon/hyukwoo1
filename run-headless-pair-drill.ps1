@@ -2,7 +2,7 @@
 param(
     [string]$ConfigPath,
     [string]$RunRoot,
-    [string]$PairId = 'pair01',
+    [string]$PairId,
     [string]$InitialTargetId,
     [int]$MaxForwardCount = 2,
     [int]$RunDurationSec = 900,

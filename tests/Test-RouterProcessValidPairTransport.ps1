@@ -19,6 +19,12 @@ function New-Utf8NoBomEncoding {
     return [System.Text.UTF8Encoding]::new($false)
 }
 
+function Normalize-MultilineText {
+    param([Parameter(Mandatory)][string]$Value)
+
+    return (($Value -replace "`r?`n", "`r`n").TrimEnd([char[]]"`r`n"))
+}
+
 function Assert-IsoTimestampString {
     param(
         [string]$Value,
@@ -269,6 +275,7 @@ try {
     $processedFile = Wait-ForArchivedMessage -Root $processedRoot -BaseName $readyFile.Name -TimeoutSeconds 15
     Assert-True (Test-Path -LiteralPath $processedFile.FullName -PathType Leaf) 'router should archive the valid pair ready file to processed.'
     Assert-True (Test-Path -LiteralPath ($processedFile.FullName + '.delivery.json') -PathType Leaf) 'processed archive should retain ready delivery metadata.'
+    Assert-True (Test-Path -LiteralPath ($processedFile.FullName + '.payload.txt') -PathType Leaf) 'processed archive should retain the exact sent payload snapshot.'
     Assert-True (-not (Test-Path -LiteralPath $readyFile.FullName -PathType Leaf)) 'ready file should leave the inbox after successful processing.'
 
     $ignoredFiles = @(Get-ChildItem -LiteralPath $ignoredRoot -Filter '*.ready.txt' -File -ErrorAction SilentlyContinue)
@@ -287,6 +294,13 @@ try {
     Assert-IsoTimestampString -Value ([string]$deliveryMetadata.SourceMessageCreatedAt) -Message 'processed delivery metadata should preserve SourceMessageCreatedAt as an ISO timestamp string.'
     Assert-True ((Get-JsonStringField -Json $deliveryMetadataRaw -FieldName 'CreatedAt') -eq [string]$deliveryMetadata.CreatedAt) 'delivery metadata reader should preserve CreatedAt without locale conversion.'
     Assert-True ((Get-JsonStringField -Json $deliveryMetadataRaw -FieldName 'SourceMessageCreatedAt') -eq [string]$deliveryMetadata.SourceMessageCreatedAt) 'delivery metadata reader should preserve SourceMessageCreatedAt without locale conversion.'
+    Assert-True ([string]$deliveryMetadata.PayloadSnapshotPath -eq ($processedFile.FullName + '.payload.txt')) 'processed delivery metadata should expose payload snapshot path.'
+    Assert-True ([string]$deliveryMetadata.PayloadSha256 -ne '') 'processed delivery metadata should expose payload snapshot hash.'
+    Assert-True ([int]$deliveryMetadata.PayloadBytes -gt 0) 'processed delivery metadata should expose payload snapshot bytes.'
+    $payloadSnapshotText = Get-Content -LiteralPath ($processedFile.FullName + '.payload.txt') -Raw -Encoding UTF8
+    $originalMessageText = Get-Content -LiteralPath $messagePath -Raw -Encoding UTF8
+    $expectedPayloadText = Normalize-MultilineText -Value $originalMessageText
+    Assert-True ($payloadSnapshotText -eq $expectedPayloadText) 'payload snapshot should match the normalized payload text sent by the router for this flow.'
 
     $statusJson = & (Join-Path $root 'show-relay-status.ps1') -ConfigPath $configPath -RecentCount 4 -AsJson
     $status = ConvertFrom-RelayJsonText -Json (($statusJson | Out-String).Trim())

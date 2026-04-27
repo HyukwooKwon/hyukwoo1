@@ -2,8 +2,8 @@
 param(
     [string]$ConfigPath,
     [string]$RunRoot,
-    [string]$PairId = 'pair01',
-    [string]$SeedTargetId = 'target01',
+    [string]$PairId,
+    [string]$SeedTargetId,
     [int]$RecentRelayCount = 5,
     [switch]$RequireVisibleReceipt,
     [switch]$AsJson
@@ -116,23 +116,6 @@ function Invoke-JsonScript {
     return ($outputText | ConvertFrom-Json)
 }
 
-function Get-PairDefinition {
-    param([Parameter(Mandatory)][string]$PairId)
-
-    $pairs = @{
-        pair01 = [pscustomobject]@{ PairId = 'pair01'; TopTargetId = 'target01'; BottomTargetId = 'target05' }
-        pair02 = [pscustomobject]@{ PairId = 'pair02'; TopTargetId = 'target02'; BottomTargetId = 'target06' }
-        pair03 = [pscustomobject]@{ PairId = 'pair03'; TopTargetId = 'target03'; BottomTargetId = 'target07' }
-        pair04 = [pscustomobject]@{ PairId = 'pair04'; TopTargetId = 'target04'; BottomTargetId = 'target08' }
-    }
-
-    if (-not $pairs.ContainsKey($PairId)) {
-        throw "알 수 없는 pair id입니다: $PairId"
-    }
-
-    return $pairs[$PairId]
-}
-
 function New-CheckResult {
     param(
         [Parameter(Mandatory)][string]$Name,
@@ -215,6 +198,54 @@ function Test-SuccessAcceptanceState {
     return ($AcceptanceState -in @('roundtrip-confirmed', 'first-handoff-confirmed'))
 }
 
+function Resolve-ConfirmPairSelection {
+    param(
+        [Parameter(Mandatory)][string]$Root,
+        [Parameter(Mandatory)][string]$ConfigPath,
+        [string]$PairId,
+        [string]$SeedTargetId
+    )
+
+    $pairTest = Resolve-PairTestConfig -Root $Root -ConfigPath $ConfigPath
+    if (-not (Test-NonEmptyString $PairId)) {
+        $PairId = Get-DefaultPairId -PairTest $pairTest
+    }
+
+    $pairDefinition = Get-PairDefinition -PairTest $pairTest -PairId $PairId
+    if (-not (Test-NonEmptyString $SeedTargetId)) {
+        $SeedTargetId = if (Test-NonEmptyString ([string]$pairDefinition.SeedTargetId)) {
+            [string]$pairDefinition.SeedTargetId
+        }
+        else {
+            [string]$pairDefinition.TopTargetId
+        }
+    }
+
+    $pairTargetIds = @(
+        [string]$pairDefinition.TopTargetId
+        [string]$pairDefinition.BottomTargetId
+    ) | Where-Object { Test-NonEmptyString $_ } | Select-Object -Unique
+
+    if ([string]$SeedTargetId -notin $pairTargetIds) {
+        throw "seed target does not belong to pair: seed=$SeedTargetId pair=$PairId"
+    }
+
+    $partnerTargetId = if ([string]$SeedTargetId -eq [string]$pairDefinition.TopTargetId) {
+        [string]$pairDefinition.BottomTargetId
+    }
+    else {
+        [string]$pairDefinition.TopTargetId
+    }
+
+    return [pscustomobject]@{
+        PairTest        = $pairTest
+        PairId          = [string]$PairId
+        SeedTargetId    = [string]$SeedTargetId
+        PartnerTargetId = [string]$partnerTargetId
+        PairDefinition  = $pairDefinition
+    }
+}
+
 function Test-VisibleReceiptRoundtripSatisfied {
     param(
         [Parameter(Mandatory)]$RunSummary,
@@ -237,6 +268,7 @@ function Test-VisibleReceiptRoundtripSatisfied {
 }
 
 $root = Split-Path -Parent $PSScriptRoot
+. (Join-Path $PSScriptRoot 'PairedExchangeConfig.ps1')
 if (-not (Test-NonEmptyString $ConfigPath)) {
     $ConfigPath = Get-DefaultConfigPath -Root $root
 }
@@ -246,16 +278,11 @@ if (-not (Test-NonEmptyString $RunRoot)) {
 
 $resolvedConfigPath = (Resolve-Path -LiteralPath $ConfigPath).Path
 $resolvedRunRoot = (Resolve-Path -LiteralPath $RunRoot).Path
-$pairDefinition = Get-PairDefinition -PairId $PairId
-$partnerTargetId = if ([string]$SeedTargetId -eq [string]$pairDefinition.TopTargetId) {
-    [string]$pairDefinition.BottomTargetId
-}
-elseif ([string]$SeedTargetId -eq [string]$pairDefinition.BottomTargetId) {
-    [string]$pairDefinition.TopTargetId
-}
-else {
-    throw "seed target does not belong to pair: seed=$SeedTargetId pair=$PairId"
-}
+$pairSelection = Resolve-ConfirmPairSelection -Root $root -ConfigPath $resolvedConfigPath -PairId $PairId -SeedTargetId $SeedTargetId
+$PairId = [string]$pairSelection.PairId
+$SeedTargetId = [string]$pairSelection.SeedTargetId
+$pairDefinition = $pairSelection.PairDefinition
+$partnerTargetId = [string]$pairSelection.PartnerTargetId
 
 $pairedStatus = Invoke-JsonScript -ScriptPath (Join-Path $root 'tests\Show-PairedExchangeStatus.ps1') -Parameters @{
     ConfigPath = $resolvedConfigPath

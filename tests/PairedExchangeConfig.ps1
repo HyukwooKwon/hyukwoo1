@@ -172,6 +172,29 @@ function Get-TargetContractPaths {
     }
 }
 
+function Get-ExternalContractPathMode {
+    param(
+        [Parameter(Mandatory)]$PairTest,
+        $PairPolicy = $null
+    )
+
+    return [bool](Get-ConfigValue -Object $PairPolicy -Name 'UseExternalWorkRepoContractPaths' -DefaultValue ([bool](Get-ConfigValue -Object $PairTest -Name 'UseExternalWorkRepoContractPaths' -DefaultValue $false)))
+}
+
+function Test-UseExternalWorkRepoRunRoot {
+    param(
+        [Parameter(Mandatory)]$PairTest,
+        $PairPolicy = $null,
+        [string]$WorkRepoRoot = ''
+    )
+
+    if (-not (Test-NonEmptyString $WorkRepoRoot)) {
+        return $false
+    }
+
+    return [bool](Get-ConfigValue -Object $PairPolicy -Name 'UseExternalWorkRepoRunRoot' -DefaultValue ([bool](Get-ConfigValue -Object $PairTest -Name 'UseExternalWorkRepoRunRoot' -DefaultValue $false)))
+}
+
 function Get-StringArray {
     param($Value)
 
@@ -203,6 +226,369 @@ function Get-StringArray {
     }
 
     return @()
+}
+
+function Get-RelaySubmitRetryModes {
+    param(
+        [Parameter(Mandatory)]$Config,
+        [string[]]$DefaultValues = @('enter')
+    )
+
+    $seen = @{}
+    $normalizedModes = New-Object System.Collections.Generic.List[string]
+    foreach ($mode in @(Get-StringArray (Get-ConfigValue -Object $Config -Name 'SubmitRetryModes' -DefaultValue @($DefaultValues)))) {
+        $normalized = [string]$mode
+        if (-not (Test-NonEmptyString $normalized)) {
+            continue
+        }
+
+        $normalized = $normalized.Trim().ToLowerInvariant()
+        if (-not (Test-NonEmptyString $normalized)) {
+            continue
+        }
+        if ($seen.ContainsKey($normalized)) {
+            continue
+        }
+
+        $seen[$normalized] = $true
+        $normalizedModes.Add($normalized)
+    }
+
+    if ($normalizedModes.Count -gt 0) {
+        return @($normalizedModes)
+    }
+
+    return @('enter')
+}
+
+function Get-RelayPrimarySubmitMode {
+    param([string[]]$Modes = @())
+
+    $normalizedModes = @($Modes | Where-Object { Test-NonEmptyString $_ })
+    if ($normalizedModes.Count -eq 0) {
+        return ''
+    }
+
+    return [string]$normalizedModes[0]
+}
+
+function Get-RelayFinalSubmitMode {
+    param([string[]]$Modes = @())
+
+    $normalizedModes = @($Modes | Where-Object { Test-NonEmptyString $_ })
+    if ($normalizedModes.Count -eq 0) {
+        return ''
+    }
+
+    return [string]$normalizedModes[-1]
+}
+
+function Get-RelaySubmitRetrySequenceSummary {
+    param([string[]]$Modes = @())
+
+    $normalizedModes = @($Modes | Where-Object { Test-NonEmptyString $_ })
+    if ($normalizedModes.Count -eq 0) {
+        return ''
+    }
+
+    return ([string]::Join(' -> ', $normalizedModes))
+}
+
+function Test-PairedAcceptanceSuccessState {
+    param([string]$AcceptanceState)
+
+    return ($AcceptanceState -in @('roundtrip-confirmed', 'first-handoff-confirmed'))
+}
+
+function Test-PairedSourceOutboxAcceptedRow {
+    param($Row)
+
+    $state = [string](Get-ConfigValue -Object $Row -Name 'SourceOutboxState' -DefaultValue '')
+    $nextAction = [string](Get-ConfigValue -Object $Row -Name 'SourceOutboxNextAction' -DefaultValue '')
+    $latestState = [string](Get-ConfigValue -Object $Row -Name 'LatestState' -DefaultValue '')
+
+    if ($state -in @('imported', 'imported-archive-pending', 'forwarded')) {
+        return $true
+    }
+    if ($state -in @('duplicate-marker-archived', 'duplicate-marker-present')) {
+        return (
+            $nextAction -in @('handoff-ready', 'already-forwarded', 'duplicate-skipped') -or
+            $latestState -in @('ready-to-forward', 'forwarded', 'duplicate-skipped')
+        )
+    }
+    return $false
+}
+
+function Test-PairedSourceOutboxObservedRow {
+    param($Row)
+
+    if ($null -eq $Row) {
+        return $false
+    }
+
+    $state = [string](Get-ConfigValue -Object $Row -Name 'SourceOutboxState' -DefaultValue '')
+    $latestState = [string](Get-ConfigValue -Object $Row -Name 'LatestState' -DefaultValue '')
+    $publishReadyPath = [string](Get-ConfigValue -Object $Row -Name 'PublishReadyPath' -DefaultValue '')
+    $summaryPath = [string](Get-ConfigValue -Object $Row -Name 'SourceSummaryPath' -DefaultValue '')
+    if (-not (Test-NonEmptyString $summaryPath)) {
+        $summaryPath = [string](Get-ConfigValue -Object $Row -Name 'SummaryPath' -DefaultValue '')
+    }
+    $reviewZipPath = [string](Get-ConfigValue -Object $Row -Name 'SourceReviewZipPath' -DefaultValue '')
+    if (-not (Test-NonEmptyString $reviewZipPath)) {
+        $reviewZipPath = [string](Get-ConfigValue -Object $Row -Name 'ReviewZipPath' -DefaultValue '')
+    }
+
+    if ($state -in @('publish-started', 'imported', 'imported-archive-pending', 'duplicate-marker-archived', 'duplicate-marker-present', 'forwarded')) {
+        return $true
+    }
+    if ($latestState -in @('ready-to-forward', 'forwarded', 'duplicate-skipped')) {
+        return $true
+    }
+    if ((Test-NonEmptyString $publishReadyPath) -and (Test-Path -LiteralPath $publishReadyPath)) {
+        return $true
+    }
+    if ((Test-NonEmptyString $summaryPath) -and (Test-Path -LiteralPath $summaryPath) -and
+        (Test-NonEmptyString $reviewZipPath) -and (Test-Path -LiteralPath $reviewZipPath)) {
+        return $true
+    }
+    return $false
+}
+
+function Test-PairedSourceOutboxStrictReadyRow {
+    param($Row)
+
+    if ($null -eq $Row) {
+        return $false
+    }
+
+    if (Test-PairedSourceOutboxAcceptedRow -Row $Row) {
+        return $true
+    }
+    if (Test-PairedHandoffTransitionReadyRow -Row $Row) {
+        return $true
+    }
+
+    $publishReadyPath = [string](Get-ConfigValue -Object $Row -Name 'PublishReadyPath' -DefaultValue '')
+    $summaryPath = [string](Get-ConfigValue -Object $Row -Name 'SourceSummaryPath' -DefaultValue '')
+    if (-not (Test-NonEmptyString $summaryPath)) {
+        $summaryPath = [string](Get-ConfigValue -Object $Row -Name 'SummaryPath' -DefaultValue '')
+    }
+    $reviewZipPath = [string](Get-ConfigValue -Object $Row -Name 'SourceReviewZipPath' -DefaultValue '')
+    if (-not (Test-NonEmptyString $reviewZipPath)) {
+        $reviewZipPath = [string](Get-ConfigValue -Object $Row -Name 'ReviewZipPath' -DefaultValue '')
+    }
+
+    return (
+        (Test-NonEmptyString $publishReadyPath) -and (Test-Path -LiteralPath $publishReadyPath) -and
+        (Test-NonEmptyString $summaryPath) -and (Test-Path -LiteralPath $summaryPath) -and
+        (Test-NonEmptyString $reviewZipPath) -and (Test-Path -LiteralPath $reviewZipPath)
+    )
+}
+
+function Test-PairedHandoffTransitionReadyRow {
+    param($Row)
+
+    $nextAction = [string](Get-ConfigValue -Object $Row -Name 'SourceOutboxNextAction' -DefaultValue '')
+    $latestState = [string](Get-ConfigValue -Object $Row -Name 'LatestState' -DefaultValue '')
+
+    return (
+        $nextAction -in @('handoff-ready', 'already-forwarded', 'duplicate-skipped') -or
+        $latestState -in @('ready-to-forward', 'forwarded', 'duplicate-skipped')
+    )
+}
+
+function Test-PairedHandoffAcceptedRow {
+    param($Row)
+
+    $latestState = [string](Get-ConfigValue -Object $Row -Name 'LatestState' -DefaultValue '')
+    $sourceOutboxState = [string](Get-ConfigValue -Object $Row -Name 'SourceOutboxState' -DefaultValue '')
+
+    return (
+        $latestState -in @('forwarded', 'duplicate-skipped') -or
+        $sourceOutboxState -eq 'forwarded'
+    )
+}
+
+function Test-PairedPartnerProgressObserved {
+    param($Row)
+
+    if ($null -eq $Row) {
+        return $false
+    }
+
+    $submitState = [string](Get-ConfigValue -Object $Row -Name 'SubmitState' -DefaultValue '')
+    $sourceOutboxState = [string](Get-ConfigValue -Object $Row -Name 'SourceOutboxState' -DefaultValue '')
+    $latestState = [string](Get-ConfigValue -Object $Row -Name 'LatestState' -DefaultValue '')
+    $dispatchState = [string](Get-ConfigValue -Object $Row -Name 'DispatchState' -DefaultValue '')
+
+    if (Test-NonEmptyString $submitState) {
+        return $true
+    }
+    if (Test-NonEmptyString $sourceOutboxState) {
+        return $true
+    }
+    if ($dispatchState -in @('running', 'failed')) {
+        return $true
+    }
+    return ($latestState -in @('ready-to-forward', 'forwarded', 'duplicate-skipped'))
+}
+
+function Test-PairedFirstHandoffDetected {
+    param(
+        $CurrentRow,
+        $PartnerRow = $null,
+        [int]$ForwardedCount = 0,
+        [int]$PartnerReadyCount = 0,
+        [int]$InitialPartnerInboxCount = 0,
+        [switch]$UseVisibleWorker
+    )
+
+    if ($UseVisibleWorker) {
+        return (
+            $ForwardedCount -ge 1 -or
+            (Test-PairedHandoffTransitionReadyRow -Row $CurrentRow) -or
+            (Test-PairedHandoffAcceptedRow -Row $CurrentRow) -or
+            ((Test-PairedSourceOutboxObservedRow -Row $CurrentRow) -and (Test-PairedPartnerProgressObserved -Row $PartnerRow))
+        )
+    }
+
+    $currentLatestState = [string](Get-ConfigValue -Object $CurrentRow -Name 'LatestState' -DefaultValue '')
+    return ($currentLatestState -eq 'forwarded' -or $PartnerReadyCount -gt $InitialPartnerInboxCount)
+}
+
+function Test-PairedRoundtripDetected {
+    param(
+        $SeedRow,
+        $PartnerRow = $null,
+        [int]$ForwardedCount = 0,
+        [int]$SeedReadyCount = 0,
+        [int]$RoundtripBaselineSeedInboxCount = 0,
+        [switch]$UseVisibleWorker
+    )
+
+    if ($UseVisibleWorker) {
+        return (
+            $ForwardedCount -ge 2 -or
+            (Test-PairedHandoffAcceptedRow -Row $PartnerRow)
+        )
+    }
+
+    return ($SeedReadyCount -gt $RoundtripBaselineSeedInboxCount)
+}
+
+function Get-PairedAcceptanceManualAttentionOutcome {
+    param([string]$RetryReason = '')
+
+    $reason = if (Test-NonEmptyString $RetryReason) { $RetryReason } else { 'manual-attention-required' }
+    return [pscustomobject]@{
+        AcceptanceState = 'manual_attention_required'
+        AcceptanceReason = $reason
+    }
+}
+
+function Get-PairedAcceptanceFailureOutcome {
+    param(
+        [string]$SubmitState = '',
+        [string]$ExecutionState = '',
+        [string]$SubmitReason = ''
+    )
+
+    $state = if ($SubmitState -eq 'unconfirmed') { 'submit-unconfirmed' } else { $ExecutionState }
+    if (-not (Test-NonEmptyString $state)) {
+        $state = 'error'
+    }
+    $reason = if (Test-NonEmptyString $SubmitReason) { $SubmitReason } else { $state }
+
+    return [pscustomobject]@{
+        AcceptanceState = $state
+        AcceptanceReason = $reason
+    }
+}
+
+function Get-PairedAcceptanceSuccessOutcome {
+    param(
+        [switch]$FirstHandoff,
+        [switch]$Roundtrip,
+        [switch]$UseVisibleWorker
+    )
+
+    if ($Roundtrip) {
+        return [pscustomobject]@{
+            AcceptanceState = 'roundtrip-confirmed'
+            AcceptanceReason = if ($UseVisibleWorker) { 'forwarded-state-roundtrip-detected' } else { 'seed-target-received-followup-ready-file' }
+        }
+    }
+
+    if ($FirstHandoff) {
+        return [pscustomobject]@{
+            AcceptanceState = 'first-handoff-confirmed'
+            AcceptanceReason = if ($UseVisibleWorker) { 'forwarded-state-detected' } else { 'partner-ready-file-detected' }
+        }
+    }
+
+    return [pscustomobject]@{
+        AcceptanceState = 'waiting'
+        AcceptanceReason = ''
+    }
+}
+
+function Get-PairedAcceptanceTimeoutOutcome {
+    param(
+        [bool]$FirstHandoffConfirmed,
+        [switch]$UseVisibleWorker,
+        [string]$WatcherStopSuffix = ''
+    )
+
+    if ($FirstHandoffConfirmed) {
+        $state = 'roundtrip-timeout'
+        $reason = if ($UseVisibleWorker) { 'roundtrip-forwarded-state-not-detected' } else { 'seed-target-followup-ready-file-not-detected' }
+    }
+    else {
+        $state = 'first-handoff-timeout'
+        $reason = if ($UseVisibleWorker) { 'first-forwarded-state-not-detected' } else { 'partner-ready-file-not-detected' }
+    }
+
+    return [pscustomobject]@{
+        AcceptanceState = $state
+        AcceptanceReason = ($reason + $WatcherStopSuffix)
+    }
+}
+
+function New-PairedPrimitiveEvidence {
+    param(
+        $TargetRow = $null,
+        $PartnerRow = $null,
+        $PairRow = $null,
+        $Receipt = $null,
+        $Watcher = $null,
+        $Counts = $null,
+        [hashtable]$Extra = @{}
+    )
+
+    $evidence = [ordered]@{}
+    if ($null -ne $TargetRow) {
+        $evidence.Target = $TargetRow
+    }
+    if ($null -ne $PartnerRow) {
+        $evidence.Partner = $PartnerRow
+    }
+    if ($null -ne $PairRow) {
+        $evidence.Pair = $PairRow
+    }
+    if ($null -ne $Receipt) {
+        $evidence.AcceptanceReceipt = $Receipt
+    }
+    if ($null -ne $Watcher) {
+        $evidence.Watcher = $Watcher
+    }
+    if ($null -ne $Counts) {
+        $evidence.Counts = $Counts
+    }
+    foreach ($key in @($Extra.Keys | Sort-Object)) {
+        $evidence[$key] = $Extra[$key]
+    }
+
+    return [pscustomobject]$evidence
 }
 
 function Get-DefaultMessageSlotOrder {
@@ -313,13 +699,430 @@ function Resolve-FullPathFromBase {
     return [System.IO.Path]::GetFullPath((Join-Path $BasePath $PathValue))
 }
 
-function Get-FallbackPairDefinitions {
-    return @(
-        [pscustomobject]@{ PairId = 'pair01'; TopTargetId = 'target01'; BottomTargetId = 'target05' }
-        [pscustomobject]@{ PairId = 'pair02'; TopTargetId = 'target02'; BottomTargetId = 'target06' }
-        [pscustomobject]@{ PairId = 'pair03'; TopTargetId = 'target03'; BottomTargetId = 'target07' }
-        [pscustomobject]@{ PairId = 'pair04'; TopTargetId = 'target04'; BottomTargetId = 'target08' }
+function Get-BookkeepingResidualRootsEvidence {
+    param(
+        [Parameter(Mandatory)]$Config,
+        [Parameter(Mandatory)][string]$BasePath
     )
+
+    $rootKeys = @(
+        'InboxRoot',
+        'ProcessedRoot',
+        'RuntimeRoot',
+        'LogsRoot'
+    )
+
+    $items = @()
+    foreach ($key in $rootKeys) {
+        $rawValue = [string](Get-ConfigValue -Object $Config -Name $key -DefaultValue '')
+        if (-not (Test-NonEmptyString $rawValue)) {
+            continue
+        }
+
+        $items += [pscustomobject]@{
+            Name = [string]$key
+            Path = (Resolve-FullPathFromBase -PathValue $rawValue -BasePath $BasePath)
+        }
+    }
+
+    return @($items)
+}
+
+function Test-PathEqualsOrIsDescendant {
+    param(
+        [string]$Path,
+        [string]$BasePath
+    )
+
+    if (-not (Test-NonEmptyString $Path) -or -not (Test-NonEmptyString $BasePath)) {
+        return $false
+    }
+
+    $normalizedPath = [System.IO.Path]::GetFullPath($Path).TrimEnd('\')
+    $normalizedBase = [System.IO.Path]::GetFullPath($BasePath).TrimEnd('\')
+    if ($normalizedPath -eq $normalizedBase) {
+        return $true
+    }
+
+    return $normalizedPath.StartsWith(($normalizedBase + '\'), [System.StringComparison]::OrdinalIgnoreCase)
+}
+
+function Test-BookkeepingRootsPolicy {
+    param(
+        [Parameter(Mandatory)]$Config,
+        [Parameter(Mandatory)]$PairTest,
+        $PairPolicy = $null,
+        [Parameter(Mandatory)][string]$AutomationRoot,
+        [Parameter(Mandatory)][string]$BasePath,
+        [string]$WorkRepoRoot = ''
+    )
+
+    $requiresExternalBookkeeping = (
+        [bool](Get-ConfigValue -Object $PairPolicy -Name 'RequireExternalRunRoot' -DefaultValue ([bool](Get-ConfigValue -Object $PairTest -Name 'RequireExternalRunRoot' -DefaultValue $false))) -or
+        [bool](Get-ConfigValue -Object $PairPolicy -Name 'UseExternalWorkRepoRunRoot' -DefaultValue ([bool](Get-ConfigValue -Object $PairTest -Name 'UseExternalWorkRepoRunRoot' -DefaultValue $false)))
+    )
+
+    if (-not $requiresExternalBookkeeping) {
+        return [pscustomobject]@{
+            Passed = $true
+            Reason = ''
+            Detail = ''
+            ResidualRoots = @()
+        }
+    }
+
+    if (-not (Test-NonEmptyString $WorkRepoRoot)) {
+        return [pscustomobject]@{
+            Passed = $false
+            Reason = 'external-bookkeeping-workrepo-required'
+            Detail = 'WorkRepoRoot is empty.'
+            ResidualRoots = @()
+        }
+    }
+
+    $resolvedAutomationRoot = [System.IO.Path]::GetFullPath($AutomationRoot)
+    $resolvedWorkRepoRoot = [System.IO.Path]::GetFullPath($WorkRepoRoot)
+    $residualRoots = @(Get-BookkeepingResidualRootsEvidence -Config $Config -BasePath $BasePath)
+
+    foreach ($item in @($residualRoots)) {
+        $path = [string]$item.Path
+        if (-not (Test-NonEmptyString $path)) {
+            continue
+        }
+
+        if (Test-PathEqualsOrIsDescendant -Path $path -BasePath $resolvedAutomationRoot) {
+            return [pscustomobject]@{
+                Passed = $false
+                Reason = 'automation-repo-bookkeeping-roots-disallowed'
+                Detail = ('{0} must be outside automation repo. automationRoot={1} path={2}' -f [string]$item.Name, $resolvedAutomationRoot, $path)
+                ResidualRoots = @($residualRoots)
+            }
+        }
+
+        if (-not (Test-PathEqualsOrIsDescendant -Path $path -BasePath $resolvedWorkRepoRoot)) {
+            return [pscustomobject]@{
+                Passed = $false
+                Reason = 'bookkeeping-root-outside-workrepo'
+                Detail = ('{0} must be inside WorkRepoRoot. workRepoRoot={1} path={2}' -f [string]$item.Name, $resolvedWorkRepoRoot, $path)
+                ResidualRoots = @($residualRoots)
+            }
+        }
+    }
+
+    return [pscustomobject]@{
+        Passed = $true
+        Reason = ''
+        Detail = ''
+        ResidualRoots = @($residualRoots)
+    }
+}
+
+function Test-SeedWorkRepoPolicy {
+    param(
+        [Parameter(Mandatory)]$PairTest,
+        [Parameter(Mandatory)]$PairPolicy,
+        [Parameter(Mandatory)][string]$AutomationRoot,
+        [string]$WorkRepoRoot,
+        [string]$ReviewInputPath = ''
+    )
+
+    $requireExternal = [bool](Get-ConfigValue -Object $PairPolicy -Name 'RequireExternalSeedWorkRepo' -DefaultValue (Get-ConfigValue -Object $PairTest -Name 'RequireExternalSeedWorkRepo' -DefaultValue $false))
+    if (-not $requireExternal) {
+        return [pscustomobject]@{
+            Passed = $true
+            Reason = ''
+            Detail = ''
+        }
+    }
+
+    if (-not (Test-NonEmptyString $WorkRepoRoot)) {
+        return [pscustomobject]@{
+            Passed = $false
+            Reason = 'external-workrepo-required'
+            Detail = 'WorkRepoRoot is empty.'
+        }
+    }
+
+    $resolvedAutomationRoot = [System.IO.Path]::GetFullPath($AutomationRoot)
+    $resolvedWorkRepoRoot = [System.IO.Path]::GetFullPath($WorkRepoRoot)
+    if (Test-PathEqualsOrIsDescendant -Path $resolvedWorkRepoRoot -BasePath $resolvedAutomationRoot) {
+        return [pscustomobject]@{
+            Passed = $false
+            Reason = 'automation-repo-workrepo-disallowed'
+            Detail = ('WorkRepoRoot must be outside automation repo. automationRoot={0} workRepoRoot={1}' -f $resolvedAutomationRoot, $resolvedWorkRepoRoot)
+        }
+    }
+
+    if (Test-NonEmptyString $ReviewInputPath) {
+        $resolvedReviewInputPath = [System.IO.Path]::GetFullPath($ReviewInputPath)
+        if (Test-PathEqualsOrIsDescendant -Path $resolvedReviewInputPath -BasePath $resolvedAutomationRoot) {
+            return [pscustomobject]@{
+                Passed = $false
+                Reason = 'automation-repo-reviewinput-disallowed'
+                Detail = ('ReviewInputPath must be outside automation repo. automationRoot={0} reviewInputPath={1}' -f $resolvedAutomationRoot, $resolvedReviewInputPath)
+            }
+        }
+    }
+
+    return [pscustomobject]@{
+        Passed = $true
+        Reason = ''
+        Detail = ''
+    }
+}
+
+function Assert-SeedWorkRepoPolicy {
+    param(
+        [Parameter(Mandatory)]$PairTest,
+        [Parameter(Mandatory)]$PairPolicy,
+        [Parameter(Mandatory)][string]$AutomationRoot,
+        [string]$WorkRepoRoot,
+        [string]$ReviewInputPath = ''
+    )
+
+    $policyResult = Test-SeedWorkRepoPolicy `
+        -PairTest $PairTest `
+        -PairPolicy $PairPolicy `
+        -AutomationRoot $AutomationRoot `
+        -WorkRepoRoot $WorkRepoRoot `
+        -ReviewInputPath $ReviewInputPath
+
+    if (-not [bool]$policyResult.Passed) {
+        throw ('seed work repo policy failed: {0} detail={1}' -f [string]$policyResult.Reason, [string]$policyResult.Detail)
+    }
+}
+
+function Test-RunRootPolicy {
+    param(
+        [Parameter(Mandatory)]$PairTest,
+        $PairPolicy = $null,
+        [Parameter(Mandatory)][string]$AutomationRoot,
+        [string]$RunRoot,
+        [string]$WorkRepoRoot = ''
+    )
+
+    $requireExternalRunRoot = [bool](Get-ConfigValue -Object $PairPolicy -Name 'RequireExternalRunRoot' -DefaultValue ([bool](Get-ConfigValue -Object $PairTest -Name 'RequireExternalRunRoot' -DefaultValue $false)))
+    if (-not $requireExternalRunRoot) {
+        return [pscustomobject]@{
+            Passed = $true
+            Reason = ''
+            Detail = ''
+        }
+    }
+
+    if (-not (Test-NonEmptyString $RunRoot)) {
+        return [pscustomobject]@{
+            Passed = $false
+            Reason = 'external-runroot-required'
+            Detail = 'RunRoot is empty.'
+        }
+    }
+
+    if (-not (Test-NonEmptyString $WorkRepoRoot)) {
+        return [pscustomobject]@{
+            Passed = $false
+            Reason = 'external-runroot-workrepo-required'
+            Detail = 'WorkRepoRoot is empty.'
+        }
+    }
+
+    $resolvedAutomationRoot = [System.IO.Path]::GetFullPath($AutomationRoot)
+    $resolvedRunRoot = [System.IO.Path]::GetFullPath($RunRoot)
+    if (Test-PathEqualsOrIsDescendant -Path $resolvedRunRoot -BasePath $resolvedAutomationRoot) {
+        return [pscustomobject]@{
+            Passed = $false
+            Reason = 'automation-repo-runroot-disallowed'
+            Detail = ('RunRoot must be outside automation repo. automationRoot={0} runRoot={1}' -f $resolvedAutomationRoot, $resolvedRunRoot)
+        }
+    }
+
+    $resolvedWorkRepoRoot = [System.IO.Path]::GetFullPath($WorkRepoRoot)
+    if (-not (Test-PathEqualsOrIsDescendant -Path $resolvedRunRoot -BasePath $resolvedWorkRepoRoot)) {
+        return [pscustomobject]@{
+            Passed = $false
+            Reason = 'external-runroot-outside-workrepo'
+            Detail = ('RunRoot must be inside WorkRepoRoot. workRepoRoot={0} runRoot={1}' -f $resolvedWorkRepoRoot, $resolvedRunRoot)
+        }
+    }
+
+    return [pscustomobject]@{
+        Passed = $true
+        Reason = ''
+        Detail = ''
+    }
+}
+
+function Assert-RunRootPolicy {
+    param(
+        [Parameter(Mandatory)]$PairTest,
+        $PairPolicy = $null,
+        [Parameter(Mandatory)][string]$AutomationRoot,
+        [string]$RunRoot,
+        [string]$WorkRepoRoot = ''
+    )
+
+    $policyResult = Test-RunRootPolicy `
+        -PairTest $PairTest `
+        -PairPolicy $PairPolicy `
+        -AutomationRoot $AutomationRoot `
+        -RunRoot $RunRoot `
+        -WorkRepoRoot $WorkRepoRoot
+
+    if (-not [bool]$policyResult.Passed) {
+        throw ('run root policy failed: {0} detail={1}' -f [string]$policyResult.Reason, [string]$policyResult.Detail)
+    }
+}
+
+function Assert-BookkeepingRootsPolicy {
+    param(
+        [Parameter(Mandatory)]$Config,
+        [Parameter(Mandatory)]$PairTest,
+        $PairPolicy = $null,
+        [Parameter(Mandatory)][string]$AutomationRoot,
+        [Parameter(Mandatory)][string]$BasePath,
+        [string]$WorkRepoRoot = ''
+    )
+
+    $policyResult = Test-BookkeepingRootsPolicy `
+        -Config $Config `
+        -PairTest $PairTest `
+        -PairPolicy $PairPolicy `
+        -AutomationRoot $AutomationRoot `
+        -BasePath $BasePath `
+        -WorkRepoRoot $WorkRepoRoot
+
+    if (-not [bool]$policyResult.Passed) {
+        throw ('bookkeeping root policy failed: {0} detail={1}' -f [string]$policyResult.Reason, [string]$policyResult.Detail)
+    }
+}
+
+function Resolve-ConfiguredPairRowSet {
+    param($Source = $null)
+
+    $pairRows = @(
+        Get-ConfigValue -Object $Source -Name 'PairDefinitions' -DefaultValue @()
+    )
+    $sourceDetail = ''
+    if (@($pairRows).Count -gt 0) {
+        $sourceDetail = 'pair-definitions'
+    }
+    if (@($pairRows).Count -eq 0) {
+        $pairRows = @(
+            Get-ConfigValue -Object $Source -Name 'Pairs' -DefaultValue @()
+        )
+        if (@($pairRows).Count -gt 0) {
+            $sourceDetail = 'pairs'
+        }
+    }
+    if (@($pairRows).Count -eq 0) {
+        $nestedPairTest = Get-ConfigValue -Object $Source -Name 'PairTest' -DefaultValue $null
+        if ($null -ne $nestedPairTest) {
+            $pairRows = @(
+                Get-ConfigValue -Object $nestedPairTest -Name 'PairDefinitions' -DefaultValue @()
+            )
+            if (@($pairRows).Count -gt 0) {
+                $sourceDetail = 'pair-definitions'
+            }
+            if (@($pairRows).Count -eq 0) {
+                $pairRows = @(
+                    Get-ConfigValue -Object $nestedPairTest -Name 'Pairs' -DefaultValue @()
+                )
+                if (@($pairRows).Count -gt 0) {
+                    $sourceDetail = 'pairs'
+                }
+            }
+        }
+    }
+
+    return [pscustomobject]@{
+        Rows = @($pairRows)
+        SourceDetail = [string]$sourceDetail
+    }
+}
+
+function Get-ConfiguredTargetRows {
+    param($Source = $null)
+
+    $targetRows = @(
+        Get-ConfigValue -Object $Source -Name 'Targets' -DefaultValue @()
+    )
+    if (@($targetRows).Count -eq 0) {
+        $nestedPairTest = Get-ConfigValue -Object $Source -Name 'PairTest' -DefaultValue $null
+        if ($null -ne $nestedPairTest) {
+            $targetRows = @(
+                Get-ConfigValue -Object $nestedPairTest -Name 'Targets' -DefaultValue @()
+            )
+        }
+    }
+
+    return @($targetRows)
+}
+
+function Get-FallbackPairDefinitions {
+    param($Source = $null)
+
+    $targetRows = @(Get-ConfiguredTargetRows -Source $Source)
+    if (@($targetRows).Count -eq 0) {
+        throw 'PairDefinitions are required when no fallback Targets are available.'
+    }
+    if ((@($targetRows).Count % 2) -ne 0) {
+        throw ('PairDefinitions are required because fallback target-order pairing needs an even number of Targets. actual={0}' -f @($targetRows).Count)
+    }
+
+    $targetIds = New-Object System.Collections.Generic.List[string]
+    foreach ($targetRow in @($targetRows)) {
+        $targetId = [string](Get-ConfigValue -Object $targetRow -Name 'Id' -DefaultValue '')
+        if (-not (Test-NonEmptyString $targetId)) {
+            $targetId = [string](Get-ConfigValue -Object $targetRow -Name 'TargetId' -DefaultValue '')
+        }
+        if (-not (Test-NonEmptyString $targetId)) {
+            throw 'Fallback target-order pairing requires every target row to define Id or TargetId.'
+        }
+        $targetIds.Add($targetId)
+    }
+
+    $pairCount = [int]($targetIds.Count / 2)
+    $pairs = New-Object System.Collections.Generic.List[object]
+    for ($index = 0; $index -lt $pairCount; $index++) {
+        $pairOrdinal = $index + 1
+        $topTargetId = [string]$targetIds[$index]
+        $bottomTargetId = [string]$targetIds[$index + $pairCount]
+        $pairs.Add([pscustomobject]@{
+                PairId = ('pair{0:d2}' -f $pairOrdinal)
+                TopTargetId = $topTargetId
+                BottomTargetId = $bottomTargetId
+                SeedTargetId = $topTargetId
+            })
+    }
+
+    return ([object[]]$pairs.ToArray())
+}
+
+function Get-PairTopologyStrategy {
+    param(
+        [string]$PairDefinitionSource = '',
+        [string]$PairDefinitionSourceDetail = ''
+    )
+
+    $source = [string]$PairDefinitionSource
+    $sourceDetail = [string]$PairDefinitionSourceDetail
+    if (Test-NonEmptyString $sourceDetail) {
+        if ($sourceDetail -like 'fallback-*') {
+            return $sourceDetail
+        }
+        if ($sourceDetail -like '*-pair-definitions' -or $sourceDetail -like '*-pairs') {
+            return 'configured'
+        }
+    }
+
+    if ($source -eq 'fallback') {
+        return 'fallback'
+    }
+    if ($source -in @('config', 'manifest')) {
+        return 'configured'
+    }
+
+    return 'unknown'
 }
 
 function Resolve-ConfiguredPairDefinitions {
@@ -328,18 +1131,19 @@ function Resolve-ConfiguredPairDefinitions {
         [string]$SourceLabel = 'config'
     )
 
-    $pairRows = @(
-        Get-ConfigValue -Object $Source -Name 'PairDefinitions' -DefaultValue @()
-    )
-    if (@($pairRows).Count -eq 0) {
-        $pairRows = @(
-            Get-ConfigValue -Object $Source -Name 'Pairs' -DefaultValue @()
-        )
-    }
+    $pairRowSet = Resolve-ConfiguredPairRowSet -Source $Source
+    $pairRows = @($pairRowSet.Rows)
     $effectiveSource = $SourceLabel
+    $effectiveSourceDetail = if (Test-NonEmptyString ([string]$pairRowSet.SourceDetail)) {
+        ('{0}-{1}' -f $SourceLabel, [string]$pairRowSet.SourceDetail)
+    }
+    else {
+        ''
+    }
     if (@($pairRows).Count -eq 0) {
-        $pairRows = @(Get-FallbackPairDefinitions)
+        $pairRows = @(Get-FallbackPairDefinitions -Source $Source)
         $effectiveSource = 'fallback'
+        $effectiveSourceDetail = 'fallback-target-order'
     }
 
     $resolved = @()
@@ -393,6 +1197,8 @@ function Resolve-ConfiguredPairDefinitions {
 
     return [pscustomobject]@{
         Source = $effectiveSource
+        SourceDetail = [string]$effectiveSourceDetail
+        Strategy = [string](Get-PairTopologyStrategy -PairDefinitionSource $effectiveSource -PairDefinitionSourceDetail $effectiveSourceDetail)
         Pairs = @($resolved)
     }
 }
@@ -423,6 +1229,10 @@ function Resolve-PairPolicyMap {
     $globalSeedReviewNameRegex = [string](Get-ConfigValue -Object $Source -Name 'DefaultSeedReviewInputNameRegex' -DefaultValue '')
     $globalSeedReviewMaxAgeHours = [double](Get-ConfigValue -Object $Source -Name 'DefaultSeedReviewInputMaxAgeHours' -DefaultValue 72)
     $globalSeedReviewRequireSingleCandidate = [bool](Get-ConfigValue -Object $Source -Name 'DefaultSeedReviewInputRequireSingleCandidate' -DefaultValue $false)
+    $globalRequireExternalSeedWorkRepo = [bool](Get-ConfigValue -Object $Source -Name 'RequireExternalSeedWorkRepo' -DefaultValue $false)
+    $globalUseExternalWorkRepoRunRoot = [bool](Get-ConfigValue -Object $Source -Name 'UseExternalWorkRepoRunRoot' -DefaultValue $false)
+    $globalRequireExternalRunRoot = [bool](Get-ConfigValue -Object $Source -Name 'RequireExternalRunRoot' -DefaultValue $false)
+    $globalExternalWorkRepoRunRootRelativeRoot = [string](Get-ConfigValue -Object $Source -Name 'ExternalWorkRepoRunRootRelativeRoot' -DefaultValue '.relay-runs\bottest-live-visible')
     $globalWatcherMaxForwardCount = [int](Get-ConfigValue -Object $Source -Name 'DefaultWatcherMaxForwardCount' -DefaultValue 0)
     $globalWatcherRunDurationSec = [int](Get-ConfigValue -Object $Source -Name 'DefaultWatcherRunDurationSec' -DefaultValue 900)
     $globalPairMaxRoundtripCount = [int](Get-ConfigValue -Object $Source -Name 'DefaultPairMaxRoundtripCount' -DefaultValue 0)
@@ -468,6 +1278,12 @@ function Resolve-PairPolicyMap {
             DefaultSeedReviewInputNameRegex = [string](Get-ConfigValue -Object $pairSource -Name 'DefaultSeedReviewInputNameRegex' -DefaultValue $globalSeedReviewNameRegex)
             DefaultSeedReviewInputMaxAgeHours = [double](Get-ConfigValue -Object $pairSource -Name 'DefaultSeedReviewInputMaxAgeHours' -DefaultValue $globalSeedReviewMaxAgeHours)
             DefaultSeedReviewInputRequireSingleCandidate = [bool](Get-ConfigValue -Object $pairSource -Name 'DefaultSeedReviewInputRequireSingleCandidate' -DefaultValue $globalSeedReviewRequireSingleCandidate)
+            RequireExternalSeedWorkRepo = [bool](Get-ConfigValue -Object $pairSource -Name 'RequireExternalSeedWorkRepo' -DefaultValue $globalRequireExternalSeedWorkRepo)
+            UseExternalWorkRepoRunRoot = [bool](Get-ConfigValue -Object $pairSource -Name 'UseExternalWorkRepoRunRoot' -DefaultValue $globalUseExternalWorkRepoRunRoot)
+            RequireExternalRunRoot = [bool](Get-ConfigValue -Object $pairSource -Name 'RequireExternalRunRoot' -DefaultValue $globalRequireExternalRunRoot)
+            ExternalWorkRepoRunRootRelativeRoot = [string](Get-ConfigValue -Object $pairSource -Name 'ExternalWorkRepoRunRootRelativeRoot' -DefaultValue $globalExternalWorkRepoRunRootRelativeRoot)
+            UseExternalWorkRepoContractPaths = [bool](Get-ConfigValue -Object $pairSource -Name 'UseExternalWorkRepoContractPaths' -DefaultValue ([bool](Get-ConfigValue -Object $Source -Name 'UseExternalWorkRepoContractPaths' -DefaultValue $false)))
+            ExternalWorkRepoContractRelativeRoot = [string](Get-ConfigValue -Object $pairSource -Name 'ExternalWorkRepoContractRelativeRoot' -DefaultValue ([string](Get-ConfigValue -Object $Source -Name 'ExternalWorkRepoContractRelativeRoot' -DefaultValue '.relay-contract\bottest-live-visible')))
             DefaultWatcherMaxForwardCount = [int](Get-ConfigValue -Object $pairSource -Name 'DefaultWatcherMaxForwardCount' -DefaultValue $globalWatcherMaxForwardCount)
             DefaultWatcherRunDurationSec = [int](Get-ConfigValue -Object $pairSource -Name 'DefaultWatcherRunDurationSec' -DefaultValue $globalWatcherRunDurationSec)
             DefaultPairMaxRoundtripCount = [int](Get-ConfigValue -Object $pairSource -Name 'DefaultPairMaxRoundtripCount' -DefaultValue $globalPairMaxRoundtripCount)
@@ -507,6 +1323,27 @@ function Select-PairDefinitions {
     return @($selectedPairs)
 }
 
+function Get-DefaultPairId {
+    param([Parameter(Mandatory)]$PairTest)
+
+    $configuredDefaultPairId = [string](Get-ConfigValue -Object $PairTest -Name 'DefaultPairId' -DefaultValue '')
+    if (Test-NonEmptyString $configuredDefaultPairId) {
+        return $configuredDefaultPairId
+    }
+
+    $firstPair = @(@($PairTest.PairDefinitions) | Select-Object -First 1)
+    if (@($firstPair).Count -eq 0) {
+        throw 'pair definitions are empty.'
+    }
+
+    $pairId = [string](Get-ConfigValue -Object $firstPair[0] -Name 'PairId' -DefaultValue '')
+    if (-not (Test-NonEmptyString $pairId)) {
+        throw 'first pair definition is missing PairId.'
+    }
+
+    return $pairId
+}
+
 function Get-PairDefinitionById {
     param(
         [Parameter(Mandatory)]$PairTest,
@@ -521,6 +1358,72 @@ function Get-PairDefinitionById {
     }
 
     return $pair[0]
+}
+
+function Get-PairDefinition {
+    param(
+        [Parameter(Mandatory)]$PairTest,
+        [Parameter(Mandatory)][string]$PairId
+    )
+
+    return (Get-PairDefinitionById -PairTest $PairTest -PairId $PairId)
+}
+
+function Resolve-PairTargetSelection {
+    param(
+        [Parameter(Mandatory)]$PairTest,
+        [string]$PairId = '',
+        [string]$TargetId = ''
+    )
+
+    $resolvedTargetId = [string]$TargetId
+    $resolvedPairId = [string]$PairId
+
+    if (-not (Test-NonEmptyString $resolvedPairId)) {
+        if (Test-NonEmptyString $resolvedTargetId) {
+            $matchingPairs = @(
+                Select-PairDefinitions -PairDefinitions @($PairTest.PairDefinitions) -TargetId $resolvedTargetId
+            )
+            if (@($matchingPairs).Count -eq 0) {
+                throw ("알 수 없는 target id입니다: " + $resolvedTargetId)
+            }
+            if (@($matchingPairs).Count -gt 1) {
+                throw ("target id가 여러 pair에 매핑됩니다: " + $resolvedTargetId)
+            }
+            $resolvedPairId = [string](Get-ConfigValue -Object $matchingPairs[0] -Name 'PairId' -DefaultValue '')
+        }
+        else {
+            $resolvedPairId = Get-DefaultPairId -PairTest $PairTest
+        }
+    }
+
+    $pairDefinition = Get-PairDefinition -PairTest $PairTest -PairId $resolvedPairId
+    $topTargetId = [string](Get-ConfigValue -Object $pairDefinition -Name 'TopTargetId' -DefaultValue '')
+    $bottomTargetId = [string](Get-ConfigValue -Object $pairDefinition -Name 'BottomTargetId' -DefaultValue '')
+    if (-not (Test-NonEmptyString $resolvedTargetId)) {
+        $resolvedTargetId = [string](Get-ConfigValue -Object $pairDefinition -Name 'SeedTargetId' -DefaultValue '')
+        if (-not (Test-NonEmptyString $resolvedTargetId)) {
+            $resolvedTargetId = $topTargetId
+        }
+    }
+
+    if ($resolvedTargetId -notin @($topTargetId, $bottomTargetId)) {
+        throw "target id does not belong to pair: target=$resolvedTargetId pair=$resolvedPairId"
+    }
+
+    $partnerTargetId = if ($resolvedTargetId -eq $topTargetId) {
+        $bottomTargetId
+    }
+    else {
+        $topTargetId
+    }
+
+    return [pscustomobject]@{
+        PairId = [string]$resolvedPairId
+        TargetId = [string]$resolvedTargetId
+        PartnerTargetId = [string]$partnerTargetId
+        PairDefinition = $pairDefinition
+    }
 }
 
 function Get-PairPolicyForPair {
@@ -550,6 +1453,9 @@ function Get-PairPolicyForPair {
         DefaultWatcherMaxForwardCount = [int](Get-ConfigValue -Object $PairTest -Name 'DefaultWatcherMaxForwardCount' -DefaultValue 0)
         DefaultWatcherRunDurationSec = [int](Get-ConfigValue -Object $PairTest -Name 'DefaultWatcherRunDurationSec' -DefaultValue 900)
         DefaultPairMaxRoundtripCount = [int](Get-ConfigValue -Object $PairTest -Name 'DefaultPairMaxRoundtripCount' -DefaultValue 0)
+        UseExternalWorkRepoRunRoot = [bool](Get-ConfigValue -Object $PairTest -Name 'UseExternalWorkRepoRunRoot' -DefaultValue $false)
+        RequireExternalRunRoot = [bool](Get-ConfigValue -Object $PairTest -Name 'RequireExternalRunRoot' -DefaultValue $false)
+        ExternalWorkRepoRunRootRelativeRoot = [string](Get-ConfigValue -Object $PairTest -Name 'ExternalWorkRepoRunRootRelativeRoot' -DefaultValue '.relay-runs\bottest-live-visible')
         PublishContractMode = [string](Get-ConfigValue -Object $PairTest -Name 'DefaultPublishContractMode' -DefaultValue 'strict')
         RecoveryPolicy = [string](Get-ConfigValue -Object $PairTest -Name 'DefaultRecoveryPolicy' -DefaultValue 'manual-review')
         PauseAllowed = [bool](Get-ConfigValue -Object $PairTest -Name 'DefaultPauseAllowed' -DefaultValue $true)
@@ -560,16 +1466,34 @@ function Resolve-PairRunRootPath {
     param(
         [Parameter(Mandatory)][string]$Root,
         [string]$RunRoot,
-        [Parameter(Mandatory)]$PairTest
+        [Parameter(Mandatory)]$PairTest,
+        $PairPolicy = $null,
+        [string]$WorkRepoRoot = ''
     )
 
     if (Test-NonEmptyString $RunRoot) {
         return (Resolve-FullPathFromBase -PathValue $RunRoot -BasePath $Root)
     }
 
-    $baseRoot = Resolve-FullPathFromBase `
-        -PathValue ([string](Get-ConfigValue -Object $PairTest -Name 'RunRootBase' -DefaultValue (Join-Path $Root 'pair-test'))) `
-        -BasePath $Root
+    $useExternalRunRoot = Test-UseExternalWorkRepoRunRoot -PairTest $PairTest -PairPolicy $PairPolicy -WorkRepoRoot $WorkRepoRoot
+    if ($useExternalRunRoot) {
+        $relativeRootSpec = [string](Get-ConfigValue -Object $PairPolicy -Name 'ExternalWorkRepoRunRootRelativeRoot' -DefaultValue ([string](Get-ConfigValue -Object $PairTest -Name 'ExternalWorkRepoRunRootRelativeRoot' -DefaultValue '.relay-runs\bottest-live-visible')))
+        if (-not (Test-NonEmptyString $WorkRepoRoot)) {
+            throw 'external run root requires a non-empty WorkRepoRoot.'
+        }
+
+        $baseRoot = if ([System.IO.Path]::IsPathRooted($relativeRootSpec)) {
+            [System.IO.Path]::GetFullPath($relativeRootSpec)
+        }
+        else {
+            [System.IO.Path]::GetFullPath((Join-Path $WorkRepoRoot $relativeRootSpec))
+        }
+    }
+    else {
+        $baseRoot = Resolve-FullPathFromBase `
+            -PathValue ([string](Get-ConfigValue -Object $PairTest -Name 'RunRootBase' -DefaultValue (Join-Path $Root 'pair-test'))) `
+            -BasePath $Root
+    }
     $pattern = [string](Get-ConfigValue -Object $PairTest -Name 'RunRootPattern' -DefaultValue 'run_{yyyyMMdd_HHmmss}')
     return [System.IO.Path]::GetFullPath((Join-Path $baseRoot (Expand-RunRootPattern -Pattern $pattern)))
 }
@@ -581,6 +1505,7 @@ function Resolve-PairTestConfig {
         $ManifestPairTest = $null
     )
 
+    $config = $null
     $configPairTest = @{}
     if ($null -eq $ManifestPairTest -and (Test-NonEmptyString $ConfigPath)) {
         $config = Import-PowerShellDataFile -Path $ConfigPath
@@ -591,13 +1516,18 @@ function Resolve-PairTestConfig {
     $messageTemplates = Get-ConfigValue -Object $source -Name 'MessageTemplates' -DefaultValue @{}
     $headlessExec = Get-ConfigValue -Object $source -Name 'HeadlessExec' -DefaultValue @{}
     $visibleWorker = Get-ConfigValue -Object $source -Name 'VisibleWorker' -DefaultValue @{}
+    $typedWindow = Get-ConfigValue -Object $source -Name 'TypedWindow' -DefaultValue @{}
     $visibleWorkerEnabled = [bool](Get-ConfigValue -Object $visibleWorker -Name 'Enabled' -DefaultValue $false)
     $executionPathMode = [string](Get-ConfigValue -Object $source -Name 'ExecutionPathMode' -DefaultValue $(if ($visibleWorkerEnabled) { 'visible-worker' } else { 'typed-window' }))
+    $requireUserVisibleCellExecution = [bool](Get-ConfigValue -Object $source -Name 'RequireUserVisibleCellExecution' -DefaultValue $false)
     if ($executionPathMode -notin @('visible-worker', 'typed-window')) {
         throw ("PairTest.ExecutionPathMode must be 'visible-worker' or 'typed-window'. actual={0}" -f $executionPathMode)
     }
     if ($executionPathMode -eq 'visible-worker' -and -not $visibleWorkerEnabled) {
         throw 'PairTest.ExecutionPathMode is visible-worker but PairTest.VisibleWorker.Enabled is false.'
+    }
+    if ($requireUserVisibleCellExecution -and $executionPathMode -ne 'typed-window') {
+        throw 'PairTest.RequireUserVisibleCellExecution requires ExecutionPathMode=typed-window.'
     }
     $initialTemplate = Get-ConfigValue -Object $messageTemplates -Name 'Initial' -DefaultValue @{}
     $handoffTemplate = Get-ConfigValue -Object $messageTemplates -Name 'Handoff' -DefaultValue @{}
@@ -605,14 +1535,40 @@ function Resolve-PairTestConfig {
         -PathValue ([string](Get-ConfigValue -Object $source -Name 'RunRootBase' -DefaultValue (Join-Path $Root 'pair-test'))) `
         -BasePath $Root
     $defaultVisibleWorkerRoot = Join-Path $Root 'runtime\visible-workers'
-    $pairDefinitionSet = Resolve-ConfiguredPairDefinitions -Source $source -SourceLabel $(if ($null -ne $ManifestPairTest) { 'manifest' } else { 'config' })
+    $pairDefinitionResolveSource = if ($null -ne $ManifestPairTest) { $ManifestPairTest } elseif ($null -ne $config) { $config } else { $source }
+    $pairDefinitionSet = Resolve-ConfiguredPairDefinitions -Source $pairDefinitionResolveSource -SourceLabel $(if ($null -ne $ManifestPairTest) { 'manifest' } else { 'config' })
     $pairPolicies = Resolve-PairPolicyMap -Source $source -PairDefinitions @($pairDefinitionSet.Pairs) -Root $Root
+    $configuredDefaultPairId = [string](Get-ConfigValue -Object $source -Name 'DefaultPairId' -DefaultValue '')
+    if (Test-NonEmptyString $configuredDefaultPairId) {
+        $defaultPairExists = @(
+            @($pairDefinitionSet.Pairs) |
+                Where-Object { [string](Get-ConfigValue -Object $_ -Name 'PairId' -DefaultValue '') -eq $configuredDefaultPairId } |
+                Select-Object -First 1
+        )
+        if (@($defaultPairExists).Count -eq 0) {
+            throw ('PairTest.DefaultPairId has no matching PairDefinitions entry: {0}' -f $configuredDefaultPairId)
+        }
+    }
+    $defaultPairId = if (Test-NonEmptyString $configuredDefaultPairId) {
+        $configuredDefaultPairId
+    }
+    elseif (@($pairDefinitionSet.Pairs).Count -gt 0) {
+        $firstPair = @($pairDefinitionSet.Pairs | Select-Object -First 1)
+        [string](Get-ConfigValue -Object $firstPair[0] -Name 'PairId' -DefaultValue '')
+    }
+    else {
+        ''
+    }
     $visibleWorkerCommandTimeoutSeconds = [int](Get-ConfigValue -Object $visibleWorker -Name 'CommandTimeoutSeconds' -DefaultValue ([math]::Max(60, ([int](Get-ConfigValue -Object $headlessExec -Name 'MaxRunSeconds' -DefaultValue 900) + 60))))
 
     return [pscustomobject]@{
         RunRootBase       = $runRootBase
         RunRootPattern    = [string](Get-ConfigValue -Object $source -Name 'RunRootPattern' -DefaultValue 'run_{yyyyMMdd_HHmmss}')
         ExecutionPathMode = $executionPathMode
+        RequireUserVisibleCellExecution = $requireUserVisibleCellExecution
+        AllowedWindowVisibilityMethods = @(
+            Get-StringArray (Get-ConfigValue -Object $source -Name 'AllowedWindowVisibilityMethods' -DefaultValue @('hwnd'))
+        )
         AcceptanceProfile = [string](Get-ConfigValue -Object $source -Name 'AcceptanceProfile' -DefaultValue 'project-review')
         SmokeSeedTaskText = [string](Get-ConfigValue -Object $source -Name 'SmokeSeedTaskText' -DefaultValue '')
         SummaryFileName   = [string](Get-ConfigValue -Object $source -Name 'SummaryFileName' -DefaultValue 'summary.txt')
@@ -629,6 +1585,7 @@ function Resolve-PairTestConfig {
         SourceReviewZipFileName = [string](Get-ConfigValue -Object $source -Name 'SourceReviewZipFileName' -DefaultValue 'review.zip')
         PublishReadyFileName = [string](Get-ConfigValue -Object $source -Name 'PublishReadyFileName' -DefaultValue 'publish.ready.json')
         PublishedArchiveFolderName = [string](Get-ConfigValue -Object $source -Name 'PublishedArchiveFolderName' -DefaultValue '.published')
+        RequireExternalSeedWorkRepo = [bool](Get-ConfigValue -Object $source -Name 'RequireExternalSeedWorkRepo' -DefaultValue $false)
         DefaultSeedWorkRepoRoot = [string](Get-ConfigValue -Object $source -Name 'DefaultSeedWorkRepoRoot' -DefaultValue '')
         DefaultSeedReviewInputPath = [string](Get-ConfigValue -Object $source -Name 'DefaultSeedReviewInputPath' -DefaultValue '')
         DefaultSeedReviewInputSearchRelativePath = [string](Get-ConfigValue -Object $source -Name 'DefaultSeedReviewInputSearchRelativePath' -DefaultValue 'reviewfile')
@@ -636,9 +1593,14 @@ function Resolve-PairTestConfig {
         DefaultSeedReviewInputNameRegex = [string](Get-ConfigValue -Object $source -Name 'DefaultSeedReviewInputNameRegex' -DefaultValue '')
         DefaultSeedReviewInputMaxAgeHours = [double](Get-ConfigValue -Object $source -Name 'DefaultSeedReviewInputMaxAgeHours' -DefaultValue 72)
         DefaultSeedReviewInputRequireSingleCandidate = [bool](Get-ConfigValue -Object $source -Name 'DefaultSeedReviewInputRequireSingleCandidate' -DefaultValue $false)
+        UseExternalWorkRepoRunRoot = [bool](Get-ConfigValue -Object $source -Name 'UseExternalWorkRepoRunRoot' -DefaultValue $false)
+        RequireExternalRunRoot = [bool](Get-ConfigValue -Object $source -Name 'RequireExternalRunRoot' -DefaultValue $false)
+        ExternalWorkRepoRunRootRelativeRoot = [string](Get-ConfigValue -Object $source -Name 'ExternalWorkRepoRunRootRelativeRoot' -DefaultValue '.relay-runs\bottest-live-visible')
         DefaultWatcherMaxForwardCount = [int](Get-ConfigValue -Object $source -Name 'DefaultWatcherMaxForwardCount' -DefaultValue 0)
         DefaultWatcherRunDurationSec = [int](Get-ConfigValue -Object $source -Name 'DefaultWatcherRunDurationSec' -DefaultValue 900)
         DefaultPairMaxRoundtripCount = [int](Get-ConfigValue -Object $source -Name 'DefaultPairMaxRoundtripCount' -DefaultValue 0)
+        UseExternalWorkRepoContractPaths = [bool](Get-ConfigValue -Object $source -Name 'UseExternalWorkRepoContractPaths' -DefaultValue $false)
+        ExternalWorkRepoContractRelativeRoot = [string](Get-ConfigValue -Object $source -Name 'ExternalWorkRepoContractRelativeRoot' -DefaultValue '.relay-contract\bottest-live-visible')
         DefaultPublishContractMode = [string](Get-ConfigValue -Object $source -Name 'DefaultPublishContractMode' -DefaultValue 'strict')
         DefaultRecoveryPolicy = [string](Get-ConfigValue -Object $source -Name 'DefaultRecoveryPolicy' -DefaultValue 'manual-review')
         DefaultPauseAllowed = [bool](Get-ConfigValue -Object $source -Name 'DefaultPauseAllowed' -DefaultValue $true)
@@ -688,6 +1650,12 @@ function Resolve-PairTestConfig {
             DispatchRunningStaleSeconds = [int](Get-ConfigValue -Object $visibleWorker -Name 'DispatchRunningStaleSeconds' -DefaultValue 30)
             AcceptanceSeedSoftTimeoutSeconds = [int](Get-ConfigValue -Object $visibleWorker -Name 'AcceptanceSeedSoftTimeoutSeconds' -DefaultValue 120)
         }
+        TypedWindow = [pscustomobject]@{
+            SubmitProbeSeconds = [int](Get-ConfigValue -Object $typedWindow -Name 'SubmitProbeSeconds' -DefaultValue 10)
+            SubmitProbePollMs = [int](Get-ConfigValue -Object $typedWindow -Name 'SubmitProbePollMs' -DefaultValue 1000)
+            SubmitRetryLimit = [int](Get-ConfigValue -Object $typedWindow -Name 'SubmitRetryLimit' -DefaultValue 1)
+            ProgressCpuDeltaThresholdSeconds = [double](Get-ConfigValue -Object $typedWindow -Name 'ProgressCpuDeltaThresholdSeconds' -DefaultValue 0.05)
+        }
         MessageTemplates  = [pscustomobject]@{
             Initial = [pscustomobject]@{
                 SlotOrder = @(Get-StringArray (Get-ConfigValue -Object $initialTemplate -Name 'SlotOrder' -DefaultValue (Get-DefaultMessageSlotOrder -TemplateName 'Initial')))
@@ -716,8 +1684,11 @@ function Resolve-PairTestConfig {
         PairOverrides     = Get-ConfigValue -Object $source -Name 'PairOverrides' -DefaultValue @{}
         RoleOverrides     = Get-ConfigValue -Object $source -Name 'RoleOverrides' -DefaultValue @{}
         TargetOverrides   = Get-ConfigValue -Object $source -Name 'TargetOverrides' -DefaultValue @{}
+        DefaultPairId     = [string]$defaultPairId
         PairDefinitions   = @($pairDefinitionSet.Pairs)
         PairDefinitionSource = [string]$pairDefinitionSet.Source
+        PairDefinitionSourceDetail = [string]$pairDefinitionSet.SourceDetail
+        PairTopologyStrategy = [string]$pairDefinitionSet.Strategy
         PairPolicies      = $pairPolicies
     }
 }

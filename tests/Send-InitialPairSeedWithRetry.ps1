@@ -3,11 +3,13 @@ param(
     [string]$ConfigPath,
     [Parameter(Mandatory)][string]$RunRoot,
     [string]$TargetId,
+    [string]$MessageTextFilePath,
     [int]$MaxAttempts = 3,
     [int]$DelaySeconds = 5,
     [int[]]$RetryBackoffMs = @(),
     [int]$WaitForRouterSeconds = 20,
     [int]$WaitForPublishSeconds = 0,
+    [switch]$DisallowInlineTypedWindowPrepare,
     [switch]$AsJson
 )
 
@@ -120,6 +122,133 @@ function Ensure-Directory {
     if (-not (Test-Path -LiteralPath $Path -PathType Container)) {
         New-Item -ItemType Directory -Path $Path -Force | Out-Null
     }
+}
+
+function New-Utf8NoBomEncoding {
+    return [System.Text.UTF8Encoding]::new($false)
+}
+
+function Get-TypedWindowSessionRoot {
+    param([Parameter(Mandatory)]$Config)
+
+    $runtimeRoot = [string](Get-ConfigValue -Object $Config -Name 'RuntimeRoot' -DefaultValue '')
+    if (-not (Test-NonEmptyString $runtimeRoot)) {
+        $runtimeRoot = Join-Path $root 'runtime\bottest-live-visible'
+    }
+
+    $sessionRoot = Join-Path $runtimeRoot 'typed-window-session'
+    Ensure-Directory -Path $sessionRoot
+    return $sessionRoot
+}
+
+function Get-TypedWindowSessionStatePath {
+    param(
+        [Parameter(Mandatory)]$Config,
+        [Parameter(Mandatory)][string]$TargetKey
+    )
+
+    return (Join-Path (Get-TypedWindowSessionRoot -Config $Config) ($TargetKey + '.json'))
+}
+
+function New-TypedWindowSessionState {
+    param(
+        [Parameter(Mandatory)][string]$TargetKey,
+        [string]$State = 'bootstrap-needed',
+        [string]$RunRoot = '',
+        [string]$PairId = '',
+        [string]$ResetReason = ''
+    )
+
+    return [ordered]@{
+        SchemaVersion                   = '1.0.0'
+        TargetId                        = $TargetKey
+        State                           = $State
+        SessionRunRoot                  = $RunRoot
+        SessionPairId                   = $PairId
+        SessionTargetId                 = $TargetKey
+        SessionEpoch                    = 0
+        LastPrepareAt                   = ''
+        LastSubmitAt                    = ''
+        LastProgressAt                  = ''
+        LastConfirmedArtifactAt         = ''
+        LastResetReason                 = $ResetReason
+        ConsecutiveSubmitUnconfirmedCount = 0
+        UpdatedAt                       = (Get-Date).ToString('o')
+    }
+}
+
+function Read-TypedWindowSessionState {
+    param(
+        [Parameter(Mandatory)]$Config,
+        [Parameter(Mandatory)][string]$TargetKey
+    )
+
+    $path = Get-TypedWindowSessionStatePath -Config $Config -TargetKey $TargetKey
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+        return [pscustomobject](New-TypedWindowSessionState -TargetKey $TargetKey)
+    }
+
+    try {
+        $session = Read-JsonObject -Path $path
+        return [pscustomobject]@{
+            SchemaVersion                     = [string](Get-ConfigValue -Object $session -Name 'SchemaVersion' -DefaultValue '1.0.0')
+            TargetId                          = [string](Get-ConfigValue -Object $session -Name 'TargetId' -DefaultValue $TargetKey)
+            State                             = [string](Get-ConfigValue -Object $session -Name 'State' -DefaultValue 'bootstrap-needed')
+            SessionRunRoot                    = [string](Get-ConfigValue -Object $session -Name 'SessionRunRoot' -DefaultValue '')
+            SessionPairId                     = [string](Get-ConfigValue -Object $session -Name 'SessionPairId' -DefaultValue '')
+            SessionTargetId                   = [string](Get-ConfigValue -Object $session -Name 'SessionTargetId' -DefaultValue $TargetKey)
+            SessionEpoch                      = [int](Get-ConfigValue -Object $session -Name 'SessionEpoch' -DefaultValue 0)
+            LastPrepareAt                     = [string](Get-ConfigValue -Object $session -Name 'LastPrepareAt' -DefaultValue '')
+            LastSubmitAt                      = [string](Get-ConfigValue -Object $session -Name 'LastSubmitAt' -DefaultValue '')
+            LastProgressAt                    = [string](Get-ConfigValue -Object $session -Name 'LastProgressAt' -DefaultValue '')
+            LastConfirmedArtifactAt           = [string](Get-ConfigValue -Object $session -Name 'LastConfirmedArtifactAt' -DefaultValue '')
+            LastResetReason                   = [string](Get-ConfigValue -Object $session -Name 'LastResetReason' -DefaultValue '')
+            ConsecutiveSubmitUnconfirmedCount = [int](Get-ConfigValue -Object $session -Name 'ConsecutiveSubmitUnconfirmedCount' -DefaultValue 0)
+            UpdatedAt                         = [string](Get-ConfigValue -Object $session -Name 'UpdatedAt' -DefaultValue '')
+        }
+    }
+    catch {
+        return [pscustomobject](New-TypedWindowSessionState -TargetKey $TargetKey -State 'dirty-session' -ResetReason 'session-parse-failed')
+    }
+}
+
+function Save-TypedWindowSessionState {
+    param(
+        [Parameter(Mandatory)]$Config,
+        [Parameter(Mandatory)][string]$TargetKey,
+        [Parameter(Mandatory)]$Session
+    )
+
+    $path = Get-TypedWindowSessionStatePath -Config $Config -TargetKey $TargetKey
+    $payload = [ordered]@{
+        SchemaVersion                     = '1.0.0'
+        TargetId                          = $TargetKey
+        State                             = [string](Get-ConfigValue -Object $Session -Name 'State' -DefaultValue 'bootstrap-needed')
+        SessionRunRoot                    = [string](Get-ConfigValue -Object $Session -Name 'SessionRunRoot' -DefaultValue '')
+        SessionPairId                     = [string](Get-ConfigValue -Object $Session -Name 'SessionPairId' -DefaultValue '')
+        SessionTargetId                   = [string](Get-ConfigValue -Object $Session -Name 'SessionTargetId' -DefaultValue $TargetKey)
+        SessionEpoch                      = [int](Get-ConfigValue -Object $Session -Name 'SessionEpoch' -DefaultValue 0)
+        LastPrepareAt                     = [string](Get-ConfigValue -Object $Session -Name 'LastPrepareAt' -DefaultValue '')
+        LastSubmitAt                      = [string](Get-ConfigValue -Object $Session -Name 'LastSubmitAt' -DefaultValue '')
+        LastProgressAt                    = [string](Get-ConfigValue -Object $Session -Name 'LastProgressAt' -DefaultValue '')
+        LastConfirmedArtifactAt           = [string](Get-ConfigValue -Object $Session -Name 'LastConfirmedArtifactAt' -DefaultValue '')
+        LastResetReason                   = [string](Get-ConfigValue -Object $Session -Name 'LastResetReason' -DefaultValue '')
+        ConsecutiveSubmitUnconfirmedCount = [int](Get-ConfigValue -Object $Session -Name 'ConsecutiveSubmitUnconfirmedCount' -DefaultValue 0)
+        UpdatedAt                         = (Get-Date).ToString('o')
+    }
+
+    $payload | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $path -Encoding UTF8
+}
+
+function Set-TypedWindowSessionFields {
+    param(
+        [Parameter(Mandatory)]$Session,
+        [Parameter(Mandatory)][string]$State
+    )
+
+    $Session.State = $State
+    $Session.UpdatedAt = (Get-Date).ToString('o')
+    return $Session
 }
 
 function Test-ProcessAlive {
@@ -311,10 +440,18 @@ function Set-SeedSendStatusEntry {
         [Parameter(Mandatory)][string]$TargetKey,
         [Parameter(Mandatory)][string]$UpdatedAt,
         [Parameter(Mandatory)][string]$FinalState,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$ExecutionPathMode,
+        [Parameter(Mandatory)][bool]$UserVisibleCellExecutionRequired,
+        [Parameter(Mandatory)][string[]]$AllowedWindowVisibilityMethods,
         [Parameter(Mandatory)][AllowEmptyString()][string]$RouterDispatchState,
         [Parameter(Mandatory)][AllowEmptyString()][string]$SubmitState,
         [Parameter(Mandatory)][bool]$SubmitConfirmed,
         [Parameter(Mandatory)][AllowEmptyString()][string]$SubmitReason,
+        [Parameter(Mandatory)][string[]]$SubmitRetryModes,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$SubmitRetrySequenceSummary,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$PrimarySubmitMode,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$FinalSubmitMode,
+        [Parameter(Mandatory)][int]$SubmitRetryIntervalMs,
         [Parameter(Mandatory)][int]$AttemptCount,
         [Parameter(Mandatory)][int]$MaxAttempts,
         [Parameter(Mandatory)][AllowEmptyString()][string]$FirstAttemptedAt,
@@ -332,17 +469,32 @@ function Set-SeedSendStatusEntry {
         [Parameter(Mandatory)][bool]$OutboxPublished,
         [Parameter(Mandatory)][AllowEmptyString()][string]$OutboxObservedAt,
         [Parameter(Mandatory)][AllowEmptyString()][string]$LastReadyPath,
-        [Parameter(Mandatory)][AllowEmptyString()][string]$LastReadyBaseName
+        [Parameter(Mandatory)][AllowEmptyString()][string]$LastReadyBaseName,
+        [AllowEmptyString()][string]$TypedWindowExecutionState = '',
+        [AllowEmptyString()][string]$SubmitProbeState = '',
+        [int]$SubmitProbeElapsedSeconds = 0,
+        [int]$SubmitRetryCount = 0,
+        [AllowEmptyString()][string]$SubmitConfirmationSignal = '',
+        [AllowEmptyString()][string]$TypedWindowSessionState = '',
+        [AllowEmptyString()][string]$TypedWindowLastResetReason = ''
     )
 
     $State[$TargetKey] = [pscustomobject]@{
         TargetId = $TargetKey
         UpdatedAt = $UpdatedAt
         FinalState = $FinalState
+        ExecutionPathMode = $ExecutionPathMode
+        UserVisibleCellExecutionRequired = $UserVisibleCellExecutionRequired
+        AllowedWindowVisibilityMethods = @($AllowedWindowVisibilityMethods)
         RouterDispatchState = $RouterDispatchState
         SubmitState = $SubmitState
         SubmitConfirmed = $SubmitConfirmed
         SubmitReason = $SubmitReason
+        SubmitRetryModes = @($SubmitRetryModes)
+        SubmitRetrySequenceSummary = $SubmitRetrySequenceSummary
+        PrimarySubmitMode = $PrimarySubmitMode
+        FinalSubmitMode = $FinalSubmitMode
+        SubmitRetryIntervalMs = $SubmitRetryIntervalMs
         AttemptCount = $AttemptCount
         MaxAttempts = $MaxAttempts
         FirstAttemptedAt = $FirstAttemptedAt
@@ -361,6 +513,13 @@ function Set-SeedSendStatusEntry {
         OutboxObservedAt = $OutboxObservedAt
         LastReadyPath = $LastReadyPath
         LastReadyBaseName = $LastReadyBaseName
+        TypedWindowExecutionState = $TypedWindowExecutionState
+        SubmitProbeState = $SubmitProbeState
+        SubmitProbeElapsedSeconds = $SubmitProbeElapsedSeconds
+        SubmitRetryCount = $SubmitRetryCount
+        SubmitConfirmationSignal = $SubmitConfirmationSignal
+        TypedWindowSessionState = $TypedWindowSessionState
+        TypedWindowLastResetReason = $TypedWindowLastResetReason
     }
 }
 
@@ -573,6 +732,458 @@ function Wait-ForOutboxPublish {
     }
 }
 
+function Get-TypedWindowRuntimeTarget {
+    param(
+        [Parameter(Mandatory)]$Config,
+        [Parameter(Mandatory)][string]$TargetKey
+    )
+
+    $runtimeMapPath = [string](Get-ConfigValue -Object $Config -Name 'RuntimeMapPath' -DefaultValue '')
+    if (-not (Test-NonEmptyString $runtimeMapPath) -or -not (Test-Path -LiteralPath $runtimeMapPath -PathType Leaf)) {
+        return $null
+    }
+
+    try {
+        $runtimeDoc = Read-JsonObject -Path $runtimeMapPath
+    }
+    catch {
+        return $null
+    }
+
+    $runtimeItems = if ($runtimeDoc -is [System.Array]) { @($runtimeDoc) } else { @($runtimeDoc) }
+    $targetRow = @($runtimeItems | Where-Object { [string](Get-ConfigValue -Object $_ -Name 'TargetId' -DefaultValue '') -eq $TargetKey } | Select-Object -First 1)
+    if (@($targetRow).Count -eq 0) {
+        return $null
+    }
+
+    return $targetRow[0]
+}
+
+function Get-ChildProcessIdsRecursive {
+    param([int]$ParentPid)
+
+    if ($ParentPid -le 0) {
+        return @()
+    }
+
+    $result = New-Object System.Collections.Generic.List[int]
+    $queue = New-Object System.Collections.Generic.Queue[int]
+    $seen = @{}
+    $queue.Enqueue($ParentPid)
+    $seen[$ParentPid] = $true
+
+    while ($queue.Count -gt 0) {
+        $currentPid = [int]$queue.Dequeue()
+        $childRows = @()
+        try {
+            $childRows = @(Get-CimInstance Win32_Process -Filter ("ParentProcessId = {0}" -f $currentPid) -ErrorAction Stop)
+        }
+        catch {
+            $childRows = @()
+        }
+
+        foreach ($childRow in @($childRows)) {
+            $childPid = [int](Get-ConfigValue -Object $childRow -Name 'ProcessId' -DefaultValue 0)
+            if ($childPid -le 0 -or $seen.ContainsKey($childPid)) {
+                continue
+            }
+
+            $seen[$childPid] = $true
+            $result.Add($childPid)
+            $queue.Enqueue($childPid)
+        }
+    }
+
+    return @($result)
+}
+
+function Get-ProcessCpuSecondsSum {
+    param([int[]]$ProcessIds = @())
+
+    $totalCpuSeconds = 0.0
+    foreach ($processId in @($ProcessIds | Where-Object { [int]$_ -gt 0 })) {
+        try {
+            $process = Get-Process -Id ([int]$processId) -ErrorAction Stop
+            if ($null -ne $process -and -not $process.HasExited -and $null -ne $process.CPU) {
+                $totalCpuSeconds += [double]$process.CPU
+            }
+        }
+        catch {
+            continue
+        }
+    }
+
+    return [math]::Round($totalCpuSeconds, 6)
+}
+
+function Get-TypedWindowProgressSnapshot {
+    param(
+        [Parameter(Mandatory)]$TargetRow,
+        [int]$ShellPid = 0,
+        [datetime]$ReferenceTime = [datetime]::MinValue
+    )
+
+    $trackedFiles = @(
+        [pscustomobject]@{ Path = [string]$TargetRow.PublishReadyPath; Signal = 'publish-ready' },
+        [pscustomobject]@{ Path = [string]$TargetRow.SourceSummaryPath; Signal = 'summary-updated' },
+        [pscustomobject]@{ Path = [string]$TargetRow.SourceReviewZipPath; Signal = 'review-zip-updated' },
+        [pscustomobject]@{ Path = [string](Get-ConfigValue -Object $TargetRow -Name 'ResultPath' -DefaultValue ''); Signal = 'result-updated' },
+        [pscustomobject]@{ Path = [string](Get-ConfigValue -Object $TargetRow -Name 'DonePath' -DefaultValue ''); Signal = 'done-updated' }
+    )
+
+    $latestTicks = 0L
+    $latestSignal = ''
+    $latestPath = ''
+    foreach ($trackedFile in @($trackedFiles)) {
+        $trackedPath = [string]$trackedFile.Path
+        if (-not (Test-NonEmptyString $trackedPath) -or -not (Test-Path -LiteralPath $trackedPath -PathType Leaf)) {
+            continue
+        }
+
+        $item = Get-Item -LiteralPath $trackedPath -ErrorAction SilentlyContinue
+        if ($null -eq $item) {
+            continue
+        }
+
+        if ($ReferenceTime -ne [datetime]::MinValue -and $item.LastWriteTime -lt $ReferenceTime) {
+            continue
+        }
+
+        if ([int64]$item.LastWriteTimeUtc.Ticks -gt $latestTicks) {
+            $latestTicks = [int64]$item.LastWriteTimeUtc.Ticks
+            $latestSignal = [string]$trackedFile.Signal
+            $latestPath = $trackedPath
+        }
+    }
+
+    $childProcessIds = if ($ShellPid -gt 0) { @(Get-ChildProcessIdsRecursive -ParentPid $ShellPid) } else { @() }
+    $cpuSeconds = Get-ProcessCpuSecondsSum -ProcessIds $childProcessIds
+
+    return [pscustomobject]@{
+        ShellPid = $ShellPid
+        ChildProcessIds = @($childProcessIds)
+        CpuSeconds = $cpuSeconds
+        LatestArtifactTicks = $latestTicks
+        LatestArtifactSignal = $latestSignal
+        LatestArtifactPath = $latestPath
+    }
+}
+
+function New-TypedWindowDebugLogPath {
+    param(
+        [Parameter(Mandatory)]$Config,
+        [Parameter(Mandatory)][string]$TargetKey,
+        [Parameter(Mandatory)][string]$Label
+    )
+
+    $logsRoot = [string](Get-ConfigValue -Object $Config -Name 'LogsRoot' -DefaultValue '')
+    if (-not (Test-NonEmptyString $logsRoot)) {
+        $logsRoot = Join-Path $root '_tmp'
+    }
+
+    $debugRoot = Join-Path $logsRoot ('typed-window-prepare\' + $TargetKey)
+    Ensure-Directory -Path $debugRoot
+    return (Join-Path $debugRoot ((Get-Date -Format 'yyyyMMdd_HHmmss_fff') + '__' + $Label + '.log'))
+}
+
+function Invoke-TypedWindowAhkPayload {
+    param(
+        [Parameter(Mandatory)]$Config,
+        [Parameter(Mandatory)][string]$TargetKey,
+        [Parameter(Mandatory)][string]$Payload,
+        [Parameter(Mandatory)][bool]$ClearInput,
+        [Parameter(Mandatory)][string[]]$SubmitModes,
+        [Parameter(Mandatory)][string]$DebugLabel
+    )
+
+    $ahkExePath = [string](Get-ConfigValue -Object $Config -Name 'AhkExePath' -DefaultValue '')
+    $ahkScriptPath = [string](Get-ConfigValue -Object $Config -Name 'AhkScriptPath' -DefaultValue '')
+    $runtimeMapPath = [string](Get-ConfigValue -Object $Config -Name 'RuntimeMapPath' -DefaultValue '')
+    if (-not (Test-NonEmptyString $ahkExePath) -or -not (Test-Path -LiteralPath $ahkExePath -PathType Leaf) -or -not (Test-NonEmptyString $ahkScriptPath) -or -not (Test-Path -LiteralPath $ahkScriptPath -PathType Leaf) -or -not (Test-NonEmptyString $runtimeMapPath) -or -not (Test-Path -LiteralPath $runtimeMapPath -PathType Leaf)) {
+        return [pscustomobject]@{
+            Executed = $false
+            ExitCode = 0
+            DebugLogPath = ''
+            SkippedReason = 'typed-window-prepare-dependencies-missing'
+        }
+    }
+
+    $payloadFile = Join-Path $stateRoot ('typed_window_payload_' + [guid]::NewGuid().ToString('N') + '.txt')
+    [System.IO.File]::WriteAllText($payloadFile, $Payload, (New-Utf8NoBomEncoding))
+    $debugLogPath = New-TypedWindowDebugLogPath -Config $Config -TargetKey $TargetKey -Label $DebugLabel
+
+    $activateSettleMs = [math]::Max(0, [int](Get-ConfigValue -Object $Config -Name 'ActivateSettleMs' -DefaultValue 250))
+    $textSettleMs = [math]::Max(0, [int](Get-ConfigValue -Object $Config -Name 'TextSettleMs' -DefaultValue 2200))
+    $terminalInputMode = [string](Get-ConfigValue -Object $Config -Name 'TerminalInputMode' -DefaultValue 'sendtext')
+    if (-not (Test-NonEmptyString $terminalInputMode)) {
+        $terminalInputMode = 'sendtext'
+    }
+    $submitGuardMs = [math]::Max(0, [int](Get-ConfigValue -Object $Config -Name 'SubmitGuardMs' -DefaultValue 0))
+    $enterDelayMs = [math]::Max(0, [int](Get-ConfigValue -Object $Config -Name 'EnterDelayMs' -DefaultValue 900))
+    $postSubmitDelayMs = [math]::Max(0, [int](Get-ConfigValue -Object $Config -Name 'PostSubmitDelayMs' -DefaultValue 900))
+    $submitRetryIntervalMs = [math]::Max(0, [int](Get-ConfigValue -Object $Config -Name 'SubmitRetryIntervalMs' -DefaultValue 1800))
+    $sendTimeoutMs = [math]::Max(1000, [int](Get-ConfigValue -Object $Config -Name 'SendTimeoutMs' -DefaultValue 5000))
+    $requireActiveBeforeEnter = [bool](Get-ConfigValue -Object $Config -Name 'RequireActiveBeforeEnter' -DefaultValue $true)
+    $resolverShellPath = [string](Get-ConfigValue -Object $Config -Name 'ResolverShellPath' -DefaultValue 'powershell.exe')
+    $visibleBeaconEnabled = [bool](Get-ConfigValue -Object $Config -Name 'VisibleExecutionBeaconEnabled' -DefaultValue $false)
+    $visiblePreHoldMs = [math]::Max(0, [int](Get-ConfigValue -Object $Config -Name 'VisibleExecutionPreHoldMs' -DefaultValue 0))
+    $visiblePostHoldMs = [math]::Max(0, [int](Get-ConfigValue -Object $Config -Name 'VisibleExecutionPostHoldMs' -DefaultValue 0))
+    $restorePreviousActive = [bool](Get-ConfigValue -Object $Config -Name 'VisibleExecutionRestorePreviousActive' -DefaultValue $true)
+    $failOnFocusSteal = [bool](Get-ConfigValue -Object $Config -Name 'VisibleExecutionFailOnFocusSteal' -DefaultValue $false)
+    $clearInputArg = if ($ClearInput) { '1' } else { '0' }
+    $requireActiveBeforeEnterArg = if ($requireActiveBeforeEnter) { '1' } else { '0' }
+    $visibleBeaconEnabledArg = if ($visibleBeaconEnabled) { '1' } else { '0' }
+    $restorePreviousActiveArg = if ($restorePreviousActive) { '1' } else { '0' }
+    $failOnFocusStealArg = if ($failOnFocusSteal) { '1' } else { '0' }
+
+    try {
+        $proc = Start-Process -FilePath $ahkExePath -ArgumentList @(
+            $ahkScriptPath,
+            '--runtime', $runtimeMapPath,
+            '--targetId', $TargetKey,
+            '--resolverShell', $resolverShellPath,
+            '--file', $payloadFile,
+            '--enter', '1',
+            '--timeoutMs', [string]$sendTimeoutMs,
+            '--activateSettleMs', [string]$activateSettleMs,
+            '--textSettleMs', [string]$textSettleMs,
+            '--inputMode', [string]$terminalInputMode,
+            '--submitGuardMs', [string]$submitGuardMs,
+            '--enterDelayMs', [string]$enterDelayMs,
+            '--postSubmitDelayMs', [string]$postSubmitDelayMs,
+            '--submitModes', ([string]::Join(',', @($SubmitModes))),
+            '--submitRetryIntervalMs', [string]$submitRetryIntervalMs,
+            '--requireActiveBeforeEnter', $requireActiveBeforeEnterArg,
+            '--requireUserIdleBeforeSend', '0',
+            '--minUserIdleBeforeSendMs', '0',
+            '--visibleBeaconEnabled', $visibleBeaconEnabledArg,
+            '--visibleLabel', $TargetKey,
+            '--visiblePreHoldMs', [string]$visiblePreHoldMs,
+            '--visiblePostHoldMs', [string]$visiblePostHoldMs,
+            '--restorePreviousActive', $restorePreviousActiveArg,
+            '--failOnFocusSteal', $failOnFocusStealArg,
+            '--clearInput', $clearInputArg,
+            '--debugLog', $debugLogPath
+        ) -Wait -PassThru -WindowStyle Hidden
+
+        return [pscustomobject]@{
+            Executed = $true
+            ExitCode = [int]$proc.ExitCode
+            DebugLogPath = $debugLogPath
+            SkippedReason = ''
+        }
+    }
+    finally {
+        if (Test-Path -LiteralPath $payloadFile -PathType Leaf) {
+            Remove-Item -LiteralPath $payloadFile -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+function Resolve-TypedWindowAhkFailure {
+    param(
+        [Parameter(Mandatory)]$Config,
+        [Parameter(Mandatory)][int]$ExitCode,
+        [Parameter(Mandatory)][string]$FailurePhase,
+        [Parameter(Mandatory)][string]$PrepareReason
+    )
+
+    $failOnFocusSteal = [bool](Get-ConfigValue -Object $Config -Name 'VisibleExecutionFailOnFocusSteal' -DefaultValue $false)
+    if ($failOnFocusSteal -and $ExitCode -eq 42) {
+        return [pscustomobject]@{
+            FinalState                = 'manual_attention_required'
+            ManualAttentionRequired   = $true
+            SubmitReason              = 'visible-focus-steal'
+            RetryReason               = 'visible-focus-steal'
+            TypedWindowExecutionState = 'typed-window-visible-contract-failed'
+            SubmitProbeState          = 'typed-window-focus-steal'
+            LastResetReason           = 'focus-steal-before-submit'
+            FailureSummary            = ('typed-window {0} failed due to visible focus steal' -f $FailurePhase)
+            VisibleContractFailed     = $true
+        }
+    }
+
+    return [pscustomobject]@{
+        FinalState                = 'failed'
+        ManualAttentionRequired   = $false
+        SubmitReason              = ('typed-window-{0}-failed' -f $FailurePhase)
+        RetryReason               = ('typed-window-{0}-failed' -f $FailurePhase)
+        TypedWindowExecutionState = ('typed-window-{0}-failed' -f $FailurePhase)
+        SubmitProbeState          = ('typed-window-{0}-failed' -f $FailurePhase)
+        LastResetReason           = if (Test-NonEmptyString $PrepareReason) { $PrepareReason } else { ('typed-window-{0}-failed' -f $FailurePhase) }
+        FailureSummary            = ('typed-window {0} failed exitCode={1}' -f $FailurePhase, $ExitCode)
+        VisibleContractFailed     = $false
+    }
+}
+
+function Resolve-TypedWindowPrepareRequirement {
+    param(
+        [Parameter(Mandatory)]$Session,
+        [Parameter(Mandatory)][string]$RunRoot,
+        [Parameter(Mandatory)][string]$PairId,
+        [Parameter(Mandatory)][string]$TargetKey
+    )
+
+    if (-not (Test-NonEmptyString ([string](Get-ConfigValue -Object $Session -Name 'SessionRunRoot' -DefaultValue '')))) {
+        return [pscustomobject]@{ Required = $true; Reason = 'bootstrap-needed' }
+    }
+
+    $sessionState = [string](Get-ConfigValue -Object $Session -Name 'State' -DefaultValue 'bootstrap-needed')
+    if ($sessionState -in @('bootstrap-needed', 'recovery-needed', 'dirty-session')) {
+        return [pscustomobject]@{ Required = $true; Reason = if (Test-NonEmptyString $sessionState) { $sessionState } else { 'bootstrap-needed' } }
+    }
+
+    if ([string](Get-ConfigValue -Object $Session -Name 'SessionRunRoot' -DefaultValue '') -ne $RunRoot) {
+        return [pscustomobject]@{ Required = $true; Reason = 'runroot-changed' }
+    }
+
+    if ([string](Get-ConfigValue -Object $Session -Name 'SessionPairId' -DefaultValue '') -ne $PairId) {
+        return [pscustomobject]@{ Required = $true; Reason = 'pair-changed' }
+    }
+
+    if ([string](Get-ConfigValue -Object $Session -Name 'SessionTargetId' -DefaultValue '') -ne $TargetKey) {
+        return [pscustomobject]@{ Required = $true; Reason = 'target-changed' }
+    }
+
+    return [pscustomobject]@{ Required = $false; Reason = 'reuse-session' }
+}
+
+function Invoke-TypedWindowPrepareIfNeeded {
+    param(
+        [Parameter(Mandatory)]$Config,
+        [Parameter(Mandatory)][string]$RunRoot,
+        [Parameter(Mandatory)][string]$PairId,
+        [Parameter(Mandatory)][string]$TargetKey,
+        [bool]$AllowInlinePrepare = $true
+    )
+
+    $session = Read-TypedWindowSessionState -Config $Config -TargetKey $TargetKey
+    $requirement = Resolve-TypedWindowPrepareRequirement -Session $session -RunRoot $RunRoot -PairId $PairId -TargetKey $TargetKey
+    if (-not [bool]$requirement.Required) {
+        return [pscustomobject]@{
+            Prepared = $false
+            PrepareReason = [string]$requirement.Reason
+            PrepareResult = $null
+            Session = $session
+        }
+    }
+
+    if (-not $AllowInlinePrepare) {
+        return [pscustomobject]@{
+            Prepared = $false
+            PrepareBlocked = $true
+            PrepareFailed = $false
+            PrepareReason = [string]$requirement.Reason
+            PrepareResult = $null
+            Session = $session
+        }
+    }
+
+    $prepareResult = Invoke-TypedWindowAhkPayload -Config $Config -TargetKey $TargetKey -Payload '/new' -ClearInput $true -SubmitModes @('enter') -DebugLabel ([string]$requirement.Reason)
+    if ([bool]$prepareResult.Executed -and [int]$prepareResult.ExitCode -ne 0) {
+        return [pscustomobject]@{
+            Prepared = $false
+            PrepareBlocked = $false
+            PrepareFailed = $true
+            PrepareReason = [string]$requirement.Reason
+            PrepareResult = $prepareResult
+            Session = $session
+        }
+    }
+
+    $session = Set-TypedWindowSessionFields -Session $session -State 'active-run'
+    $session.SessionRunRoot = $RunRoot
+    $session.SessionPairId = $PairId
+    $session.SessionTargetId = $TargetKey
+    $session.SessionEpoch = [int](Get-ConfigValue -Object $session -Name 'SessionEpoch' -DefaultValue 0) + 1
+    $session.LastPrepareAt = (Get-Date).ToString('o')
+    $session.LastResetReason = [string]$requirement.Reason
+    $session.ConsecutiveSubmitUnconfirmedCount = 0
+    Save-TypedWindowSessionState -Config $Config -TargetKey $TargetKey -Session $session
+
+    return [pscustomobject]@{
+        Prepared = $true
+        PrepareBlocked = $false
+        PrepareFailed = $false
+        PrepareReason = [string]$requirement.Reason
+        PrepareResult = $prepareResult
+        Session = $session
+    }
+}
+
+function Wait-ForTypedWindowSubmitProgress {
+    param(
+        [Parameter(Mandatory)]$Config,
+        [Parameter(Mandatory)]$TargetRow,
+        [Parameter(Mandatory)][string]$TargetKey,
+        [datetime]$ReferenceTime = [datetime]::MinValue,
+        [int]$ProbeSeconds = 10,
+        [int]$ProbePollMs = 1000,
+        [double]$ProgressCpuDeltaThresholdSeconds = 0.05
+    )
+
+    $runtimeTarget = Get-TypedWindowRuntimeTarget -Config $Config -TargetKey $TargetKey
+    $shellPid = if ($null -ne $runtimeTarget) { [int](Get-ConfigValue -Object $runtimeTarget -Name 'ShellPid' -DefaultValue 0) } else { 0 }
+    $baseline = Get-TypedWindowProgressSnapshot -TargetRow $TargetRow -ShellPid $shellPid -ReferenceTime $ReferenceTime
+    if ($baseline.LatestArtifactTicks -gt 0 -and (Test-NonEmptyString $baseline.LatestArtifactSignal)) {
+        return [pscustomobject]@{
+            ProgressDetected = $true
+            Signal = [string]$baseline.LatestArtifactSignal
+            SignalStrength = 'strong'
+            SignalPath = [string]$baseline.LatestArtifactPath
+            ElapsedSeconds = 0
+            CpuDeltaSeconds = 0.0
+            ShellPid = $shellPid
+            ChildProcessIds = @($baseline.ChildProcessIds)
+        }
+    }
+
+    $probeStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+    $deadline = (Get-Date).AddSeconds([math]::Max(1, $ProbeSeconds))
+    $pollMs = [math]::Max(100, $ProbePollMs)
+    do {
+        Start-Sleep -Milliseconds $pollMs
+        $current = Get-TypedWindowProgressSnapshot -TargetRow $TargetRow -ShellPid $shellPid -ReferenceTime $ReferenceTime
+        if ($current.LatestArtifactTicks -gt 0 -and (Test-NonEmptyString $current.LatestArtifactSignal)) {
+            return [pscustomobject]@{
+                ProgressDetected = $true
+                Signal = [string]$current.LatestArtifactSignal
+                SignalStrength = 'strong'
+                SignalPath = [string]$current.LatestArtifactPath
+                ElapsedSeconds = [int][math]::Round($probeStopwatch.Elapsed.TotalSeconds, 0)
+                CpuDeltaSeconds = [math]::Round(([double]$current.CpuSeconds - [double]$baseline.CpuSeconds), 6)
+                ShellPid = $shellPid
+                ChildProcessIds = @($current.ChildProcessIds)
+            }
+        }
+
+        $cpuDeltaSeconds = [math]::Round(([double]$current.CpuSeconds - [double]$baseline.CpuSeconds), 6)
+        if ($cpuDeltaSeconds -ge $ProgressCpuDeltaThresholdSeconds) {
+            return [pscustomobject]@{
+                ProgressDetected = $true
+                Signal = 'codex-cpu-delta'
+                SignalStrength = 'weak'
+                SignalPath = ''
+                ElapsedSeconds = [int][math]::Round($probeStopwatch.Elapsed.TotalSeconds, 0)
+                CpuDeltaSeconds = $cpuDeltaSeconds
+                ShellPid = $shellPid
+                ChildProcessIds = @($current.ChildProcessIds)
+            }
+        }
+    } while ((Get-Date) -lt $deadline)
+
+    return [pscustomobject]@{
+        ProgressDetected = $false
+        Signal = 'none'
+        SignalStrength = 'none'
+        SignalPath = ''
+        ElapsedSeconds = [int][math]::Round($probeStopwatch.Elapsed.TotalSeconds, 0)
+        CpuDeltaSeconds = [math]::Round(([double](Get-TypedWindowProgressSnapshot -TargetRow $TargetRow -ShellPid $shellPid -ReferenceTime $ReferenceTime).CpuSeconds - [double]$baseline.CpuSeconds), 6)
+        ShellPid = $shellPid
+        ChildProcessIds = @($baseline.ChildProcessIds)
+    }
+}
+
 function Get-VisibleWorkerDispatchResult {
     param(
         [Parameter(Mandatory)]$WaitResult,
@@ -681,6 +1292,38 @@ function Resolve-VisibleWorkerLateSuccess {
         SubmitState = if ($superseded) { 'confirmed' } else { $CurrentSubmitState }
         SubmitConfirmed = if ($superseded) { $true } else { $CurrentSubmitConfirmed }
         SubmitReason = if ($superseded) { if ($dispatchCompleted) { 'outbox-publish-detected-after-dispatch-timeout' } else { 'outbox-publish-detected-late' } } else { $CurrentSubmitReason }
+        OutboxResult = $outboxSnapshot
+    }
+}
+
+function Resolve-TypedWindowLateSuccess {
+    param(
+        [Parameter(Mandatory)]$TargetRow,
+        [string]$CurrentFinalState,
+        [string]$CurrentSubmitState,
+        [bool]$CurrentSubmitConfirmed,
+        [string]$CurrentSubmitReason,
+        [string]$CurrentTypedWindowExecutionState,
+        [string]$CurrentSubmitProbeState,
+        [string]$CurrentSubmitConfirmationSignal
+    )
+
+    $outboxSnapshot = Wait-ForOutboxPublish -TargetRow $TargetRow -TimeoutSeconds 0 -ReferenceTime ([datetime]::MinValue)
+    $superseded = $outboxSnapshot.Published -and (-not $CurrentSubmitConfirmed)
+
+    return [pscustomobject]@{
+        Superseded = $superseded
+        FinalState = if ($superseded) { 'publish-detected-late' } else { $CurrentFinalState }
+        SubmitState = if ($superseded) { 'confirmed' } else { $CurrentSubmitState }
+        SubmitConfirmed = if ($superseded) { $true } else { $CurrentSubmitConfirmed }
+        SubmitReason = if ($superseded) { 'outbox-publish-detected-late' } else { $CurrentSubmitReason }
+        TypedWindowExecutionState = if ($superseded) { 'typed-window-running-confirmed' } else { $CurrentTypedWindowExecutionState }
+        SubmitProbeState = if ($superseded) { 'typed-window-running-confirmed' } else { $CurrentSubmitProbeState }
+        SubmitConfirmationSignal = if ($superseded) {
+            if (Test-NonEmptyString $CurrentSubmitConfirmationSignal) { $CurrentSubmitConfirmationSignal } else { 'outbox-publish-ready' }
+        } else {
+            $CurrentSubmitConfirmationSignal
+        }
         OutboxResult = $outboxSnapshot
     }
 }
@@ -847,6 +1490,16 @@ if ($MaxAttempts -lt 1) {
 $manifest = Read-JsonObject -Path $manifestPath
 $pairTest = Resolve-PairTestConfig -Root $root -ConfigPath $resolvedConfigPath -ManifestPairTest (Get-ConfigValue -Object $manifest -Name 'PairTest' -DefaultValue $null)
 $executionPathMode = [string](Get-ConfigValue -Object $pairTest -Name 'ExecutionPathMode' -DefaultValue $(if ([bool]$pairTest.VisibleWorker.Enabled) { 'visible-worker' } else { 'typed-window' }))
+$requireUserVisibleCellExecution = [bool](Get-ConfigValue -Object $pairTest -Name 'RequireUserVisibleCellExecution' -DefaultValue $false)
+$allowedWindowVisibilityMethods = @(Get-StringArray (Get-ConfigValue -Object $pairTest -Name 'AllowedWindowVisibilityMethods' -DefaultValue @('hwnd')))
+if ($allowedWindowVisibilityMethods.Count -eq 0) {
+    $allowedWindowVisibilityMethods = @('hwnd')
+}
+$submitRetryModes = @(Get-RelaySubmitRetryModes -Config $config)
+$submitRetrySequenceSummary = Get-RelaySubmitRetrySequenceSummary -Modes $submitRetryModes
+$primarySubmitMode = Get-RelayPrimarySubmitMode -Modes $submitRetryModes
+$finalSubmitMode = Get-RelayFinalSubmitMode -Modes $submitRetryModes
+$submitRetryIntervalMs = [int](Get-ConfigValue -Object $config -Name 'SubmitRetryIntervalMs' -DefaultValue 1000)
 $visibleWorkerEnabled = ($executionPathMode -eq 'visible-worker')
 if ($visibleWorkerEnabled -and -not [bool]$pairTest.VisibleWorker.Enabled) {
     throw 'PairTest.ExecutionPathMode is visible-worker but PairTest.VisibleWorker.Enabled is false.'
@@ -857,8 +1510,33 @@ $visibleWorkerDispatchTimeoutSeconds = if ($visibleWorkerEnabled) {
 else {
     0
 }
+$typedWindowSubmitProbeSeconds = if (-not $visibleWorkerEnabled) {
+    [math]::Max(1, [int](Get-ConfigValue -Object $pairTest.TypedWindow -Name 'SubmitProbeSeconds' -DefaultValue 10))
+}
+else {
+    0
+}
+$typedWindowSubmitProbePollMs = if (-not $visibleWorkerEnabled) {
+    [math]::Max(100, [int](Get-ConfigValue -Object $pairTest.TypedWindow -Name 'SubmitProbePollMs' -DefaultValue 1000))
+}
+else {
+    0
+}
+$typedWindowSubmitRetryLimit = if (-not $visibleWorkerEnabled) {
+    [math]::Max(0, [int](Get-ConfigValue -Object $pairTest.TypedWindow -Name 'SubmitRetryLimit' -DefaultValue 1))
+}
+else {
+    0
+}
+$typedWindowProgressCpuDeltaThresholdSeconds = if (-not $visibleWorkerEnabled) {
+    [math]::Max(0.0, [double](Get-ConfigValue -Object $pairTest.TypedWindow -Name 'ProgressCpuDeltaThresholdSeconds' -DefaultValue 0.05))
+}
+else {
+    0.0
+}
 $targetRow = Resolve-TargetManifestRow -Manifest $manifest -TargetId $TargetId
 $targetKey = [string]$targetRow.TargetId
+$pairId = [string](Get-ConfigValue -Object $targetRow -Name 'PairId' -DefaultValue '')
 $targetConfig = @($config.Targets | Where-Object { [string]$_.Id -eq $targetKey } | Select-Object -First 1)
 if ($targetConfig.Count -eq 0) {
     throw "target relay config not found: $targetKey"
@@ -874,6 +1552,10 @@ $stateRoot = Join-Path $resolvedRunRoot '.state'
 $seedSendStatusPath = Join-Path $stateRoot 'seed-send-status.json'
 Ensure-Directory -Path $stateRoot
 $seedSendState = Load-SeedSendStatusState -Path $seedSendStatusPath
+$resolvedMessageTextFilePath = ''
+if (Test-NonEmptyString $MessageTextFilePath) {
+    $resolvedMessageTextFilePath = (Resolve-Path -LiteralPath $MessageTextFilePath).Path
+}
 
 $attemptResults = @()
 $finalState = 'not-started'
@@ -892,6 +1574,15 @@ $failedAt = ''
 $retryPendingAt = ''
 $workerCommandId = ''
 $workerDispatchPath = ''
+$typedWindowExecutionState = ''
+$submitProbeState = ''
+$submitProbeElapsedSeconds = 0
+$submitRetryCount = 0
+$submitConfirmationSignal = ''
+$typedWindowSessionState = ''
+$typedWindowLastResetReason = ''
+$typedWindowSession = $null
+$resendSeedReadyFile = $false
 
 for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
     $readyPath = ''
@@ -908,6 +1599,154 @@ for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
     $nextRetryAt = ''
     $backoffMs = 0
 
+    if (-not $visibleWorkerEnabled) {
+        $prepareResult = Invoke-TypedWindowPrepareIfNeeded `
+            -Config $config `
+            -RunRoot $resolvedRunRoot `
+            -PairId $pairId `
+            -TargetKey $targetKey `
+            -AllowInlinePrepare:(-not $DisallowInlineTypedWindowPrepare)
+        $typedWindowSession = $prepareResult.Session
+        $typedWindowSessionState = [string](Get-ConfigValue -Object $typedWindowSession -Name 'State' -DefaultValue '')
+        $typedWindowLastResetReason = [string](Get-ConfigValue -Object $typedWindowSession -Name 'LastResetReason' -DefaultValue '')
+        if ([bool](Get-ConfigValue -Object $prepareResult -Name 'PrepareBlocked' -DefaultValue $false)) {
+            $typedWindowExecutionState = 'typed-window-inline-prepare-blocked'
+            $submitProbeState = 'typed-window-inline-prepare-blocked'
+            $submitReason = 'typed-window-inline-prepare-blocked'
+            $retryReason = 'typed-window-inline-prepare-blocked'
+            $finalState = 'manual_attention_required'
+            $manualAttentionRequired = $true
+            $submitConfirmed = $false
+            $submitState = 'failed'
+            $submitConfirmationSignal = ('inline prepare blocked target={0} reason={1}' -f $targetKey, [string]$prepareResult.PrepareReason)
+            if ($null -eq $typedWindowSession) {
+                $typedWindowSession = Read-TypedWindowSessionState -Config $config -TargetKey $targetKey
+            }
+            $typedWindowSession = Set-TypedWindowSessionFields -Session $typedWindowSession -State 'recovery-needed'
+            $typedWindowSession.LastResetReason = 'typed-window-inline-prepare-blocked'
+            $typedWindowSession.ConsecutiveSubmitUnconfirmedCount = [int](Get-ConfigValue -Object $typedWindowSession -Name 'ConsecutiveSubmitUnconfirmedCount' -DefaultValue 0) + 1
+            Save-TypedWindowSessionState -Config $config -TargetKey $targetKey -Session $typedWindowSession
+            $typedWindowSessionState = [string](Get-ConfigValue -Object $typedWindowSession -Name 'State' -DefaultValue '')
+            $typedWindowLastResetReason = [string](Get-ConfigValue -Object $typedWindowSession -Name 'LastResetReason' -DefaultValue '')
+
+            Set-SeedSendStatusEntry -State $seedSendState `
+                -TargetKey $targetKey `
+                -UpdatedAt (Get-Date).ToString('o') `
+                -FinalState $finalState `
+                -ExecutionPathMode $executionPathMode `
+                -UserVisibleCellExecutionRequired $requireUserVisibleCellExecution `
+                -AllowedWindowVisibilityMethods @($allowedWindowVisibilityMethods) `
+                -RouterDispatchState '' `
+                -SubmitState $submitState `
+                -SubmitConfirmed $false `
+                -SubmitReason $submitReason `
+                -SubmitRetryModes @($submitRetryModes) `
+                -SubmitRetrySequenceSummary $submitRetrySequenceSummary `
+                -PrimarySubmitMode $primarySubmitMode `
+                -FinalSubmitMode $finalSubmitMode `
+                -SubmitRetryIntervalMs $submitRetryIntervalMs `
+                -AttemptCount @($attemptResults).Count `
+                -MaxAttempts $MaxAttempts `
+                -FirstAttemptedAt $firstAttemptedAt `
+                -LastAttemptedAt $lastAttemptedAt `
+                -NextRetryAt '' `
+                -BackoffMs 0 `
+                -RetryReason $retryReason `
+                -ManualAttentionRequired $manualAttentionRequired `
+                -ProcessedPath '' `
+                -ProcessedAt '' `
+                -FailedPath '' `
+                -FailedAt '' `
+                -RetryPendingPath '' `
+                -RetryPendingAt '' `
+                -OutboxPublished $false `
+                -OutboxObservedAt '' `
+                -LastReadyPath '' `
+                -LastReadyBaseName '' `
+                -TypedWindowExecutionState $typedWindowExecutionState `
+                -SubmitProbeState $submitProbeState `
+                -SubmitProbeElapsedSeconds 0 `
+                -SubmitRetryCount $submitRetryCount `
+                -SubmitConfirmationSignal $submitConfirmationSignal `
+                -TypedWindowSessionState $typedWindowSessionState `
+                -TypedWindowLastResetReason $typedWindowLastResetReason
+            Save-SeedSendStatusState -Path $seedSendStatusPath -RunRoot $resolvedRunRoot -State $seedSendState
+            break
+        }
+        if ([bool](Get-ConfigValue -Object $prepareResult -Name 'PrepareFailed' -DefaultValue $false)) {
+            $prepareExitCode = [int](Get-ConfigValue -Object $prepareResult.PrepareResult -Name 'ExitCode' -DefaultValue 1)
+            $prepareFailure = Resolve-TypedWindowAhkFailure `
+                -Config $config `
+                -ExitCode $prepareExitCode `
+                -FailurePhase 'prepare' `
+                -PrepareReason ([string]$prepareResult.PrepareReason)
+            $typedWindowExecutionState = [string]$prepareFailure.TypedWindowExecutionState
+            $submitProbeState = [string]$prepareFailure.SubmitProbeState
+            $submitReason = [string]$prepareFailure.SubmitReason
+            $retryReason = [string]$prepareFailure.RetryReason
+            $finalState = [string]$prepareFailure.FinalState
+            $manualAttentionRequired = [bool]$prepareFailure.ManualAttentionRequired
+            $submitConfirmationSignal = [string]$prepareFailure.FailureSummary
+            $submitConfirmed = $false
+            $submitState = 'failed'
+            if ($null -eq $typedWindowSession) {
+                $typedWindowSession = Read-TypedWindowSessionState -Config $config -TargetKey $targetKey
+            }
+            $typedWindowSession = Set-TypedWindowSessionFields -Session $typedWindowSession -State $(if ($manualAttentionRequired) { 'recovery-needed' } else { 'dirty-session' })
+            $typedWindowSession.LastResetReason = [string]$prepareFailure.LastResetReason
+            if ($manualAttentionRequired) {
+                $typedWindowSession.ConsecutiveSubmitUnconfirmedCount = [int](Get-ConfigValue -Object $typedWindowSession -Name 'ConsecutiveSubmitUnconfirmedCount' -DefaultValue 0) + 1
+            }
+            Save-TypedWindowSessionState -Config $config -TargetKey $targetKey -Session $typedWindowSession
+            $typedWindowSessionState = [string](Get-ConfigValue -Object $typedWindowSession -Name 'State' -DefaultValue '')
+            $typedWindowLastResetReason = [string](Get-ConfigValue -Object $typedWindowSession -Name 'LastResetReason' -DefaultValue '')
+
+            Set-SeedSendStatusEntry -State $seedSendState `
+                -TargetKey $targetKey `
+                -UpdatedAt (Get-Date).ToString('o') `
+                -FinalState $finalState `
+                -ExecutionPathMode $executionPathMode `
+                -UserVisibleCellExecutionRequired $requireUserVisibleCellExecution `
+                -AllowedWindowVisibilityMethods @($allowedWindowVisibilityMethods) `
+                -RouterDispatchState '' `
+                -SubmitState $submitState `
+                -SubmitConfirmed $false `
+                -SubmitReason $submitReason `
+                -SubmitRetryModes @($submitRetryModes) `
+                -SubmitRetrySequenceSummary $submitRetrySequenceSummary `
+                -PrimarySubmitMode $primarySubmitMode `
+                -FinalSubmitMode $finalSubmitMode `
+                -SubmitRetryIntervalMs $submitRetryIntervalMs `
+                -AttemptCount @($attemptResults).Count `
+                -MaxAttempts $MaxAttempts `
+                -FirstAttemptedAt $firstAttemptedAt `
+                -LastAttemptedAt $lastAttemptedAt `
+                -NextRetryAt '' `
+                -BackoffMs 0 `
+                -RetryReason $retryReason `
+                -ManualAttentionRequired $manualAttentionRequired `
+                -ProcessedPath '' `
+                -ProcessedAt '' `
+                -FailedPath '' `
+                -FailedAt '' `
+                -RetryPendingPath '' `
+                -RetryPendingAt '' `
+                -OutboxPublished $false `
+                -OutboxObservedAt '' `
+                -LastReadyPath '' `
+                -LastReadyBaseName '' `
+                -TypedWindowExecutionState $typedWindowExecutionState `
+                -SubmitProbeState $submitProbeState `
+                -SubmitProbeElapsedSeconds 0 `
+                -SubmitRetryCount $submitRetryCount `
+                -SubmitConfirmationSignal ([string]$prepareFailure.FailureSummary) `
+                -TypedWindowSessionState $typedWindowSessionState `
+                -TypedWindowLastResetReason $typedWindowLastResetReason
+            Save-SeedSendStatusState -Path $seedSendStatusPath -RunRoot $resolvedRunRoot -State $seedSendState
+            break
+        }
+    }
+
     if ($requireUserIdleBeforeSend -and $minUserIdleBeforeSendMs -gt 0 -and $seedWaitForUserIdleTimeoutSeconds -gt 0) {
         $idleWaitResult = Wait-ForUserIdle -RequiredIdleMs $minUserIdleBeforeSendMs -TimeoutSeconds $seedWaitForUserIdleTimeoutSeconds
         if (-not [bool]$idleWaitResult.Satisfied) {
@@ -918,12 +1757,18 @@ for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
         }
     }
 
-    if ($attempt -eq 1) {
-        $seedRaw = & (Join-Path $root 'tests\Send-InitialPairSeed.ps1') `
-            -ConfigPath $resolvedConfigPath `
-            -RunRoot $resolvedRunRoot `
-            -TargetId $targetKey `
-            -AsJson
+    if ($attempt -eq 1 -or $resendSeedReadyFile) {
+        $seedParameters = @{
+            ConfigPath = $resolvedConfigPath
+            RunRoot = $resolvedRunRoot
+            TargetId = $targetKey
+            AsJson = $true
+        }
+        if (Test-NonEmptyString $resolvedMessageTextFilePath) {
+            $seedParameters['MessageTextFilePath'] = $resolvedMessageTextFilePath
+        }
+
+        $seedRaw = & (Join-Path $root 'tests\Send-InitialPairSeed.ps1') @seedParameters
         $seedResult = $seedRaw | ConvertFrom-Json
         $seedRow = @($seedResult.Results | Where-Object { [string]$_.TargetId -eq $targetKey } | Select-Object -First 1)
         if ($seedRow.Count -eq 0) {
@@ -938,6 +1783,7 @@ for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
             throw "seed enqueue returned empty ready path for target: $targetKey output=$producerOutput"
         }
         $baseName = [System.IO.Path]::GetFileName($readyPath)
+        $resendSeedReadyFile = $false
     }
     elseif (Test-NonEmptyString $retryPendingPath) {
         $readyPath = Move-RetryPendingMessageToInbox -RetryPendingPath $retryPendingPath -InboxRoot $inboxRoot
@@ -947,6 +1793,20 @@ for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
     }
     else {
         break
+    }
+
+    if (-not $visibleWorkerEnabled) {
+        if ($null -eq $typedWindowSession) {
+            $typedWindowSession = Read-TypedWindowSessionState -Config $config -TargetKey $targetKey
+        }
+        $typedWindowSession = Set-TypedWindowSessionFields -Session $typedWindowSession -State 'active-run'
+        $typedWindowSession.SessionRunRoot = $resolvedRunRoot
+        $typedWindowSession.SessionPairId = $pairId
+        $typedWindowSession.SessionTargetId = $targetKey
+        $typedWindowSession.LastSubmitAt = $attemptedAt
+        Save-TypedWindowSessionState -Config $config -TargetKey $targetKey -Session $typedWindowSession
+        $typedWindowSessionState = [string](Get-ConfigValue -Object $typedWindowSession -Name 'State' -DefaultValue '')
+        $typedWindowLastResetReason = [string](Get-ConfigValue -Object $typedWindowSession -Name 'LastResetReason' -DefaultValue '')
     }
 
     if ($visibleWorkerEnabled) {
@@ -1013,12 +1873,157 @@ for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
                 }
                 $processedItem = Get-Item -LiteralPath $processedPath -ErrorAction SilentlyContinue
                 $referenceTime = if ($null -ne $processedItem) { $processedItem.LastWriteTime } else { Get-Date }
+                if (-not $visibleWorkerEnabled -and $WaitForPublishSeconds -gt 0) {
+                    $typedWindowProgress = Wait-ForTypedWindowSubmitProgress `
+                        -Config $config `
+                        -TargetRow $targetRow `
+                        -TargetKey $targetKey `
+                        -ReferenceTime $referenceTime `
+                        -ProbeSeconds $typedWindowSubmitProbeSeconds `
+                        -ProbePollMs $typedWindowSubmitProbePollMs `
+                        -ProgressCpuDeltaThresholdSeconds $typedWindowProgressCpuDeltaThresholdSeconds
+                    $submitProbeElapsedSeconds = [int]$typedWindowProgress.ElapsedSeconds
+                    $submitConfirmationSignal = [string]$typedWindowProgress.Signal
+                    if ([bool]$typedWindowProgress.ProgressDetected) {
+                        $signalStrength = [string](Get-ConfigValue -Object $typedWindowProgress -Name 'SignalStrength' -DefaultValue 'weak')
+                        if ($signalStrength -eq 'strong') {
+                            $typedWindowExecutionState = 'typed-window-running-confirmed'
+                            $submitProbeState = 'typed-window-running-confirmed'
+                        }
+                        else {
+                            $typedWindowExecutionState = 'typed-window-possible-running'
+                            $submitProbeState = 'typed-window-possible-running'
+                        }
+                        if ($null -eq $typedWindowSession) {
+                            $typedWindowSession = Read-TypedWindowSessionState -Config $config -TargetKey $targetKey
+                        }
+                        $typedWindowSession = Set-TypedWindowSessionFields -Session $typedWindowSession -State $(if ($signalStrength -eq 'strong') { 'running-confirmed' } else { 'active-run' })
+                        $typedWindowSession.LastProgressAt = (Get-Date).ToString('o')
+                        Save-TypedWindowSessionState -Config $config -TargetKey $targetKey -Session $typedWindowSession
+                        $typedWindowSessionState = [string](Get-ConfigValue -Object $typedWindowSession -Name 'State' -DefaultValue '')
+                        $typedWindowLastResetReason = [string](Get-ConfigValue -Object $typedWindowSession -Name 'LastResetReason' -DefaultValue '')
+                    }
+                    else {
+                        $canRetryTypedWindowSubmit = ($attempt -lt $MaxAttempts -and $submitRetryCount -lt $typedWindowSubmitRetryLimit)
+                        if ($canRetryTypedWindowSubmit) {
+                            $submitRetryCount += 1
+                            $typedWindowExecutionState = ('typed-window-retry-{0}' -f $submitRetryCount)
+                            $submitProbeState = 'typed-window-submit-unconfirmed'
+                            $retryReason = 'typed-window-submit-unconfirmed'
+                            $finalState = 'retry-pending'
+                            if ($null -eq $typedWindowSession) {
+                                $typedWindowSession = Read-TypedWindowSessionState -Config $config -TargetKey $targetKey
+                            }
+                            $typedWindowSession = Set-TypedWindowSessionFields -Session $typedWindowSession -State 'recovery-needed'
+                            $typedWindowSession.LastResetReason = 'typed-window-submit-unconfirmed'
+                            $typedWindowSession.ConsecutiveSubmitUnconfirmedCount = [int](Get-ConfigValue -Object $typedWindowSession -Name 'ConsecutiveSubmitUnconfirmedCount' -DefaultValue 0) + 1
+                            Save-TypedWindowSessionState -Config $config -TargetKey $targetKey -Session $typedWindowSession
+                            $typedWindowSessionState = [string](Get-ConfigValue -Object $typedWindowSession -Name 'State' -DefaultValue '')
+                            $typedWindowLastResetReason = [string](Get-ConfigValue -Object $typedWindowSession -Name 'LastResetReason' -DefaultValue '')
+                            $backoffMs = Get-RetryBackoffMilliseconds -AttemptNumber $attempt -BackoffScheduleMs $RetryBackoffMs -FallbackDelaySeconds $DelaySeconds
+                            $nextRetryAt = (Get-Date).AddMilliseconds($backoffMs).ToString('o')
+                            $resendSeedReadyFile = $true
+                            Set-SeedSendStatusEntry -State $seedSendState `
+                                -TargetKey $targetKey `
+                                -UpdatedAt (Get-Date).ToString('o') `
+                                -FinalState $finalState `
+                                -ExecutionPathMode $executionPathMode `
+                                -UserVisibleCellExecutionRequired $requireUserVisibleCellExecution `
+                                -AllowedWindowVisibilityMethods @($allowedWindowVisibilityMethods) `
+                                -RouterDispatchState 'processed' `
+                                -SubmitState 'unconfirmed' `
+                                -SubmitConfirmed $false `
+                                -SubmitReason $retryReason `
+                                -SubmitRetryModes @($submitRetryModes) `
+                                -SubmitRetrySequenceSummary $submitRetrySequenceSummary `
+                                -PrimarySubmitMode $primarySubmitMode `
+                                -FinalSubmitMode $finalSubmitMode `
+                                -SubmitRetryIntervalMs $submitRetryIntervalMs `
+                                -AttemptCount $attempt `
+                                -MaxAttempts $MaxAttempts `
+                                -FirstAttemptedAt $firstAttemptedAt `
+                                -LastAttemptedAt $lastAttemptedAt `
+                                -NextRetryAt $nextRetryAt `
+                                -BackoffMs $backoffMs `
+                                -RetryReason $retryReason `
+                                -ManualAttentionRequired $false `
+                                -ProcessedPath $processedPath `
+                                -ProcessedAt $processedAt `
+                                -FailedPath $failedPath `
+                                -FailedAt $failedAt `
+                                -RetryPendingPath '' `
+                                -RetryPendingAt '' `
+                                -OutboxPublished $false `
+                                -OutboxObservedAt '' `
+                                -LastReadyPath $readyPath `
+                                -LastReadyBaseName $baseName `
+                                -TypedWindowExecutionState $typedWindowExecutionState `
+                                -SubmitProbeState $submitProbeState `
+                                -SubmitProbeElapsedSeconds $submitProbeElapsedSeconds `
+                                -SubmitRetryCount $submitRetryCount `
+                                -SubmitConfirmationSignal $submitConfirmationSignal `
+                                -TypedWindowSessionState $typedWindowSessionState `
+                                -TypedWindowLastResetReason $typedWindowLastResetReason
+                            Save-SeedSendStatusState -Path $seedSendStatusPath -RunRoot $resolvedRunRoot -State $seedSendState
+                            Start-Sleep -Milliseconds $backoffMs
+                            $retryScheduled = $true
+                            break
+                        }
+
+                        $typedWindowExecutionState = 'typed-window-submit-unconfirmed'
+                        $submitProbeState = 'typed-window-submit-unconfirmed'
+                        $retryReason = 'typed-window-submit-unconfirmed'
+                        $finalState = 'submit-unconfirmed'
+                        if ($null -eq $typedWindowSession) {
+                            $typedWindowSession = Read-TypedWindowSessionState -Config $config -TargetKey $targetKey
+                        }
+                        $typedWindowSession = Set-TypedWindowSessionFields -Session $typedWindowSession -State 'recovery-needed'
+                        $typedWindowSession.LastResetReason = 'typed-window-submit-unconfirmed'
+                        $typedWindowSession.ConsecutiveSubmitUnconfirmedCount = [int](Get-ConfigValue -Object $typedWindowSession -Name 'ConsecutiveSubmitUnconfirmedCount' -DefaultValue 0) + 1
+                        Save-TypedWindowSessionState -Config $config -TargetKey $targetKey -Session $typedWindowSession
+                        $typedWindowSessionState = [string](Get-ConfigValue -Object $typedWindowSession -Name 'State' -DefaultValue '')
+                        $typedWindowLastResetReason = [string](Get-ConfigValue -Object $typedWindowSession -Name 'LastResetReason' -DefaultValue '')
+                        break
+                    }
+                }
                 $outboxResult = Wait-ForOutboxPublish -TargetRow $targetRow -TimeoutSeconds $WaitForPublishSeconds -ReferenceTime $referenceTime
                 if ($outboxResult.Published) {
                     $finalState = 'publish-detected'
+                    if (-not $visibleWorkerEnabled) {
+                        if ($null -eq $typedWindowSession) {
+                            $typedWindowSession = Read-TypedWindowSessionState -Config $config -TargetKey $targetKey
+                        }
+                        $typedWindowExecutionState = 'typed-window-running-confirmed'
+                        $submitProbeState = 'typed-window-running-confirmed'
+                        $typedWindowSession = Set-TypedWindowSessionFields -Session $typedWindowSession -State 'running-confirmed'
+                        $typedWindowSession.LastProgressAt = (Get-Date).ToString('o')
+                        $typedWindowSession.LastConfirmedArtifactAt = (Get-Date).ToString('o')
+                        $typedWindowSession.ConsecutiveSubmitUnconfirmedCount = 0
+                        Save-TypedWindowSessionState -Config $config -TargetKey $targetKey -Session $typedWindowSession
+                        $typedWindowSessionState = [string](Get-ConfigValue -Object $typedWindowSession -Name 'State' -DefaultValue '')
+                        $typedWindowLastResetReason = [string](Get-ConfigValue -Object $typedWindowSession -Name 'LastResetReason' -DefaultValue '')
+                    }
                 }
                 elseif ($WaitForPublishSeconds -gt 0) {
-                    $finalState = 'submit-unconfirmed'
+                    if (-not $visibleWorkerEnabled -and $typedWindowExecutionState -eq 'typed-window-possible-running') {
+                        $typedWindowExecutionState = 'typed-window-running-no-artifact'
+                        $submitProbeState = 'typed-window-running-no-artifact'
+                        if ($null -eq $typedWindowSession) {
+                            $typedWindowSession = Read-TypedWindowSessionState -Config $config -TargetKey $targetKey
+                        }
+                        $typedWindowSession = Set-TypedWindowSessionFields -Session $typedWindowSession -State 'dirty-session'
+                        $typedWindowSession.LastResetReason = 'no-artifact-after-submit'
+                        Save-TypedWindowSessionState -Config $config -TargetKey $targetKey -Session $typedWindowSession
+                        $typedWindowSessionState = [string](Get-ConfigValue -Object $typedWindowSession -Name 'State' -DefaultValue '')
+                        $typedWindowLastResetReason = [string](Get-ConfigValue -Object $typedWindowSession -Name 'LastResetReason' -DefaultValue '')
+                        $finalState = 'processed'
+                    }
+                    elseif (-not $visibleWorkerEnabled -and $typedWindowExecutionState -eq 'typed-window-running-confirmed') {
+                        $finalState = 'processed'
+                    }
+                    else {
+                        $finalState = 'submit-unconfirmed'
+                    }
                 }
                 break
             }
@@ -1056,10 +2061,18 @@ for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
                     -TargetKey $targetKey `
                     -UpdatedAt (Get-Date).ToString('o') `
                     -FinalState $finalState `
+                    -ExecutionPathMode $executionPathMode `
+                    -UserVisibleCellExecutionRequired $requireUserVisibleCellExecution `
+                    -AllowedWindowVisibilityMethods @($allowedWindowVisibilityMethods) `
                     -RouterDispatchState '' `
                     -SubmitState '' `
                     -SubmitConfirmed $false `
                     -SubmitReason '' `
+                    -SubmitRetryModes @($submitRetryModes) `
+                    -SubmitRetrySequenceSummary $submitRetrySequenceSummary `
+                    -PrimarySubmitMode $primarySubmitMode `
+                    -FinalSubmitMode $finalSubmitMode `
+                    -SubmitRetryIntervalMs $submitRetryIntervalMs `
                     -AttemptCount $attempt `
                     -MaxAttempts $MaxAttempts `
                     -FirstAttemptedAt $firstAttemptedAt `
@@ -1077,7 +2090,14 @@ for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
                     -OutboxPublished $false `
                     -OutboxObservedAt '' `
                     -LastReadyPath $readyPath `
-                    -LastReadyBaseName $baseName
+                    -LastReadyBaseName $baseName `
+                    -TypedWindowExecutionState $typedWindowExecutionState `
+                    -SubmitProbeState $submitProbeState `
+                    -SubmitProbeElapsedSeconds $submitProbeElapsedSeconds `
+                    -SubmitRetryCount $submitRetryCount `
+                    -SubmitConfirmationSignal $submitConfirmationSignal `
+                    -TypedWindowSessionState $typedWindowSessionState `
+                    -TypedWindowLastResetReason $typedWindowLastResetReason
                 Save-SeedSendStatusState -Path $seedSendStatusPath -RunRoot $resolvedRunRoot -State $seedSendState
                 Start-Sleep -Milliseconds $backoffMs
                 $retryScheduled = $true
@@ -1109,14 +2129,49 @@ $routerDispatchState = if ($visibleWorkerEnabled) {
 $submitState = ''
 $submitConfirmed = $false
 $submitReason = ''
-if ($null -ne $outboxResult -and [bool]$outboxResult.Published) {
+if (-not $visibleWorkerEnabled -and $typedWindowExecutionState -eq 'typed-window-inline-prepare-blocked') {
+    $submitState = 'failed'
+    $submitConfirmed = $false
+    $submitReason = if (Test-NonEmptyString $retryReason) { $retryReason } else { 'typed-window-inline-prepare-blocked' }
+}
+elseif (-not $visibleWorkerEnabled -and $typedWindowExecutionState -eq 'typed-window-visible-contract-failed') {
+    $submitState = 'failed'
+    $submitConfirmed = $false
+    $submitReason = if (Test-NonEmptyString $retryReason) { $retryReason } else { 'visible-focus-steal' }
+}
+elseif ($null -ne $outboxResult -and [bool]$outboxResult.Published) {
     $submitState = 'confirmed'
     $submitConfirmed = $true
     $submitReason = 'outbox-publish-detected'
 }
+elseif (-not $visibleWorkerEnabled -and $typedWindowExecutionState -eq 'typed-window-running-confirmed') {
+    $submitState = 'confirmed'
+    $submitConfirmed = $true
+    $submitReason = if (Test-NonEmptyString $submitConfirmationSignal) {
+        ('typed-window-running-confirmed:' + $submitConfirmationSignal)
+    }
+    else {
+        'typed-window-running-confirmed'
+    }
+}
+elseif (-not $visibleWorkerEnabled -and $typedWindowExecutionState -in @('typed-window-possible-running', 'typed-window-running-no-artifact')) {
+    $submitState = 'possible-running'
+    $submitConfirmed = $false
+    $submitReason = if (Test-NonEmptyString $submitConfirmationSignal) {
+        ('typed-window-possible-running:' + $submitConfirmationSignal)
+    }
+    else {
+        'typed-window-possible-running'
+    }
+}
 elseif ($finalState -eq 'submit-unconfirmed') {
     $submitState = 'unconfirmed'
-    $submitReason = if ($visibleWorkerEnabled) { 'no-outbox-publish-after-visible-worker' } else { 'no-outbox-publish-within-wait-window' }
+    if (-not $visibleWorkerEnabled -and $submitProbeState -in @('typed-window-submit-unconfirmed', 'typed-window-stalled-after-submit')) {
+        $submitReason = $submitProbeState
+    }
+    else {
+        $submitReason = if ($visibleWorkerEnabled) { 'no-outbox-publish-after-visible-worker' } else { 'no-outbox-publish-within-wait-window' }
+    }
 }
 elseif ($finalState -in @('timeout', 'worker-not-ready', 'dispatch-accepted-stale', 'dispatch-running-stale-no-heartbeat')) {
     $submitState = 'unconfirmed'
@@ -1152,6 +2207,63 @@ if ($visibleWorkerEnabled) {
         $outboxObservedAt = if ($outboxPublished) { (Get-Date).ToString('o') } else { '' }
     }
 }
+elseif ($null -ne $typedWindowSession -or -not $visibleWorkerEnabled) {
+    $lateTypedWindowSuccess = Resolve-TypedWindowLateSuccess `
+        -TargetRow $targetRow `
+        -CurrentFinalState $finalState `
+        -CurrentSubmitState $submitState `
+        -CurrentSubmitConfirmed $submitConfirmed `
+        -CurrentSubmitReason $submitReason `
+        -CurrentTypedWindowExecutionState $typedWindowExecutionState `
+        -CurrentSubmitProbeState $submitProbeState `
+        -CurrentSubmitConfirmationSignal $submitConfirmationSignal
+    if ([bool]$lateTypedWindowSuccess.Superseded) {
+        $finalState = [string]$lateTypedWindowSuccess.FinalState
+        $submitState = [string]$lateTypedWindowSuccess.SubmitState
+        $submitConfirmed = [bool]$lateTypedWindowSuccess.SubmitConfirmed
+        $submitReason = [string]$lateTypedWindowSuccess.SubmitReason
+        $typedWindowExecutionState = [string]$lateTypedWindowSuccess.TypedWindowExecutionState
+        $submitProbeState = [string]$lateTypedWindowSuccess.SubmitProbeState
+        $submitConfirmationSignal = [string]$lateTypedWindowSuccess.SubmitConfirmationSignal
+        $outboxResult = $lateTypedWindowSuccess.OutboxResult
+        $outboxPublished = [bool]$outboxResult.Published
+        $outboxObservedAt = if ($outboxPublished) { (Get-Date).ToString('o') } else { '' }
+    }
+
+    if ($null -eq $typedWindowSession) {
+        $typedWindowSession = Read-TypedWindowSessionState -Config $config -TargetKey $targetKey
+    }
+
+    if ($outboxPublished) {
+        $typedWindowSession = Set-TypedWindowSessionFields -Session $typedWindowSession -State 'running-confirmed'
+        $typedWindowSession.LastProgressAt = (Get-Date).ToString('o')
+        $typedWindowSession.LastConfirmedArtifactAt = (Get-Date).ToString('o')
+        $typedWindowSession.ConsecutiveSubmitUnconfirmedCount = 0
+    }
+    elseif ($finalState -eq 'submit-unconfirmed') {
+        $typedWindowSession = Set-TypedWindowSessionFields -Session $typedWindowSession -State 'recovery-needed'
+        $typedWindowSession.LastResetReason = 'typed-window-submit-unconfirmed'
+        $typedWindowSession.ConsecutiveSubmitUnconfirmedCount = [int](Get-ConfigValue -Object $typedWindowSession -Name 'ConsecutiveSubmitUnconfirmedCount' -DefaultValue 0) + 1
+    }
+    elseif ($typedWindowExecutionState -eq 'typed-window-inline-prepare-blocked') {
+        $typedWindowSession = Set-TypedWindowSessionFields -Session $typedWindowSession -State 'recovery-needed'
+        $typedWindowSession.LastResetReason = 'typed-window-inline-prepare-blocked'
+        $typedWindowSession.ConsecutiveSubmitUnconfirmedCount = [int](Get-ConfigValue -Object $typedWindowSession -Name 'ConsecutiveSubmitUnconfirmedCount' -DefaultValue 0) + 1
+    }
+    elseif ($finalState -in @('failed', 'manual_attention_required')) {
+        $typedWindowSession = Set-TypedWindowSessionFields -Session $typedWindowSession -State 'dirty-session'
+        if ($typedWindowExecutionState -eq 'typed-window-visible-contract-failed') {
+            $typedWindowSession.LastResetReason = 'focus-steal-before-submit'
+        }
+        else {
+            $typedWindowSession.LastResetReason = if ($finalState -eq 'failed') { 'typed-window-failed' } else { 'typed-window-manual-attention' }
+        }
+    }
+
+    Save-TypedWindowSessionState -Config $config -TargetKey $targetKey -Session $typedWindowSession
+    $typedWindowSessionState = [string](Get-ConfigValue -Object $typedWindowSession -Name 'State' -DefaultValue '')
+    $typedWindowLastResetReason = [string](Get-ConfigValue -Object $typedWindowSession -Name 'LastResetReason' -DefaultValue '')
+}
 $lastReadyPath = if (@($attemptResults).Count -gt 0) { [string]$attemptResults[-1].ReadyPath } else { '' }
 $lastReadyBaseName = if (@($attemptResults).Count -gt 0) { [string]$attemptResults[-1].ReadyBaseName } else { '' }
 
@@ -1159,6 +2271,20 @@ $result = [pscustomobject]@{
     RunRoot = $resolvedRunRoot
     ConfigPath = $resolvedConfigPath
     ExecutionPathMode = $executionPathMode
+    UserVisibleCellExecutionRequired = $requireUserVisibleCellExecution
+    AllowedWindowVisibilityMethods = @($allowedWindowVisibilityMethods)
+    SubmitRetryModes = @($submitRetryModes)
+    SubmitRetrySequenceSummary = $submitRetrySequenceSummary
+    PrimarySubmitMode = $primarySubmitMode
+    FinalSubmitMode = $finalSubmitMode
+    SubmitRetryIntervalMs = $submitRetryIntervalMs
+    TypedWindowExecutionState = $typedWindowExecutionState
+    SubmitProbeState = $submitProbeState
+    SubmitProbeElapsedSeconds = $submitProbeElapsedSeconds
+    SubmitRetryCount = $submitRetryCount
+    SubmitConfirmationSignal = $submitConfirmationSignal
+    TypedWindowSessionState = $typedWindowSessionState
+    TypedWindowLastResetReason = $typedWindowLastResetReason
     TargetId = $targetKey
     FinalState = $finalState
     RouterDispatchState = $routerDispatchState
@@ -1181,6 +2307,7 @@ $result = [pscustomobject]@{
     SourceReviewZipPath = [string]$targetRow.SourceReviewZipPath
     PublishReadyPath = [string]$targetRow.PublishReadyPath
     OutboxPublished = $outboxPublished
+    MessageTextFilePath = $resolvedMessageTextFilePath
     CommandId = $workerCommandId
     DispatchPath = $workerDispatchPath
     TransportMode = if ($visibleWorkerEnabled) { 'visible-worker' } else { 'router-ready-file' }
@@ -1190,10 +2317,18 @@ Set-SeedSendStatusEntry -State $seedSendState `
     -TargetKey $targetKey `
     -UpdatedAt (Get-Date).ToString('o') `
     -FinalState $finalState `
+    -ExecutionPathMode $executionPathMode `
+    -UserVisibleCellExecutionRequired $requireUserVisibleCellExecution `
+    -AllowedWindowVisibilityMethods @($allowedWindowVisibilityMethods) `
     -RouterDispatchState $routerDispatchState `
     -SubmitState $submitState `
     -SubmitConfirmed $submitConfirmed `
     -SubmitReason $submitReason `
+    -SubmitRetryModes @($submitRetryModes) `
+    -SubmitRetrySequenceSummary $submitRetrySequenceSummary `
+    -PrimarySubmitMode $primarySubmitMode `
+    -FinalSubmitMode $finalSubmitMode `
+    -SubmitRetryIntervalMs $submitRetryIntervalMs `
     -AttemptCount @($attemptResults).Count `
     -MaxAttempts $MaxAttempts `
     -FirstAttemptedAt $firstAttemptedAt `
@@ -1211,7 +2346,14 @@ Set-SeedSendStatusEntry -State $seedSendState `
     -OutboxPublished ([bool]$result.OutboxPublished) `
     -OutboxObservedAt $outboxObservedAt `
     -LastReadyPath $lastReadyPath `
-    -LastReadyBaseName $lastReadyBaseName
+    -LastReadyBaseName $lastReadyBaseName `
+    -TypedWindowExecutionState $typedWindowExecutionState `
+    -SubmitProbeState $submitProbeState `
+    -SubmitProbeElapsedSeconds $submitProbeElapsedSeconds `
+    -SubmitRetryCount $submitRetryCount `
+    -SubmitConfirmationSignal $submitConfirmationSignal `
+    -TypedWindowSessionState $typedWindowSessionState `
+    -TypedWindowLastResetReason $typedWindowLastResetReason
 Save-SeedSendStatusState -Path $seedSendStatusPath -RunRoot $resolvedRunRoot -State $seedSendState
 
 if ($AsJson) {

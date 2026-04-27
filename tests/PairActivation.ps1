@@ -29,11 +29,31 @@ function Resolve-PairActivationConfig {
 }
 
 function Get-KnownPairIds {
-    param([string[]]$PairIds = @())
+    param(
+        [string[]]$PairIds = @(),
+        $Config = $null
+    )
 
     $known = @($PairIds | Where-Object { Test-NonEmptyString $_ } | Sort-Object -Unique)
     if ($known.Count -gt 0) {
         return $known
+    }
+
+    if ($null -ne $Config -and $null -ne (Get-Command -Name 'Resolve-ConfiguredPairDefinitions' -ErrorAction SilentlyContinue)) {
+        try {
+            $pairDefinitionSet = Resolve-ConfiguredPairDefinitions -Source $Config -SourceLabel 'config'
+            $known = @(
+                @($pairDefinitionSet.Pairs) |
+                    ForEach-Object { [string](Get-ConfigValue -Object $_ -Name 'PairId' -DefaultValue '') } |
+                    Where-Object { Test-NonEmptyString $_ } |
+                    Sort-Object -Unique
+            )
+            if ($known.Count -gt 0) {
+                return $known
+            }
+        }
+        catch {
+        }
     }
 
     return @('pair01', 'pair02', 'pair03', 'pair04')
@@ -203,7 +223,7 @@ function Get-PairActivationSummary {
     )
 
     return @(
-        Get-KnownPairIds -PairIds $PairIds | ForEach-Object {
+        Get-KnownPairIds -PairIds $PairIds -Config $Config | ForEach-Object {
             Get-PairActivationState -Root $Root -Config $Config -PairId $_
         }
     )

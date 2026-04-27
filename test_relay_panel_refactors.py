@@ -61,7 +61,12 @@ from relay_panel_watcher_workflow import (
 )
 from relay_panel_watchers import WATCHER_BRIDGE_REQUIRED_FIELDS, WatcherService, WatcherStartRequest
 from relay_operator_panel import ARTIFACT_SOURCE_MEMORY_SCHEMA_VERSION, RelayOperatorPanel
-from relay_test_temp import configure_workspace_tempfile, make_workspace_tempdir, restore_tempfile_configuration
+from relay_test_temp import (
+    ExternalTemporaryDirectory,
+    configure_workspace_tempfile,
+    make_workspace_tempdir,
+    restore_tempfile_configuration,
+)
 
 
 def setUpModule() -> None:
@@ -1211,13 +1216,62 @@ class PairedExchangePromptTextTests(unittest.TestCase):
 
     def test_show_effective_config_handles_handoff_preview_zip_pattern_in_real_runroot(self) -> None:
         repo_root = Path(__file__).resolve().parent
-        config_path = repo_root / "config" / "settings.bottest-live-visible.psd1"
+        source_config = repo_root / "config" / "settings.bottest-live-visible.psd1"
         powershell_exe = require_pwsh_or_skip()
 
-        tmp_root = Path("_tmp")
-        tmp_root.mkdir(exist_ok=True)
-        with tempfile.TemporaryDirectory(dir=str(tmp_root.resolve())) as tmp:
-            run_root = Path(tmp) / "run_real_preview"
+        with ExternalTemporaryDirectory(prefix="real-preview-") as tmp:
+            temp_root = Path(tmp)
+            work_repo_root = temp_root / "work-repo"
+            run_root_base = work_repo_root / ".relay-runs" / "bottest-live-visible"
+            review_input_path = work_repo_root / "reviewfile" / "seed_review_input_latest.zip"
+            runtime_root = work_repo_root / "runtime" / "bottest-live-visible"
+            logs_root = work_repo_root / "logs" / "bottest-live-visible"
+            inbox_root = work_repo_root / "inbox" / "bottest-live-visible"
+            retry_pending_root = work_repo_root / "retry-pending" / "bottest-live-visible"
+            failed_root = work_repo_root / "failed" / "bottest-live-visible"
+            processed_root = work_repo_root / "processed" / "bottest-live-visible"
+            review_input_path.parent.mkdir(parents=True, exist_ok=True)
+            review_input_path.write_text("seed review input", encoding="utf-8")
+            config_path = temp_root / "settings.real-preview.psd1"
+            config_text = source_config.read_text(encoding="utf-8")
+            config_text = config_text.replace(
+                "C:\\dev\\python\\relay-workrepo-visible-smoke",
+                str(work_repo_root),
+            )
+            config_text = config_text.replace(
+                "C:\\dev\\python\\relay-workrepo-visible-smoke\\reviewfile\\seed_review_input_latest.zip",
+                str(review_input_path),
+            )
+            config_text = config_text.replace(
+                "C:\\dev\\python\\relay-workrepo-visible-smoke\\.relay-runs\\bottest-live-visible",
+                str(run_root_base),
+            )
+            config_text = config_text.replace(
+                "C:\\dev\\python\\hyukwoo\\hyukwoo1\\runtime\\bottest-live-visible",
+                str(runtime_root),
+            )
+            config_text = config_text.replace(
+                "C:\\dev\\python\\hyukwoo\\hyukwoo1\\logs\\bottest-live-visible",
+                str(logs_root),
+            )
+            config_text = config_text.replace(
+                "C:\\dev\\python\\hyukwoo\\hyukwoo1\\inbox\\bottest-live-visible",
+                str(inbox_root),
+            )
+            config_text = config_text.replace(
+                "C:\\dev\\python\\hyukwoo\\hyukwoo1\\retry-pending\\bottest-live-visible",
+                str(retry_pending_root),
+            )
+            config_text = config_text.replace(
+                "C:\\dev\\python\\hyukwoo\\hyukwoo1\\failed\\bottest-live-visible",
+                str(failed_root),
+            )
+            config_text = config_text.replace(
+                "C:\\dev\\python\\hyukwoo\\hyukwoo1\\processed\\bottest-live-visible",
+                str(processed_root),
+            )
+            config_path.write_text(config_text, encoding="utf-8")
+            run_root = run_root_base / "run_real_preview"
             start_command = [
                 powershell_exe,
                 "-NoProfile",
@@ -1282,13 +1336,57 @@ class PairedExchangePromptTextTests(unittest.TestCase):
         source_config = repo_root / "config" / "settings.bottest-live-visible.psd1"
         powershell_exe = require_pwsh_or_skip()
 
-        tmp_root = Path("_tmp")
-        tmp_root.mkdir(exist_ok=True)
-        with tempfile.TemporaryDirectory(dir=str(tmp_root.resolve())) as tmp:
-            tmp_root = Path(tmp)
-            config_path = tmp_root / "settings.handoff-recipient.psd1"
+        with ExternalTemporaryDirectory(prefix="handoff-recipient-") as tmp:
+            temp_root = Path(tmp)
+            work_repo_root = temp_root / "work-repo"
+            run_root_base = work_repo_root / ".relay-runs" / "bottest-live-visible"
+            review_input_path = work_repo_root / "reviewfile" / "seed_review_input_latest.zip"
+            runtime_root = work_repo_root / "runtime" / "bottest-live-visible"
+            logs_root = work_repo_root / "logs" / "bottest-live-visible"
+            inbox_root = work_repo_root / "inbox" / "bottest-live-visible"
+            retry_pending_root = work_repo_root / "retry-pending" / "bottest-live-visible"
+            failed_root = work_repo_root / "failed" / "bottest-live-visible"
+            processed_root = work_repo_root / "processed" / "bottest-live-visible"
+            review_input_path.parent.mkdir(parents=True, exist_ok=True)
+            review_input_path.write_text("seed review input", encoding="utf-8")
+            config_path = temp_root / "settings.handoff-recipient.psd1"
             config_text = source_config.read_text(encoding="utf-8")
-            inbox_root = tmp_root / "inbox"
+            config_text = config_text.replace(
+                "C:\\dev\\python\\relay-workrepo-visible-smoke",
+                str(work_repo_root),
+            )
+            config_text = config_text.replace(
+                "C:\\dev\\python\\relay-workrepo-visible-smoke\\reviewfile\\seed_review_input_latest.zip",
+                str(review_input_path),
+            )
+            config_text = config_text.replace(
+                "C:\\dev\\python\\relay-workrepo-visible-smoke\\.relay-runs\\bottest-live-visible",
+                str(run_root_base),
+            )
+            config_text = config_text.replace(
+                "C:\\dev\\python\\hyukwoo\\hyukwoo1\\runtime\\bottest-live-visible",
+                str(runtime_root),
+            )
+            config_text = config_text.replace(
+                "C:\\dev\\python\\hyukwoo\\hyukwoo1\\logs\\bottest-live-visible",
+                str(logs_root),
+            )
+            config_text = config_text.replace(
+                "C:\\dev\\python\\hyukwoo\\hyukwoo1\\inbox\\bottest-live-visible",
+                str(inbox_root),
+            )
+            config_text = config_text.replace(
+                "C:\\dev\\python\\hyukwoo\\hyukwoo1\\retry-pending\\bottest-live-visible",
+                str(retry_pending_root),
+            )
+            config_text = config_text.replace(
+                "C:\\dev\\python\\hyukwoo\\hyukwoo1\\failed\\bottest-live-visible",
+                str(failed_root),
+            )
+            config_text = config_text.replace(
+                "C:\\dev\\python\\hyukwoo\\hyukwoo1\\processed\\bottest-live-visible",
+                str(processed_root),
+            )
             for target_id in ("target01", "target05"):
                 target_folder = str((inbox_root / target_id).resolve())
                 config_text = config_text.replace(
@@ -1297,7 +1395,7 @@ class PairedExchangePromptTextTests(unittest.TestCase):
                 )
             config_path.write_text(config_text, encoding="utf-8")
 
-            run_root = tmp_root / "run_handoff_recipient"
+            run_root = run_root_base / "run_handoff_recipient"
             start_command = [
                 powershell_exe,
                 "-NoProfile",
@@ -1325,34 +1423,22 @@ class PairedExchangePromptTextTests(unittest.TestCase):
             )
             self.assertEqual(0, start_result.returncode, start_result.stderr or start_result.stdout)
 
-            source_outbox = run_root / "pair01" / "target01" / "source-outbox"
-            summary_path = source_outbox / "summary.txt"
-            review_zip_path = source_outbox / "review.zip"
-            publish_ready_path = source_outbox / "publish.ready.json"
+            manifest = json.loads((run_root / "manifest.json").read_text(encoding="utf-8"))
+            target01 = next(item for item in manifest["Targets"] if item["TargetId"] == "target01")
+            target_folder = Path(target01["TargetFolder"])
+            review_folder = Path(target01["ReviewFolderPath"])
+            summary_path = Path(target01["SummaryPath"])
+            done_path = target_folder / manifest["PairTest"]["HeadlessExec"]["DoneFileName"]
 
-            summary_path.write_text("target01 summary", encoding="utf-8")
+            review_folder.mkdir(parents=True, exist_ok=True)
+            payload_path = review_folder / "target01-payload.txt"
+            review_zip_path = review_folder / "target01-review.zip"
+            payload_path.write_text("target01 review zip", encoding="utf-8")
             with zipfile.ZipFile(review_zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zip_file:
-                zip_file.writestr("note.txt", "target01 review zip")
-
-            publish_ready_path.write_text(
-                json.dumps(
-                    {
-                        "SchemaVersion": "1.0.0",
-                        "PairId": "pair01",
-                        "TargetId": "target01",
-                        "SummaryPath": str(summary_path),
-                        "ReviewZipPath": str(review_zip_path),
-                        "PublishedAt": datetime.now(timezone.utc).isoformat(),
-                        "SummarySizeBytes": summary_path.stat().st_size,
-                        "ReviewZipSizeBytes": review_zip_path.stat().st_size,
-                        "SummarySha256": hashlib.sha256(summary_path.read_bytes()).hexdigest(),
-                        "ReviewZipSha256": hashlib.sha256(review_zip_path.read_bytes()).hexdigest(),
-                    },
-                    ensure_ascii=False,
-                    indent=2,
-                ),
-                encoding="utf-8",
-            )
+                zip_file.write(payload_path, arcname=payload_path.name)
+            payload_path.unlink()
+            summary_path.write_text("target01 summary", encoding="utf-8")
+            done_path.write_text("done", encoding="utf-8")
 
             watch_command = [
                 powershell_exe,
@@ -1392,14 +1478,15 @@ class PairedExchangePromptTextTests(unittest.TestCase):
         repo_root = Path(__file__).resolve().parent
         powershell_exe = require_pwsh_or_skip()
 
-        tmp_root = Path("_tmp")
-        tmp_root.mkdir(exist_ok=True)
-        with tempfile.TemporaryDirectory(dir=str(tmp_root.resolve())) as tmp:
-            tmp_root = Path(tmp)
-            inbox_root = tmp_root / "very" / "long" / "nested" / "inbox" / "path" / "for" / "seed" / "target01"
-            inbox_root.mkdir(parents=True)
-            inbox_literal = str(inbox_root).replace("'", "''")
-            run_root = tmp_root / ("run_" + ("preview_" * 12))
+        with ExternalTemporaryDirectory(prefix="seed-ready-path-") as tmp:
+            temp_root = Path(tmp)
+            target01_inbox = temp_root / "very" / "long" / "nested" / "inbox" / "path" / "for" / "seed" / "target01"
+            target05_inbox = temp_root / "very" / "long" / "nested" / "inbox" / "path" / "for" / "seed" / "target05"
+            target01_inbox.mkdir(parents=True)
+            target05_inbox.mkdir(parents=True)
+            target01_inbox_literal = str(target01_inbox).replace("'", "''")
+            target05_inbox_literal = str(target05_inbox).replace("'", "''")
+            run_root = temp_root / ("run_" + ("preview_" * 12))
             message_root = run_root / "messages"
             message_root.mkdir(parents=True)
             message_path = message_root / "target01.txt"
@@ -1425,14 +1512,20 @@ class PairedExchangePromptTextTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            config_path = tmp_root / "settings.test.psd1"
+            config_path = temp_root / "settings.test.psd1"
             config_path.write_text(
                 "\n".join(
                     [
                         "@{",
                         "    Targets = @(",
-                        f"        @{{ Id = 'target01'; Folder = '{inbox_literal}' }}",
+                        f"        @{{ Id = 'target01'; Folder = '{target01_inbox_literal}' }}",
+                        f"        @{{ Id = 'target05'; Folder = '{target05_inbox_literal}' }}",
                         "    )",
+                        "    PairTest = @{",
+                        "        PairDefinitions = @(",
+                        "            @{ PairId = 'pair01'; TopTargetId = 'target01'; BottomTargetId = 'target05'; SeedTargetId = 'target01' }",
+                        "        )",
+                        "    }",
                         "}",
                     ]
                 ),
@@ -1541,13 +1634,59 @@ class MessageConfigServiceTests(unittest.TestCase):
 
     def test_slot_order_save_flows_into_show_effective_config(self) -> None:
         service = MessageConfigService(CommandService())
-        tmp_root = Path("_tmp")
-        tmp_root.mkdir(exist_ok=True)
-        with tempfile.TemporaryDirectory(dir=str(tmp_root.resolve())) as tmp:
+        with ExternalTemporaryDirectory(prefix="slot-order-") as tmp:
             temp_root = Path(tmp)
             source_config = Path("config/settings.bottest-live-visible.psd1")
             config_path = temp_root / "settings.slot-order.psd1"
-            shutil.copy2(source_config, config_path)
+            work_repo_root = temp_root / "work-repo"
+            run_root_base = work_repo_root / ".relay-runs" / "bottest-live-visible"
+            review_input_path = work_repo_root / "reviewfile" / "seed_review_input_latest.zip"
+            runtime_root = work_repo_root / "runtime" / "bottest-live-visible"
+            logs_root = work_repo_root / "logs" / "bottest-live-visible"
+            inbox_root = work_repo_root / "inbox" / "bottest-live-visible"
+            retry_pending_root = work_repo_root / "retry-pending" / "bottest-live-visible"
+            failed_root = work_repo_root / "failed" / "bottest-live-visible"
+            processed_root = work_repo_root / "processed" / "bottest-live-visible"
+            review_input_path.parent.mkdir(parents=True, exist_ok=True)
+            review_input_path.write_text("seed review input", encoding="utf-8")
+            config_text = source_config.read_text(encoding="utf-8")
+            config_text = config_text.replace(
+                "C:\\dev\\python\\relay-workrepo-visible-smoke",
+                str(work_repo_root),
+            )
+            config_text = config_text.replace(
+                "C:\\dev\\python\\relay-workrepo-visible-smoke\\reviewfile\\seed_review_input_latest.zip",
+                str(review_input_path),
+            )
+            config_text = config_text.replace(
+                "C:\\dev\\python\\relay-workrepo-visible-smoke\\.relay-runs\\bottest-live-visible",
+                str(run_root_base),
+            )
+            config_text = config_text.replace(
+                "C:\\dev\\python\\hyukwoo\\hyukwoo1\\runtime\\bottest-live-visible",
+                str(runtime_root),
+            )
+            config_text = config_text.replace(
+                "C:\\dev\\python\\hyukwoo\\hyukwoo1\\logs\\bottest-live-visible",
+                str(logs_root),
+            )
+            config_text = config_text.replace(
+                "C:\\dev\\python\\hyukwoo\\hyukwoo1\\inbox\\bottest-live-visible",
+                str(inbox_root),
+            )
+            config_text = config_text.replace(
+                "C:\\dev\\python\\hyukwoo\\hyukwoo1\\retry-pending\\bottest-live-visible",
+                str(retry_pending_root),
+            )
+            config_text = config_text.replace(
+                "C:\\dev\\python\\hyukwoo\\hyukwoo1\\failed\\bottest-live-visible",
+                str(failed_root),
+            )
+            config_text = config_text.replace(
+                "C:\\dev\\python\\hyukwoo\\hyukwoo1\\processed\\bottest-live-visible",
+                str(processed_root),
+            )
+            config_path.write_text(config_text, encoding="utf-8")
 
             document = service.load_config_document(str(config_path))
             service.set_slot_order(
@@ -1558,7 +1697,7 @@ class MessageConfigServiceTests(unittest.TestCase):
             service.save_document(str(config_path), document)
 
             command_service = CommandService()
-            run_root = temp_root / "pair-test" / ("run_slot_order_" + datetime.now().strftime("%Y%m%d_%H%M%S_%f"))
+            run_root = run_root_base / ("run_slot_order_" + datetime.now().strftime("%Y%m%d_%H%M%S_%f"))
             prepare = command_service.build_script_command(
                 "tests/Start-PairedExchangeTest.ps1",
                 config_path=str(config_path),
@@ -1844,6 +1983,40 @@ class RelayOperatorPanelRuntimeCommandTests(unittest.TestCase):
 
         self.assertEqual("show-paired-run-summary.ps1", captured.get("script_name"))
         self.assertEqual({"allow_when_busy": True}, captured.get("kwargs"))
+
+    def test_open_important_summary_text_uses_current_run_root(self) -> None:
+        panel = self._make_panel()
+        with tempfile.TemporaryDirectory() as tmp:
+            run_root = Path(tmp) / "run_current"
+            summary_path = run_root / ".state" / "important-summary.txt"
+            summary_path.parent.mkdir(parents=True, exist_ok=True)
+            summary_path.write_text("[important-summary]\n", encoding="utf-8")
+            panel.effective_data = {"RunContext": {"SelectedRunRoot": str(run_root)}}
+
+            opened: list[str] = []
+            with mock.patch("relay_operator_panel.os.startfile", side_effect=lambda path: opened.append(path)):
+                panel.open_important_summary_text()
+
+        self.assertEqual([str(summary_path)], opened)
+        self.assertIn("important-summary 열기", panel._captured_output)
+        self.assertIn(str(summary_path), panel._captured_output)
+
+    def test_open_important_summary_text_warns_when_file_missing(self) -> None:
+        panel = self._make_panel()
+        with tempfile.TemporaryDirectory() as tmp:
+            run_root = Path(tmp) / "run_missing"
+            run_root.mkdir(parents=True, exist_ok=True)
+            panel.run_root_var.set(str(run_root))
+            expected_path = run_root / ".state" / "important-summary.txt"
+            warnings: list[tuple[str, str]] = []
+
+            with mock.patch("relay_operator_panel.messagebox.showwarning", side_effect=lambda title, message: warnings.append((title, message))):
+                panel.open_important_summary_text()
+
+        self.assertEqual(
+            [("important-summary 없음", f"먼저 runroot 요약을 실행해 important-summary.txt를 생성하세요.\n{expected_path}")],
+            warnings,
+        )
 
     def test_run_prepare_all_continues_past_visibility_blockers(self) -> None:
         panel = self._make_panel()

@@ -50,6 +50,23 @@ function Resolve-OptionalLiteralPath {
     return (Resolve-Path -LiteralPath $PathValue).Path
 }
 
+function Resolve-FullPathFromBase {
+    param(
+        [AllowEmptyString()][string]$PathValue,
+        [Parameter(Mandatory)][string]$BasePath
+    )
+
+    if (-not (Test-NonEmptyString $PathValue)) {
+        return ''
+    }
+
+    if ([System.IO.Path]::IsPathRooted($PathValue)) {
+        return [System.IO.Path]::GetFullPath($PathValue)
+    }
+
+    return [System.IO.Path]::GetFullPath((Join-Path $BasePath $PathValue))
+}
+
 function Get-SeedReviewInputCandidates {
     param(
         [Parameter(Mandatory)][string]$DirectoryPath,
@@ -167,12 +184,41 @@ function Compose-RelayPayloadPreview {
     )
 
     $normalizedBody = Normalize-MultilineText -Value $Body
+    $effectiveFixedSuffix = if ($null -eq $FixedSuffix) { '' } else { [string]$FixedSuffix }
+    if ($effectiveFixedSuffix.Trim() -eq '여기에 고정문구 입력') {
+        $FixedSuffix = ''
+    }
     if ([string]::IsNullOrWhiteSpace($FixedSuffix)) {
         return $normalizedBody
     }
 
     $normalizedSuffix = Normalize-MultilineText -Value $FixedSuffix
     return ($normalizedBody + "`r`n`r`n" + $normalizedSuffix)
+}
+
+function Get-EffectiveRelayPayloadPreviewFixedSuffix {
+    param(
+        [Parameter(Mandatory)]$Config,
+        [Parameter(Mandatory)]$Target
+    )
+
+    $placeholderFixedSuffix = '여기에 고정문구 입력'
+    $targetFixedSuffixValue = Get-ConfigValue -Object $Target -Name 'FixedSuffix' -DefaultValue $null
+    if ($null -ne $targetFixedSuffixValue) {
+        $targetFixedSuffix = [string]$targetFixedSuffixValue
+        if ($targetFixedSuffix.Trim() -eq $placeholderFixedSuffix) {
+            return ''
+        }
+
+        return $targetFixedSuffix
+    }
+
+    $defaultFixedSuffix = [string](Get-ConfigValue -Object $Config -Name 'DefaultFixedSuffix' -DefaultValue '')
+    if ($defaultFixedSuffix.Trim() -eq $placeholderFixedSuffix) {
+        return ''
+    }
+
+    return $defaultFixedSuffix
 }
 
 function Assert-RelayPayloadBudget {
@@ -187,7 +233,7 @@ function Assert-RelayPayloadBudget {
         throw "target relay config not found: $TargetId"
     }
 
-    $fixedSuffix = if ($null -ne $target[0].FixedSuffix) { [string]$target[0].FixedSuffix } else { '' }
+    $fixedSuffix = Get-EffectiveRelayPayloadPreviewFixedSuffix -Config $Config -Target $target[0]
     $payload = Compose-RelayPayloadPreview -Body $Body -FixedSuffix $fixedSuffix
     $payloadChars = $payload.Length
     $payloadBytes = (New-Utf8NoBomEncoding).GetByteCount($payload)
@@ -459,6 +505,190 @@ function Resolve-TargetSeedContext {
     }
 }
 
+function Get-PathLeafName {
+    param([Parameter(Mandatory)][string]$Path)
+
+    $trimmed = $Path.TrimEnd([char[]]"\ /")
+    if (-not (Test-NonEmptyString $trimmed)) {
+        return ''
+    }
+
+    return [System.IO.Path]::GetFileName($trimmed)
+}
+
+function Resolve-PairWorkRepoRoot {
+    param(
+        [Parameter(Mandatory)]$PairPolicy,
+        [string]$ExplicitSeedWorkRepoRoot = ''
+    )
+
+    $workRepoRootCandidate = if (Test-NonEmptyString $ExplicitSeedWorkRepoRoot) {
+        $ExplicitSeedWorkRepoRoot
+    }
+    else {
+        [string](Get-ConfigValue -Object $PairPolicy -Name 'DefaultSeedWorkRepoRoot' -DefaultValue '')
+    }
+
+    return (Resolve-OptionalLiteralPath -PathValue $workRepoRootCandidate)
+}
+
+function Test-UseExternalWorkRepoContractPaths {
+    param(
+        [Parameter(Mandatory)]$PairTest,
+        [Parameter(Mandatory)]$PairPolicy,
+        [string]$PairWorkRepoRoot = ''
+    )
+
+    if (-not (Test-NonEmptyString $PairWorkRepoRoot)) {
+        return $false
+    }
+
+    return [bool](Get-ConfigValue -Object $PairPolicy -Name 'UseExternalWorkRepoContractPaths' -DefaultValue ([bool](Get-ConfigValue -Object $PairTest -Name 'UseExternalWorkRepoContractPaths' -DefaultValue $false)))
+}
+
+function Get-TargetSourceContractPaths {
+    param(
+        [Parameter(Mandatory)]$PairTest,
+        [Parameter(Mandatory)]$PairPolicy,
+        [Parameter(Mandatory)][string]$RunRoot,
+        [Parameter(Mandatory)][string]$PairId,
+        [Parameter(Mandatory)][string]$TargetId,
+        [Parameter(Mandatory)][string]$TargetFolder,
+        [string]$PairWorkRepoRoot = ''
+    )
+
+    $useExternal = Test-UseExternalWorkRepoContractPaths -PairTest $PairTest -PairPolicy $PairPolicy -PairWorkRepoRoot $PairWorkRepoRoot
+    if ($useExternal) {
+        $contractRootSpec = [string](Get-ConfigValue -Object $PairPolicy -Name 'ExternalWorkRepoContractRelativeRoot' -DefaultValue ([string](Get-ConfigValue -Object $PairTest -Name 'ExternalWorkRepoContractRelativeRoot' -DefaultValue '.relay-contract\bottest-live-visible')))
+        $resolvedContractBase = if ([System.IO.Path]::IsPathRooted($contractRootSpec)) {
+            [System.IO.Path]::GetFullPath($contractRootSpec)
+        }
+        else {
+            [System.IO.Path]::GetFullPath((Join-Path $PairWorkRepoRoot $contractRootSpec))
+        }
+        $runLeaf = Get-PathLeafName -Path $RunRoot
+        $contractRootPath = Join-Path $resolvedContractBase (Join-Path $runLeaf (Join-Path $PairId $TargetId))
+        $sourceOutboxPath = Join-Path $contractRootPath ([string]$PairTest.SourceOutboxFolderName)
+        $sourceSummaryPath = Join-Path $sourceOutboxPath ([string]$PairTest.SourceSummaryFileName)
+        $sourceReviewZipPath = Join-Path $sourceOutboxPath ([string]$PairTest.SourceReviewZipFileName)
+        $publishReadyPath = Join-Path $sourceOutboxPath ([string]$PairTest.PublishReadyFileName)
+        $publishedArchivePath = Join-Path $sourceOutboxPath ([string]$PairTest.PublishedArchiveFolderName)
+
+        return [pscustomobject]@{
+            ContractPathMode    = 'external-workrepo'
+            ContractRootPath    = $contractRootPath
+            ContractBasePath    = $resolvedContractBase
+            SourceOutboxPath    = $sourceOutboxPath
+            SourceSummaryPath   = $sourceSummaryPath
+            SourceReviewZipPath = $sourceReviewZipPath
+            PublishReadyPath    = $publishReadyPath
+            PublishedArchivePath = $publishedArchivePath
+        }
+    }
+
+    $sourceOutboxPath = Join-Path $TargetFolder ([string]$PairTest.SourceOutboxFolderName)
+    $sourceSummaryPath = Join-Path $sourceOutboxPath ([string]$PairTest.SourceSummaryFileName)
+    $sourceReviewZipPath = Join-Path $sourceOutboxPath ([string]$PairTest.SourceReviewZipFileName)
+    $publishReadyPath = Join-Path $sourceOutboxPath ([string]$PairTest.PublishReadyFileName)
+    $publishedArchivePath = Join-Path $sourceOutboxPath ([string]$PairTest.PublishedArchiveFolderName)
+
+    return [pscustomobject]@{
+        ContractPathMode    = 'runroot'
+        ContractRootPath    = $TargetFolder
+        ContractBasePath    = $RunRoot
+        SourceOutboxPath    = $sourceOutboxPath
+        SourceSummaryPath   = $sourceSummaryPath
+        SourceReviewZipPath = $sourceReviewZipPath
+        PublishReadyPath    = $publishReadyPath
+        PublishedArchivePath = $publishedArchivePath
+    }
+}
+
+function Get-NormalizedAbsolutePath {
+    param([Parameter(Mandatory)][string]$Path)
+
+    return [System.IO.Path]::GetFullPath($Path)
+}
+
+function Test-PathDescendsFromRoot {
+    param(
+        [Parameter(Mandatory)][string]$RootPath,
+        [Parameter(Mandatory)][string]$CandidatePath
+    )
+
+    $normalizedRoot = (Get-NormalizedAbsolutePath -Path $RootPath).TrimEnd([System.IO.Path]::DirectorySeparatorChar, [System.IO.Path]::AltDirectorySeparatorChar)
+    $normalizedCandidate = Get-NormalizedAbsolutePath -Path $CandidatePath
+    $comparison = [System.StringComparison]::OrdinalIgnoreCase
+    if ($normalizedCandidate.Equals($normalizedRoot, $comparison)) {
+        return $true
+    }
+
+    $rootWithSeparator = ($normalizedRoot + [System.IO.Path]::DirectorySeparatorChar)
+    return $normalizedCandidate.StartsWith($rootWithSeparator, $comparison)
+}
+
+function Assert-ExternalContractPathValidation {
+    param(
+        [Parameter(Mandatory)]$PairRows,
+        [Parameter(Mandatory)]$TargetContractPathMap
+    )
+
+    $ownerByPath = @{}
+    foreach ($pair in @($PairRows)) {
+        $pairId = [string]$pair.PairId
+        $pairWorkRepoRoot = [string]$pair.PairWorkRepoRoot
+        $useExternal = [bool]$pair.UseExternalWorkRepoContractPaths
+
+        foreach ($targetId in @([string]$pair.TopTargetId, [string]$pair.BottomTargetId)) {
+            $contractKey = ($pairId + '|' + $targetId)
+            $contractPaths = $TargetContractPathMap[$contractKey]
+            if ($null -eq $contractPaths) {
+                throw ("external-contract-paths-missing pair={0} target={1}" -f $pairId, $targetId)
+            }
+
+            $ownerLabel = ($pairId + ':' + $targetId)
+            $requiredFields = @(
+                'ContractRootPath',
+                'SourceOutboxPath',
+                'SourceSummaryPath',
+                'SourceReviewZipPath',
+                'PublishReadyPath',
+                'PublishedArchivePath'
+            )
+            foreach ($fieldName in $requiredFields) {
+                $fieldValue = [string](Get-ConfigValue -Object $contractPaths -Name $fieldName -DefaultValue '')
+                if (-not (Test-NonEmptyString $fieldValue)) {
+                    throw ("external-contract-path-missing field={0} pair={1} target={2}" -f $fieldName, $pairId, $targetId)
+                }
+
+                $normalizedValue = Get-NormalizedAbsolutePath -Path $fieldValue
+                $existingOwner = [string](Get-ConfigValue -Object $ownerByPath -Name $normalizedValue -DefaultValue '')
+                if ((Test-NonEmptyString $existingOwner) -and ($existingOwner -ne $ownerLabel)) {
+                    throw ("external-contract-path-collision path={0} owner={1} other={2}" -f $normalizedValue, $ownerLabel, $existingOwner)
+                }
+                $ownerByPath[$normalizedValue] = $ownerLabel
+
+                if ($useExternal -and -not (Test-PathDescendsFromRoot -RootPath $pairWorkRepoRoot -CandidatePath $normalizedValue)) {
+                    throw ("external-contract-path-outside-workrepo pair={0} target={1} field={2} workRepoRoot={3} path={4}" -f $pairId, $targetId, $fieldName, $pairWorkRepoRoot, $normalizedValue)
+                }
+            }
+
+            $normalizedSourceOutboxPath = Get-NormalizedAbsolutePath -Path ([string]$contractPaths.SourceOutboxPath)
+            $normalizedContractRootPath = Get-NormalizedAbsolutePath -Path ([string]$contractPaths.ContractRootPath)
+            if (-not (Test-PathDescendsFromRoot -RootPath $normalizedContractRootPath -CandidatePath $normalizedSourceOutboxPath)) {
+                throw ("external-contract-source-outbox-outside-root pair={0} target={1} contractRoot={2} sourceOutbox={3}" -f $pairId, $targetId, $normalizedContractRootPath, $normalizedSourceOutboxPath)
+            }
+
+            foreach ($childField in @('SourceSummaryPath', 'SourceReviewZipPath', 'PublishReadyPath', 'PublishedArchivePath')) {
+                $childPath = Get-NormalizedAbsolutePath -Path ([string](Get-ConfigValue -Object $contractPaths -Name $childField -DefaultValue ''))
+                if (-not (Test-PathDescendsFromRoot -RootPath $normalizedSourceOutboxPath -CandidatePath $childPath)) {
+                    throw ("external-contract-child-outside-outbox pair={0} target={1} field={2} sourceOutbox={3} path={4}" -f $pairId, $targetId, $childField, $normalizedSourceOutboxPath, $childPath)
+                }
+            }
+        }
+    }
+}
+
 function Get-AutomaticPathGuideBlock {
     param(
         [Parameter(Mandatory)][string]$TargetId,
@@ -469,6 +699,7 @@ function Get-AutomaticPathGuideBlock {
         [Parameter(Mandatory)][string]$OutputSummaryPath,
         [Parameter(Mandatory)][string]$OutputReviewZipPath,
         [Parameter(Mandatory)][string]$PublishReadyPath,
+        [string]$WorkRepoRoot = '',
         [string]$ExternalReviewInputPath = ''
     )
 
@@ -492,6 +723,7 @@ function Get-AutomaticPathGuideBlock {
     $lines = @(
         '[자동 경로 안내]'
         ('현재 대상: ' + $TargetId)
+        ('프로젝트 작업 repo: ' + $(if (Test-NonEmptyString $WorkRepoRoot) { $WorkRepoRoot } else { '(not-set)' }))
         ('내 작업 폴더: ' + $TargetFolder)
         ('상대 작업 폴더: ' + $PartnerFolder)
         ''
@@ -525,6 +757,8 @@ function Get-TargetInstructionText {
         [Parameter(Mandatory)][string]$PartnerTargetId,
         [Parameter(Mandatory)][string]$TargetFolder,
         [Parameter(Mandatory)][string]$PartnerFolder,
+        [string]$PartnerSourceSummaryPath = '',
+        [string]$PartnerSourceReviewZipPath = '',
         [Parameter(Mandatory)][string]$SummaryPath,
         [Parameter(Mandatory)][string]$ReviewFolderPath,
         [Parameter(Mandatory)][string]$DoneFilePath,
@@ -567,18 +801,24 @@ function Get-TargetInstructionText {
     $sourceReviewZipFileName = [string]$PairTest.SourceReviewZipFileName
     $publishReadyFileName = [string]$PairTest.PublishReadyFileName
     $oneTimeSplit = Split-OneTimeQueueItemsByPlacement -Items $OneTimeItems
-    $partnerSourceOutboxPath = Join-Path $PartnerFolder ([string]$PairTest.SourceOutboxFolderName)
-    $partnerSourceSummaryPath = Join-Path $partnerSourceOutboxPath ([string]$PairTest.SourceSummaryFileName)
-    $partnerSourceReviewZipPath = Join-Path $partnerSourceOutboxPath ([string]$PairTest.SourceReviewZipFileName)
+    if (-not (Test-NonEmptyString $PartnerSourceSummaryPath)) {
+        $partnerSourceOutboxPath = Join-Path $PartnerFolder ([string]$PairTest.SourceOutboxFolderName)
+        $PartnerSourceSummaryPath = Join-Path $partnerSourceOutboxPath ([string]$PairTest.SourceSummaryFileName)
+    }
+    if (-not (Test-NonEmptyString $PartnerSourceReviewZipPath)) {
+        $partnerSourceOutboxPath = Join-Path $PartnerFolder ([string]$PairTest.SourceOutboxFolderName)
+        $PartnerSourceReviewZipPath = Join-Path $partnerSourceOutboxPath ([string]$PairTest.SourceReviewZipFileName)
+    }
     $pathGuideBlock = Get-AutomaticPathGuideBlock `
         -TargetId $TargetId `
         -TargetFolder $TargetFolder `
         -PartnerFolder $PartnerFolder `
-        -ReviewSummaryPath $partnerSourceSummaryPath `
-        -ReviewZipPath $partnerSourceReviewZipPath `
+        -ReviewSummaryPath $PartnerSourceSummaryPath `
+        -ReviewZipPath $PartnerSourceReviewZipPath `
         -OutputSummaryPath $SourceSummaryPath `
         -OutputReviewZipPath $SourceReviewZipPath `
         -PublishReadyPath $PublishReadyPath `
+        -WorkRepoRoot $WorkRepoRoot `
         -ExternalReviewInputPath $ReviewInputPath
 
     $primaryBlock = switch ($InitialRoleMode) {
@@ -676,6 +916,8 @@ function Get-TargetInitialSeedMessageText {
         [Parameter(Mandatory)][string]$InstructionPath,
         [Parameter(Mandatory)][string]$TargetFolder,
         [Parameter(Mandatory)][string]$PartnerFolder,
+        [string]$PartnerSourceSummaryPath = '',
+        [string]$PartnerSourceReviewZipPath = '',
         [Parameter(Mandatory)][string]$SourceOutboxPath,
         [Parameter(Mandatory)][string]$SourceSummaryPath,
         [Parameter(Mandatory)][string]$SourceReviewZipPath,
@@ -700,18 +942,24 @@ function Get-TargetInitialSeedMessageText {
             }
         }
     }
-    $partnerSourceOutboxPath = Join-Path $PartnerFolder ([string]$PairTest.SourceOutboxFolderName)
-    $partnerSourceSummaryPath = Join-Path $partnerSourceOutboxPath ([string]$PairTest.SourceSummaryFileName)
-    $partnerSourceReviewZipPath = Join-Path $partnerSourceOutboxPath ([string]$PairTest.SourceReviewZipFileName)
+    if (-not (Test-NonEmptyString $PartnerSourceSummaryPath)) {
+        $partnerSourceOutboxPath = Join-Path $PartnerFolder ([string]$PairTest.SourceOutboxFolderName)
+        $PartnerSourceSummaryPath = Join-Path $partnerSourceOutboxPath ([string]$PairTest.SourceSummaryFileName)
+    }
+    if (-not (Test-NonEmptyString $PartnerSourceReviewZipPath)) {
+        $partnerSourceOutboxPath = Join-Path $PartnerFolder ([string]$PairTest.SourceOutboxFolderName)
+        $PartnerSourceReviewZipPath = Join-Path $partnerSourceOutboxPath ([string]$PairTest.SourceReviewZipFileName)
+    }
     $pathGuideBlock = Get-AutomaticPathGuideBlock `
         -TargetId $TargetId `
         -TargetFolder $TargetFolder `
         -PartnerFolder $PartnerFolder `
-        -ReviewSummaryPath $partnerSourceSummaryPath `
-        -ReviewZipPath $partnerSourceReviewZipPath `
+        -ReviewSummaryPath $PartnerSourceSummaryPath `
+        -ReviewZipPath $PartnerSourceReviewZipPath `
         -OutputSummaryPath $SourceSummaryPath `
         -OutputReviewZipPath $SourceReviewZipPath `
         -PublishReadyPath $PublishReadyPath `
+        -WorkRepoRoot $WorkRepoRoot `
         -ExternalReviewInputPath $ReviewInputPath
     $bodyBlock = switch ($InitialRoleMode) {
         'seed' {
@@ -798,7 +1046,6 @@ if ([string]::IsNullOrWhiteSpace($ConfigPath)) {
 $resolvedConfigPath = (Resolve-Path -LiteralPath $ConfigPath).Path
 $config = Import-PowerShellDataFile -Path $resolvedConfigPath
 $pairTest = Resolve-PairTestConfig -Root $root -ConfigPath $resolvedConfigPath
-$RunRoot = Resolve-PairRunRootPath -Root $root -RunRoot $RunRoot -PairTest $pairTest
 $selectedPairs = @(Get-PairDefinitions -PairTest $pairTest -IncludePairId $IncludePairId)
 
 $requestedSeedTargetIds = @(
@@ -877,18 +1124,94 @@ else {
 $resolvedSeedWorkRepoRoot = [string]$manifestSeedContext.WorkRepoRoot
 $seedReviewSelection = $manifestSeedContext.ReviewInputSelection
 $resolvedSeedReviewInputPath = [string]$manifestSeedContext.ReviewInputPath
+if ($null -ne $seedTargetPairPolicy) {
+    Assert-SeedWorkRepoPolicy `
+        -PairTest $pairTest `
+        -PairPolicy $seedTargetPairPolicy `
+        -AutomationRoot $root `
+        -WorkRepoRoot $resolvedSeedWorkRepoRoot `
+        -ReviewInputPath $resolvedSeedReviewInputPath
+}
+
+$pairRows = @()
+$pairActivationSummary = @()
+foreach ($pair in @($selectedPairs)) {
+    $pairId = [string]$pair.PairId
+    $pairPolicy = Get-PairPolicyForPair -PairTest $pairTest -PairId $pairId
+    $pairWorkRepoRoot = Resolve-PairWorkRepoRoot -PairPolicy $pairPolicy -ExplicitSeedWorkRepoRoot $SeedWorkRepoRoot
+    $pairUsesExternalContractPaths = Test-UseExternalWorkRepoContractPaths -PairTest $pairTest -PairPolicy $pairPolicy -PairWorkRepoRoot $pairWorkRepoRoot
+    $pairUsesExternalRunRoot = Test-UseExternalWorkRepoRunRoot -PairTest $pairTest -PairPolicy $pairPolicy -WorkRepoRoot $pairWorkRepoRoot
+    $pairRows += [pscustomobject]@{
+        PairId = $pairId
+        TopTargetId = [string]$pair.TopTargetId
+        BottomTargetId = [string]$pair.BottomTargetId
+        SeedTargetId = [string]$pair.SeedTargetId
+        Policy = $pairPolicy
+        PairWorkRepoRoot = $pairWorkRepoRoot
+        UseExternalWorkRepoContractPaths = $pairUsesExternalContractPaths
+        UseExternalWorkRepoRunRoot = $pairUsesExternalRunRoot
+    }
+}
+
+$runRootPolicy = $null
+$runRootWorkRepoRoot = ''
+$externalRunRootPairs = @($pairRows | Where-Object { [bool]$_.UseExternalWorkRepoRunRoot })
+if ($externalRunRootPairs.Count -gt 0) {
+    $distinctWorkRepoRoots = @(
+        $externalRunRootPairs |
+            ForEach-Object { [string]$_.PairWorkRepoRoot } |
+            Where-Object { Test-NonEmptyString $_ } |
+            Sort-Object -Unique
+    )
+    if ($distinctWorkRepoRoots.Count -ne 1) {
+        throw ('external run root requires exactly one shared WorkRepoRoot for the selected pairs. actual={0}' -f ($distinctWorkRepoRoots -join ', '))
+    }
+
+    $runRootPolicy = $externalRunRootPairs[0].Policy
+    $runRootWorkRepoRoot = [string]$distinctWorkRepoRoots[0]
+}
+elseif ($pairRows.Count -gt 0) {
+    $runRootPolicy = $pairRows[0].Policy
+}
+
+$RunRoot = Resolve-PairRunRootPath `
+    -Root $root `
+    -RunRoot $RunRoot `
+    -PairTest $pairTest `
+    -PairPolicy $runRootPolicy `
+    -WorkRepoRoot $runRootWorkRepoRoot
+
+foreach ($pairRow in @($pairRows)) {
+    Assert-RunRootPolicy `
+        -PairTest $pairTest `
+        -PairPolicy $pairRow.Policy `
+        -AutomationRoot $root `
+        -RunRoot $RunRoot `
+        -WorkRepoRoot ([string]$pairRow.PairWorkRepoRoot)
+
+    Assert-BookkeepingRootsPolicy `
+        -Config $config `
+        -PairTest $pairTest `
+        -PairPolicy $pairRow.Policy `
+        -AutomationRoot $root `
+        -BasePath $root `
+        -WorkRepoRoot ([string]$pairRow.PairWorkRepoRoot)
+}
 
 Ensure-Directory -Path $RunRoot
 $messagesRoot = Join-Path $RunRoot ([string]$pairTest.MessageFolderName)
 Ensure-Directory -Path $messagesRoot
 
 $targetFolderMap = @{}
-$pairRows = @()
-$pairActivationSummary = @()
+$targetContractPathMap = @{}
 
 foreach ($pair in @($selectedPairs)) {
-    $pairActivationSummary += @(Assert-PairActivationEnabled -Root $root -Config $config -PairId ([string]$pair.PairId))
-    $pairRoot = Join-Path $RunRoot ([string]$pair.PairId)
+    $pairId = [string]$pair.PairId
+    $pairPolicy = Get-PairPolicyForPair -PairTest $pairTest -PairId $pairId
+    $pairWorkRepoRoot = Resolve-PairWorkRepoRoot -PairPolicy $pairPolicy -ExplicitSeedWorkRepoRoot $SeedWorkRepoRoot
+    $pairUsesExternalContractPaths = Test-UseExternalWorkRepoContractPaths -PairTest $pairTest -PairPolicy $pairPolicy -PairWorkRepoRoot $pairWorkRepoRoot
+    $pairActivationSummary += @(Assert-PairActivationEnabled -Root $root -Config $config -PairId $pairId)
+    $pairRoot = Join-Path $RunRoot $pairId
     Ensure-Directory -Path $pairRoot
 
     foreach ($entry in @(
@@ -898,23 +1221,31 @@ foreach ($pair in @($selectedPairs)) {
         $targetRoot = Join-Path $pairRoot ([string]$entry.TargetId)
         $reviewRoot = Join-Path $targetRoot ([string]$pairTest.ReviewFolderName)
         $workRoot = Join-Path $targetRoot ([string]$pairTest.WorkFolderName)
-        $sourceOutboxRoot = Join-Path $targetRoot ([string]$pairTest.SourceOutboxFolderName)
-        $publishedArchiveRoot = Join-Path $sourceOutboxRoot ([string]$pairTest.PublishedArchiveFolderName)
+        $contractPaths = Get-TargetSourceContractPaths `
+            -PairTest $pairTest `
+            -PairPolicy $pairPolicy `
+            -RunRoot $RunRoot `
+            -PairId $pairId `
+            -TargetId ([string]$entry.TargetId) `
+            -TargetFolder $targetRoot `
+            -PairWorkRepoRoot $pairWorkRepoRoot
+        $sourceOutboxRoot = [string]$contractPaths.SourceOutboxPath
+        $publishedArchiveRoot = [string]$contractPaths.PublishedArchivePath
         Ensure-Directory -Path $targetRoot
         Ensure-Directory -Path $reviewRoot
         Ensure-Directory -Path $workRoot
         Ensure-Directory -Path $sourceOutboxRoot
         Ensure-Directory -Path $publishedArchiveRoot
         $targetFolderMap[[string]$entry.TargetId] = $targetRoot
+        $targetContractPathMap[($pairId + '|' + [string]$entry.TargetId)] = $contractPaths
     }
 
-    $pairRows += [pscustomobject]@{
-        PairId = [string]$pair.PairId
-        TopTargetId = [string]$pair.TopTargetId
-        BottomTargetId = [string]$pair.BottomTargetId
-        SeedTargetId = [string]$pair.SeedTargetId
-        Policy = (Get-PairPolicyForPair -PairTest $pairTest -PairId ([string]$pair.PairId))
-    }
+}
+
+$externalContractPathsValidated = $false
+if (@($pairRows | Where-Object { [bool]$_.UseExternalWorkRepoContractPaths }).Count -gt 0) {
+    Assert-ExternalContractPathValidation -PairRows $pairRows -TargetContractPathMap $targetContractPathMap
+    $externalContractPathsValidated = $true
 }
 
 $messageFiles = @()
@@ -949,11 +1280,32 @@ foreach ($pair in $pairRows) {
             -ExplicitSeedTaskText $resolvedSeedTaskText
         $initialRoleMode = if ($isSeedTarget) { 'seed' } else { 'handoff_wait' }
         $targetWorkRepoRoot = [string]$targetSeedContext.WorkRepoRoot
+        $effectiveTargetWorkRepoRoot = if (Test-NonEmptyString $targetWorkRepoRoot) {
+            $targetWorkRepoRoot
+        }
+        elseif ([bool]$pair.UseExternalWorkRepoContractPaths -and (Test-NonEmptyString ([string]$pair.PairWorkRepoRoot))) {
+            [string]$pair.PairWorkRepoRoot
+        }
+        else {
+            ''
+        }
         $targetReviewInputPath = [string]$targetSeedContext.ReviewInputPath
         $targetSeedTaskText = [string]$targetSeedContext.SeedTaskText
         $targetReviewInputSelection = $targetSeedContext.ReviewInputSelection
+        if ($isSeedTarget) {
+            Assert-SeedWorkRepoPolicy `
+                -PairTest $pairTest `
+                -PairPolicy $pairPolicy `
+                -AutomationRoot $root `
+                -WorkRepoRoot $effectiveTargetWorkRepoRoot `
+                -ReviewInputPath $targetReviewInputPath
+        }
         $targetFolder = [string]$targetFolderMap[[string]$entry.TargetId]
         $partnerFolder = [string]$targetFolderMap[[string]$entry.PartnerTargetId]
+        $contractKey = ([string]$entry.PairId + '|' + [string]$entry.TargetId)
+        $partnerContractKey = ([string]$entry.PairId + '|' + [string]$entry.PartnerTargetId)
+        $contractPaths = $targetContractPathMap[$contractKey]
+        $partnerContractPaths = $targetContractPathMap[$partnerContractKey]
         $summaryPath = Join-Path $targetFolder ([string]$pairTest.SummaryFileName)
         $reviewFolderPath = Join-Path $targetFolder ([string]$pairTest.ReviewFolderName)
         $doneFilePath = Join-Path $targetFolder ([string]$pairTest.HeadlessExec.DoneFileName)
@@ -962,14 +1314,16 @@ foreach ($pair in $pairRows) {
         $outputLastMessagePath = Join-Path $targetFolder ([string]$pairTest.HeadlessExec.OutputLastMessageFileName)
         $headlessPromptFilePath = Join-Path $targetFolder ([string]$pairTest.HeadlessExec.PromptFileName)
         $workFolderPath = Join-Path $targetFolder ([string]$pairTest.WorkFolderName)
-        $sourceOutboxPath = Join-Path $targetFolder ([string]$pairTest.SourceOutboxFolderName)
-        $sourceSummaryPath = Join-Path $sourceOutboxPath ([string]$pairTest.SourceSummaryFileName)
-        $sourceReviewZipPath = Join-Path $sourceOutboxPath ([string]$pairTest.SourceReviewZipFileName)
-        $publishReadyPath = Join-Path $sourceOutboxPath ([string]$pairTest.PublishReadyFileName)
-        $publishedArchivePath = Join-Path $sourceOutboxPath ([string]$pairTest.PublishedArchiveFolderName)
-        $partnerSourceOutboxPath = Join-Path $partnerFolder ([string]$pairTest.SourceOutboxFolderName)
-        $partnerSourceSummaryPath = Join-Path $partnerSourceOutboxPath ([string]$pairTest.SourceSummaryFileName)
-        $partnerSourceReviewZipPath = Join-Path $partnerSourceOutboxPath ([string]$pairTest.SourceReviewZipFileName)
+        $sourceOutboxPath = [string]$contractPaths.SourceOutboxPath
+        $sourceSummaryPath = [string]$contractPaths.SourceSummaryPath
+        $sourceReviewZipPath = [string]$contractPaths.SourceReviewZipPath
+        $publishReadyPath = [string]$contractPaths.PublishReadyPath
+        $publishedArchivePath = [string]$contractPaths.PublishedArchivePath
+        $contractPathMode = [string]$contractPaths.ContractPathMode
+        $contractRootPath = [string]$contractPaths.ContractRootPath
+        $partnerSourceOutboxPath = [string]$partnerContractPaths.SourceOutboxPath
+        $partnerSourceSummaryPath = [string]$partnerContractPaths.SourceSummaryPath
+        $partnerSourceReviewZipPath = [string]$partnerContractPaths.SourceReviewZipPath
         $availableReviewInputPaths = @()
         foreach ($candidate in @($partnerSourceSummaryPath, $partnerSourceReviewZipPath, $targetReviewInputPath)) {
             if (-not (Test-NonEmptyString $candidate)) {
@@ -1009,6 +1363,8 @@ foreach ($pair in $pairRows) {
             -PartnerTargetId ([string]$entry.PartnerTargetId) `
             -TargetFolder $targetFolder `
             -PartnerFolder $partnerFolder `
+            -PartnerSourceSummaryPath $partnerSourceSummaryPath `
+            -PartnerSourceReviewZipPath $partnerSourceReviewZipPath `
             -SummaryPath $summaryPath `
             -ReviewFolderPath $reviewFolderPath `
             -DoneFilePath $doneFilePath `
@@ -1024,7 +1380,7 @@ foreach ($pair in $pairRows) {
             -CheckCmdPath ([string]$automationPaths.CheckCmdPath) `
             -SubmitCmdPath ([string]$automationPaths.SubmitCmdPath) `
             -InitialRoleMode $initialRoleMode `
-            -WorkRepoRoot $targetWorkRepoRoot `
+            -WorkRepoRoot $effectiveTargetWorkRepoRoot `
             -ReviewInputPath $targetReviewInputPath `
             -SeedTaskText $targetSeedTaskText `
             -OneTimeItems $effectiveInitialOneTimeItems
@@ -1042,11 +1398,13 @@ foreach ($pair in $pairRows) {
             -InstructionPath $instructionPath `
             -TargetFolder $targetFolder `
             -PartnerFolder $partnerFolder `
+            -PartnerSourceSummaryPath $partnerSourceSummaryPath `
+            -PartnerSourceReviewZipPath $partnerSourceReviewZipPath `
             -SourceOutboxPath $sourceOutboxPath `
             -SourceSummaryPath $sourceSummaryPath `
             -SourceReviewZipPath $sourceReviewZipPath `
             -PublishReadyPath $publishReadyPath `
-            -WorkRepoRoot $targetWorkRepoRoot `
+            -WorkRepoRoot $effectiveTargetWorkRepoRoot `
             -ReviewInputPath $targetReviewInputPath `
             -SeedTaskText $targetSeedTaskText `
             -OneTimeItems $effectiveInitialOneTimeItems
@@ -1071,8 +1429,9 @@ foreach ($pair in $pairRows) {
         $messageMetadataPath = Write-RelayMessageMetadata -MessagePath $messagePath -Metadata $messageMetadata
 
         $requestPath = Join-Path $targetFolder ([string]$pairTest.HeadlessExec.RequestFileName)
+        $requestCreatedAt = (Get-Date).ToString('o')
         $requestPayload = [pscustomobject]@{
-            CreatedAt              = (Get-Date).ToString('o')
+            CreatedAt              = $requestCreatedAt
             PairId                 = [string]$entry.PairId
             RoleName               = [string]$entry.RoleName
             TargetId               = [string]$entry.TargetId
@@ -1112,12 +1471,15 @@ foreach ($pair in $pairRows) {
             SourceReviewZipPath    = $sourceReviewZipPath
             PublishReadyPath       = $publishReadyPath
             PublishedArchivePath   = $publishedArchivePath
+            ContractPathMode       = $contractPathMode
+            ContractRootPath       = $contractRootPath
+            ContractReferenceTimeUtc = $requestCreatedAt
             SeedEnabled            = [bool]$isSeedTarget
             SeedTargetId           = $seedTargetId
             SeedTargetIds          = @($requestedSeedTargetIds)
             InitialRoleMode        = $initialRoleMode
             PairPolicy             = $pairPolicy
-            WorkRepoRoot           = $targetWorkRepoRoot
+            WorkRepoRoot           = $effectiveTargetWorkRepoRoot
             ReviewInputPath        = $targetReviewInputPath
             ReviewInputSelectionMode = if ($isSeedTarget) { [string]$targetReviewInputSelection.SelectionMode } else { '' }
             ReviewInputSearchRoot  = if ($isSeedTarget) { [string]$targetReviewInputSelection.SearchRoot } else { '' }
@@ -1169,12 +1531,15 @@ foreach ($pair in $pairRows) {
             SourceReviewZipPath = $sourceReviewZipPath
             PublishReadyPath = $publishReadyPath
             PublishedArchivePath = $publishedArchivePath
+            ContractPathMode = $contractPathMode
+            ContractRootPath = $contractRootPath
+            ContractReferenceTimeUtc = $requestCreatedAt
             SeedEnabled     = [bool]$isSeedTarget
             SeedTargetId    = $seedTargetId
             SeedTargetIds   = @($requestedSeedTargetIds)
             InitialRoleMode = $initialRoleMode
             PairPolicy      = $pairPolicy
-            WorkRepoRoot    = $targetWorkRepoRoot
+            WorkRepoRoot    = $effectiveTargetWorkRepoRoot
             ReviewInputPath = $targetReviewInputPath
             ReviewInputSelectionMode = if ($isSeedTarget) { [string]$targetReviewInputSelection.SelectionMode } else { '' }
             ReviewInputSearchRoot = if ($isSeedTarget) { [string]$targetReviewInputSelection.SearchRoot } else { '' }
@@ -1194,10 +1559,21 @@ foreach ($pair in $pairRows) {
     }
 }
 
+$bookkeepingExternalized = ($externalRunRootPairs.Count -gt 0)
+$fullExternalized = (($bookkeepingExternalized) -and (@($pairRows | Where-Object { [bool]$_.UseExternalWorkRepoContractPaths }).Count -gt 0))
+
 $manifest = [pscustomobject]@{
     CreatedAt  = (Get-Date).ToString('o')
     RunRoot    = $RunRoot
     ConfigPath = $resolvedConfigPath
+    ExternalWorkRepoUsed = [bool](@($pairRows | Where-Object { Test-NonEmptyString ([string]$_.PairWorkRepoRoot) }).Count -gt 0)
+    PrimaryContractExternalized = [bool](@($pairRows | Where-Object { [bool]$_.UseExternalWorkRepoContractPaths }).Count -gt 0)
+    ExternalRunRootUsed = [bool](@($pairRows | Where-Object { [bool]$_.UseExternalWorkRepoRunRoot }).Count -gt 0)
+    BookkeepingExternalized = [bool]$bookkeepingExternalized
+    FullExternalized = [bool]$fullExternalized
+    ExternalContractPathsValidated = $externalContractPathsValidated
+    RunRootPathValidated = $true
+    InternalResidualRoots = @(Get-BookkeepingResidualRootsEvidence -Config $config -BasePath $root)
     PairTest   = $pairTest
     PairActivationSummary = @($pairActivationSummary)
     SeedTargetId = $seedTargetId
