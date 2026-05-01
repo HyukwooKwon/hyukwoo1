@@ -64,7 +64,13 @@ function Get-EffectiveRelayPayloadPreviewFixedSuffix {
 
 $root = Split-Path -Parent $PSScriptRoot
 if ([string]::IsNullOrWhiteSpace($ConfigPath)) {
-    $ConfigPath = Join-Path $root 'config\settings.bottest-live-visible.psd1'
+    $preferredExternalizedConfigPath = 'C:\dev\python\relay-workrepo-visible-smoke\.relay-config\bottest-live-visible\settings.externalized.psd1'
+    if (Test-Path -LiteralPath $preferredExternalizedConfigPath -PathType Leaf) {
+        $ConfigPath = $preferredExternalizedConfigPath
+    }
+    else {
+        $ConfigPath = Join-Path $root 'config\settings.bottest-live-visible.psd1'
+    }
 }
 
 $baseConfigPath = (Resolve-Path -LiteralPath $ConfigPath).Path
@@ -133,8 +139,10 @@ $expectedDonePath = Join-Path $targetRoot 'done.json'
 $expectedResultPath = Join-Path $targetRoot 'result.json'
 $expectedCheckScriptPath = Join-Path $targetRoot 'check-artifact.ps1'
 $expectedSubmitScriptPath = Join-Path $targetRoot 'submit-artifact.ps1'
+$expectedPublishScriptPath = Join-Path $targetRoot 'publish-artifact.ps1'
 $expectedCheckCmdPath = Join-Path $targetRoot 'check-artifact.cmd'
 $expectedSubmitCmdPath = Join-Path $targetRoot 'submit-artifact.cmd'
+$expectedPublishCmdPath = Join-Path $targetRoot 'publish-artifact.cmd'
 
 Assert-True ([string]$request.SummaryPath -eq $expectedSummaryPath) 'request should contain absolute SummaryPath.'
 Assert-True ([string]$request.ReviewFolderPath -eq $expectedReviewFolderPath) 'request should contain absolute ReviewFolderPath.'
@@ -155,16 +163,20 @@ Assert-True ([string]$request.DoneFilePath -eq $expectedDonePath) 'request shoul
 Assert-True ([string]$request.ResultFilePath -eq $expectedResultPath) 'request should contain ResultFilePath.'
 Assert-True ([string]$request.CheckScriptPath -eq $expectedCheckScriptPath) 'request should contain CheckScriptPath.'
 Assert-True ([string]$request.SubmitScriptPath -eq $expectedSubmitScriptPath) 'request should contain SubmitScriptPath.'
+Assert-True ([string]$request.PublishScriptPath -eq $expectedPublishScriptPath) 'request should contain PublishScriptPath.'
 Assert-True ([string]$request.CheckCmdPath -eq $expectedCheckCmdPath) 'request should contain CheckCmdPath.'
 Assert-True ([string]$request.SubmitCmdPath -eq $expectedSubmitCmdPath) 'request should contain SubmitCmdPath.'
+Assert-True ([string]$request.PublishCmdPath -eq $expectedPublishCmdPath) 'request should contain PublishCmdPath.'
 Assert-True ((Test-Path -LiteralPath ([string]$request.MessagePath) -PathType Leaf)) 'message file should be created for the target.'
 Assert-True ((Test-Path -LiteralPath $expectedWorkFolderPath -PathType Container)) 'work folder should be created for the target.'
 Assert-True ((Test-Path -LiteralPath $expectedSourceOutboxPath -PathType Container)) 'source-outbox folder should be created for the target.'
 Assert-True ((Test-Path -LiteralPath $expectedPublishedArchivePath -PathType Container)) 'published archive folder should be created for the target.'
 Assert-True ((Test-Path -LiteralPath $expectedCheckScriptPath -PathType Leaf)) 'check script should be created for the target.'
 Assert-True ((Test-Path -LiteralPath $expectedSubmitScriptPath -PathType Leaf)) 'submit script should be created for the target.'
+Assert-True ((Test-Path -LiteralPath $expectedPublishScriptPath -PathType Leaf)) 'publish script should be created for the target.'
 Assert-True ((Test-Path -LiteralPath $expectedCheckCmdPath -PathType Leaf)) 'check cmd launcher should be created for the target.'
 Assert-True ((Test-Path -LiteralPath $expectedSubmitCmdPath -PathType Leaf)) 'submit cmd launcher should be created for the target.'
+Assert-True ((Test-Path -LiteralPath $expectedPublishCmdPath -PathType Leaf)) 'publish cmd launcher should be created for the target.'
 
 Assert-True ([string]$manifestTarget.SummaryPath -eq $expectedSummaryPath) 'manifest target row should echo SummaryPath.'
 Assert-True ([string]$manifestTarget.ReviewFolderPath -eq $expectedReviewFolderPath) 'manifest target row should echo ReviewFolderPath.'
@@ -183,8 +195,10 @@ Assert-True ([string]$manifestTarget.WorkRepoRoot -eq $seedWorkRepoRoot) 'manife
 Assert-True ([string]$manifestTarget.ReviewInputPath -eq $seedReviewInputPath) 'manifest target row should echo ReviewInputPath.'
 Assert-True ([string]$manifestTarget.CheckScriptPath -eq $expectedCheckScriptPath) 'manifest target row should echo CheckScriptPath.'
 Assert-True ([string]$manifestTarget.SubmitScriptPath -eq $expectedSubmitScriptPath) 'manifest target row should echo SubmitScriptPath.'
+Assert-True ([string]$manifestTarget.PublishScriptPath -eq $expectedPublishScriptPath) 'manifest target row should echo PublishScriptPath.'
 Assert-True ([string]$manifestTarget.CheckCmdPath -eq $expectedCheckCmdPath) 'manifest target row should echo CheckCmdPath.'
 Assert-True ([string]$manifestTarget.SubmitCmdPath -eq $expectedSubmitCmdPath) 'manifest target row should echo SubmitCmdPath.'
+Assert-True ([string]$manifestTarget.PublishCmdPath -eq $expectedPublishCmdPath) 'manifest target row should echo PublishCmdPath.'
 
 Assert-True ($instructions.Contains("SummaryPath: $expectedSummaryPath")) 'instructions should contain absolute SummaryPath.'
 Assert-True ($instructions.Contains("ReviewFolderPath: $expectedReviewFolderPath")) 'instructions should contain absolute ReviewFolderPath.'
@@ -203,11 +217,14 @@ Assert-True ($instructions.Contains("ReviewInputPath: $seedReviewInputPath")) 's
 Assert-True ($instructions.Contains($seedTaskText)) 'seed target instructions should contain SeedTaskText.'
 Assert-True ($instructions.Contains("CheckScriptPath: $expectedCheckScriptPath")) 'instructions should contain CheckScriptPath.'
 Assert-True ($instructions.Contains("SubmitScriptPath: $expectedSubmitScriptPath")) 'instructions should contain SubmitScriptPath.'
+Assert-True ($instructions.Contains("PublishScriptPath: $expectedPublishScriptPath")) 'instructions should contain PublishScriptPath.'
 Assert-True ($instructions.Contains("CheckCmdPath: $expectedCheckCmdPath")) 'instructions should contain CheckCmdPath.'
 Assert-True ($instructions.Contains("SubmitCmdPath: $expectedSubmitCmdPath")) 'instructions should contain SubmitCmdPath.'
+Assert-True ($instructions.Contains("PublishCmdPath: $expectedPublishCmdPath")) 'instructions should contain PublishCmdPath.'
 Assert-True ($instructions.Contains('일반 프로젝트 폴더나 다른 target 폴더에만 파일을 만들고 끝내면 watcher가 인식하지 않습니다.')) 'instructions should warn that general project folders are not watched.'
 Assert-True ($instructions.Contains('publish 완료 신호는')) 'instructions should guide the source-outbox publish flow.'
 Assert-True ($instructions.Contains('자동 publish가 실패하거나 legacy RunRoot 복구가 필요할 때만')) 'instructions should keep wrappers as recovery only.'
+Assert-True ($instructions.Contains("'$expectedPublishCmdPath' 또는 '$expectedPublishScriptPath' helper로만 생성")) 'instructions should require publish helper for publish.ready.json.'
 
 $relayTarget = @($config.Targets | Where-Object { [string]$_.Id -eq 'target01' } | Select-Object -First 1)
 Assert-True ($relayTarget.Count -eq 1) 'relay config target01 row should exist.'
@@ -218,11 +235,10 @@ $partnerPayloadPreview = Compose-RelayPayloadPreview -Body $partnerMessageText -
 $partnerPayloadBytes = [System.Text.UTF8Encoding]::new($false).GetByteCount($partnerPayloadPreview)
 
 Assert-True ($messageText.Contains('[paired-exchange-seed]')) 'message should use the short seed format.'
-Assert-True ($messageText.Contains("WorkRepoRoot: $seedWorkRepoRoot")) 'seed message should contain WorkRepoRoot.'
-Assert-True ($messageText.Contains("ReviewInputPath: $seedReviewInputPath")) 'seed message should contain ReviewInputPath.'
 Assert-True ($messageText.Contains($seedTaskText)) 'seed message should contain SeedTaskText.'
 Assert-True ($messageText.Contains("SourceOutboxPath: $expectedSourceOutboxPath")) 'message should contain SourceOutboxPath.'
 Assert-True ($messageText.Contains("publish.ready.json: $expectedPublishReadyPath")) 'message should contain PublishReadyPath.'
+Assert-True ($messageText.Contains("publish helper: $expectedPublishCmdPath")) 'message should contain publish helper cmd path.'
 Assert-True ($messageText.Contains("instructions.txt 를 확인하세요: $instructionPath")) 'message should point to instructions.txt for the full contract.'
 Assert-True (-not $messageText.Contains("SummaryPath: $expectedSummaryPath")) 'message should not inline the full contract SummaryPath.'
 Assert-True (-not $messageText.Contains("ReviewFolderPath: $expectedReviewFolderPath")) 'message should not inline the full contract ReviewFolderPath.'

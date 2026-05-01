@@ -111,6 +111,13 @@ function Get-WarningPolicy {
             BlocksOperations = $false
             BlocksEvidence = $true
         }
+        'runroot-explicit-requested' = [pscustomobject]@{
+            Severity = 'warning'
+            Decision = 'review'
+            Priority = 15
+            BlocksOperations = $false
+            BlocksEvidence = $false
+        }
         'runroot-next-preview' = [pscustomobject]@{
             Severity = 'warning'
             Decision = 'review'
@@ -143,6 +150,13 @@ function Get-WarningPolicy {
             Severity = 'warning'
             Decision = 'review'
             Priority = 60
+            BlocksOperations = $false
+            BlocksEvidence = $false
+        }
+        'pair-workrepo-inherited' = [pscustomobject]@{
+            Severity = 'warning'
+            Decision = 'review'
+            Priority = 70
             BlocksOperations = $false
             BlocksEvidence = $false
         }
@@ -1072,6 +1086,9 @@ $warningRecords = @()
 if (-not [bool]$runContext.SelectedRunRootExists -and [string]$runContext.SelectedRunRootSource -ne 'next-preview') {
     $warningRecords += (New-PolicyWarningRecord -PolicyMap $warningPolicy -Code 'runroot-missing' -Message 'Selected run root does not exist on disk. Paths may be preview-only or stale references.')
 }
+if ([string]$runContext.SelectedRunRootSource -eq 'requested' -and (Test-NonEmptyString ([string]$runContext.RequestedRunRoot))) {
+    $warningRecords += (New-PolicyWarningRecord -PolicyMap $warningPolicy -Code 'runroot-explicit-requested' -Message 'Selected run root is pinned by explicit RunRoot input. Pair repo/path changes will not be reflected until the override is cleared or replaced.')
+}
 if ([string]$runContext.SelectedRunRootSource -eq 'latest-existing') {
     $warningRecords += (New-PolicyWarningRecord -PolicyMap $warningPolicy -Code 'runroot-latest-existing' -Message 'RunRoot was not explicitly requested. Showing latest-existing run root.')
 }
@@ -1086,6 +1103,14 @@ if ([string]$pairDefinition.Source -eq 'fallback') {
 }
 if ($null -ne $runContext.SelectedRunRootAgeSeconds -and $runContext.SelectedRunRootAgeSeconds -ge $StaleRunThresholdSec) {
     $warningRecords += (New-PolicyWarningRecord -PolicyMap $warningPolicy -Code 'runroot-stale' -Message ("Selected run root is older than stale threshold: age={0}s threshold={1}s" -f $runContext.SelectedRunRootAgeSeconds, $StaleRunThresholdSec))
+}
+$inheritedWorkRepoPairs = @(
+    $overviewPairs |
+        Where-Object { [bool](Get-ConfigValue -Object $_.Policy -Name 'DefaultSeedWorkRepoRootInherited' -DefaultValue $false) } |
+        ForEach-Object { [string]$_.PairId }
+)
+if ($inheritedWorkRepoPairs.Count -gt 0) {
+    $warningRecords += (New-PolicyWarningRecord -PolicyMap $warningPolicy -Code 'pair-workrepo-inherited' -Message ("Pair work repo root is inherited from global default for: {0}" -f ($inheritedWorkRepoPairs -join ', ')))
 }
 
 $warningRecords = @($warningRecords | Sort-Object Priority, Code)
@@ -1398,11 +1423,14 @@ Write-Host ''
 Write-Host 'Pair Overview'
 foreach ($pair in @($effectiveConfig.OverviewPairs)) {
     $activation = @($effectiveConfig.PairActivationSummary | Where-Object { [string]$_.PairId -eq [string]$pair.PairId } | Select-Object -First 1)
+    $policy = $pair.Policy
+    $repoRoot = [string](Get-ConfigValue -Object $policy -Name 'DefaultSeedWorkRepoRoot' -DefaultValue '')
+    $repoSource = [string](Get-ConfigValue -Object $policy -Name 'DefaultSeedWorkRepoRootSource' -DefaultValue 'unset')
     if ($activation.Count -gt 0) {
-        Write-Host ("- {0}: {1} (top) <-> {2} (bottom) / state={3} / enabled={4}" -f [string]$pair.PairId, [string]$pair.TopTargetId, [string]$pair.BottomTargetId, [string]$activation[0].State, [bool]$activation[0].EffectiveEnabled)
+        Write-Host ("- {0}: {1} (top) <-> {2} (bottom) / state={3} / enabled={4} / seed={5} / repo={6} / repo-source={7}" -f [string]$pair.PairId, [string]$pair.TopTargetId, [string]$pair.BottomTargetId, [string]$activation[0].State, [bool]$activation[0].EffectiveEnabled, [string]$pair.SeedTargetId, $(if (Test-NonEmptyString $repoRoot) { $repoRoot } else { '(not-set)' }), $repoSource)
     }
     else {
-        Write-Host ("- {0}: {1} (top) <-> {2} (bottom)" -f [string]$pair.PairId, [string]$pair.TopTargetId, [string]$pair.BottomTargetId)
+        Write-Host ("- {0}: {1} (top) <-> {2} (bottom) / seed={3} / repo={4} / repo-source={5}" -f [string]$pair.PairId, [string]$pair.TopTargetId, [string]$pair.BottomTargetId, [string]$pair.SeedTargetId, $(if (Test-NonEmptyString $repoRoot) { $repoRoot } else { '(not-set)' }), $repoSource)
     }
 }
 

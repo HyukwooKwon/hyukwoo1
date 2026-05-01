@@ -70,7 +70,13 @@ function Invoke-PowerShellJson {
 
 $root = Split-Path -Parent $PSScriptRoot
 if ([string]::IsNullOrWhiteSpace($ConfigPath)) {
-    $ConfigPath = Join-Path $root 'config\settings.bottest-live-visible.psd1'
+    $preferredExternalizedConfigPath = 'C:\dev\python\relay-workrepo-visible-smoke\.relay-config\bottest-live-visible\settings.externalized.psd1'
+    if (Test-Path -LiteralPath $preferredExternalizedConfigPath -PathType Leaf) {
+        $ConfigPath = $preferredExternalizedConfigPath
+    }
+    else {
+        $ConfigPath = Join-Path $root 'config\settings.bottest-live-visible.psd1'
+    }
 }
 
 $resolvedConfigPath = (Resolve-Path -LiteralPath $ConfigPath).Path
@@ -98,7 +104,12 @@ $target01Root = Join-Path $contractRunRoot 'pair01\target01'
 $target05Root = Join-Path $contractRunRoot 'pair01\target05'
 $target01CheckPath = Join-Path $target01Root 'check-artifact.ps1'
 $target01SubmitPath = Join-Path $target01Root 'submit-artifact.ps1'
+$target01PublishPath = Join-Path $target01Root 'publish-artifact.ps1'
 $target05CheckPath = Join-Path $target05Root 'check-artifact.ps1'
+$target01Request = Get-Content -LiteralPath (Join-Path $target01Root 'request.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+$target01SourceSummaryPath = [string]$target01Request.SourceSummaryPath
+$target01SourceReviewZipPath = [string]$target01Request.SourceReviewZipPath
+$target01PublishReadyPath = [string]$target01Request.PublishReadyPath
 
 $commonArgs = @(
     '-SummarySourcePath', $summarySourcePath,
@@ -123,6 +134,18 @@ Assert-True ([string]$target01Submit.Json.Target.TargetId -eq 'target01') 'targe
 Assert-True ([string]$target01Submit.Json.PostImportStatus.LatestState -eq 'ready-to-forward') 'target01 submit wrapper should drive ready-to-forward state.'
 Assert-True ((Test-Path -LiteralPath ([string]$target01Submit.Json.Contract.SummaryPath) -PathType Leaf)) 'target01 submit wrapper should write summary to contract path.'
 Assert-True ((Test-Path -LiteralPath ([string]$target01Submit.Json.Contract.DestinationZipPath) -PathType Leaf)) 'target01 submit wrapper should write review zip to contract path.'
+
+$sourceOutboxRoot = Split-Path -Parent $target01PublishReadyPath
+New-Item -ItemType Directory -Path $sourceOutboxRoot -Force | Out-Null
+[System.IO.File]::WriteAllText($target01SourceSummaryPath, 'source publish summary', (New-Utf8NoBomEncoding))
+[System.IO.File]::WriteAllText((Join-Path $sourceOutboxRoot 'source-publish-note.txt'), 'source publish zip content', (New-Utf8NoBomEncoding))
+Compress-Archive -LiteralPath (Join-Path $sourceOutboxRoot 'source-publish-note.txt') -DestinationPath $target01SourceReviewZipPath -Force
+$target01Publish = Invoke-PowerShellJson -ScriptPath $target01PublishPath -Arguments @('-AsJson')
+Assert-True ($target01Publish.ExitCode -eq 0) 'target01 publish wrapper should succeed.'
+Assert-True ([bool]$target01Publish.Json.PublishReadyCreated) 'target01 publish wrapper should create publish.ready.json.'
+Assert-True ((Test-Path -LiteralPath $target01PublishReadyPath -PathType Leaf)) 'target01 publish wrapper should write publish.ready.json.'
+Assert-True ([bool]$target01Publish.Json.Marker.ValidationPassed) 'target01 publish wrapper should stamp validation passed.'
+Assert-True ([string]$target01Publish.Json.Marker.PublishedBy -eq 'publish-paired-exchange-artifact.ps1') 'target01 publish wrapper should stamp helper source.'
 
 $repeatSubmit = Invoke-PowerShellJson -ScriptPath $target01SubmitPath -Arguments $commonArgs
 Assert-True ($repeatSubmit.ExitCode -ne 0) 'target01 submit wrapper should preserve overwrite guard.'

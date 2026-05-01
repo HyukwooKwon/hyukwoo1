@@ -121,6 +121,8 @@ $successRunRoot = Join-Path $pairRunRootBase ('run_contract_exec_process_result_
     -RunRoot $successRunRoot `
     -IncludePairId pair01 | Out-Null
 
+$successWorkRepoRoot = Join-Path $successRunRoot 'pair-workrepo-target01'
+New-Item -ItemType Directory -Path $successWorkRepoRoot -Force | Out-Null
 $successScriptPath = Join-Path $successRunRoot 'fake-codex-process-success.ps1'
 $successScript = @'
 param()
@@ -129,7 +131,30 @@ param()
 Write-Output 'stdout from fake codex'
 Write-Error 'stderr from fake codex'
 
-$request = Get-Content -LiteralPath 'request.json' -Raw -Encoding UTF8 | ConvertFrom-Json
+$codexWorkingDirectory = ''
+$outputPath = ''
+for ($i = 0; $i -lt $args.Count; $i++) {
+    if ($args[$i] -eq '-C' -and ($i + 1) -lt $args.Count) {
+        $codexWorkingDirectory = [string]$args[$i + 1]
+        $i++
+        continue
+    }
+
+    if ($args[$i] -eq '-o' -and ($i + 1) -lt $args.Count) {
+        $outputPath = [string]$args[$i + 1]
+        $i++
+        continue
+    }
+}
+
+$requestPath = if (-not [string]::IsNullOrWhiteSpace($outputPath)) {
+    Join-Path (Split-Path -Parent $outputPath) 'request.json'
+}
+else {
+    Join-Path (Get-Location) 'request.json'
+}
+
+$request = Get-Content -LiteralPath $requestPath -Raw -Encoding UTF8 | ConvertFrom-Json
 $summaryPath = if ([string]::IsNullOrWhiteSpace([string]$request.SummaryPath)) { Join-Path (Get-Location) 'summary.txt' } else { [string]$request.SummaryPath }
 $reviewFolderPath = if ([string]::IsNullOrWhiteSpace([string]$request.ReviewFolderPath)) { Join-Path (Get-Location) 'reviewfile' } else { [string]$request.ReviewFolderPath }
 if (-not (Test-Path -LiteralPath $reviewFolderPath)) {
@@ -144,6 +169,18 @@ $notePath = Join-Path $reviewFolderPath 'process-contract-note.txt'
 [System.IO.File]::WriteAllText($notePath, 'zip payload', [System.Text.UTF8Encoding]::new($false))
 $zipPath = Join-Path $reviewFolderPath 'process-contract-review.zip'
 Compress-Archive -LiteralPath $notePath -DestinationPath $zipPath -Force
+$probePath = [string]$request.WorkdirProbePath
+if (-not [string]::IsNullOrWhiteSpace($probePath)) {
+    $probeParent = Split-Path -Parent $probePath
+    if ($probeParent -and -not (Test-Path -LiteralPath $probeParent)) {
+        New-Item -ItemType Directory -Path $probeParent -Force | Out-Null
+    }
+
+    [pscustomobject]@{
+        ProcessWorkingDirectory = (Get-Location).Path
+        CodexChangeDirectory = $codexWorkingDirectory
+    } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $probePath -Encoding UTF8
+}
 '@
 [System.IO.File]::WriteAllText($successScriptPath, $successScript, (New-Utf8NoBomEncoding))
 
@@ -153,6 +190,13 @@ $successConfigRaw = $successConfigRaw.Replace("            Enabled              
 $successConfigRaw = $successConfigRaw.Replace("            CodexExecutable           = 'codex'", ("            CodexExecutable           = '" + (ConvertTo-PowerShellSingleQuotedLiteral -Value $successScriptPath) + "'"))
 $successConfigRaw = $successConfigRaw.Replace("            Arguments                 = @('exec', '--skip-git-repo-check', '--dangerously-bypass-approvals-and-sandbox')", "            Arguments                 = @()")
 [System.IO.File]::WriteAllText($successConfigPath, $successConfigRaw, (New-Utf8NoBomEncoding))
+
+$successRequestPath = Join-Path $successRunRoot 'pair01\target01\request.json'
+$successRequest = Get-Content -LiteralPath $successRequestPath -Raw -Encoding UTF8 | ConvertFrom-Json
+$successRequest.WorkRepoRoot = $successWorkRepoRoot
+$successProbePath = Join-Path $successRunRoot 'pair01\target01\workdir-probe.json'
+$successRequest | Add-Member -NotePropertyName WorkdirProbePath -NotePropertyValue $successProbePath -Force
+$successRequest | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $successRequestPath -Encoding UTF8
 
 $successExec = Invoke-PowerShellJson -ScriptPath (Join-Path $root 'invoke-codex-exec-turn.ps1') -Arguments @(
     '-ConfigPath', $successConfigPath,
@@ -165,6 +209,7 @@ $successTargetRoot = Join-Path $successRunRoot 'pair01\target01'
 $successResultPath = Join-Path $successTargetRoot 'result.json'
 $successDonePath = Join-Path $successTargetRoot 'done.json'
 $successResult = Get-Content -LiteralPath $successResultPath -Raw -Encoding UTF8 | ConvertFrom-Json
+$successProbe = Get-Content -LiteralPath $successProbePath -Raw -Encoding UTF8 | ConvertFrom-Json
 
 Assert-True ($successExec.ExitCode -eq 0) 'successful fake process should complete cleanly.'
 Assert-True ([bool]$successExec.Json.ContractArtifactsReady) 'successful fake process should produce ready contract artifacts.'
@@ -180,6 +225,10 @@ Assert-True ([int]$successResult.StdOutChars -gt 0) 'result.json should include 
 Assert-True ([int]$successResult.StdErrChars -gt 0) 'result.json should include stderr character count.'
 Assert-True (-not [bool]$successResult.TimedOut) 'result.json should report TimedOut=false on success.'
 Assert-True (-not [bool]$successResult.Killed) 'result.json should report Killed=false on success.'
+Assert-True ([string]$successExec.Json.WorkRepoRoot -eq $successWorkRepoRoot) 'status should echo WorkRepoRoot from request.'
+Assert-True ([string]$successExec.Json.EffectiveWorkingDirectory -eq $successWorkRepoRoot) 'executor should promote WorkRepoRoot to EffectiveWorkingDirectory.'
+Assert-True ([string]$successProbe.ProcessWorkingDirectory -eq $successWorkRepoRoot) 'fake codex process should start in WorkRepoRoot.'
+Assert-True ([string]$successProbe.CodexChangeDirectory -eq $successWorkRepoRoot) 'codex -C should target WorkRepoRoot.'
 
 $timeoutRunRoot = Join-Path $pairRunRootBase ('run_contract_exec_process_timeout_' + (Get-Date -Format 'yyyyMMdd_HHmmss_fff'))
 & (Join-Path $root 'tests\Start-PairedExchangeTest.ps1') `

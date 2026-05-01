@@ -82,15 +82,19 @@ Assert-True ($null -ne $targetRow) 'manifest should contain target01.'
 New-Item -ItemType Directory -Path ([System.IO.Path]::GetDirectoryName([string]$targetRow.SourceSummaryPath)) -Force | Out-Null
 Set-Content -LiteralPath ([string]$targetRow.SourceSummaryPath) -Encoding UTF8 -Value 'summary-ready'
 Set-Content -LiteralPath ([string]$targetRow.SourceReviewZipPath) -Encoding UTF8 -Value 'zip-ready'
+${publishedAt} = (Get-Date).ToString('o')
 @{
     SchemaVersion = '1.0.0'
     PairId = 'pair01'
     TargetId = 'target01'
     SummaryPath = [string]$targetRow.SourceSummaryPath
     ReviewZipPath = [string]$targetRow.SourceReviewZipPath
-    PublishedAt = (Get-Date).ToString('o')
+    PublishedAt = $publishedAt
     SummarySizeBytes = 12
     ReviewZipSizeBytes = 8
+    PublishedBy = 'publish-paired-exchange-artifact.ps1'
+    ValidationPassed = $true
+    ValidationCompletedAt = $publishedAt
 } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath ([string]$targetRow.PublishReadyPath) -Encoding UTF8
 
 $stateRoot = Join-Path $runRoot '.state'

@@ -245,9 +245,7 @@ SendPayload(target, text, enterCount, clearInput := false, activateSettleMs := 1
     if IsTerminalHostedWindow(winRef) {
         previousActive := WinExist("A")
         DebugLog("terminal_activate ref=" winRef " previousActive=" previousActive)
-        WinActivate winRef
-
-        if !WinWaitActive(winRef, , 1.5)
+        if !ActivateWindowWithRetry(winRef, "terminal_initial_activate")
             ExitApp 41
 
         if (visibleBeaconEnabled) {
@@ -311,6 +309,20 @@ SendPayload(target, text, enterCount, clearInput := false, activateSettleMs := 1
 
         SubmitPayload(winRef, false, enterCount, submitGuardMs, enterDelayMs, postSubmitDelayMs, requireActiveBeforeEnter, submitModes, submitRetryIntervalMs, visibleBeaconEnabled, visibleBaseTitle, visibleLabel, visiblePostHoldMs, failOnFocusSteal)
     }
+}
+
+ActivateWindowWithRetry(winRef, contextLabel, attemptCount := 4, waitSeconds := 0.75) {
+    Loop attemptCount {
+        DebugLogWindowState(contextLabel "_attempt try=" A_Index "/" attemptCount, winRef)
+        try WinActivate winRef
+        if WinWaitActive(winRef, , waitSeconds) {
+            DebugLogWindowState(contextLabel "_active try=" A_Index "/" attemptCount, winRef)
+            return true
+        }
+    }
+
+    DebugLogWindowState(contextLabel "_failed", winRef)
+    return false
 }
 
 SubmitPayload(winRef, isTerminalHosted, enterCount, submitGuardMs, enterDelayMs, postSubmitDelayMs, requireActiveBeforeEnter, submitModes, submitRetryIntervalMs, visibleBeaconEnabled := false, visibleBaseTitle := "", visibleLabel := "", visiblePostHoldMs := 0, failOnFocusSteal := false) {

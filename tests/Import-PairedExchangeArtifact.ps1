@@ -5,6 +5,14 @@ param(
     [Parameter(Mandatory)][string]$TargetId,
     [Parameter(Mandatory)][string]$SummarySourcePath,
     [Parameter(Mandatory)][string]$ReviewZipSourcePath,
+    [string]$SourcePublishReadyPath = '',
+    [string]$SourcePublishedAt = '',
+    [string]$SourcePublishAttemptId = '',
+    [int]$SourcePublishSequence = 0,
+    [string]$SourcePublishCycleId = '',
+    [string]$SourceValidationCompletedAt = '',
+    [string]$SourceSummarySha256 = '',
+    [string]$SourceReviewZipSha256 = '',
     [string]$ImportMode = 'manual-import',
     [switch]$KeepZipFileName,
     [switch]$Overwrite,
@@ -298,6 +306,20 @@ elseif (Test-Path -LiteralPath $resolvedReviewZipSourcePath -PathType Leaf) {
         $issues.Add('review-zip-source-invalid')
     }
 }
+$summaryForbiddenArtifact = Get-ForbiddenArtifactTextFileMatch `
+    -Path $resolvedSummarySourcePath `
+    -LiteralList @($pairTest.ForbiddenArtifactLiterals) `
+    -RegexPatternList @($pairTest.ForbiddenArtifactRegexes)
+if ([bool]$summaryForbiddenArtifact.Found) {
+    $issues.Add('summary-source-forbidden-artifact')
+}
+$reviewZipForbiddenArtifact = Get-ForbiddenArtifactZipMatch `
+    -Path $resolvedReviewZipSourcePath `
+    -LiteralList @($pairTest.ForbiddenArtifactLiterals) `
+    -RegexPatternList @($pairTest.ForbiddenArtifactRegexes)
+if ([bool]$reviewZipForbiddenArtifact.Found) {
+    $issues.Add('review-zip-source-forbidden-artifact')
+}
 if (-not (Test-NonEmptyString $contract.TargetFolder)) {
     $issues.Add('target-folder-missing-from-contract')
 }
@@ -369,6 +391,8 @@ $preflightLines.Add(('Overwrite requested: {0}' -f $(if ($Overwrite) { 'yes' } e
 $preflightLines.Add(('Conflict summary: {0}' -f $(if ($blockingLatestState -in $guardedStates) { "현재 target은 $blockingLatestState 상태입니다." } elseif ($overwriteTargets.Count -gt 0) { '현재 contract 파일이 이미 존재합니다.' } else { '(none)' })))
 $preflightLines.Add(('Manual copy likely state: {0}' -f $manualCopyLikelyState))
 $preflightLines.Add(('Warnings: {0}' -f $(if ($warnings.Count -gt 0) { $warnings -join ', ' } else { '(none)' })))
+$preflightLines.Add(('ForbiddenArtifactSummary: {0}' -f $(if ([bool]$summaryForbiddenArtifact.Found) { ('detected type=' + [string]$summaryForbiddenArtifact.MatchKind + ' pattern=' + [string]$summaryForbiddenArtifact.Pattern + ' match=' + [string]$summaryForbiddenArtifact.MatchText) } else { '(clean)' })))
+$preflightLines.Add(('ForbiddenArtifactReviewZip: {0}' -f $(if ([bool]$reviewZipForbiddenArtifact.Found) { ('detected type=' + [string]$reviewZipForbiddenArtifact.MatchKind + ' pattern=' + [string]$reviewZipForbiddenArtifact.Pattern + ' match=' + [string]$reviewZipForbiddenArtifact.MatchText + ' entry=' + [string]$reviewZipForbiddenArtifact.EntryPath) } else { '(clean)' })))
 $preflightLines.Add(('BlockingIssues: {0}' -f $(if ($blockingIssues.Count -gt 0) { $blockingIssues -join ', ' } else { '(none)' })))
 $effectiveIssues = New-Object System.Collections.Generic.List[string]
 foreach ($issue in $issues) {
@@ -404,6 +428,14 @@ if ($effectiveIssues.Count -eq 0 -and -not $DryRun) {
         RequestPath            = $contract.RequestPath
         SummarySourcePath      = $resolvedSummarySourcePath
         ReviewZipSourcePath    = $resolvedReviewZipSourcePath
+        SourcePublishReadyPath = [string]$SourcePublishReadyPath
+        SourcePublishedAt      = [string]$SourcePublishedAt
+        SourcePublishAttemptId = [string]$SourcePublishAttemptId
+        SourcePublishSequence  = [int]$SourcePublishSequence
+        SourcePublishCycleId   = [string]$SourcePublishCycleId
+        SourceValidationCompletedAt = [string]$SourceValidationCompletedAt
+        SourceSummarySha256    = [string]$SourceSummarySha256
+        SourceReviewZipSha256  = [string]$SourceReviewZipSha256
         SummaryPath            = $contract.SummaryPath
         LatestZipPath          = $destinationZipPath
         ImportedZipPath        = $destinationZipPath
@@ -424,6 +456,14 @@ if ($effectiveIssues.Count -eq 0 -and -not $DryRun) {
         RequestPath            = $contract.RequestPath
         SummarySourcePath      = $resolvedSummarySourcePath
         ReviewZipSourcePath    = $resolvedReviewZipSourcePath
+        SourcePublishReadyPath = [string]$SourcePublishReadyPath
+        SourcePublishedAt      = [string]$SourcePublishedAt
+        SourcePublishAttemptId = [string]$SourcePublishAttemptId
+        SourcePublishSequence  = [int]$SourcePublishSequence
+        SourcePublishCycleId   = [string]$SourcePublishCycleId
+        SourceValidationCompletedAt = [string]$SourceValidationCompletedAt
+        SourceSummarySha256    = [string]$SourceSummarySha256
+        SourceReviewZipSha256  = [string]$SourceReviewZipSha256
         SummaryPath            = $contract.SummaryPath
         LatestZipPath          = $destinationZipPath
         ResultPath             = $contract.ResultPath
@@ -464,6 +504,10 @@ $status = [pscustomobject]@{
         RequiresOverwrite = [bool]$requiresOverwrite
         OverwriteTargets = @($overwriteTargets)
         BlockingLatestState = $blockingLatestState
+        ForbiddenArtifactChecks = [pscustomobject]@{
+            Summary = $summaryForbiddenArtifact
+            ReviewZip = $reviewZipForbiddenArtifact
+        }
     }
     Target = [pscustomobject]@{
         PairId = [string]$targetEntry.PairId
@@ -475,6 +519,16 @@ $status = [pscustomobject]@{
         Summary = $summarySourceInfo
         ReviewZip = $reviewZipSourceInfo
         SummaryZipDeltaSeconds = $summaryZipDeltaSeconds
+    }
+    SourcePublish = [pscustomobject]@{
+        PublishReadyPath = [string]$SourcePublishReadyPath
+        PublishedAt = [string]$SourcePublishedAt
+        AttemptId = [string]$SourcePublishAttemptId
+        PublishSequence = [int]$SourcePublishSequence
+        PublishCycleId = [string]$SourcePublishCycleId
+        ValidationCompletedAt = [string]$SourceValidationCompletedAt
+        SummarySha256 = [string]$SourceSummarySha256
+        ReviewZipSha256 = [string]$SourceReviewZipSha256
     }
     Preflight = [pscustomobject]@{
         SummaryLines = @($preflightLines)

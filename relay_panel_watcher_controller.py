@@ -84,6 +84,14 @@ class WatcherController:
             "이 값은 pair별 왕복 제한이 아닙니다. 계속 왕복이 필요하면 MaxForwardCount를 0 또는 더 큰 값으로 별도 실행하세요."
         )
 
+    @staticmethod
+    def control_semantics_guidance() -> str:
+        return (
+            "pause/resume: queued/pending 상태를 유지한 채 다음 동작만 잠시 멈춥니다. "
+            "stop: 현재 watcher를 종료합니다. stop 뒤에는 resume이 아니라 watch 재시작이 필요합니다. "
+            "watcher 제어 전용 hotkey는 현재 없습니다."
+        )
+
     def _record_audit(
         self,
         *,

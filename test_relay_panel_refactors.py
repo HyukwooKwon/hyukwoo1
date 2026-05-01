@@ -35,6 +35,7 @@ from relay_panel_contract import (
 )
 from relay_panel_home_controller import HomeController
 from relay_panel_message_config import MessageConfigService
+from relay_panel_message_config import CONFIG_BACKUP_RETENTION_COUNT
 from relay_panel_models import AppContext, DashboardRawBundle, PairSummaryModel
 from relay_panel_pair_controller import PairController
 from relay_panel_refresh_controller import PanelRefreshController, RuntimeRefreshResult
@@ -60,7 +61,7 @@ from relay_panel_watcher_workflow import (
     WatcherRestartRequest,
 )
 from relay_panel_watchers import WATCHER_BRIDGE_REQUIRED_FIELDS, WatcherService, WatcherStartRequest
-from relay_operator_panel import ARTIFACT_SOURCE_MEMORY_SCHEMA_VERSION, RelayOperatorPanel
+from relay_operator_panel import ARTIFACT_SOURCE_MEMORY_SCHEMA_VERSION, MESSAGE_EDITOR_TAB_METADATA, RelayOperatorPanel
 from relay_test_temp import (
     ExternalTemporaryDirectory,
     configure_workspace_tempfile,
@@ -236,6 +237,25 @@ class VarStub:
 class ButtonStub:
     def __init__(self) -> None:
         self.state = ""
+
+    def configure(self, **kwargs) -> None:
+        if "state" in kwargs:
+            self.state = kwargs["state"]
+
+
+class TextWidgetStub:
+    def __init__(self, value: str = "") -> None:
+        self.value = value
+        self.state = "normal"
+
+    def get(self, _start: str = "1.0", _end: str = "end-1c") -> str:
+        return self.value
+
+    def delete(self, _start: str, _end: str) -> None:
+        self.value = ""
+
+    def insert(self, _start: str, value: str) -> None:
+        self.value = value
 
     def configure(self, **kwargs) -> None:
         if "state" in kwargs:
@@ -1567,6 +1587,28 @@ class PairedExchangePromptTextTests(unittest.TestCase):
 
 
 class MessageConfigServiceTests(unittest.TestCase):
+    @staticmethod
+    def _write_minimal_message_config(path: Path, default_suffix: str) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            "@{\n"
+            f"    DefaultFixedSuffix = '{default_suffix}'\n"
+            "    PairTest = @{\n"
+            "        MessageTemplates = @{\n"
+            "            Initial = @{ PrefixBlocks = @('a'); SuffixBlocks = @('b') }\n"
+            "            Handoff = @{ PrefixBlocks = @('c'); SuffixBlocks = @('d') }\n"
+            "        }\n"
+            "        PairOverrides = @{}\n"
+            "        RoleOverrides = @{}\n"
+            "        TargetOverrides = @{}\n"
+            "    }\n"
+            "    Targets = @(\n"
+            "        @{ Id = 'target01'; FixedSuffix = $null }\n"
+            "    )\n"
+            "}\n",
+            encoding="utf-8",
+        )
+
     def test_snapshot_and_diff_capture_slot_order_and_suffixes(self) -> None:
         service = MessageConfigService(CommandService())
         document = {
@@ -1604,24 +1646,7 @@ class MessageConfigServiceTests(unittest.TestCase):
         tmp_root.mkdir(exist_ok=True)
         with tempfile.TemporaryDirectory(dir=str(tmp_root.resolve())) as tmp:
             config_path = Path(tmp) / "settings.test.psd1"
-            config_path.write_text(
-                "@{\n"
-                "    DefaultFixedSuffix = '원본'\n"
-                "    PairTest = @{\n"
-                "        MessageTemplates = @{\n"
-                "            Initial = @{ PrefixBlocks = @('a'); SuffixBlocks = @('b') }\n"
-                "            Handoff = @{ PrefixBlocks = @('c'); SuffixBlocks = @('d') }\n"
-                "        }\n"
-                "        PairOverrides = @{}\n"
-                "        RoleOverrides = @{}\n"
-                "        TargetOverrides = @{}\n"
-                "    }\n"
-                "    Targets = @(\n"
-                "        @{ Id = 'target01'; FixedSuffix = $null }\n"
-                "    )\n"
-                "}\n",
-                encoding="utf-8",
-            )
+            self._write_minimal_message_config(config_path, "원본")
             document = service.load_config_document(str(config_path))
             service.set_default_fixed_suffix(document, "변경")
             backup_path = service.save_document(str(config_path), document)
@@ -1631,6 +1656,102 @@ class MessageConfigServiceTests(unittest.TestCase):
             restored = service.rollback_last_backup(str(config_path))
             self.assertTrue(restored.exists())
             self.assertIn("원본", config_path.read_text(encoding="utf-8"))
+
+    def test_backups_are_isolated_by_normalized_source_path(self) -> None:
+        service = MessageConfigService(CommandService())
+        tmp_root = Path("_tmp")
+        tmp_root.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=str(tmp_root.resolve())) as tmp:
+            temp_root = Path(tmp)
+            config_path_a = temp_root / "lane-a" / "settings.test.psd1"
+            config_path_b = temp_root / "lane-b" / "settings.test.psd1"
+            self._write_minimal_message_config(config_path_a, "원본A")
+            self._write_minimal_message_config(config_path_b, "원본B")
+
+            document_a = service.load_config_document(str(config_path_a))
+            service.set_default_fixed_suffix(document_a, "변경A")
+            backup_path_a = service.save_document(str(config_path_a), document_a)
+
+            document_b = service.load_config_document(str(config_path_b))
+            service.set_default_fixed_suffix(document_b, "변경B")
+            backup_path_b = service.save_document(str(config_path_b), document_b)
+
+            self.assertEqual([backup_path_a], service.list_backups(str(config_path_a)))
+            self.assertEqual([backup_path_b], service.list_backups(str(config_path_b)))
+
+            backup_meta_a = service._read_backup_meta(service._backup_meta_path(backup_path_a))
+            self.assertIsNotNone(backup_meta_a)
+            self.assertEqual(service._backup_key(str(config_path_a)), backup_meta_a["backup_key"])
+            self.assertEqual(
+                service._normalize_config_path(str(config_path_a)),
+                backup_meta_a["source_config_path_normalized"],
+            )
+
+            service.rollback_last_backup(str(config_path_a))
+            self.assertIn("원본A", config_path_a.read_text(encoding="utf-8"))
+            self.assertIn("변경B", config_path_b.read_text(encoding="utf-8"))
+
+    def test_list_backups_ignores_invalid_metadata_records(self) -> None:
+        service = MessageConfigService(CommandService())
+        tmp_root = Path("_tmp")
+        tmp_root.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=str(tmp_root.resolve())) as tmp:
+            config_path = Path(tmp) / "settings.test.psd1"
+            self._write_minimal_message_config(config_path, "원본")
+
+            document = service.load_config_document(str(config_path))
+            service.set_default_fixed_suffix(document, "변경")
+            backup_path = service.save_document(str(config_path), document)
+            meta_path = service._backup_meta_path(backup_path)
+            meta_path.write_text("{broken", encoding="utf-8")
+
+            self.assertEqual([], service.list_backups(str(config_path)))
+            with self.assertRaises(FileNotFoundError):
+                service.rollback_last_backup(str(config_path))
+
+    def test_backup_retention_keeps_latest_records_only(self) -> None:
+        service = MessageConfigService(CommandService())
+        tmp_root = Path("_tmp")
+        tmp_root.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=str(tmp_root.resolve())) as tmp:
+            config_path = Path(tmp) / "settings.test.psd1"
+            self._write_minimal_message_config(config_path, "원본")
+            document = service.load_config_document(str(config_path))
+
+            for index in range(CONFIG_BACKUP_RETENTION_COUNT + 5):
+                service.set_default_fixed_suffix(document, f"버전{index}")
+                service.save_document(str(config_path), document)
+
+            backups = service.list_backups(str(config_path))
+            self.assertEqual(CONFIG_BACKUP_RETENTION_COUNT, len(backups))
+            for backup_path in backups:
+                self.assertTrue(backup_path.exists())
+                self.assertTrue(service._backup_meta_path(backup_path).exists())
+
+    def test_backup_retention_does_not_prune_other_config_keys(self) -> None:
+        service = MessageConfigService(CommandService())
+        tmp_root = Path("_tmp")
+        tmp_root.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=str(tmp_root.resolve())) as tmp:
+            temp_root = Path(tmp)
+            config_path_a = temp_root / "lane-a" / "settings.test.psd1"
+            config_path_b = temp_root / "lane-b" / "settings.test.psd1"
+            self._write_minimal_message_config(config_path_a, "원본A")
+            self._write_minimal_message_config(config_path_b, "원본B")
+
+            document_b = service.load_config_document(str(config_path_b))
+            service.set_default_fixed_suffix(document_b, "변경B")
+            backup_path_b = service.save_document(str(config_path_b), document_b)
+
+            document_a = service.load_config_document(str(config_path_a))
+            for index in range(CONFIG_BACKUP_RETENTION_COUNT + 5):
+                service.set_default_fixed_suffix(document_a, f"버전{index}")
+                service.save_document(str(config_path_a), document_a)
+
+            self.assertEqual(CONFIG_BACKUP_RETENTION_COUNT, len(service.list_backups(str(config_path_a))))
+            self.assertEqual([backup_path_b], service.list_backups(str(config_path_b)))
+            self.assertTrue(backup_path_b.exists())
+            self.assertTrue(service._backup_meta_path(backup_path_b).exists())
 
     def test_slot_order_save_flows_into_show_effective_config(self) -> None:
         service = MessageConfigService(CommandService())
@@ -1750,6 +1871,54 @@ class MessageConfigServiceTests(unittest.TestCase):
             self.assertIn("임시 preview 전용 문구", row["Initial"]["Preview"])
             self.assertNotIn("임시 preview 전용 문구", config_path.read_text(encoding="utf-8"))
 
+    def test_effective_pair_policy_inherits_defaults_and_setter_persists_explicit_values(self) -> None:
+        service = MessageConfigService(CommandService())
+        document = {
+            "PairTest": {
+                "PairDefinitions": [
+                    {"PairId": "pair01", "TopTargetId": "target01", "BottomTargetId": "target05", "SeedTargetId": "target01"},
+                ],
+                "PairPolicies": {
+                    "pair01": {
+                        "UseExternalWorkRepoContractPaths": True,
+                    }
+                },
+                "DefaultSeedWorkRepoRoot": r"C:\repo-global",
+                "UseExternalWorkRepoRunRoot": True,
+                "UseExternalWorkRepoContractPaths": False,
+                "DefaultPairMaxRoundtripCount": 4,
+            }
+        }
+
+        inherited = service.effective_pair_policy(document, "pair01")
+
+        self.assertEqual(r"C:\repo-global", inherited["DefaultSeedWorkRepoRoot"])
+        self.assertEqual("global-default", inherited["DefaultSeedWorkRepoRootSource"])
+        self.assertTrue(inherited["DefaultSeedWorkRepoRootInherited"])
+        self.assertTrue(inherited["UseExternalWorkRepoRunRoot"])
+        self.assertTrue(inherited["UseExternalWorkRepoContractPaths"])
+        self.assertEqual(4, inherited["DefaultPairMaxRoundtripCount"])
+        self.assertEqual("target01", inherited["DefaultSeedTargetId"])
+
+        service.set_pair_policy_values(
+            document,
+            "pair01",
+            default_seed_work_repo_root=r"C:\repo-pair01",
+            default_seed_target_id="target05",
+            use_external_work_repo_run_root=False,
+            use_external_work_repo_contract_paths=True,
+            default_pair_max_roundtrip_count=7,
+        )
+
+        updated = service.effective_pair_policy(document, "pair01")
+        self.assertEqual(r"C:\repo-pair01", updated["DefaultSeedWorkRepoRoot"])
+        self.assertEqual("pair-policy", updated["DefaultSeedWorkRepoRootSource"])
+        self.assertFalse(updated["DefaultSeedWorkRepoRootInherited"])
+        self.assertFalse(updated["UseExternalWorkRepoRunRoot"])
+        self.assertTrue(updated["UseExternalWorkRepoContractPaths"])
+        self.assertEqual(7, updated["DefaultPairMaxRoundtripCount"])
+        self.assertEqual("target05", updated["DefaultSeedTargetId"])
+
     def test_validate_document_reports_duplicate_blocks(self) -> None:
         service = MessageConfigService(CommandService())
         document = {
@@ -1867,10 +2036,42 @@ class MessageConfigServiceTests(unittest.TestCase):
         )
 
 
+class RelayOperatorPanelMessageEditorTabTests(unittest.TestCase):
+    def test_message_editor_tab_meta_keeps_compact_label_with_full_title(self) -> None:
+        metadata = RelayOperatorPanel._message_editor_tab_meta("initial_preview")
+
+        self.assertEqual("Initial", metadata["label"])
+        self.assertEqual("Initial Preview", metadata["title"])
+        self.assertLess(len(metadata["label"]), len(metadata["title"]))
+        self.assertIn("preview", metadata["description"])
+        self.assertEqual("전달문", MESSAGE_EDITOR_TAB_METADATA["final_delivery"]["label"])
+
+    def test_refresh_message_editor_tab_heading_tracks_selected_tab(self) -> None:
+        panel = RelayOperatorPanel.__new__(RelayOperatorPanel)
+        panel.message_editor_tab_title_var = VarStub("")
+        panel.message_editor_tab_detail_var = VarStub("")
+        selected_widget = ".editor.handoff"
+        panel.message_editor_tab_meta_by_widget = {
+            selected_widget: RelayOperatorPanel._message_editor_tab_meta("handoff_preview"),
+        }
+
+        class NotebookStub:
+            def select(self) -> str:
+                return selected_widget
+
+        panel.editor_right_notebook = NotebookStub()
+
+        panel._refresh_message_editor_tab_heading()
+
+        self.assertEqual("Handoff Preview", panel.message_editor_tab_title_var.get())
+        self.assertIn("Handoff", panel.message_editor_tab_detail_var.get())
+
+
 class RelayOperatorPanelRuntimeCommandTests(unittest.TestCase):
     def _make_panel(self) -> RelayOperatorPanel:
         panel = RelayOperatorPanel.__new__(RelayOperatorPanel)
         panel.command_service = CommandService()
+        panel.message_config_service = MessageConfigService(panel.command_service)
         panel.status_service = StatusService(panel.command_service)
         panel.home_controller = HomeController()
         panel.refresh_controller = None
@@ -1922,7 +2123,27 @@ class RelayOperatorPanelRuntimeCommandTests(unittest.TestCase):
         panel.visible_acceptance_status_var = VarStub("")
         panel.visible_acceptance_detail_var = VarStub("")
         panel.home_context_var = VarStub("")
+        panel.pair_policy_editor_status_var = VarStub("")
         panel.preview_rows = []
+        panel.pair_policy_card_vars = {
+            pair_id: {
+                "meta_var": VarStub(f"{pair_id} / (미구성)"),
+                "repo_root_var": VarStub(""),
+                "seed_target_var": VarStub(""),
+                "roundtrip_var": VarStub("0"),
+                "external_run_root_var": VarStub(False),
+                "external_contract_var": VarStub(False),
+                "route_badge_var": VarStub(""),
+                "repo_source_badge_var": VarStub(""),
+                "override_badge_var": VarStub(""),
+                "route_state_var": VarStub(""),
+                "effective_preview_var": VarStub(""),
+            }
+            for pair_id in ["pair01", "pair02", "pair03", "pair04"]
+        }
+        panel.pair_policy_clone_source_var = VarStub("pair01")
+        panel.pair_policy_clone_target_var = VarStub("pair02")
+        panel.pair_policy_card_seed_combos = {}
         panel.pair_controller = PairController()
         panel.watcher_service = WatcherService()
         panel.watcher_controller = WatcherController(panel.watcher_service)
@@ -2195,7 +2416,7 @@ class RelayOperatorPanelRuntimeCommandTests(unittest.TestCase):
         )
         self.assertEqual("C:\\runs\\fresh", panel.run_root_var.get())
         self.assertNotIn("-RunRoot", panel.last_command_var.get())
-        self.assertIn("오래된 explicit RunRoot 무시 후 새 RunRoot 생성", panel._captured_output)
+        self.assertIn("오래된 RunRoot 입력 무시 후 새 RunRoot 생성", panel._captured_output)
         self.assertIn("ActionRunRoot: C:\\runs\\fresh", panel._captured_output)
         self.assertIn("RunRoot 입력칸 갱신 완료", panel._captured_output)
         self.assertIn("[runroot 요약]", panel._captured_output)
@@ -2266,6 +2487,130 @@ class RelayOperatorPanelRuntimeCommandTests(unittest.TestCase):
         )
         self.assertIn("snapshot overall=success", panel._captured_output)
         self.assertEqual("", panel.run_root_var.get())
+
+    def test_prepare_run_root_uses_pair_scoped_prepare_config_when_resolved(self) -> None:
+        panel = self._make_panel()
+        panel._resolve_run_prepare_config_path = lambda *, pair_id, config_path: "pair-cfg.psd1"
+
+        class CommandServiceStub:
+            def __init__(self) -> None:
+                self.commands: list[list[str]] = []
+
+            def build_script_command(
+                self,
+                script_name: str,
+                *,
+                config_path: str = "",
+                run_root: str = "",
+                pair_id: str = "",
+                target_id: str = "",
+                extra: list[str] | None = None,
+            ) -> list[str]:
+                command = [script_name]
+                if config_path:
+                    command += ["-ConfigPath", config_path]
+                if run_root:
+                    command += ["-RunRoot", run_root]
+                if pair_id:
+                    command += ["-PairId", pair_id]
+                if target_id:
+                    command += ["-TargetId", target_id]
+                if extra:
+                    command += list(extra)
+                return command
+
+            def run(self, command: list[str]) -> subprocess.CompletedProcess[str]:
+                self.commands.append(list(command))
+                if command[0] == "show-paired-run-summary.ps1":
+                    return subprocess.CompletedProcess(command, 0, stdout="fresh overall=success", stderr="")
+                if command[0] != "tests/Start-PairedExchangeTest.ps1":
+                    raise AssertionError(command)
+                return subprocess.CompletedProcess(
+                    command,
+                    0,
+                    stdout="prepared pair test root: C:\\runs\\fresh",
+                    stderr="",
+                )
+
+        panel.command_service = CommandServiceStub()
+
+        panel.prepare_run_root()
+
+        self.assertEqual(
+            [
+                ["tests/Start-PairedExchangeTest.ps1", "-ConfigPath", "pair-cfg.psd1", "-IncludePairId", "pair01"],
+                ["show-paired-run-summary.ps1", "-ConfigPath", "pair-cfg.psd1", "-RunRoot", "C:\\runs\\fresh"],
+            ],
+            panel.command_service.commands,
+        )
+        self.assertIn("-ConfigPath pair-cfg.psd1", panel.last_command_var.get())
+
+    def test_prepare_run_root_does_not_reuse_mirrored_selected_run_root(self) -> None:
+        panel = self._make_panel()
+        panel.effective_data = {
+            "RunContext": {
+                "SelectedRunRoot": "C:\\runs\\current",
+                "SelectedRunRootIsStale": False,
+            }
+        }
+        panel.run_root_var.set("C:\\runs\\current")
+
+        class CommandServiceStub:
+            def __init__(self) -> None:
+                self.commands: list[list[str]] = []
+
+            def build_script_command(
+                self,
+                script_name: str,
+                *,
+                config_path: str = "",
+                run_root: str = "",
+                pair_id: str = "",
+                target_id: str = "",
+                extra: list[str] | None = None,
+            ) -> list[str]:
+                command = [script_name]
+                if config_path:
+                    command += ["-ConfigPath", config_path]
+                if run_root:
+                    command += ["-RunRoot", run_root]
+                if pair_id:
+                    command += ["-PairId", pair_id]
+                if target_id:
+                    command += ["-TargetId", target_id]
+                if extra:
+                    command += list(extra)
+                return command
+
+            def run(self, command: list[str]) -> subprocess.CompletedProcess[str]:
+                self.commands.append(list(command))
+                if command[0] == "show-paired-run-summary.ps1":
+                    return subprocess.CompletedProcess(command, 0, stdout="fresh-mirrored overall=success", stderr="")
+                if command[0] != "tests/Start-PairedExchangeTest.ps1":
+                    raise AssertionError(command)
+                return subprocess.CompletedProcess(
+                    command,
+                    0,
+                    stdout="prepared pair test root: C:\\runs\\fresh-mirrored",
+                    stderr="",
+                )
+
+        panel.command_service = CommandServiceStub()
+
+        panel.prepare_run_root()
+
+        self.assertEqual(
+            [
+                ["tests/Start-PairedExchangeTest.ps1", "-ConfigPath", "cfg.psd1", "-IncludePairId", "pair01"],
+                ["show-paired-run-summary.ps1", "-ConfigPath", "cfg.psd1", "-RunRoot", "C:\\runs\\fresh-mirrored"],
+            ],
+            panel.command_service.commands,
+        )
+        self.assertEqual("C:\\runs\\fresh-mirrored", panel.run_root_var.get())
+        self.assertNotIn("-RunRoot", panel.last_command_var.get())
+        self.assertIn("ActionRunRoot: C:\\runs\\fresh-mirrored", panel._captured_output)
+        self.assertIn("RunRoot 입력칸 갱신 완료", panel._captured_output)
+        self.assertIn("fresh-mirrored overall=success", panel._captured_output)
 
     def test_run_prepare_all_ignores_stale_selected_run_root_for_run_prepare_step(self) -> None:
         panel = self._make_panel()
@@ -2349,12 +2694,97 @@ class RelayOperatorPanelRuntimeCommandTests(unittest.TestCase):
         self.assertEqual("C:\\runs\\fresh-prepared", panel.run_root_var.get())
         self.assertNotIn("-RunRoot", panel.last_command_var.get())
         self.assertIn("[run 준비]", panel._captured_output)
-        self.assertIn("오래된 explicit RunRoot 무시 후 새 RunRoot 생성", panel._captured_output)
+        self.assertIn("오래된 RunRoot 입력 무시 후 새 RunRoot 생성", panel._captured_output)
         self.assertIn("ActionRunRoot: C:\\runs\\fresh-prepared", panel._captured_output)
         self.assertIn("RunRoot 입력칸 갱신 완료", panel._captured_output)
         self.assertIn("[runroot 요약]", panel._captured_output)
         self.assertIn("fresh-prepared overall=success", panel._captured_output)
         self.assertIn("입력칸 갱신 완료", panel.last_result_var.get())
+
+    def test_run_prepare_all_does_not_reuse_mirrored_selected_run_root(self) -> None:
+        panel = self._make_panel()
+        panel.effective_data = {
+            "RunContext": {
+                "SelectedRunRoot": "C:\\runs\\current",
+                "SelectedRunRootIsStale": False,
+            }
+        }
+        panel.run_root_var.set("C:\\runs\\current")
+        panel.panel_state = SimpleNamespace(
+            stages=[
+                SimpleNamespace(key="launch_windows", status_text="완료"),
+                SimpleNamespace(key="attach_windows", status_text="완료"),
+            ]
+        )
+        panel.refresh_controller = SimpleNamespace(
+            refresh_runtime=lambda _context: RuntimeRefreshResult(
+                relay_status={"Runtime": {"ExpectedTargetCount": 8}},
+                visibility_status={
+                    "ExpectedTargetCount": 8,
+                    "InjectableCount": 8,
+                    "NonInjectableCount": 0,
+                    "MissingRuntimeCount": 0,
+                    "Targets": [],
+                },
+            )
+        )
+
+        class CommandServiceStub:
+            def __init__(self) -> None:
+                self.commands: list[list[str]] = []
+
+            def build_script_command(
+                self,
+                script_name: str,
+                *,
+                config_path: str = "",
+                run_root: str = "",
+                pair_id: str = "",
+                target_id: str = "",
+                extra: list[str] | None = None,
+            ) -> list[str]:
+                command = [script_name]
+                if config_path:
+                    command += ["-ConfigPath", config_path]
+                if run_root:
+                    command += ["-RunRoot", run_root]
+                if pair_id:
+                    command += ["-PairId", pair_id]
+                if target_id:
+                    command += ["-TargetId", target_id]
+                if extra:
+                    command += list(extra)
+                return command
+
+            def run(self, command: list[str]) -> subprocess.CompletedProcess[str]:
+                self.commands.append(list(command))
+                if command[0] == "show-paired-run-summary.ps1":
+                    return subprocess.CompletedProcess(command, 0, stdout="fresh-run-prepare-all overall=success", stderr="")
+                if command[0] != "tests/Start-PairedExchangeTest.ps1":
+                    raise AssertionError(command)
+                return subprocess.CompletedProcess(
+                    command,
+                    0,
+                    stdout="prepared pair test root: C:\\runs\\fresh-run-prepare-all",
+                    stderr="",
+                )
+
+        panel.command_service = CommandServiceStub()
+
+        panel.run_prepare_all()
+
+        self.assertEqual(
+            [
+                ["tests/Start-PairedExchangeTest.ps1", "-ConfigPath", "cfg.psd1", "-IncludePairId", "pair01"],
+                ["show-paired-run-summary.ps1", "-ConfigPath", "cfg.psd1", "-RunRoot", "C:\\runs\\fresh-run-prepare-all"],
+            ],
+            panel.command_service.commands,
+        )
+        self.assertEqual("C:\\runs\\fresh-run-prepare-all", panel.run_root_var.get())
+        self.assertNotIn("-RunRoot", panel.last_command_var.get())
+        self.assertIn("ActionRunRoot: C:\\runs\\fresh-run-prepare-all", panel._captured_output)
+        self.assertIn("RunRoot 입력칸 갱신 완료", panel._captured_output)
+        self.assertIn("fresh-run-prepare-all overall=success", panel._captured_output)
 
     def test_run_prepare_all_uses_snapshotted_context_for_summary_when_prepared_root_missing(self) -> None:
         panel = self._make_panel()
@@ -2439,6 +2869,80 @@ class RelayOperatorPanelRuntimeCommandTests(unittest.TestCase):
         self.assertEqual("C:\\runs\\snapshot", panel.relay_status_data["ContextRunRoot"])
         self.assertIn("snapshot overall=success", panel._captured_output)
         self.assertEqual("", panel.run_root_var.get())
+
+    def test_run_prepare_all_uses_pair_scoped_prepare_config_when_resolved(self) -> None:
+        panel = self._make_panel()
+        panel._resolve_run_prepare_config_path = lambda *, pair_id, config_path: "pair-cfg.psd1"
+        panel.panel_state = SimpleNamespace(
+            stages=[
+                SimpleNamespace(key="launch_windows", status_text="완료"),
+                SimpleNamespace(key="attach_windows", status_text="완료"),
+            ]
+        )
+        panel.refresh_controller = SimpleNamespace(
+            refresh_runtime=lambda _context: RuntimeRefreshResult(
+                relay_status={"Runtime": {"ExpectedTargetCount": 8}},
+                visibility_status={
+                    "ExpectedTargetCount": 8,
+                    "InjectableCount": 8,
+                    "NonInjectableCount": 0,
+                    "MissingRuntimeCount": 0,
+                    "Targets": [],
+                },
+            )
+        )
+
+        class CommandServiceStub:
+            def __init__(self) -> None:
+                self.commands: list[list[str]] = []
+
+            def build_script_command(
+                self,
+                script_name: str,
+                *,
+                config_path: str = "",
+                run_root: str = "",
+                pair_id: str = "",
+                target_id: str = "",
+                extra: list[str] | None = None,
+            ) -> list[str]:
+                command = [script_name]
+                if config_path:
+                    command += ["-ConfigPath", config_path]
+                if run_root:
+                    command += ["-RunRoot", run_root]
+                if pair_id:
+                    command += ["-PairId", pair_id]
+                if target_id:
+                    command += ["-TargetId", target_id]
+                if extra:
+                    command += list(extra)
+                return command
+
+            def run(self, command: list[str]) -> subprocess.CompletedProcess[str]:
+                self.commands.append(list(command))
+                if command[0] == "show-paired-run-summary.ps1":
+                    return subprocess.CompletedProcess(command, 0, stdout="prepared overall=success", stderr="")
+                if command[0] != "tests/Start-PairedExchangeTest.ps1":
+                    raise AssertionError(command)
+                return subprocess.CompletedProcess(
+                    command,
+                    0,
+                    stdout="prepared pair test root: C:\\runs\\prepared",
+                    stderr="",
+                )
+
+        panel.command_service = CommandServiceStub()
+
+        panel.run_prepare_all()
+
+        self.assertEqual(
+            [
+                ["tests/Start-PairedExchangeTest.ps1", "-ConfigPath", "pair-cfg.psd1", "-IncludePairId", "pair01"],
+                ["show-paired-run-summary.ps1", "-ConfigPath", "pair-cfg.psd1", "-RunRoot", "C:\\runs\\prepared"],
+            ],
+            panel.command_service.commands,
+        )
 
     def test_current_run_root_marks_explicit_existing_stale_override_as_stale(self) -> None:
         panel = self._make_panel()
@@ -2968,14 +3472,14 @@ class RelayOperatorPanelRuntimeCommandTests(unittest.TestCase):
         self.assertIn("success callback boom", panel.last_result_var.get())
         self.assertIn("success callback boom", panel._captured_output)
 
-    def test_run_visibility_check_uses_snapshotted_context_in_worker(self) -> None:
+    def test_run_visibility_check_uses_effective_refresh_context_snapshot_in_worker(self) -> None:
         panel = self._make_panel()
         calls: list[str] = []
 
-        def current_context() -> AppContext:
+        def effective_refresh_context() -> AppContext:
             calls.append("context")
-            if len(calls) > 2:
-                raise AssertionError("worker should not read panel context again")
+            if len(calls) > 1:
+                raise AssertionError("worker should not re-read effective refresh context")
             return AppContext(
                 config_path="cfg.psd1",
                 run_root="C:\\runs\\snap",
@@ -2983,7 +3487,7 @@ class RelayOperatorPanelRuntimeCommandTests(unittest.TestCase):
                 target_id="target01",
             )
 
-        panel._current_context = current_context
+        panel._effective_refresh_context = effective_refresh_context
         relay_payload = {"Runtime": {"ExpectedTargetCount": 8}}
         visibility_payload = {
             "ExpectedTargetCount": 8,
@@ -3001,7 +3505,7 @@ class RelayOperatorPanelRuntimeCommandTests(unittest.TestCase):
 
         panel.run_visibility_check()
 
-        self.assertEqual(["context", "context"], calls)
+        self.assertEqual(["context"], calls)
         self.assertEqual("C:\\runs\\snap", panel.relay_status_data["ContextRunRoot"])
 
     def test_run_to_output_uses_snapshotted_context_in_worker(self) -> None:
@@ -3895,6 +4399,118 @@ class RelayOperatorPanelRuntimeCommandTests(unittest.TestCase):
             self.assertIn("IgnoredRunRoot: " + tmp, panel._captured_output)
             self.assertIn("selected overall=success", panel._captured_output)
 
+    def test_run_root_override_state_treats_normalized_selected_path_as_mirror(self) -> None:
+        panel = self._make_panel()
+        panel._normalized_optional_path = RelayOperatorPanel._normalized_optional_path.__get__(panel, RelayOperatorPanel)
+        panel._same_run_root_path = RelayOperatorPanel._same_run_root_path.__get__(panel, RelayOperatorPanel)
+        panel._run_root_override_state = RelayOperatorPanel._run_root_override_state.__get__(panel, RelayOperatorPanel)
+        panel.effective_data = {
+            "RunContext": {
+                "SelectedRunRoot": "C:\\runs\\current",
+            }
+        }
+        panel.run_root_var.set("c:\\RUNS\\current\\")
+
+        self.assertEqual("mirror-selected", panel._run_root_override_state())
+
+    def test_panel_runtime_hints_do_not_mark_normalized_mirror_as_override(self) -> None:
+        panel = self._make_panel()
+        panel._normalized_optional_path = RelayOperatorPanel._normalized_optional_path.__get__(panel, RelayOperatorPanel)
+        panel._same_run_root_path = RelayOperatorPanel._same_run_root_path.__get__(panel, RelayOperatorPanel)
+        panel._run_root_override_state = RelayOperatorPanel._run_root_override_state.__get__(panel, RelayOperatorPanel)
+        panel._current_run_root_for_actions = RelayOperatorPanel._current_run_root_for_actions.__get__(panel, RelayOperatorPanel)
+        panel._run_root_timing_snapshot = RelayOperatorPanel._run_root_timing_snapshot.__get__(panel, RelayOperatorPanel)
+        panel._current_run_root_is_stale_for_actions = RelayOperatorPanel._current_run_root_is_stale_for_actions.__get__(panel, RelayOperatorPanel)
+        panel._run_root_is_stale = RelayOperatorPanel._run_root_is_stale.__get__(panel, RelayOperatorPanel)
+        panel._panel_runtime_hints = RelayOperatorPanel._panel_runtime_hints.__get__(panel, RelayOperatorPanel)
+        panel.effective_data = {
+            "RunContext": {
+                "SelectedRunRoot": "C:\\runs\\current",
+                "SelectedRunRootIsStale": False,
+                "StaleRunThresholdSec": 1800,
+            }
+        }
+        panel.run_root_var.set("c:\\RUNS\\current\\")
+
+        hints = panel._panel_runtime_hints()
+
+        self.assertEqual("c:\\RUNS\\current\\", hints["ActionRunRoot"])
+        self.assertFalse(hints["ActionRunRootUsesOverride"])
+        self.assertFalse(hints["ActionRunRootIsStale"])
+
+    def test_current_run_root_display_text_does_not_append_override_for_normalized_mirror(self) -> None:
+        panel = self._make_panel()
+        panel._normalized_optional_path = RelayOperatorPanel._normalized_optional_path.__get__(panel, RelayOperatorPanel)
+        panel._same_run_root_path = RelayOperatorPanel._same_run_root_path.__get__(panel, RelayOperatorPanel)
+        panel._run_root_override_state = RelayOperatorPanel._run_root_override_state.__get__(panel, RelayOperatorPanel)
+        panel._current_run_root_for_actions = RelayOperatorPanel._current_run_root_for_actions.__get__(panel, RelayOperatorPanel)
+        panel._current_run_root_display_text = RelayOperatorPanel._current_run_root_display_text.__get__(panel, RelayOperatorPanel)
+        panel.effective_data = {
+            "RunContext": {
+                "SelectedRunRoot": "C:\\runs\\current",
+            }
+        }
+        panel.run_root_var.set("c:\\RUNS\\current\\")
+
+        display_text = panel._current_run_root_display_text()
+
+        self.assertEqual("c:\\RUNS\\current\\", display_text)
+        self.assertNotIn("(override)", display_text)
+
+    def test_refresh_runtime_status_only_uses_effective_refresh_context_for_normalized_mirror(self) -> None:
+        panel = self._make_panel()
+        panel._normalized_optional_path = RelayOperatorPanel._normalized_optional_path.__get__(panel, RelayOperatorPanel)
+        panel._same_run_root_path = RelayOperatorPanel._same_run_root_path.__get__(panel, RelayOperatorPanel)
+        panel._run_root_override_state = RelayOperatorPanel._run_root_override_state.__get__(panel, RelayOperatorPanel)
+        panel._current_run_root_for_actions = RelayOperatorPanel._current_run_root_for_actions.__get__(panel, RelayOperatorPanel)
+        panel._action_context_state = RelayOperatorPanel._action_context_state.__get__(panel, RelayOperatorPanel)
+        panel._effective_refresh_context = RelayOperatorPanel._effective_refresh_context.__get__(panel, RelayOperatorPanel)
+        panel.refresh_runtime_status_only = RelayOperatorPanel.refresh_runtime_status_only.__get__(panel, RelayOperatorPanel)
+        captured: dict[str, object] = {}
+        panel.effective_data = {
+            "RunContext": {
+                "SelectedRunRoot": "C:\\runs\\current",
+            }
+        }
+        panel.run_root_var.set("c:\\RUNS\\current\\")
+        panel.refresh_controller = SimpleNamespace(
+            refresh_runtime=lambda context: captured.update({"run_root": context.run_root}) or RuntimeRefreshResult(
+                relay_status={"ContextRunRoot": context.run_root},
+                visibility_status={},
+            )
+        )
+        panel._apply_runtime_refresh_result = lambda runtime_result: captured.update(
+            {"applied_run_root": runtime_result.relay_status["ContextRunRoot"]}
+        )
+
+        panel.refresh_runtime_status_only()
+
+        self.assertEqual("", captured["run_root"])
+        self.assertEqual("", captured["applied_run_root"])
+
+    def test_runtime_refresh_command_preview_uses_effective_refresh_context_for_normalized_mirror(self) -> None:
+        panel = self._make_panel()
+        panel._normalized_optional_path = RelayOperatorPanel._normalized_optional_path.__get__(panel, RelayOperatorPanel)
+        panel._same_run_root_path = RelayOperatorPanel._same_run_root_path.__get__(panel, RelayOperatorPanel)
+        panel._run_root_override_state = RelayOperatorPanel._run_root_override_state.__get__(panel, RelayOperatorPanel)
+        panel._current_run_root_for_actions = RelayOperatorPanel._current_run_root_for_actions.__get__(panel, RelayOperatorPanel)
+        panel._action_context_state = RelayOperatorPanel._action_context_state.__get__(panel, RelayOperatorPanel)
+        panel._effective_refresh_context = RelayOperatorPanel._effective_refresh_context.__get__(panel, RelayOperatorPanel)
+        panel._runtime_refresh_command_preview = RelayOperatorPanel._runtime_refresh_command_preview.__get__(panel, RelayOperatorPanel)
+        panel.target_id_var.set("target01")
+        panel.effective_data = {
+            "RunContext": {
+                "SelectedRunRoot": "C:\\runs\\current",
+            }
+        }
+        panel.run_root_var.set("c:\\RUNS\\current\\")
+
+        preview = panel._runtime_refresh_command_preview()
+
+        self.assertIn("show-relay-status.ps1", preview)
+        self.assertIn("check-target-window-visibility.ps1", preview)
+        self.assertNotIn("-RunRoot", preview)
+
     def test_board_status_text_includes_attach_wait_reason(self) -> None:
         panel = self._make_panel()
         panel.panel_state = SimpleNamespace(
@@ -4113,6 +4729,44 @@ class PanelRuntimeWorkflowServiceTests(unittest.TestCase):
             command_service.commands,
         )
 
+    def test_prepare_run_root_uses_prepare_config_path_when_provided(self) -> None:
+        calls: list[tuple[str, object]] = []
+
+        class CommandServiceStub:
+            def build_script_command(self, script_name: str, **kwargs) -> list[str]:
+                calls.append(("build_script", script_name, kwargs.get("run_root", ""), kwargs.get("config_path", "")))
+                return [script_name, kwargs.get("run_root", "")]
+
+            def run(self, command: list[str]) -> subprocess.CompletedProcess[str]:
+                calls.append(("run", tuple(command)))
+                if command[0] == "tests/Start-PairedExchangeTest.ps1":
+                    return subprocess.CompletedProcess(command, 0, stdout="prepared pair test root: C:\\runs\\prepared", stderr="")
+                if command[0] == "show-paired-run-summary.ps1":
+                    return subprocess.CompletedProcess(command, 0, stdout="overall=success", stderr="")
+                raise AssertionError(command)
+
+        service = PanelRuntimeWorkflowService(CommandServiceStub(), SimpleNamespace(), SimpleNamespace())
+        result = service.prepare_run_root(
+            RunRootPrepareRequest(
+                config_path="cfg.psd1",
+                prepare_config_path="pair-cfg.psd1",
+                pair_id="pair01",
+                requested_run_root="C:\\runs\\requested",
+                summary_fallback_run_root="C:\\runs\\fallback",
+            )
+        )
+
+        self.assertEqual("C:\\runs\\prepared", result.prepared_run_root)
+        self.assertEqual(
+            [
+                ("build_script", "tests/Start-PairedExchangeTest.ps1", "C:\\runs\\requested", "pair-cfg.psd1"),
+                ("run", ("tests/Start-PairedExchangeTest.ps1", "C:\\runs\\requested")),
+                ("build_script", "show-paired-run-summary.ps1", "C:\\runs\\prepared", "pair-cfg.psd1"),
+                ("run", ("show-paired-run-summary.ps1", "C:\\runs\\prepared")),
+            ],
+            calls,
+        )
+
     def test_run_prepare_all_preserves_launch_attach_refresh_prepare_sequence(self) -> None:
         calls: list[tuple[str, object]] = []
         runtime_result = RuntimeRefreshResult(
@@ -4180,10 +4834,64 @@ class PanelRuntimeWorkflowServiceTests(unittest.TestCase):
             calls,
         )
 
+    def test_run_prepare_all_forwards_prepare_config_path_to_prepare_step(self) -> None:
+        calls: list[tuple[str, object]] = []
+        runtime_result = RuntimeRefreshResult(
+            relay_status={"Runtime": {"ExpectedTargetCount": 8}},
+            visibility_status={"ExpectedTargetCount": 8},
+        )
+
+        class CommandServiceStub:
+            def build_script_command(self, script_name: str, **kwargs) -> list[str]:
+                calls.append(("build_script", script_name, kwargs.get("run_root", ""), kwargs.get("config_path", "")))
+                return [script_name, kwargs.get("run_root", "")]
+
+            def run(self, command: list[str]) -> subprocess.CompletedProcess[str]:
+                calls.append(("run", tuple(command)))
+                if command[0] == "tests/Start-PairedExchangeTest.ps1":
+                    return subprocess.CompletedProcess(command, 0, stdout="prepared pair test root: C:\\runs\\prepared", stderr="")
+                if command[0] == "show-paired-run-summary.ps1":
+                    return subprocess.CompletedProcess(command, 0, stdout="overall=success", stderr="")
+                raise AssertionError(command)
+
+        service = PanelRuntimeWorkflowService(
+            CommandServiceStub(),
+            SimpleNamespace(),
+            SimpleNamespace(refresh_runtime=lambda context: calls.append(("refresh", context.run_root)) or runtime_result),
+        )
+        result = service.run_prepare_all(
+            PrepareAllRequest(
+                context=AppContext(config_path="cfg.psd1", run_root="C:\\runs\\current", pair_id="pair01", target_id=""),
+                config_path="cfg.psd1",
+                pair_id="pair01",
+                explicit_run_root="C:\\runs\\requested",
+                prepare_config_path="pair-cfg.psd1",
+                wrapper_path="",
+                launch_windows_needed=False,
+                attach_windows_needed=False,
+            )
+        )
+
+        self.assertEqual("C:\\runs\\prepared", result.run_root_result.prepared_run_root)
+        self.assertEqual(
+            [
+                ("refresh", "C:\\runs\\current"),
+                ("build_script", "tests/Start-PairedExchangeTest.ps1", "C:\\runs\\requested", "pair-cfg.psd1"),
+                ("run", ("tests/Start-PairedExchangeTest.ps1", "C:\\runs\\requested")),
+                ("build_script", "show-paired-run-summary.ps1", "C:\\runs\\prepared", "pair-cfg.psd1"),
+                ("run", ("show-paired-run-summary.ps1", "C:\\runs\\prepared")),
+            ],
+            calls,
+        )
+
 
 class RelayOperatorPanelMessageSlotTests(unittest.TestCase):
     def _make_panel(self) -> RelayOperatorPanel:
         panel = RelayOperatorPanel.__new__(RelayOperatorPanel)
+        panel.command_service = SimpleNamespace(
+            build_powershell_file_command=lambda script_path, extra=None: [script_path] + list(extra or []),
+            run_json=lambda _command: {},
+        )
         panel.message_config_service = MessageConfigService(CommandService())
         panel.message_config_doc = {
             "PairTest": {
@@ -4191,20 +4899,51 @@ class RelayOperatorPanelMessageSlotTests(unittest.TestCase):
                     "Initial": {},
                     "Handoff": {},
                 },
+                "PairDefinitions": [
+                    {"PairId": "pair01", "TopTargetId": "target01", "BottomTargetId": "target05", "SeedTargetId": "target01"},
+                ],
+                "PairPolicies": {
+                    "pair01": {
+                        "DefaultSeedWorkRepoRoot": r"C:\repo-a",
+                        "UseExternalWorkRepoRunRoot": True,
+                        "UseExternalWorkRepoContractPaths": True,
+                        "DefaultPairMaxRoundtripCount": 2,
+                        "DefaultSeedTargetId": "target01",
+                    }
+                },
                 "PairOverrides": {"pair01": {"InitialExtraBlocks": ["pair block"]}},
                 "RoleOverrides": {"top": {"InitialExtraBlocks": ["role block"]}},
                 "TargetOverrides": {"target01": {"InitialExtraBlocks": ["target block"]}},
             },
-            "Targets": [{"Id": "target01"}],
+            "DefaultSeedWorkRepoRoot": r"C:\repo-global",
+            "UseExternalWorkRepoRunRoot": False,
+            "UseExternalWorkRepoContractPaths": False,
+            "DefaultPairMaxRoundtripCount": 0,
+            "Targets": [{"Id": "target01"}, {"Id": "target05"}],
         }
         panel.preview_rows = [
             {"PairId": "pair01", "RoleName": "top", "TargetId": "target01"},
+            {"PairId": "pair01", "RoleName": "bottom", "TargetId": "target05"},
         ]
         panel.config_path_var = VarStub("cfg.psd1")
+        panel.last_command_var = VarStub("")
+        panel.last_result_var = VarStub("")
         panel.run_root_var = VarStub("")
         panel.effective_data = {"RunContext": {"SelectedRunRoot": "C:\\runs\\current"}}
+        panel.paired_status_data = None
+        panel.paired_status_error = ""
         panel.pair_id_var = VarStub("pair01")
         panel.target_id_var = VarStub("target01")
+        panel.seed_kickoff_status_var = VarStub("")
+        panel.seed_kickoff_pair_var = VarStub("pair01")
+        panel.seed_kickoff_target_var = VarStub("target01")
+        panel.seed_kickoff_review_input_var = VarStub("")
+        panel.seed_kickoff_applies_to_var = VarStub("initial")
+        panel.seed_kickoff_placement_var = VarStub("one-time-prefix")
+        panel.seed_kickoff_target_banner_var = VarStub("")
+        panel.seed_kickoff_readiness_var = VarStub("")
+        panel.seed_kickoff_detail_visible_var = VarStub(False)
+        panel.seed_kickoff_last_preview = None
         panel.action_context_source = "controls"
         panel.inspection_context_source = ""
         panel.inspection_context_row_index = None
@@ -4227,6 +4966,93 @@ class RelayOperatorPanelMessageSlotTests(unittest.TestCase):
         panel.message_preview_doc_version = -1
         panel.message_preview_cached_context_key = ""
         panel.visible_workflow_progress_by_scope = {}
+        panel.pair_policy_editor_status_var = VarStub("")
+        panel.pair_policy_parallel_status_var = VarStub("")
+        panel.parallel_coordinator_repo_root_var = VarStub(r"C:\coord")
+        panel.output_text = TextWidgetStub("")
+        panel.seed_kickoff_task_text = TextWidgetStub("")
+        panel.seed_kickoff_contract_text = TextWidgetStub("")
+        panel.seed_kickoff_helper_text = TextWidgetStub("")
+        panel.seed_kickoff_steps_text = TextWidgetStub("")
+        panel.seed_kickoff_preview_text = TextWidgetStub("")
+        panel.seed_kickoff_preview_stack_frame = None
+        panel.seed_kickoff_preview_detail_frame = None
+        panel.pair_policy_card_vars = {
+            "pair01": {
+                "meta_var": VarStub(""),
+                "repo_root_var": VarStub(r"C:\repo-a"),
+                "seed_target_var": VarStub("target01"),
+                "roundtrip_var": VarStub("2"),
+                "external_run_root_var": VarStub(True),
+                "external_contract_var": VarStub(True),
+                "route_badge_var": VarStub(""),
+                "repo_source_badge_var": VarStub(""),
+                "override_badge_var": VarStub(""),
+                "route_state_var": VarStub(""),
+                "effective_preview_var": VarStub(""),
+                "runtime_badge_var": VarStub(""),
+                "runtime_summary_var": VarStub(""),
+                "parallel_selected_var": VarStub(True),
+            },
+            "pair02": {
+                "meta_var": VarStub(""),
+                "repo_root_var": VarStub(""),
+                "seed_target_var": VarStub(""),
+                "roundtrip_var": VarStub("0"),
+                "external_run_root_var": VarStub(False),
+                "external_contract_var": VarStub(False),
+                "route_badge_var": VarStub(""),
+                "repo_source_badge_var": VarStub(""),
+                "override_badge_var": VarStub(""),
+                "route_state_var": VarStub(""),
+                "effective_preview_var": VarStub(""),
+                "runtime_badge_var": VarStub(""),
+                "runtime_summary_var": VarStub(""),
+                "parallel_selected_var": VarStub(False),
+            },
+            "pair03": {
+                "meta_var": VarStub(""),
+                "repo_root_var": VarStub(""),
+                "seed_target_var": VarStub(""),
+                "roundtrip_var": VarStub("0"),
+                "external_run_root_var": VarStub(False),
+                "external_contract_var": VarStub(False),
+                "route_badge_var": VarStub(""),
+                "repo_source_badge_var": VarStub(""),
+                "override_badge_var": VarStub(""),
+                "route_state_var": VarStub(""),
+                "effective_preview_var": VarStub(""),
+                "runtime_badge_var": VarStub(""),
+                "runtime_summary_var": VarStub(""),
+                "parallel_selected_var": VarStub(False),
+            },
+            "pair04": {
+                "meta_var": VarStub(""),
+                "repo_root_var": VarStub(""),
+                "seed_target_var": VarStub(""),
+                "roundtrip_var": VarStub("0"),
+                "external_run_root_var": VarStub(False),
+                "external_contract_var": VarStub(False),
+                "route_badge_var": VarStub(""),
+                "repo_source_badge_var": VarStub(""),
+                "override_badge_var": VarStub(""),
+                "route_state_var": VarStub(""),
+                "effective_preview_var": VarStub(""),
+                "runtime_badge_var": VarStub(""),
+                "runtime_summary_var": VarStub(""),
+                "parallel_selected_var": VarStub(False),
+            },
+        }
+        panel.pair_policy_clone_source_var = VarStub("pair01")
+        panel.pair_policy_clone_target_var = VarStub("pair02")
+        panel.pair_policy_card_seed_combos = {}
+        panel.pair_policy_card_runtime_badge_labels = {}
+        panel.pair_policy_card_effective_preview_widgets = {
+            pair_id: TextWidgetStub("")
+            for pair_id in ["pair01", "pair02", "pair03", "pair04"]
+        }
+        panel.seed_kickoff_pair_combo = None
+        panel.seed_kickoff_target_combo = None
         panel._editor_preview_text = lambda _key: "(preview)"
         panel._editor_final_delivery_text = lambda: "(final-delivery)"
         panel._editor_path_summary_text = lambda: "(path-summary)"
@@ -4695,6 +5521,923 @@ class RelayOperatorPanelMessageSlotTests(unittest.TestCase):
         self.assertEqual(0, panel.inspection_context_row_index)
         self.assertIn("inspection 선택만 바뀌었습니다.", panel._captured_detail)
 
+    def test_on_row_selected_surfaces_pair_route_snapshot(self) -> None:
+        panel = self._make_panel()
+        panel.preview_rows = [
+            {
+                "PairId": "pair01",
+                "RoleName": "top",
+                "TargetId": "target01",
+                "PartnerTargetId": "target05",
+                "WorkRepoRoot": r"C:\repo-shared",
+                "PairRunRoot": r"C:\repo-shared\.relay-runs\bottest-live-visible\pairs\pair01\run_1",
+                "SourceOutboxPath": r"C:\repo-shared\.relay-contract\bottest-live-visible\run_1\pair01\target01\source-outbox",
+                "PublishReadyPath": r"C:\repo-shared\.relay-contract\bottest-live-visible\run_1\pair01\target01\source-outbox\publish.ready.json",
+            },
+            {
+                "PairId": "pair01",
+                "RoleName": "bottom",
+                "TargetId": "target05",
+                "PartnerTargetId": "target01",
+                "WorkRepoRoot": r"C:\repo-shared",
+                "PairRunRoot": r"C:\repo-shared\.relay-runs\bottest-live-visible\pairs\pair01\run_1",
+                "SourceOutboxPath": r"C:\repo-shared\.relay-contract\bottest-live-visible\run_1\pair01\target05\source-outbox",
+                "PublishReadyPath": r"C:\repo-shared\.relay-contract\bottest-live-visible\run_1\pair01\target05\source-outbox\publish.ready.json",
+            },
+            {
+                "PairId": "pair02",
+                "RoleName": "top",
+                "TargetId": "target02",
+                "PartnerTargetId": "target06",
+                "WorkRepoRoot": r"C:\repo-shared",
+                "PairRunRoot": r"C:\repo-shared\.relay-runs\bottest-live-visible\pairs\pair02\run_1",
+                "SourceOutboxPath": r"C:\repo-shared\.relay-contract\bottest-live-visible\run_1\pair02\target02\source-outbox",
+                "PublishReadyPath": r"C:\repo-shared\.relay-contract\bottest-live-visible\run_1\pair02\target02\source-outbox\publish.ready.json",
+            },
+        ]
+
+        class RowTreeStub:
+            def selection(self) -> tuple[str, ...]:
+                return ("0",)
+
+        panel.row_tree = RowTreeStub()
+        panel.details_text = object()
+        panel.initial_text = object()
+        panel.handoff_text = object()
+        panel.plan_text = object()
+        panel.one_time_text = object()
+        panel.render_target_board = lambda: None
+        panel.render_message_editor = lambda: None
+        panel.set_text = lambda widget, value: setattr(panel, "_captured_detail", value) if widget is panel.details_text else None
+        panel.pair_id_var.set("pair01")
+        panel.target_id_var.set("target01")
+
+        panel.on_row_selected()
+
+        self.assertIn("[pair route snapshot]", panel._captured_detail)
+        self.assertIn("route state: aligned", panel._captured_detail)
+        self.assertIn(r"same pair work repo root: C:\repo-shared", panel._captured_detail)
+        self.assertIn(r"same pair run root: C:\repo-shared\.relay-runs\bottest-live-visible\pairs\pair01\run_1", panel._captured_detail)
+        self.assertIn("same pair targets share repo root: True", panel._captured_detail)
+        self.assertIn("same pair targets share pair run root: True", panel._captured_detail)
+        self.assertIn("same pair target outboxes distinct: True", panel._captured_detail)
+        self.assertIn("other pairs share this repo root: True", panel._captured_detail)
+        self.assertIn(r"top source outbox: C:\repo-shared\.relay-contract\bottest-live-visible\run_1\pair01\target01\source-outbox", panel._captured_detail)
+        self.assertIn(r"bottom source outbox: C:\repo-shared\.relay-contract\bottest-live-visible\run_1\pair01\target05\source-outbox", panel._captured_detail)
+
+    def test_refresh_pair_policy_editor_populates_card_from_pair_policy_and_current_route(self) -> None:
+        panel = self._make_panel()
+        panel.preview_rows = [
+            {
+                "PairId": "pair01",
+                "RoleName": "top",
+                "TargetId": "target01",
+                "WorkRepoRoot": r"C:\repo-a",
+                "PairRunRoot": r"C:\repo-a\.relay-runs\bottest-live-visible\pairs\pair01\run_1",
+                "SourceOutboxPath": r"C:\repo-a\.relay-contract\bottest-live-visible\run_1\pair01\target01\source-outbox",
+                "PublishReadyPath": r"C:\repo-a\.relay-contract\bottest-live-visible\run_1\pair01\target01\source-outbox\publish.ready.json",
+            },
+            {
+                "PairId": "pair01",
+                "RoleName": "bottom",
+                "TargetId": "target05",
+                "WorkRepoRoot": r"C:\repo-a",
+                "PairRunRoot": r"C:\repo-a\.relay-runs\bottest-live-visible\pairs\pair01\run_1",
+                "SourceOutboxPath": r"C:\repo-a\.relay-contract\bottest-live-visible\run_1\pair01\target05\source-outbox",
+                "PublishReadyPath": r"C:\repo-a\.relay-contract\bottest-live-visible\run_1\pair01\target05\source-outbox\publish.ready.json",
+            },
+        ]
+        panel.message_config_service.load_config_document = lambda _path: panel.message_config_service.clone_document(panel.message_config_doc)
+
+        panel.refresh_pair_policy_editor()
+
+        card = panel.pair_policy_card_vars["pair01"]
+        self.assertIn("top=target01", card["meta_var"].get())
+        self.assertEqual(r"C:\repo-a", card["repo_root_var"].get())
+        self.assertEqual("target01", card["seed_target_var"].get())
+        self.assertEqual("2", card["roundtrip_var"].get())
+        self.assertTrue(card["external_run_root_var"].get())
+        self.assertTrue(card["external_contract_var"].get())
+        self.assertEqual("ROUTE OK", card["route_badge_var"].get())
+        self.assertEqual("PAIR POLICY", card["repo_source_badge_var"].get())
+        self.assertEqual("RUNROOT AUTO", card["override_badge_var"].get())
+        self.assertIn("route=aligned", card["route_state_var"].get())
+        self.assertIn(r"top outbox=C:\repo-a\.relay-contract\bottest-live-visible\run_1\pair01\target01\source-outbox", card["effective_preview_var"].get())
+        self.assertIn(r"top outbox=C:\repo-a\.relay-contract\bottest-live-visible\run_1\pair01\target01\source-outbox", panel.pair_policy_card_effective_preview_widgets["pair01"].value)
+
+    def test_refresh_pair_policy_editor_marks_shared_repo_badge_when_other_pair_uses_same_root(self) -> None:
+        panel = self._make_panel()
+        panel.preview_rows = [
+            {
+                "PairId": "pair01",
+                "RoleName": "top",
+                "TargetId": "target01",
+                "WorkRepoRoot": r"C:\repo-shared",
+                "PairRunRoot": r"C:\repo-shared\.relay-runs\bottest-live-visible\pairs\pair01\run_1",
+                "SourceOutboxPath": r"C:\repo-shared\.relay-contract\bottest-live-visible\run_1\pair01\target01\source-outbox",
+                "PublishReadyPath": r"C:\repo-shared\.relay-contract\bottest-live-visible\run_1\pair01\target01\source-outbox\publish.ready.json",
+            },
+            {
+                "PairId": "pair01",
+                "RoleName": "bottom",
+                "TargetId": "target05",
+                "WorkRepoRoot": r"C:\repo-shared",
+                "PairRunRoot": r"C:\repo-shared\.relay-runs\bottest-live-visible\pairs\pair01\run_1",
+                "SourceOutboxPath": r"C:\repo-shared\.relay-contract\bottest-live-visible\run_1\pair01\target05\source-outbox",
+                "PublishReadyPath": r"C:\repo-shared\.relay-contract\bottest-live-visible\run_1\pair01\target05\source-outbox\publish.ready.json",
+            },
+            {
+                "PairId": "pair02",
+                "RoleName": "top",
+                "TargetId": "target02",
+                "WorkRepoRoot": r"C:\repo-shared",
+                "PairRunRoot": r"C:\repo-shared\.relay-runs\bottest-live-visible\pairs\pair02\run_1",
+                "SourceOutboxPath": r"C:\repo-shared\.relay-contract\bottest-live-visible\run_1\pair02\target02\source-outbox",
+                "PublishReadyPath": r"C:\repo-shared\.relay-contract\bottest-live-visible\run_1\pair02\target02\source-outbox\publish.ready.json",
+            },
+        ]
+        panel.message_config_service.load_config_document = lambda _path: panel.message_config_service.clone_document(panel.message_config_doc)
+        panel.pair_policy_card_vars["pair01"]["repo_root_var"].set(r"C:\repo-shared")
+
+        panel.refresh_pair_policy_editor()
+
+        self.assertEqual("SHARED REPO OK", panel.pair_policy_card_vars["pair01"]["route_badge_var"].get())
+
+    def test_copy_pair_policy_effective_preview_copies_full_text(self) -> None:
+        panel = self._make_panel()
+        panel.pair_policy_card_vars["pair01"]["effective_preview_var"].set(
+            "pair=pair01 / seed=target01 / repo=C:\\repo-a\nrunroot=C:\\repo-a\\.relay-runs\\bottest-live-visible\\pairs\\pair01\\run_1"
+        )
+        copied: list[str] = []
+        panel._copy_to_clipboard = copied.append
+
+        panel.copy_pair_policy_effective_preview("pair01")
+
+        self.assertEqual(1, len(copied))
+        self.assertIn("pair=pair01", copied[0])
+        self.assertIn("runroot=C:\\repo-a\\.relay-runs\\bottest-live-visible\\pairs\\pair01\\run_1", copied[0])
+        self.assertIn("pair01 실효값 복사 완료", panel.output_text.value)
+
+    def test_refresh_pair_policy_editor_populates_parallel_runtime_from_wrapper_status(self) -> None:
+        panel = self._make_panel()
+        coordinator_run_root = make_workspace_tempdir("pair-wrapper-status")
+        wrapper_status_path = coordinator_run_root / ".state" / "wrapper-status.json"
+        wrapper_status_path.parent.mkdir(parents=True, exist_ok=True)
+        panel.effective_data = {"RunContext": {"SelectedRunRoot": str(coordinator_run_root)}}
+        panel.preview_rows = [
+            {
+                "PairId": "pair01",
+                "RoleName": "top",
+                "TargetId": "target01",
+                "WorkRepoRoot": r"C:\repo-a",
+                "PairRunRoot": r"C:\repo-a\.relay-runs\bottest-live-visible\pairs\pair01\run_1",
+                "SourceOutboxPath": r"C:\repo-a\.relay-contract\bottest-live-visible\run_1\pair01\target01\source-outbox",
+                "PublishReadyPath": r"C:\repo-a\.relay-contract\bottest-live-visible\run_1\pair01\target01\source-outbox\publish.ready.json",
+            },
+            {
+                "PairId": "pair01",
+                "RoleName": "bottom",
+                "TargetId": "target05",
+                "WorkRepoRoot": r"C:\repo-a",
+                "PairRunRoot": r"C:\repo-a\.relay-runs\bottest-live-visible\pairs\pair01\run_1",
+                "SourceOutboxPath": r"C:\repo-a\.relay-contract\bottest-live-visible\run_1\pair01\target05\source-outbox",
+                "PublishReadyPath": r"C:\repo-a\.relay-contract\bottest-live-visible\run_1\pair01\target05\source-outbox\publish.ready.json",
+            },
+        ]
+        wrapper_status_path.write_text(
+            json.dumps(
+                {
+                    "Status": "running",
+                    "PairRuns": [
+                        {
+                            "PairId": "pair01",
+                            "WorkRepoRoot": r"C:\repo-a",
+                            "RunRoot": r"C:\repo-a\.relay-runs\bottest-live-visible\pairs\pair01\run_1",
+                            "WatcherState": "running",
+                            "WatcherReason": "heartbeat",
+                            "RoundtripCount": 1,
+                            "CurrentPhase": "partner-running",
+                            "NextAction": "await-partner-output",
+                            "LastForwardedAt": "2026-04-30T12:05:00+09:00",
+                            "LastHeartbeatAt": "2026-04-30T12:05:02+09:00",
+                            "DonePresentCount": 0,
+                            "ErrorPresentCount": 0,
+                            "FinalResult": "running",
+                            "CompletionSource": "",
+                        }
+                    ],
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        panel.message_config_service.load_config_document = lambda _path: panel.message_config_service.clone_document(panel.message_config_doc)
+
+        panel.refresh_pair_policy_editor()
+
+        card = panel.pair_policy_card_vars["pair01"]
+        self.assertEqual("RUNNING", card["runtime_badge_var"].get())
+        self.assertIn("source=wrapper-status", card["runtime_summary_var"].get())
+        self.assertIn("watcher=running", card["runtime_summary_var"].get())
+        self.assertIn("phase=partner-running", card["runtime_summary_var"].get())
+        self.assertIn("RUNNING=1", panel.pair_policy_parallel_status_var.get())
+
+    def test_refresh_pair_policy_editor_uses_paired_status_when_wrapper_status_missing(self) -> None:
+        panel = self._make_panel()
+        panel.paired_status_data = {
+            "Watcher": {
+                "Status": "running",
+                "HeartbeatAt": "2026-04-30T12:07:00+09:00",
+                "StatusReason": "heartbeat",
+            },
+            "Pairs": [
+                {
+                    "PairId": "pair01",
+                    "RoundtripCount": 1,
+                    "CurrentPhase": "waiting-handoff",
+                    "NextAction": "handoff-ready",
+                    "LastForwardedAt": "2026-04-30T12:06:30+09:00",
+                }
+            ],
+        }
+        panel.message_config_service.load_config_document = lambda _path: panel.message_config_service.clone_document(panel.message_config_doc)
+
+        panel.refresh_pair_policy_editor()
+
+        card = panel.pair_policy_card_vars["pair01"]
+        self.assertEqual("WAITING", card["runtime_badge_var"].get())
+        self.assertIn("source=paired-status", card["runtime_summary_var"].get())
+        self.assertIn("phase=waiting-handoff", card["runtime_summary_var"].get())
+        self.assertIn("WAITING=1", panel.pair_policy_parallel_status_var.get())
+
+    def test_preview_pair_policy_effective_uses_card_draft_values(self) -> None:
+        panel = self._make_panel()
+        panel.message_config_service.load_config_document = lambda _path: panel.message_config_service.clone_document(panel.message_config_doc)
+        captured: dict[str, dict] = {}
+
+        def render_preview(document, *, config_path: str, run_root: str = "", pair_id: str = "", target_id: str = "", mode: str = "both"):
+            captured["policy"] = panel.message_config_service.effective_pair_policy(document, pair_id)
+            return {
+                "Warnings": [],
+                "PreviewRows": [
+                    {
+                        "PairId": "pair01",
+                        "RoleName": "top",
+                        "TargetId": "target01",
+                        "PairTargetFolder": r"C:\repo-draft\.relay-runs\bottest-live-visible\pairs\pair01\run_preview\target01",
+                        "SourceOutboxPath": r"C:\repo-draft\.relay-contract\bottest-live-visible\run_preview\pair01\target01\source-outbox",
+                        "PublishReadyPath": r"C:\repo-draft\.relay-contract\bottest-live-visible\run_preview\pair01\target01\source-outbox\publish.ready.json",
+                    },
+                    {
+                        "PairId": "pair01",
+                        "RoleName": "bottom",
+                        "TargetId": "target05",
+                        "PairTargetFolder": r"C:\repo-draft\.relay-runs\bottest-live-visible\pairs\pair01\run_preview\target05",
+                        "SourceOutboxPath": r"C:\repo-draft\.relay-contract\bottest-live-visible\run_preview\pair01\target05\source-outbox",
+                        "PublishReadyPath": r"C:\repo-draft\.relay-contract\bottest-live-visible\run_preview\pair01\target05\source-outbox\publish.ready.json",
+                    },
+                ],
+            }
+
+        panel.message_config_service.render_effective_preview = render_preview
+        panel.pair_policy_card_vars["pair01"]["repo_root_var"].set(r"C:\repo-draft")
+        panel.pair_policy_card_vars["pair01"]["seed_target_var"].set("target05")
+        panel.pair_policy_card_vars["pair01"]["roundtrip_var"].set("3")
+        panel.pair_policy_card_vars["pair01"]["external_run_root_var"].set(True)
+        panel.pair_policy_card_vars["pair01"]["external_contract_var"].set(True)
+
+        panel.preview_pair_policy_effective("pair01")
+
+        self.assertEqual(r"C:\repo-draft", captured["policy"]["DefaultSeedWorkRepoRoot"])
+        self.assertEqual("target05", captured["policy"]["DefaultSeedTargetId"])
+        self.assertEqual(3, captured["policy"]["DefaultPairMaxRoundtripCount"])
+        self.assertEqual("ROUTE OK", panel.pair_policy_card_vars["pair01"]["route_badge_var"].get())
+        self.assertIn(r"repo=C:\repo-draft", panel.pair_policy_card_vars["pair01"]["effective_preview_var"].get())
+        self.assertIn("repo-source=pair-policy", panel.pair_policy_card_vars["pair01"]["effective_preview_var"].get())
+        self.assertIn(r"top outbox=C:\repo-draft\.relay-contract\bottest-live-visible\run_preview\pair01\target01\source-outbox", panel.pair_policy_card_vars["pair01"]["effective_preview_var"].get())
+
+    def test_refresh_seed_kickoff_composer_uses_pair_policy_pair_and_targets(self) -> None:
+        panel = self._make_panel()
+
+        panel.refresh_seed_kickoff_composer()
+
+        self.assertEqual("pair01", panel.seed_kickoff_pair_var.get())
+        self.assertEqual("target01", panel.seed_kickoff_target_var.get())
+        self.assertIn("pair=pair01", panel.seed_kickoff_status_var.get())
+        self.assertIn("붙여넣기 대상: pair01 / target01", panel.seed_kickoff_target_banner_var.get())
+        self.assertEqual("차단: 작업 설명 또는 입력 파일 필요", panel.seed_kickoff_readiness_var.get())
+
+    def test_preview_seed_kickoff_message_builds_contract_helper_and_full_preview(self) -> None:
+        panel = self._make_panel()
+        panel.message_config_service.load_config_document = lambda _path: panel.message_config_service.clone_document(panel.message_config_doc)
+
+        def render_preview(document, *, config_path: str, run_root: str = "", pair_id: str = "", target_id: str = "", mode: str = "both"):
+            self.assertEqual("pair01", pair_id)
+            self.assertEqual("target01", target_id)
+            self.assertEqual("initial", mode)
+            return {
+                "Warnings": [],
+                "RunContext": {"NextRunRootPreview": r"C:\repo-a\.relay-runs\bottest-live-visible\pairs\pair01\run_preview"},
+                "PreviewRows": [
+                    {
+                        "PairId": "pair01",
+                        "RoleName": "top",
+                        "TargetId": "target01",
+                        "PairRunRoot": r"C:\repo-a\.relay-runs\bottest-live-visible\pairs\pair01\run_preview",
+                        "PairTargetFolder": r"C:\repo-a\.relay-runs\bottest-live-visible\pairs\pair01\run_preview\target01",
+                        "SourceOutboxPath": r"C:\repo-a\.relay-contract\bottest-live-visible\run_preview\pair01\target01\source-outbox",
+                        "SourceSummaryPath": r"C:\repo-a\.relay-contract\bottest-live-visible\run_preview\pair01\target01\source-outbox\summary.txt",
+                        "SourceReviewZipPath": r"C:\repo-a\.relay-contract\bottest-live-visible\run_preview\pair01\target01\source-outbox\review.zip",
+                        "PublishReadyPath": r"C:\repo-a\.relay-contract\bottest-live-visible\run_preview\pair01\target01\source-outbox\publish.ready.json",
+                        "CheckScriptPath": r"C:\repo-a\.relay-runs\bottest-live-visible\pairs\pair01\run_preview\target01\check-artifact.ps1",
+                        "CheckCmdPath": r"C:\repo-a\.relay-runs\bottest-live-visible\pairs\pair01\run_preview\target01\check-artifact.cmd",
+                        "SubmitScriptPath": r"C:\repo-a\.relay-runs\bottest-live-visible\pairs\pair01\run_preview\target01\submit-artifact.ps1",
+                        "SubmitCmdPath": r"C:\repo-a\.relay-runs\bottest-live-visible\pairs\pair01\run_preview\target01\submit-artifact.cmd",
+                        "PublishScriptPath": r"C:\repo-a\.relay-runs\bottest-live-visible\pairs\pair01\run_preview\target01\publish-artifact.ps1",
+                        "PublishCmdPath": r"C:\repo-a\.relay-runs\bottest-live-visible\pairs\pair01\run_preview\target01\publish-artifact.cmd",
+                    },
+                    {
+                        "PairId": "pair01",
+                        "RoleName": "bottom",
+                        "TargetId": "target05",
+                        "PairRunRoot": r"C:\repo-a\.relay-runs\bottest-live-visible\pairs\pair01\run_preview",
+                        "PairTargetFolder": r"C:\repo-a\.relay-runs\bottest-live-visible\pairs\pair01\run_preview\target05",
+                        "SourceOutboxPath": r"C:\repo-a\.relay-contract\bottest-live-visible\run_preview\pair01\target05\source-outbox",
+                        "SourceSummaryPath": r"C:\repo-a\.relay-contract\bottest-live-visible\run_preview\pair01\target05\source-outbox\summary.txt",
+                        "SourceReviewZipPath": r"C:\repo-a\.relay-contract\bottest-live-visible\run_preview\pair01\target05\source-outbox\review.zip",
+                        "PublishReadyPath": r"C:\repo-a\.relay-contract\bottest-live-visible\run_preview\pair01\target05\source-outbox\publish.ready.json",
+                    },
+                ],
+            }
+
+        panel.message_config_service.render_effective_preview = render_preview
+        panel.seed_kickoff_review_input_var.set(r"C:\incoming\seed-note.md")
+        panel.seed_kickoff_task_text.value = "이 저장소의 현재 상태를 검토하고 수정 계획을 정리하세요."
+
+        panel.preview_seed_kickoff_message()
+
+        self.assertIn("summary.txt: C:\\repo-a\\.relay-contract\\bottest-live-visible\\run_preview\\pair01\\target01\\source-outbox\\summary.txt", panel.seed_kickoff_contract_text.value)
+        self.assertIn("publish.ready.json: C:\\repo-a\\.relay-contract\\bottest-live-visible\\run_preview\\pair01\\target01\\source-outbox\\publish.ready.json", panel.seed_kickoff_contract_text.value)
+        self.assertIn("- publish: C:\\repo-a\\.relay-runs\\bottest-live-visible\\pairs\\pair01\\run_preview\\target01\\publish-artifact.cmd", panel.seed_kickoff_helper_text.value)
+        self.assertIn("[권장 시작 순서]", panel.seed_kickoff_steps_text.value)
+        self.assertIn("summary.txt -> review.zip -> publish.ready.json", panel.seed_kickoff_steps_text.value)
+        self.assertIn("[초기 실행 작업 설명]", panel.seed_kickoff_preview_text.value)
+        self.assertIn("이 저장소의 현재 상태를 검토하고 수정 계획을 정리하세요.", panel.seed_kickoff_preview_text.value)
+        self.assertIn("[추가 입력 파일]", panel.seed_kickoff_preview_text.value)
+        self.assertIn("repo-source=pair-policy / route=ROUTE OK", panel.seed_kickoff_preview_text.value)
+        self.assertIn("[시작 방법]", panel.seed_kickoff_preview_text.value)
+        self.assertIn("수동 시작", panel.seed_kickoff_preview_text.value)
+        self.assertIn("붙여넣기 대상: pair01 / target01", panel.seed_kickoff_target_banner_var.get())
+        self.assertIn("준비됨: 시작문 복사 또는 초기 입력 큐잉 가능", panel.seed_kickoff_readiness_var.get())
+
+    def test_copy_seed_kickoff_path_block_copies_contract_text(self) -> None:
+        panel = self._make_panel()
+        panel.message_config_service.load_config_document = lambda _path: panel.message_config_service.clone_document(panel.message_config_doc)
+        panel.message_config_service.render_effective_preview = lambda *args, **kwargs: {
+            "Warnings": [],
+            "RunContext": {"NextRunRootPreview": r"C:\repo-a\.relay-runs\bottest-live-visible\pairs\pair01\run_preview"},
+            "PreviewRows": [
+                {
+                    "PairId": "pair01",
+                    "RoleName": "top",
+                    "TargetId": "target01",
+                    "PairRunRoot": r"C:\repo-a\.relay-runs\bottest-live-visible\pairs\pair01\run_preview",
+                    "PairTargetFolder": r"C:\repo-a\.relay-runs\bottest-live-visible\pairs\pair01\run_preview\target01",
+                    "SourceOutboxPath": r"C:\repo-a\.relay-contract\bottest-live-visible\run_preview\pair01\target01\source-outbox",
+                    "SourceSummaryPath": r"C:\repo-a\.relay-contract\bottest-live-visible\run_preview\pair01\target01\source-outbox\summary.txt",
+                    "SourceReviewZipPath": r"C:\repo-a\.relay-contract\bottest-live-visible\run_preview\pair01\target01\source-outbox\review.zip",
+                    "PublishReadyPath": r"C:\repo-a\.relay-contract\bottest-live-visible\run_preview\pair01\target01\source-outbox\publish.ready.json",
+                }
+            ],
+        }
+        copied: list[str] = []
+        panel._copy_to_clipboard = copied.append
+
+        panel.copy_seed_kickoff_path_block()
+
+        self.assertEqual(1, len(copied))
+        self.assertIn("summary.txt: C:\\repo-a\\.relay-contract\\bottest-live-visible\\run_preview\\pair01\\target01\\source-outbox\\summary.txt", copied[0])
+
+    def test_copy_seed_kickoff_start_steps_copies_checklist_text(self) -> None:
+        panel = self._make_panel()
+        panel.message_config_service.load_config_document = lambda _path: panel.message_config_service.clone_document(panel.message_config_doc)
+        panel.message_config_service.render_effective_preview = lambda *args, **kwargs: {
+            "Warnings": [],
+            "RunContext": {"NextRunRootPreview": r"C:\repo-a\.relay-runs\bottest-live-visible\pairs\pair01\run_preview"},
+            "PreviewRows": [
+                {
+                    "PairId": "pair01",
+                    "RoleName": "top",
+                    "TargetId": "target01",
+                    "PairRunRoot": r"C:\repo-a\.relay-runs\bottest-live-visible\pairs\pair01\run_preview",
+                    "PairTargetFolder": r"C:\repo-a\.relay-runs\bottest-live-visible\pairs\pair01\run_preview\target01",
+                    "SourceOutboxPath": r"C:\repo-a\.relay-contract\bottest-live-visible\run_preview\pair01\target01\source-outbox",
+                    "SourceSummaryPath": r"C:\repo-a\.relay-contract\bottest-live-visible\run_preview\pair01\target01\source-outbox\summary.txt",
+                    "SourceReviewZipPath": r"C:\repo-a\.relay-contract\bottest-live-visible\run_preview\pair01\target01\source-outbox\review.zip",
+                    "PublishReadyPath": r"C:\repo-a\.relay-contract\bottest-live-visible\run_preview\pair01\target01\source-outbox\publish.ready.json",
+                }
+            ],
+        }
+        copied: list[str] = []
+        panel._copy_to_clipboard = copied.append
+
+        panel.copy_seed_kickoff_start_steps()
+
+        self.assertEqual(1, len(copied))
+        self.assertIn("[권장 시작 순서]", copied[0])
+        self.assertIn("summary.txt -> review.zip -> publish.ready.json", copied[0])
+        self.assertIn("초기 실행 시작 순서 복사 완료", panel.output_text.value)
+
+    def test_copy_seed_kickoff_full_text_sets_manual_paste_status(self) -> None:
+        panel = self._make_panel()
+        panel.message_config_service.load_config_document = lambda _path: panel.message_config_service.clone_document(panel.message_config_doc)
+        panel.message_config_service.render_effective_preview = lambda *args, **kwargs: {
+            "Warnings": [],
+            "RunContext": {"NextRunRootPreview": r"C:\repo-a\.relay-runs\bottest-live-visible\pairs\pair01\run_preview"},
+            "PreviewRows": [
+                {
+                    "PairId": "pair01",
+                    "RoleName": "top",
+                    "TargetId": "target01",
+                    "PairRunRoot": r"C:\repo-a\.relay-runs\bottest-live-visible\pairs\pair01\run_preview",
+                    "PairTargetFolder": r"C:\repo-a\.relay-runs\bottest-live-visible\pairs\pair01\run_preview\target01",
+                    "SourceOutboxPath": r"C:\repo-a\.relay-contract\bottest-live-visible\run_preview\pair01\target01\source-outbox",
+                    "SourceSummaryPath": r"C:\repo-a\.relay-contract\bottest-live-visible\run_preview\pair01\target01\source-outbox\summary.txt",
+                    "SourceReviewZipPath": r"C:\repo-a\.relay-contract\bottest-live-visible\run_preview\pair01\target01\source-outbox\review.zip",
+                    "PublishReadyPath": r"C:\repo-a\.relay-contract\bottest-live-visible\run_preview\pair01\target01\source-outbox\publish.ready.json",
+                }
+            ],
+        }
+        copied: list[str] = []
+        panel._copy_to_clipboard = copied.append
+        panel.seed_kickoff_task_text.value = "초기 작업 설명"
+
+        panel.copy_seed_kickoff_full_text()
+
+        self.assertEqual(1, len(copied))
+        self.assertIn("[작업 내용]", copied[0])
+        self.assertIn("초기 작업 설명", copied[0])
+        self.assertIn("[생성해야 할 파일]", copied[0])
+        self.assertIn("1. summary.txt -> C:\\repo-a\\.relay-contract\\bottest-live-visible\\run_preview\\pair01\\target01\\source-outbox\\summary.txt", copied[0])
+        self.assertIn("3. publish.ready.json -> C:\\repo-a\\.relay-contract\\bottest-live-visible\\run_preview\\pair01\\target01\\source-outbox\\publish.ready.json", copied[0])
+        self.assertNotIn("[자동 계약 / 경로]", copied[0])
+        self.assertNotIn("[helper / wrapper]", copied[0])
+        self.assertNotIn("[시작 방법]", copied[0])
+        self.assertNotIn("[queue 등록 동작]", copied[0])
+        self.assertNotIn("[초기 실행 입력 합성 미리보기]", copied[0])
+        self.assertIn("PowerShell/셀 창에 직접 붙여넣으세요", panel.seed_kickoff_status_var.get())
+        self.assertIn("수동 시작문 복사 완료", panel.output_text.value)
+        self.assertIn("대상: pair01 / target01 실제 셀 창", panel.output_text.value)
+
+    def test_enqueue_seed_kickoff_message_calls_one_time_queue_with_pair_target_and_text(self) -> None:
+        panel = self._make_panel()
+        panel.message_config_service.load_config_document = lambda _path: panel.message_config_service.clone_document(panel.message_config_doc)
+        panel.message_config_service.render_effective_preview = lambda *args, **kwargs: {
+            "Warnings": [],
+            "RunContext": {"NextRunRootPreview": r"C:\repo-a\.relay-runs\bottest-live-visible\pairs\pair01\run_preview"},
+            "PreviewRows": [
+                {
+                    "PairId": "pair01",
+                    "RoleName": "top",
+                    "TargetId": "target01",
+                    "PairRunRoot": r"C:\repo-a\.relay-runs\bottest-live-visible\pairs\pair01\run_preview",
+                    "PairTargetFolder": r"C:\repo-a\.relay-runs\bottest-live-visible\pairs\pair01\run_preview\target01",
+                    "SourceOutboxPath": r"C:\repo-a\.relay-contract\bottest-live-visible\run_preview\pair01\target01\source-outbox",
+                    "SourceSummaryPath": r"C:\repo-a\.relay-contract\bottest-live-visible\run_preview\pair01\target01\source-outbox\summary.txt",
+                    "SourceReviewZipPath": r"C:\repo-a\.relay-contract\bottest-live-visible\run_preview\pair01\target01\source-outbox\review.zip",
+                    "PublishReadyPath": r"C:\repo-a\.relay-contract\bottest-live-visible\run_preview\pair01\target01\source-outbox\publish.ready.json",
+                }
+            ],
+        }
+        captured_command: list[str] = []
+        panel.command_service = SimpleNamespace(
+            build_powershell_file_command=lambda script_path, extra=None: [script_path] + list(extra or []),
+            run_json=lambda command: captured_command.extend(command) or {"QueuePath": r"C:\queue\pair01.json", "Item": {"Id": "seed-1"}},
+        )
+        panel.seed_kickoff_review_input_var.set(r"C:\incoming\seed-note.md")
+        panel.seed_kickoff_task_text.value = "초기 작업 설명"
+
+        with mock.patch("relay_operator_panel.messagebox.showinfo"):
+            panel.enqueue_seed_kickoff_message()
+
+        command_text = " ".join(captured_command)
+        self.assertIn("Enqueue-OneTimeMessage.ps1", command_text)
+        self.assertIn("-PairId pair01", command_text)
+        self.assertIn("-TargetId target01", command_text)
+        self.assertIn("-Role top", command_text)
+        self.assertIn("-AppliesTo initial", command_text)
+        self.assertIn("-Placement one-time-prefix", command_text)
+        self.assertIn("초기 작업 설명", command_text)
+        self.assertIn("pair=pair01", panel.output_text.value)
+
+    def test_enqueue_seed_kickoff_message_blocks_when_pair_policy_card_is_unsaved(self) -> None:
+        panel = self._make_panel()
+        panel.message_config_service.load_config_document = lambda _path: panel.message_config_service.clone_document(panel.message_config_doc)
+        panel.message_config_service.render_effective_preview = lambda *args, **kwargs: {
+            "Warnings": [],
+            "RunContext": {"NextRunRootPreview": r"C:\repo-draft\.relay-runs\bottest-live-visible\pairs\pair01\run_preview"},
+            "PreviewRows": [
+                {
+                    "PairId": "pair01",
+                    "RoleName": "top",
+                    "TargetId": "target01",
+                    "PairRunRoot": r"C:\repo-draft\.relay-runs\bottest-live-visible\pairs\pair01\run_preview",
+                    "PairTargetFolder": r"C:\repo-draft\.relay-runs\bottest-live-visible\pairs\pair01\run_preview\target01",
+                    "SourceOutboxPath": r"C:\repo-draft\.relay-contract\bottest-live-visible\run_preview\pair01\target01\source-outbox",
+                    "SourceSummaryPath": r"C:\repo-draft\.relay-contract\bottest-live-visible\run_preview\pair01\target01\source-outbox\summary.txt",
+                    "SourceReviewZipPath": r"C:\repo-draft\.relay-contract\bottest-live-visible\run_preview\pair01\target01\source-outbox\review.zip",
+                    "PublishReadyPath": r"C:\repo-draft\.relay-contract\bottest-live-visible\run_preview\pair01\target01\source-outbox\publish.ready.json",
+                }
+            ],
+        }
+        panel.pair_policy_card_vars["pair01"]["repo_root_var"].set(r"C:\repo-draft")
+        panel.seed_kickoff_task_text.value = "초기 작업 설명"
+        panel.command_service = SimpleNamespace(
+            build_powershell_file_command=lambda script_path, extra=None: [script_path] + list(extra or []),
+            run_json=lambda _command: self.fail("queue command should not run when pair policy card is unsaved"),
+        )
+
+        with mock.patch("relay_operator_panel.messagebox.showwarning") as showwarning:
+            panel.enqueue_seed_kickoff_message()
+
+        self.assertTrue(showwarning.called)
+        self.assertIn("미저장 설정", panel.seed_kickoff_status_var.get())
+
+    def test_save_pair_policy_editor_clears_stale_run_root_when_repo_changes(self) -> None:
+        panel = self._make_panel()
+        panel.save_pair_policy_editor = RelayOperatorPanel.save_pair_policy_editor.__get__(panel, RelayOperatorPanel)
+        panel.load_message_editor_document = lambda: None
+        panel.load_effective_config = lambda: None
+        panel.run_root_var.set(r"C:\runs\old-requested")
+        panel.pair_policy_card_vars["pair01"]["repo_root_var"].set(r"C:\repo-new")
+        panel.message_config_service.load_config_document = lambda _path: panel.message_config_service.clone_document(panel.message_config_doc)
+        panel.message_config_service.save_document = lambda _path, _document: Path(r"C:\tmp\pair-policy-backup.psd1")
+
+        panel.save_pair_policy_editor()
+
+        self.assertEqual("", panel.run_root_var.get())
+        self.assertIn("repo 변경: pair01", panel.pair_policy_editor_status_var.get())
+        self.assertIn("old RunRoot override 자동 비움", panel.pair_policy_editor_status_var.get())
+        self.assertIn("적용 확인:", panel.pair_policy_editor_status_var.get())
+        self.assertIn("repo-source=pair-policy", panel.pair_policy_editor_status_var.get())
+
+    def test_refresh_pair_policy_editor_marks_selected_run_root_mirror_badge(self) -> None:
+        panel = self._make_panel()
+        panel.run_root_var.set(r"C:\runs\current")
+        panel.message_config_service.load_config_document = lambda _path: panel.message_config_service.clone_document(panel.message_config_doc)
+
+        panel.refresh_pair_policy_editor()
+
+        self.assertEqual("RUNROOT SELECTED MIRROR", panel.pair_policy_card_vars["pair01"]["override_badge_var"].get())
+
+    def test_update_run_root_controls_surfaces_selected_mirror_state(self) -> None:
+        panel = self._make_panel()
+        panel.run_root_var = VarStub(r"C:\runs\current")
+        panel.run_root_label_var = VarStub("")
+        panel.run_root_status_var = VarStub("")
+        panel.run_root_help_var = VarStub("")
+        panel._same_run_root_path = RelayOperatorPanel._same_run_root_path.__get__(panel, RelayOperatorPanel)
+        panel._current_run_root_for_actions = RelayOperatorPanel._current_run_root_for_actions.__get__(panel, RelayOperatorPanel)
+        panel._run_root_timing_snapshot = RelayOperatorPanel._run_root_timing_snapshot.__get__(panel, RelayOperatorPanel)
+        panel._run_root_is_stale = lambda _run_root: False
+        panel._refresh_pair_policy_override_badges = lambda: None
+        panel._refresh_sticky_context_bar = lambda: None
+
+        panel._update_run_root_controls()
+
+        self.assertEqual("RunRoot Override", panel.run_root_label_var.get())
+        self.assertIn("SELECTED MIRROR", panel.run_root_status_var.get())
+        self.assertIn("현재 선택된 runroot", panel.run_root_help_var.get())
+
+    def test_pair_route_matrix_payload_collects_pair_card_and_preview_state(self) -> None:
+        panel = self._make_panel()
+        panel.preview_rows = [
+            {
+                "PairId": "pair01",
+                "RoleName": "top",
+                "TargetId": "target01",
+                "WorkRepoRoot": r"C:\repo-a",
+                "PairRunRoot": r"C:\repo-a\.relay-runs\bottest-live-visible\pairs\pair01\run_1",
+                "SourceOutboxPath": r"C:\repo-a\.relay-contract\bottest-live-visible\run_1\pair01\target01\source-outbox",
+                "PublishReadyPath": r"C:\repo-a\.relay-contract\bottest-live-visible\run_1\pair01\target01\source-outbox\publish.ready.json",
+            },
+            {
+                "PairId": "pair01",
+                "RoleName": "bottom",
+                "TargetId": "target05",
+                "WorkRepoRoot": r"C:\repo-a",
+                "PairRunRoot": r"C:\repo-a\.relay-runs\bottest-live-visible\pairs\pair01\run_1",
+                "SourceOutboxPath": r"C:\repo-a\.relay-contract\bottest-live-visible\run_1\pair01\target05\source-outbox",
+                "PublishReadyPath": r"C:\repo-a\.relay-contract\bottest-live-visible\run_1\pair01\target05\source-outbox\publish.ready.json",
+            },
+        ]
+
+        payload = panel._pair_route_matrix_payload()
+
+        self.assertEqual("cfg.psd1", payload["ConfigPath"])
+        pair01 = next(item for item in payload["PairRouteMatrix"] if item["PairId"] == "pair01")
+        self.assertEqual(r"C:\repo-a", pair01["PairWorkRepoRoot"])
+        self.assertEqual("ROUTE OK", pair01["RouteBadge"])
+        self.assertEqual("aligned", pair01["RouteSnapshot"]["RouteState"])
+        self.assertIn(r"\pair01\target01\source-outbox", pair01["RouteSnapshot"]["TopSourceOutboxPath"])
+
+    def test_copy_pair_route_matrix_copies_text_snapshot(self) -> None:
+        panel = self._make_panel()
+        panel.preview_rows = [
+            {
+                "PairId": "pair01",
+                "RoleName": "top",
+                "TargetId": "target01",
+                "WorkRepoRoot": r"C:\repo-a",
+                "PairRunRoot": r"C:\repo-a\.relay-runs\bottest-live-visible\pairs\pair01\run_1",
+                "SourceOutboxPath": r"C:\repo-a\.relay-contract\bottest-live-visible\run_1\pair01\target01\source-outbox",
+                "PublishReadyPath": r"C:\repo-a\.relay-contract\bottest-live-visible\run_1\pair01\target01\source-outbox\publish.ready.json",
+            },
+            {
+                "PairId": "pair01",
+                "RoleName": "bottom",
+                "TargetId": "target05",
+                "WorkRepoRoot": r"C:\repo-a",
+                "PairRunRoot": r"C:\repo-a\.relay-runs\bottest-live-visible\pairs\pair01\run_1",
+                "SourceOutboxPath": r"C:\repo-a\.relay-contract\bottest-live-visible\run_1\pair01\target05\source-outbox",
+                "PublishReadyPath": r"C:\repo-a\.relay-contract\bottest-live-visible\run_1\pair01\target05\source-outbox\publish.ready.json",
+            },
+        ]
+        copied: list[str] = []
+        panel.output_text = object()
+        panel._copy_to_clipboard = copied.append
+        panel.set_text = lambda _widget, value: setattr(panel, "_captured_output", value)
+
+        panel.copy_pair_route_matrix()
+
+        self.assertEqual(1, len(copied))
+        self.assertIn("[pair-route-matrix]", copied[0])
+        self.assertIn("pair01 / ROUTE OK", copied[0])
+        self.assertIn(r"repo=C:\repo-a", copied[0])
+        self.assertIn("pair route matrix 복사 완료", panel._captured_output)
+
+    def test_browse_pair_policy_repo_root_updates_card_value(self) -> None:
+        panel = self._make_panel()
+        with mock.patch("relay_operator_panel.filedialog.askdirectory", return_value=r"C:\repo-picked"):
+            panel.browse_pair_policy_repo_root("pair01")
+
+        self.assertEqual(r"C:\repo-picked", panel.pair_policy_card_vars["pair01"]["repo_root_var"].get())
+        self.assertIn(r"C:\repo-picked", panel.pair_policy_editor_status_var.get())
+
+    def test_open_pair_policy_repo_root_uses_current_card_value(self) -> None:
+        panel = self._make_panel()
+        captured: dict[str, str] = {}
+        panel.pair_policy_card_vars["pair01"]["repo_root_var"].set(r"C:\repo-open")
+        panel._open_path = lambda path_value, *, kind: captured.update({"path": path_value, "kind": kind})
+
+        panel.open_pair_policy_repo_root("pair01")
+
+        self.assertEqual(r"C:\repo-open", captured["path"])
+        self.assertEqual("pair01 RepoRoot", captured["kind"])
+
+    def test_selected_parallel_pair_ids_returns_checked_pairs(self) -> None:
+        panel = self._make_panel()
+        panel.message_config_doc["PairTest"]["PairDefinitions"].append(
+            {"PairId": "pair02", "TopTargetId": "target02", "BottomTargetId": "target06", "SeedTargetId": "target02"}
+        )
+        panel.pair_policy_card_vars["pair01"]["parallel_selected_var"].set(True)
+        panel.pair_policy_card_vars["pair02"]["parallel_selected_var"].set(True)
+
+        selected = panel._selected_parallel_pair_ids()
+
+        self.assertEqual(["pair01", "pair02"], selected)
+
+    def test_browse_parallel_coordinator_repo_root_updates_value(self) -> None:
+        panel = self._make_panel()
+        with mock.patch("relay_operator_panel.filedialog.askdirectory", return_value=r"C:\coord-picked"):
+            panel.browse_parallel_coordinator_repo_root()
+
+        self.assertEqual(r"C:\coord-picked", panel.parallel_coordinator_repo_root_var.get())
+        self.assertIn(r"C:\coord-picked", panel.pair_policy_editor_status_var.get())
+
+    def test_open_parallel_coordinator_repo_root_uses_current_value(self) -> None:
+        panel = self._make_panel()
+        captured: dict[str, str] = {}
+        panel.parallel_coordinator_repo_root_var.set(r"C:\coord-open")
+        panel._open_path = lambda path_value, *, kind: captured.update({"path": path_value, "kind": kind})
+
+        panel.open_parallel_coordinator_repo_root()
+
+        self.assertEqual(r"C:\coord-open", captured["path"])
+        self.assertEqual("병렬 drill coordinator repo", captured["kind"])
+
+    def test_run_selected_parallel_pair_drill_executes_checked_pairs_and_sets_coordinator_run_root(self) -> None:
+        panel = self._make_panel()
+        panel.output_text = object()
+        panel.set_text = lambda _widget, value: setattr(panel, "_captured_output", value)
+        panel.message_config_doc["PairTest"]["PairDefinitions"].append(
+            {"PairId": "pair02", "TopTargetId": "target02", "BottomTargetId": "target06", "SeedTargetId": "target02"}
+        )
+        panel.pair_policy_card_vars["pair01"]["parallel_selected_var"].set(True)
+        panel.pair_policy_card_vars["pair02"]["parallel_selected_var"].set(True)
+        panel.pair_policy_card_vars["pair02"]["repo_root_var"].set(r"C:\repo-b")
+        panel.parallel_coordinator_repo_root_var.set(r"C:\coord-root")
+        panel.command_service = SimpleNamespace(
+            build_powershell_file_command=lambda script_path, extra=None: [script_path, *(list(extra or []))]
+        )
+        panel._selected_parallel_pair_execution_allowed = lambda pair_ids=None: (True, "")
+        panel._build_watcher_start_request_from_controls = lambda **_kwargs: WatcherStartRequest(
+            config_path="cfg.psd1",
+            run_root="",
+            use_headless_dispatch=True,
+            max_forward_count=0,
+            run_duration_sec=600,
+            pair_max_roundtrip_count=1,
+        )
+        panel.get_pair_activation_state = lambda pair_id: {"PairId": pair_id, "EffectiveEnabled": True}
+        panel._sync_preview_selection_with_pair = lambda pair_id, target_id="": setattr(panel, "_synced_pair", (pair_id, target_id)) or True
+        panel.refresh_pair_policy_editor = lambda: setattr(panel, "_refresh_pair_policy_editor_called", True)
+        panel.load_effective_config = lambda: setattr(panel, "_load_effective_config_called", True)
+        panel.run_background_task = lambda **kwargs: kwargs["on_success"](kwargs["worker"]())
+
+        payload = {
+            "CoordinatorWorkRepoRoot": r"C:\coord-root",
+            "CoordinatorRunRoot": r"C:\coord-root\.relay-runs\bottest-live-visible\pair-scoped-shared\run_1",
+            "CoordinatorWrapperStatusPath": r"C:\coord-root\.relay-runs\bottest-live-visible\pair-scoped-shared\run_1\.state\wrapper-status.json",
+            "PairMaxRoundtripCount": 1,
+            "RunDurationSec": 600,
+            "PairRuns": [
+                {
+                    "PairId": "pair01",
+                    "WorkRepoRoot": r"C:\repo-a",
+                    "RunRoot": r"C:\repo-a\.relay-runs\bottest-live-visible\pairs\pair01\run_1",
+                    "WatcherStatus": "stopped",
+                    "DonePresentCount": 2,
+                    "ErrorPresentCount": 0,
+                    "ForwardedStateCount": 2,
+                },
+                {
+                    "PairId": "pair02",
+                    "WorkRepoRoot": r"C:\repo-b",
+                    "RunRoot": r"C:\repo-b\.relay-runs\bottest-live-visible\pairs\pair02\run_1",
+                    "WatcherStatus": "stopped",
+                    "DonePresentCount": 2,
+                    "ErrorPresentCount": 0,
+                    "ForwardedStateCount": 2,
+                },
+            ],
+        }
+
+        with mock.patch(
+            "relay_operator_panel.run_command",
+            return_value=subprocess.CompletedProcess(["pwsh"], 0, stdout=json.dumps(payload), stderr=""),
+        ):
+            panel.run_selected_parallel_pair_drill()
+
+        self.assertIn("Run-ParallelPairScopedHeadlessDrill.ps1", panel.last_command_var.get())
+        self.assertIn("-CoordinatorWorkRepoRoot", panel.last_command_var.get())
+        self.assertIn("-PairId pair01", panel.last_command_var.get())
+        self.assertIn("-PairId pair02", panel.last_command_var.get())
+        self.assertEqual(payload["CoordinatorRunRoot"], panel.run_root_var.get())
+        self.assertEqual("pair01", panel.pair_id_var.get())
+        self.assertEqual(("pair01", ""), panel.__dict__.get("_synced_pair"))
+        self.assertTrue(getattr(panel, "_refresh_pair_policy_editor_called", False))
+        self.assertTrue(getattr(panel, "_load_effective_config_called", False))
+        self.assertIn("선택 pair 병렬 Headless Drill 완료", panel._captured_output)
+        self.assertIn("[pair01] watcher=stopped done=2 error=0 forwarded=2", panel._captured_output)
+        self.assertIn(r"wrapper-status:", panel._captured_output)
+
+    def test_clone_pair_policy_card_settings_copies_repo_roundtrip_and_flags(self) -> None:
+        panel = self._make_panel()
+        panel.pair_policy_card_vars["pair01"]["repo_root_var"].set(r"C:\repo-source")
+        panel.pair_policy_card_vars["pair01"]["roundtrip_var"].set("5")
+        panel.pair_policy_card_vars["pair01"]["external_run_root_var"].set(True)
+        panel.pair_policy_card_vars["pair01"]["external_contract_var"].set(True)
+        panel.pair_policy_card_vars["pair01"]["seed_target_var"].set("target01")
+        panel.pair_policy_card_vars["pair02"]["repo_root_var"].set(r"C:\repo-target")
+        panel.pair_policy_card_vars["pair02"]["roundtrip_var"].set("1")
+        panel.pair_policy_card_vars["pair02"]["external_run_root_var"].set(False)
+        panel.pair_policy_card_vars["pair02"]["external_contract_var"].set(False)
+        panel.pair_policy_card_vars["pair02"]["seed_target_var"].set("")
+        panel.pair_policy_clone_source_var.set("pair01")
+        panel.pair_policy_clone_target_var.set("pair02")
+
+        panel.clone_pair_policy_card_settings()
+
+        self.assertEqual(r"C:\repo-source", panel.pair_policy_card_vars["pair02"]["repo_root_var"].get())
+        self.assertEqual("5", panel.pair_policy_card_vars["pair02"]["roundtrip_var"].get())
+        self.assertTrue(panel.pair_policy_card_vars["pair02"]["external_run_root_var"].get())
+        self.assertTrue(panel.pair_policy_card_vars["pair02"]["external_contract_var"].get())
+        self.assertIn("pair01 설정을 pair02 카드에 복제", panel.pair_policy_editor_status_var.get())
+
+    def test_open_pair_policy_pair_summary_uses_pair_run_root_summary_file(self) -> None:
+        panel = self._make_panel()
+        run_root = make_workspace_tempdir("pair-summary-open")
+        summary_path = run_root / ".state" / "important-summary.txt"
+        summary_path.parent.mkdir(parents=True, exist_ok=True)
+        summary_path.write_text("[important-summary]\n", encoding="utf-8")
+        panel.preview_rows = [
+            {
+                "PairId": "pair01",
+                "RoleName": "top",
+                "TargetId": "target01",
+                "WorkRepoRoot": r"C:\repo-a",
+                "PairRunRoot": str(run_root),
+                "SourceOutboxPath": r"C:\repo-a\.relay-contract\bottest-live-visible\run_1\pair01\target01\source-outbox",
+                "PublishReadyPath": r"C:\repo-a\.relay-contract\bottest-live-visible\run_1\pair01\target01\source-outbox\publish.ready.json",
+            },
+            {
+                "PairId": "pair01",
+                "RoleName": "bottom",
+                "TargetId": "target05",
+                "WorkRepoRoot": r"C:\repo-a",
+                "PairRunRoot": str(run_root),
+                "SourceOutboxPath": r"C:\repo-a\.relay-contract\bottest-live-visible\run_1\pair01\target05\source-outbox",
+                "PublishReadyPath": r"C:\repo-a\.relay-contract\bottest-live-visible\run_1\pair01\target05\source-outbox\publish.ready.json",
+            },
+        ]
+        captured: dict[str, str] = {}
+        panel.output_text = object()
+        panel._open_path = lambda path_value, *, kind: captured.update({"path": path_value, "kind": kind})
+        panel.set_text = lambda _widget, value: setattr(panel, "_captured_output", value)
+
+        panel.open_pair_policy_pair_summary("pair01")
+
+        self.assertEqual(str(summary_path), captured["path"])
+        self.assertEqual("pair01 important-summary.txt", captured["kind"])
+        self.assertIn("pair01 important-summary 열기", panel._captured_output)
+
+    def test_preview_all_pair_policy_effective_updates_multiple_pairs_and_status_summary(self) -> None:
+        panel = self._make_panel()
+        panel.message_config_doc["PairTest"]["PairDefinitions"].append(
+            {"PairId": "pair02", "TopTargetId": "target02", "BottomTargetId": "target06", "SeedTargetId": "target02"}
+        )
+        panel.message_config_doc["PairTest"]["PairPolicies"]["pair02"] = {
+            "DefaultSeedWorkRepoRoot": r"C:\repo-shared",
+            "UseExternalWorkRepoRunRoot": True,
+            "UseExternalWorkRepoContractPaths": True,
+            "DefaultPairMaxRoundtripCount": 1,
+            "DefaultSeedTargetId": "target02",
+        }
+        panel.message_config_doc["Targets"] = [
+            {"Id": "target01"},
+            {"Id": "target05"},
+            {"Id": "target02"},
+            {"Id": "target06"},
+        ]
+        panel.message_config_service.load_config_document = lambda _path: panel.message_config_service.clone_document(panel.message_config_doc)
+
+        def render_preview(_document, *, config_path: str, run_root: str = "", pair_id: str = "", target_id: str = "", mode: str = "both"):
+            self.assertEqual("", pair_id)
+            return {
+                "Warnings": ["shared repo warning"],
+                "PreviewRows": [
+                    {
+                        "PairId": "pair01",
+                        "RoleName": "top",
+                        "TargetId": "target01",
+                        "WorkRepoRoot": r"C:\repo-shared",
+                        "PairRunRoot": r"C:\repo-shared\.relay-runs\bottest-live-visible\pairs\pair01\run_preview",
+                        "SourceOutboxPath": r"C:\repo-shared\.relay-contract\bottest-live-visible\run_preview\pair01\target01\source-outbox",
+                        "PublishReadyPath": r"C:\repo-shared\.relay-contract\bottest-live-visible\run_preview\pair01\target01\source-outbox\publish.ready.json",
+                    },
+                    {
+                        "PairId": "pair01",
+                        "RoleName": "bottom",
+                        "TargetId": "target05",
+                        "WorkRepoRoot": r"C:\repo-shared",
+                        "PairRunRoot": r"C:\repo-shared\.relay-runs\bottest-live-visible\pairs\pair01\run_preview",
+                        "SourceOutboxPath": r"C:\repo-shared\.relay-contract\bottest-live-visible\run_preview\pair01\target05\source-outbox",
+                        "PublishReadyPath": r"C:\repo-shared\.relay-contract\bottest-live-visible\run_preview\pair01\target05\source-outbox\publish.ready.json",
+                    },
+                    {
+                        "PairId": "pair02",
+                        "RoleName": "top",
+                        "TargetId": "target02",
+                        "WorkRepoRoot": r"C:\repo-shared",
+                        "PairRunRoot": r"C:\repo-shared\.relay-runs\bottest-live-visible\pairs\pair02\run_preview",
+                        "SourceOutboxPath": r"C:\repo-shared\.relay-contract\bottest-live-visible\run_preview\pair02\target02\source-outbox",
+                        "PublishReadyPath": r"C:\repo-shared\.relay-contract\bottest-live-visible\run_preview\pair02\target02\source-outbox\publish.ready.json",
+                    },
+                    {
+                        "PairId": "pair02",
+                        "RoleName": "bottom",
+                        "TargetId": "target06",
+                        "WorkRepoRoot": r"C:\repo-shared",
+                        "PairRunRoot": r"C:\repo-shared\.relay-runs\bottest-live-visible\pairs\pair02\run_preview",
+                        "SourceOutboxPath": r"C:\repo-shared\.relay-contract\bottest-live-visible\run_preview\pair02\target06\source-outbox",
+                        "PublishReadyPath": r"C:\repo-shared\.relay-contract\bottest-live-visible\run_preview\pair02\target06\source-outbox\publish.ready.json",
+                    },
+                ],
+            }
+
+        panel.message_config_service.render_effective_preview = render_preview
+        panel.pair_policy_card_vars["pair01"]["repo_root_var"].set(r"C:\repo-shared")
+        panel.pair_policy_card_vars["pair02"]["repo_root_var"].set(r"C:\repo-shared")
+
+        panel.preview_all_pair_policy_effective()
+
+        self.assertEqual("SHARED REPO OK", panel.pair_policy_card_vars["pair01"]["route_badge_var"].get())
+        self.assertEqual("SHARED REPO OK", panel.pair_policy_card_vars["pair02"]["route_badge_var"].get())
+        self.assertIn("shared repo warning", panel.pair_policy_card_vars["pair01"]["effective_preview_var"].get())
+        self.assertIn("active=2", panel.pair_policy_editor_status_var.get())
+        self.assertIn("shared=2", panel.pair_policy_editor_status_var.get())
+
     def test_apply_selected_inspection_context_promotes_preview_selection_to_action_context(self) -> None:
         panel = self._make_panel()
         panel.inspection_pair_id = "pair02"
@@ -4791,8 +6534,10 @@ class RelayOperatorPanelMessageSlotTests(unittest.TestCase):
         panel.refresh_controller = RefreshControllerStub()
         panel._current_context = lambda: AppContext(config_path="cfg.psd1", run_root="C:\\runs\\current")
         panel.run_root_var = VarStub("")
+        panel.config_path_var = VarStub("cfg.psd1")
         panel.pair_id_var = VarStub("pair01")
         panel.target_id_var = VarStub("target05")
+        panel.message_config_service = MessageConfigService(CommandService())
         panel.watcher_service = WatcherService()
         panel.watcher_controller = WatcherController(panel.watcher_service)
         panel.watcher_max_forward_var = VarStub("2")
@@ -4808,6 +6553,26 @@ class RelayOperatorPanelMessageSlotTests(unittest.TestCase):
         panel.paired_status_data = None
         panel.paired_status_error = ""
         panel.preview_rows = []
+        panel.pair_policy_editor_status_var = VarStub("")
+        panel.pair_policy_card_vars = {
+            pair_id: {
+                "meta_var": VarStub(""),
+                "repo_root_var": VarStub(""),
+                "seed_target_var": VarStub(""),
+                "roundtrip_var": VarStub("0"),
+                "external_run_root_var": VarStub(False),
+                "external_contract_var": VarStub(False),
+                "route_badge_var": VarStub(""),
+                "repo_source_badge_var": VarStub(""),
+                "override_badge_var": VarStub(""),
+                "route_state_var": VarStub(""),
+                "effective_preview_var": VarStub(""),
+            }
+            for pair_id in ["pair01", "pair02", "pair03", "pair04"]
+        }
+        panel.pair_policy_clone_source_var = VarStub("pair01")
+        panel.pair_policy_clone_target_var = VarStub("pair02")
+        panel.pair_policy_card_seed_combos = {}
         panel.row_tree = RowTreeStub()
         panel.render_summary = lambda _payload: None
         panel.render_rows = lambda rows: None
@@ -4819,6 +6584,7 @@ class RelayOperatorPanelMessageSlotTests(unittest.TestCase):
         panel.update_pair_button_states = lambda: None
         panel.clear_details = lambda: None
         panel.set_operator_status = lambda *args, **kwargs: None
+        panel.refresh_pair_policy_editor = lambda: None
         selected_rows: list[str] = []
         panel.on_row_selected = lambda _event=None, **_kwargs: selected_rows.append(preview_rows[int(panel.row_tree.selected)]["TargetId"])
 
@@ -4827,6 +6593,70 @@ class RelayOperatorPanelMessageSlotTests(unittest.TestCase):
         self.assertEqual("C:\\runs\\current", panel.run_root_var.get())
         self.assertEqual("1", panel.row_tree.selected)
         self.assertEqual(["target05"], selected_rows)
+
+    def test_load_effective_config_does_not_pin_mirrored_selected_run_root(self) -> None:
+        panel = self._make_panel()
+        captured: dict[str, object] = {}
+
+        class RefreshControllerStub:
+            def refresh_full(self, context):
+                captured["run_root"] = context.run_root
+                return DashboardRawBundle(
+                    effective_data={
+                        "RunContext": {
+                            "SelectedRunRoot": "C:\\runs\\fresh",
+                            "SelectedRunRootSource": "latest-existing",
+                        },
+                        "PreviewRows": [],
+                    },
+                    relay_status={},
+                    visibility_status={},
+                    paired_status={},
+                    paired_status_error="",
+                )
+
+        panel.refresh_controller = RefreshControllerStub()
+        panel.run_root_var = VarStub("C:\\runs\\old")
+        panel.config_path_var = VarStub("cfg.psd1")
+        panel.pair_id_var = VarStub("pair01")
+        panel.target_id_var = VarStub("target01")
+        panel.effective_data = {
+            "RunContext": {
+                "SelectedRunRoot": "C:\\runs\\old",
+                "SelectedRunRootSource": "latest-existing",
+            }
+        }
+        panel.relay_status_data = None
+        panel.visibility_status_data = None
+        panel.paired_status_data = None
+        panel.paired_status_error = ""
+        panel.preview_rows = []
+        panel.render_summary = lambda _payload: None
+        panel.render_rows = lambda rows: None
+        panel.render_message_editor = lambda: None
+        panel.render_target_board = lambda: None
+        panel.rebuild_panel_state = lambda: None
+        panel.refresh_artifacts_tab = lambda: None
+        panel.refresh_snapshot_list = lambda: None
+        panel.update_pair_button_states = lambda: None
+        panel.clear_details = lambda: None
+        panel.set_operator_status = lambda *args, **kwargs: None
+        panel.refresh_pair_policy_editor = lambda: None
+        panel._coerce_selected_pair_into_runtime_scope = lambda: None
+        panel._sync_message_scope_id_from_context = lambda: None
+        panel._refresh_watcher_notes = lambda: None
+        panel._selected_inspection_target_id = lambda: ""
+        panel._selected_inspection_pair_id = lambda: ""
+        panel.message_config_doc = {}
+        panel.row_tree = SimpleNamespace(
+            get_children=lambda: (),
+            selection_set=lambda _iid: None,
+        )
+
+        panel.load_effective_config()
+
+        self.assertEqual("", captured["run_root"])
+        self.assertEqual("C:\\runs\\fresh", panel.run_root_var.get())
 
 
 class DashboardAggregatorTests(unittest.TestCase):
@@ -6386,6 +8216,17 @@ class WatcherServiceTests(unittest.TestCase):
 
 
 class WatcherControllerTests(unittest.TestCase):
+    def test_control_semantics_guidance_mentions_pause_and_stop_difference(self) -> None:
+        controller = WatcherController(WatcherService())
+
+        guidance = controller.control_semantics_guidance()
+
+        self.assertIn("pause/resume", guidance)
+        self.assertIn("queued/pending", guidance)
+        self.assertIn("stop", guidance)
+        self.assertIn("watch 재시작", guidance)
+        self.assertIn("hotkey", guidance)
+
     def test_diagnostics_includes_parse_errors_and_paths(self) -> None:
         controller = WatcherController(WatcherService())
         diagnostics = controller.diagnostics(

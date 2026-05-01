@@ -128,11 +128,28 @@ MESSAGE_FILTER_RESET_POLICY = {
     "clear_filter": {"clear_search": True, "clear_changed_only": True},
 }
 BOARD_TARGET_FALLBACK = [f"target{index:02d}" for index in range(1, 9)]
+PAIR_ID_OPTIONS = ["pair01", "pair02", "pair03", "pair04"]
 RUN_ROOT_CONTEXT_REFRESH_DEBOUNCE_MS = 250
 READ_ONLY_DASHBOARD_ACTION_KEYS = {
     "copy_command",
     "run_relay_status",
     "run_paired_status",
+    "open_watcher_status",
+    "open_watcher_control",
+    "open_watcher_audit",
+    "focus_ready_to_forward_artifact",
+}
+STICKY_ACTION_BUTTON_LABELS = {
+    "copy_command": "명령 복사",
+    "focus_ready_to_forward_artifact": "다음 전달 대상 보기",
+    "visible_cleanup_apply": "cleanup 적용",
+    "visible_preflight": "입력 전 점검",
+    "visible_active_acceptance": "실제 acceptance 실행",
+    "visible_post_cleanup": "post-cleanup",
+    "visible_clean_preflight": "clean preflight 재점검",
+    "visible_confirm": "shared confirm",
+    "visible_receipt_confirm": "receipt 확인",
+    "watcher_recommended_action": "watch 권장 조치",
 }
 READ_ONLY_OPS_BUTTON_LABELS = {
     "watch 진단",
@@ -145,6 +162,63 @@ READ_ONLY_OPS_BUTTON_LABELS = {
     "important-summary 열기",
     "Headless 준비 확인",
     "적용 설정 JSON",
+}
+MESSAGE_EDITOR_TAB_METADATA = {
+    "context": {
+        "label": "현재",
+        "title": "현재 문맥",
+        "description": "선택한 pair/target 기준 현재 문맥과 입력/출력 경로를 확인합니다.",
+    },
+    "plan": {
+        "label": "적용",
+        "title": "적용 source / plan",
+        "description": "어떤 source가 어떤 순서로 합성되는지 확인합니다.",
+    },
+    "initial_preview": {
+        "label": "Initial",
+        "title": "Initial Preview",
+        "description": "현재 편집본 기준 Initial 완성 preview를 보여줍니다.",
+    },
+    "handoff_preview": {
+        "label": "Handoff",
+        "title": "Handoff Preview",
+        "description": "현재 편집본 기준 Handoff 완성 preview를 보여줍니다.",
+    },
+    "final_delivery": {
+        "label": "전달문",
+        "title": "최종 전달문",
+        "description": "현재 target 기준 실제 전달 payload 완성본을 확인합니다.",
+    },
+    "path_summary": {
+        "label": "경로",
+        "title": "경로 요약",
+        "description": "현재 target/partner 경로와 바로가기 액션을 확인합니다.",
+    },
+    "one_time": {
+        "label": "1회성",
+        "title": "1회성 문구",
+        "description": "queue 기반 1회성 prefix/suffix 결과를 확인합니다.",
+    },
+    "validation": {
+        "label": "검증",
+        "title": "저장 전 검증",
+        "description": "저장 전 에러/경고를 먼저 확인합니다.",
+    },
+    "summary": {
+        "label": "요약",
+        "title": "편집 요약",
+        "description": "변경 영향과 현재 편집 상태를 요약해서 보여줍니다.",
+    },
+    "diff": {
+        "label": "Diff",
+        "title": "Diff",
+        "description": "현재 편집본과 저장본 차이를 확인합니다.",
+    },
+    "backup": {
+        "label": "백업",
+        "title": "백업",
+        "description": "자동 백업 목록과 diff 비교 지점을 확인합니다.",
+    },
 }
 
 
@@ -179,14 +253,19 @@ class RelayOperatorPanel(tk.Tk):
             self.status_service,
         )
         self.config_path_var = tk.StringVar(value=self._default_config())
-        self.run_root_label_var = tk.StringVar(value="RunRoot")
+        self.run_root_label_var = tk.StringVar(value="RunRoot Override")
         self.run_root_var = tk.StringVar()
-        self.run_root_status_var = tk.StringVar(value="selected")
+        self.run_root_status_var = tk.StringVar(value="AUTO")
+        self.run_root_help_var = tk.StringVar(value="비워두면 pair 정책 기준 selected/new RunRoot를 사용합니다.")
         self.pair_id_var = tk.StringVar(value="pair01")
         self.target_id_var = tk.StringVar()
         self.artifact_run_root_filter_var = tk.StringVar(value="")
         self.artifact_pair_filter_var = tk.StringVar(value="")
         self.artifact_target_filter_var = tk.StringVar(value="")
+        self.artifact_home_browse_pair_filter_var = tk.BooleanVar(value=False)
+        self.artifact_home_browse_toggle_var = tk.StringVar(value="Home Pair만 보기")
+        self.artifact_home_browse_target_filter_var = tk.BooleanVar(value=False)
+        self.artifact_home_browse_target_toggle_var = tk.StringVar(value="보고 target 따라가기")
         self.artifact_path_kind_var = tk.StringVar(value="summary")
         self.artifact_latest_only_var = tk.BooleanVar(value=False)
         self.artifact_include_missing_var = tk.BooleanVar(value=True)
@@ -199,21 +278,61 @@ class RelayOperatorPanel(tk.Tk):
         self.mode_banner_var = tk.StringVar(value="MODE: Headless Drill")
         self.mode_banner_detail_var = tk.StringVar(value="headless drill / transport closure / 진단 기준으로 시작합니다.")
         self.simple_mode_var = tk.BooleanVar(value=False)
+        self.header_compact_var = tk.BooleanVar(value=True)
+        self.result_panel_collapsed_var = tk.BooleanVar(value=False)
+        self.result_panel_dock_var = tk.StringVar(value="bottom")
+        self.header_toggle_button_var = tk.StringVar(value="세부 펼치기")
+        self.result_toggle_button_var = tk.StringVar(value="결과 접기")
+        self.result_dock_button_var = tk.StringVar(value="오른쪽 도킹")
         self.home_context_var = tk.StringVar(value="Lane: -")
         self.home_updated_at_var = tk.StringVar(value="마지막 갱신: -")
         self.home_overall_var = tk.StringVar(value="상태: -")
         self.home_overall_detail_var = tk.StringVar(value="안내: 상태를 불러오면 준비 단계와 다음 조치를 여기서 보여줍니다.")
         self.home_pair_detail_var = tk.StringVar(value="Pair 요약을 불러오면 여기서 선택한 pair의 상태를 간단히 보여줍니다.")
+        self.pair_focus_badge_var = tk.StringVar(value="STATE 미확인")
+        self.pair_focus_summary_var = tk.StringVar(value="현재 실행 Pair 요약을 준비 중입니다.")
+        self.pair_focus_detail_var = tk.StringVar(value="phase / next / runroot / handoff 카운트를 여기서 고정 표시합니다.")
+        self.sticky_action_context_var = tk.StringVar(value="pair01/(target 없음) [상단 실행 선택]")
+        self.sticky_inspection_context_var = tk.StringVar(value="(없음)")
+        self.sticky_run_root_context_var = tk.StringVar(value="RunRoot: (없음)")
+        self.sticky_runtime_context_var = tk.StringVar(value="대기 중 / watcher=미확인")
+        self.sticky_next_step_var = tk.StringVar(value="-")
+        self.sticky_next_action_button_var = tk.StringVar(value="다음 단계 실행")
+        self.sticky_context_badge_var = tk.StringVar(value="보고 대상 미고정")
+        self.artifact_summary_collapsed_var = tk.BooleanVar(value=False)
+        self.artifact_details_collapsed_var = tk.BooleanVar(value=True)
+        self.artifact_summary_toggle_var = tk.StringVar(value="summary 접기")
+        self.artifact_details_toggle_var = tk.StringVar(value="경로 펼치기")
         self.visible_acceptance_status_var = tk.StringVar(value="shared visible 공식 절차 상태를 여기서 확인합니다.")
         self.visible_acceptance_detail_var = tk.StringVar(value="cleanup -> preflight-only -> active acceptance -> post-cleanup -> confirm")
         self.visible_primitive_status_var = tk.StringVar(value="pair primitive 상태를 여기서 확인합니다.")
         self.visible_primitive_detail_var = tk.StringVar(value="preview/apply -> submit -> publish/handoff 확인을 잘라 점검합니다.")
+        self.visible_primitive_stage_badge_var = tk.StringVar(value="준비 필요")
+        self.visible_primitive_stage_detail_var = tk.StringVar(value="현재 row 기준 다음 단계를 여기서 요약합니다.")
         self.artifact_status_var = tk.StringVar(value="결과 / 산출물 탭에서 현재 RunRoot 기준 상태를 확인할 수 있습니다.")
         self.artifact_status_base_text = "결과 / 산출물 탭에서 현재 RunRoot 기준 상태를 확인할 수 있습니다."
         self.board_status_var = tk.StringVar(value="8창 보드에서 target별 attach / 입력 가능 / pair 매칭을 한눈에 확인할 수 있습니다.")
         self.message_editor_status_var = tk.StringVar(value="설정 편집기에서 고정문구, override 블록, 슬롯 순서를 수정할 수 있습니다.")
         self.message_preview_status_var = tk.StringVar(value="저장 전 편집본 preview는 '미리보기 갱신'으로 다시 계산합니다.")
+        self.pair_policy_editor_status_var = tk.StringVar(value="4 pair 설정 카드에서 repo/path 정책 초안을 편집하고, 실효 경로를 pair별로 확인할 수 있습니다.")
+        self.pair_policy_parallel_status_var = tk.StringVar(
+            value="병렬 실행: pair 간 실행은 병렬, 같은 pair 내부 handoff는 순차입니다. 현재 RunRoot의 wrapper-status 또는 paired status에서 pair별 진행률을 함께 읽습니다."
+        )
+        self.parallel_coordinator_repo_root_var = tk.StringVar(value=str((ROOT / "_tmp" / "pair-parallel-coordinator").resolve()))
+        self.seed_kickoff_status_var = tk.StringVar(
+            value="초기 실행 준비: 작업 설명만 입력하면 현재 pair 실효 경로 기준 자동 계약 블록을 합쳐 수동 복붙 시작문으로 쓰거나 1회성 queue로 등록할 수 있습니다."
+        )
+        self.seed_kickoff_pair_var = tk.StringVar(value="pair01")
+        self.seed_kickoff_target_var = tk.StringVar(value="")
+        self.seed_kickoff_review_input_var = tk.StringVar(value="")
+        self.seed_kickoff_applies_to_var = tk.StringVar(value="initial")
+        self.seed_kickoff_placement_var = tk.StringVar(value="one-time-prefix")
+        self.seed_kickoff_target_banner_var = tk.StringVar(value="붙여넣기 대상: (미확인)")
+        self.seed_kickoff_readiness_var = tk.StringVar(value="준비 상태를 확인하세요.")
+        self.seed_kickoff_detail_visible_var = tk.BooleanVar(value=False)
         self.message_block_filter_var = tk.StringVar(value="")
+        self._sticky_next_action_key = ""
+        self._sticky_next_action_command_text = ""
         self.message_block_changed_only_var = tk.BooleanVar(value=False)
         self.message_block_filter_status_var = tk.StringVar(value="블록 표시: 0/0")
         self.message_block_badges_var = tk.StringVar(value="")
@@ -223,12 +342,15 @@ class RelayOperatorPanel(tk.Tk):
         self.message_scope_label_var = tk.StringVar(value="글로벌 Prefix")
         self.message_scope_id_var = tk.StringVar(value="")
         self.message_target_suffix_var = tk.StringVar(value="")
+        self.message_editor_tab_title_var = tk.StringVar(value=MESSAGE_EDITOR_TAB_METADATA["context"]["title"])
+        self.message_editor_tab_detail_var = tk.StringVar(value=MESSAGE_EDITOR_TAB_METADATA["context"]["description"])
         self.watcher_max_forward_var = tk.StringVar(value=str(DEFAULT_WATCHER_MAX_FORWARD_COUNT))
         self.watcher_run_duration_var = tk.StringVar(value=str(DEFAULT_WATCHER_RUN_DURATION_SEC))
         self.watcher_pair_roundtrip_var = tk.StringVar(value="0")
         self.watcher_quick_start_note_var = tk.StringVar(value="")
         self.watcher_current_note_var = tk.StringVar(value="")
         self.watcher_start_note_var = tk.StringVar(value="")
+        self.watcher_control_note_var = tk.StringVar(value=self.watcher_controller.control_semantics_guidance())
         self.artifact_source_memory_path = SNAPSHOT_DIR / "artifact-source-memory.json"
         self.artifact_source_memory_warning = ""
 
@@ -274,14 +396,56 @@ class RelayOperatorPanel(tk.Tk):
         self.message_backup_paths: list[Path] = []
         self.long_task_widgets: list[tk.Widget] = []
         self.read_only_widgets: set[tk.Widget] = set()
+        self.message_editor_tab_meta_by_widget: dict[str, dict[str, str]] = {}
         self.home_card_vars: dict[str, dict[str, tk.StringVar]] = {}
         self.home_stage_vars: dict[str, dict[str, tk.StringVar]] = {}
         self.home_stage_buttons: dict[str, ttk.Button] = {}
+        self.pair_policy_card_vars: dict[str, dict[str, tk.Variable]] = {}
+        self.pair_policy_card_badge_labels: dict[str, tk.Label] = {}
+        self.pair_policy_card_repo_source_badge_labels: dict[str, tk.Label] = {}
+        self.pair_policy_card_override_badge_labels: dict[str, tk.Label] = {}
+        self.pair_policy_card_runtime_badge_labels: dict[str, tk.Label] = {}
+        self.pair_policy_card_focus_badge_labels: dict[str, tk.Label] = {}
+        self.pair_policy_card_effective_preview_widgets: dict[str, tk.Text] = {}
+        self.pair_policy_card_seed_combos: dict[str, ttk.Combobox] = {}
+        self.seed_kickoff_target_combo: ttk.Combobox | None = None
+        self.seed_kickoff_pair_combo: ttk.Combobox | None = None
+        self.seed_kickoff_task_text: tk.Text | None = None
+        self.seed_kickoff_contract_text: tk.Text | None = None
+        self.seed_kickoff_helper_text: tk.Text | None = None
+        self.seed_kickoff_steps_text: tk.Text | None = None
+        self.seed_kickoff_preview_text: tk.Text | None = None
+        self.seed_kickoff_preview_stack_frame: ttk.Frame | None = None
+        self.seed_kickoff_preview_detail_frame: ttk.Frame | None = None
+        self.seed_kickoff_input_columns_frame: ttk.Frame | None = None
+        self.seed_kickoff_detail_column_frame: ttk.Frame | None = None
+        self.seed_kickoff_detail_actions_frame: ttk.Frame | None = None
+        self.pair_policy_clone_source_var = tk.StringVar(value=PAIR_ID_OPTIONS[0])
+        self.pair_policy_clone_target_var = tk.StringVar(value=PAIR_ID_OPTIONS[1] if len(PAIR_ID_OPTIONS) > 1 else PAIR_ID_OPTIONS[0])
+        for pair_id in PAIR_ID_OPTIONS:
+            self.pair_policy_card_vars[pair_id] = {
+                "meta_var": tk.StringVar(value=f"{pair_id} / (미구성)"),
+                "repo_root_var": tk.StringVar(value=""),
+                "seed_target_var": tk.StringVar(value=""),
+                "roundtrip_var": tk.StringVar(value="0"),
+                "external_run_root_var": tk.BooleanVar(value=False),
+                "external_contract_var": tk.BooleanVar(value=False),
+                "route_badge_var": tk.StringVar(value="ROUTE 미확인"),
+                "repo_source_badge_var": tk.StringVar(value="REPO 미확인"),
+                "override_badge_var": tk.StringVar(value="RUNROOT AUTO"),
+                "route_state_var": tk.StringVar(value="route: (미확인)"),
+                "effective_preview_var": tk.StringVar(value="실효값 미리보기를 실행하면 pair별 repo/runroot/outbox 경로를 여기서 확인합니다."),
+                "runtime_badge_var": tk.StringVar(value="STATE 미확인"),
+                "runtime_summary_var": tk.StringVar(value="runtime 상태는 현재 RunRoot의 wrapper-status 또는 paired status를 읽으면 표시됩니다."),
+                "parallel_selected_var": tk.BooleanVar(value=(pair_id in {"pair01", "pair02"})),
+            }
         self._busy = False
         self._mode_banner_label = "MODE: Headless Drill"
         self._mode_banner_detail = "headless drill / transport closure / 진단 기준으로 시작합니다."
         self._last_visible_mode_label = "MODE: Active Visible"
         self._last_visible_mode_detail = "shared visible 공식 절차 기준 preflight / acceptance / cleanup / confirm을 진행합니다."
+        self.seed_kickoff_last_preview: dict[str, object] | None = None
+        self._artifact_manual_filters_before_browse: tuple[str, str] | None = None
         self.panel_opened_at_utc = self._utc_now_iso()
         self.window_launch_anchor_utc = self.panel_opened_at_utc
         self.run_root_context_refresh_after_id: str | None = None
@@ -317,6 +481,416 @@ class RelayOperatorPanel(tk.Tk):
         if presets:
             return presets[0]
         return str(ROOT / "config" / "settings.psd1")
+
+    def _create_scrollable_tab(
+        self,
+        notebook: ttk.Notebook,
+        *,
+        title: str,
+        padding: int = 10,
+    ) -> tuple[ttk.Frame, ttk.Frame]:
+        tab_container = ttk.Frame(notebook, padding=0)
+        tab_container.columnconfigure(0, weight=1)
+        tab_container.rowconfigure(0, weight=1)
+        notebook.add(tab_container, text=title)
+
+        canvas = tk.Canvas(tab_container, highlightthickness=0)
+        canvas.grid(row=0, column=0, sticky="nsew")
+        scrollbar = ttk.Scrollbar(tab_container, orient="vertical", command=canvas.yview)
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        canvas.configure(yscrollcommand=scrollbar.set)
+
+        body = ttk.Frame(canvas, padding=padding)
+        body_window = canvas.create_window((0, 0), window=body, anchor="nw")
+
+        def _sync_scroll_region(_event: object | None = None) -> None:
+            try:
+                canvas.configure(scrollregion=canvas.bbox("all"))
+            except Exception:
+                pass
+
+        def _sync_canvas_width(event: object) -> None:
+            try:
+                width = int(getattr(event, "width", 0) or 0)
+            except Exception:
+                width = 0
+            if width <= 0:
+                return
+            try:
+                canvas.itemconfigure(body_window, width=width)
+            except Exception:
+                pass
+
+        def _on_mousewheel(event: object) -> str | None:
+            try:
+                delta = int(getattr(event, "delta", 0) or 0)
+            except Exception:
+                delta = 0
+            if not delta:
+                return None
+            canvas.yview_scroll(int(-1 * (delta / 120)), "units")
+            return "break"
+
+        body.bind("<Configure>", _sync_scroll_region)
+        canvas.bind("<Configure>", _sync_canvas_width)
+        canvas.bind("<MouseWheel>", _on_mousewheel)
+        body.bind("<MouseWheel>", _on_mousewheel)
+        return tab_container, body
+
+    def _apply_header_compact_mode(self) -> None:
+        frame = self.__dict__.get("header_details_frame")
+        var = self.__dict__.get("header_compact_var")
+        label_var = self.__dict__.get("header_toggle_button_var")
+        if frame is None or var is None or label_var is None or not hasattr(var, "get"):
+            return
+        compact = bool(var.get())
+        try:
+            if compact:
+                frame.grid_remove()
+                label_var.set("세부 펼치기")
+            else:
+                frame.grid()
+                label_var.set("세부 접기")
+        except Exception:
+            pass
+
+    def toggle_header_compact(self) -> None:
+        if not self._has_ui_attr("header_compact_var"):
+            return
+        self.header_compact_var.set(not bool(self.header_compact_var.get()))
+        self._apply_header_compact_mode()
+        state_label = "compact" if self.header_compact_var.get() else "expanded"
+        self.set_operator_status(
+            "헤더 표시 변경",
+            f"상단 글로벌 헤더를 {state_label} 모드로 전환했습니다.",
+        )
+        self._refresh_sticky_context_bar()
+
+    def _apply_result_panel_visibility(self) -> None:
+        body = self.__dict__.get("result_body_frame")
+        var = self.__dict__.get("result_panel_collapsed_var")
+        label_var = self.__dict__.get("result_toggle_button_var")
+        if body is None or var is None or label_var is None or not hasattr(var, "get"):
+            return
+        collapsed = bool(var.get())
+        try:
+            if collapsed:
+                body.grid_remove()
+                label_var.set("결과 펼치기")
+            else:
+                body.grid()
+                label_var.set("결과 접기")
+        except Exception:
+            pass
+
+    def toggle_result_panel(self) -> None:
+        if not self._has_ui_attr("result_panel_collapsed_var"):
+            return
+        self.result_panel_collapsed_var.set(not bool(self.result_panel_collapsed_var.get()))
+        self._apply_result_panel_visibility()
+        state_label = "접기" if self.result_panel_collapsed_var.get() else "펼치기"
+        self.set_operator_status("결과 패널 표시 변경", f"하단 결과 패널을 {state_label} 상태로 바꿨습니다.")
+        self._refresh_sticky_context_bar()
+
+    def _apply_result_panel_dock_mode(self) -> None:
+        frame = self.__dict__.get("result_frame")
+        notebook = self.__dict__.get("notebook")
+        dock_var = self.__dict__.get("result_panel_dock_var")
+        label_var = self.__dict__.get("result_dock_button_var")
+        if frame is None or notebook is None or dock_var is None or label_var is None or not hasattr(dock_var, "get"):
+            return
+        dock_mode = str(dock_var.get() or "bottom").strip().lower()
+        dock_right = dock_mode == "right"
+        self.rowconfigure(2, weight=0 if dock_right else 1)
+        self.columnconfigure(1, weight=0)
+        try:
+            if dock_right:
+                notebook.grid_configure(row=1, column=0, sticky="nsew", padx=(10, 6), pady=(0, 10))
+                frame.grid_configure(row=1, column=1, sticky="nsew", padx=(0, 10), pady=(0, 10))
+                label_var.set("하단 도킹")
+            else:
+                notebook.grid_configure(row=1, column=0, sticky="nsew", padx=10, pady=(0, 10))
+                frame.grid_configure(row=2, column=0, sticky="nsew", padx=10, pady=(0, 10))
+                label_var.set("오른쪽 도킹")
+        except Exception:
+            pass
+
+    def toggle_result_panel_dock(self) -> None:
+        if not self._has_ui_attr("result_panel_dock_var"):
+            return
+        next_mode = "right" if str(self.result_panel_dock_var.get() or "bottom") == "bottom" else "bottom"
+        self.result_panel_dock_var.set(next_mode)
+        self._apply_result_panel_dock_mode()
+        state_label = "오른쪽 도킹" if next_mode == "right" else "하단 도킹"
+        self.set_operator_status("결과 패널 배치 변경", f"작업 / 조회 결과 패널을 {state_label} 모드로 전환했습니다.")
+        self._refresh_sticky_context_bar()
+
+    def _apply_artifact_section_visibility(self) -> None:
+        sections = [
+            ("artifact_summary_body_frame", "artifact_summary_collapsed_var", "artifact_summary_toggle_var", "summary 접기", "summary 펼치기"),
+            ("artifact_details_body_frame", "artifact_details_collapsed_var", "artifact_details_toggle_var", "경로 접기", "경로 펼치기"),
+        ]
+        for body_attr, collapsed_attr, label_attr, expanded_label, collapsed_label in sections:
+            body = self.__dict__.get(body_attr)
+            collapsed_var = self.__dict__.get(collapsed_attr)
+            label_var = self.__dict__.get(label_attr)
+            if body is None or collapsed_var is None or label_var is None or not hasattr(collapsed_var, "get"):
+                continue
+            collapsed = bool(collapsed_var.get())
+            try:
+                if collapsed:
+                    body.grid_remove()
+                    label_var.set(collapsed_label)
+                else:
+                    body.grid()
+                    label_var.set(expanded_label)
+            except Exception:
+                pass
+
+    def toggle_artifact_summary_section(self) -> None:
+        if not self._has_ui_attr("artifact_summary_collapsed_var"):
+            return
+        self.artifact_summary_collapsed_var.set(not bool(self.artifact_summary_collapsed_var.get()))
+        self._apply_artifact_section_visibility()
+
+    def toggle_artifact_details_section(self) -> None:
+        if not self._has_ui_attr("artifact_details_collapsed_var"):
+            return
+        self.artifact_details_collapsed_var.set(not bool(self.artifact_details_collapsed_var.get()))
+        self._apply_artifact_section_visibility()
+
+    def _selected_notebook_tab_id(self) -> str:
+        notebook = self.__dict__.get("notebook")
+        if notebook is None:
+            return ""
+        try:
+            return str(notebook.select() or "")
+        except tk.TclError:
+            return ""
+
+    def _current_next_step_summary(self) -> str:
+        selected_tab = self._selected_notebook_tab_id()
+        if self._has_ui_attr("visible_acceptance_tab") and selected_tab == str(self.visible_acceptance_tab):
+            try:
+                visible_state = self._build_visible_acceptance_state()
+            except Exception:
+                visible_state = None
+            if visible_state is not None and visible_state.next_step:
+                return f"Visible: {visible_state.next_step}"
+
+        if self._has_ui_attr("artifacts_tab") and selected_tab == str(self.artifacts_tab):
+            selected_state = self._selected_artifact_state() if self._has_ui_attr("artifact_tree") else None
+            if selected_state is not None and getattr(self, "artifact_controller", None) is not None:
+                preview = self.artifact_controller.get_preview(self.artifact_states, selected_state.target_id)
+                if preview is not None:
+                    if preview.recommended_action:
+                        return f"Artifact: {preview.recommended_action}"
+                    if preview.source_outbox_next_action:
+                        next_action = self.artifact_service.display_next_action(preview.source_outbox_next_action)
+                        return f"Artifact: {next_action}"
+
+        if self.panel_state and self.panel_state.next_actions:
+            return self.panel_state.next_actions[0].label
+        if self.panel_state and self.panel_state.issues:
+            return self.panel_state.issues[0].action_label
+        if self._has_ui_attr("operator_hint_var"):
+            hint = self.operator_hint_var.get().strip()
+            if hint:
+                return hint
+        return "-"
+
+    @staticmethod
+    def _sticky_action_button_label(action_key: str, fallback: str = "") -> str:
+        label = STICKY_ACTION_BUTTON_LABELS.get(action_key, "").strip()
+        if label:
+            return label
+        return str(fallback or action_key or "다음 단계 실행").strip()
+
+    def _current_sticky_action_spec(self) -> dict[str, object]:
+        selected_tab = self._selected_notebook_tab_id()
+        if self._has_ui_attr("visible_acceptance_tab") and selected_tab == str(self.visible_acceptance_tab):
+            try:
+                visible_state = self._build_visible_acceptance_state()
+            except Exception:
+                visible_state = None
+            if visible_state is not None and visible_state.next_action_key:
+                return {
+                    "action_key": visible_state.next_action_key,
+                    "label": self._sticky_action_button_label(visible_state.next_action_key, visible_state.next_step),
+                    "command_text": "",
+                    "read_only": self._dashboard_action_is_read_only(visible_state.next_action_key),
+                }
+
+        if self._has_ui_attr("artifacts_tab") and selected_tab == str(self.artifacts_tab):
+            ready_target_exists = any(self.artifact_service.is_handoff_ready(item) for item in self.artifact_states)
+            if ready_target_exists:
+                return {
+                    "action_key": "focus_ready_to_forward_artifact",
+                    "label": self._sticky_action_button_label("focus_ready_to_forward_artifact"),
+                    "command_text": "",
+                    "read_only": True,
+                }
+
+        if self.panel_state and self.panel_state.next_actions:
+            action = self.panel_state.next_actions[0]
+            if action.action_key:
+                return {
+                    "action_key": action.action_key,
+                    "label": self._sticky_action_button_label(action.action_key, action.label),
+                    "command_text": action.command_text,
+                    "read_only": self._dashboard_action_is_read_only(action.action_key),
+                }
+
+        recommendation = self._watcher_recommendation() if getattr(self, "watcher_controller", None) is not None else None
+        if recommendation is not None and recommendation.action_key:
+            return {
+                "action_key": "watcher_recommended_action",
+                "label": self._sticky_action_button_label("watcher_recommended_action", recommendation.label),
+                "command_text": "",
+                "read_only": self._dashboard_action_is_read_only(recommendation.action_key),
+            }
+
+        if self.panel_state and self.panel_state.issues:
+            issue = self.panel_state.issues[0]
+            if issue.action_key:
+                return {
+                    "action_key": issue.action_key,
+                    "label": self._sticky_action_button_label(issue.action_key, issue.action_label),
+                    "command_text": "",
+                    "read_only": self._dashboard_action_is_read_only(issue.action_key),
+                }
+
+        return {
+            "action_key": "",
+            "label": "",
+            "command_text": "",
+            "read_only": False,
+        }
+
+    def run_sticky_recommended_action(self) -> None:
+        action_key = str(getattr(self, "_sticky_next_action_key", "") or "").strip()
+        command_text = str(getattr(self, "_sticky_next_action_command_text", "") or "")
+        if not action_key:
+            messagebox.showinfo("실행 항목 없음", "현재 문맥에서 바로 실행할 다음 단계가 없습니다.")
+            return
+        if action_key == "watcher_recommended_action":
+            self.apply_watcher_recommended_action()
+            return
+        self.handle_dashboard_action(action_key, command_text=command_text)
+
+    def _current_context_badge_spec(self) -> dict[str, str | bool]:
+        inspection_context = self._selected_inspection_context_state()
+        action_context = self._action_context_state()
+        if not inspection_context.pair_id and not inspection_context.target_id:
+            return {
+                "text": "보고 대상 미고정",
+                "background": "#6B7280",
+                "foreground": "#FFFFFF",
+                "apply_enabled": False,
+            }
+        if self._inspection_context_differs_from_action():
+            badge_target = inspection_context.target_id or action_context.target_id or "(target 없음)"
+            badge_pair = inspection_context.pair_id or action_context.pair_id or "(pair 없음)"
+            return {
+                "text": f"문맥 분리: 보고={badge_pair}/{badge_target}",
+                "background": "#B45309",
+                "foreground": "#FFFFFF",
+                "apply_enabled": True,
+            }
+        return {
+            "text": "문맥 일치",
+            "background": "#166534",
+            "foreground": "#FFFFFF",
+            "apply_enabled": False,
+        }
+
+    def _refresh_sticky_context_bar(self) -> None:
+        if not self._has_ui_attr("sticky_action_context_var"):
+            return
+        self.sticky_action_context_var.set(self._action_context_summary())
+        self.sticky_inspection_context_var.set(self._inspection_context_summary())
+
+        run_root_text = self._current_run_root_display_text()
+        run_root_state = self.run_root_status_var.get().strip() if self._has_ui_attr("run_root_status_var") else ""
+        if run_root_state:
+            self.sticky_run_root_context_var.set(f"{run_root_text} ({run_root_state})")
+        else:
+            self.sticky_run_root_context_var.set(run_root_text)
+
+        watcher_status = self._watcher_status() if getattr(self, "watcher_controller", None) is not None else "미확인"
+        runtime_label = self.panel_state.overall_label if self.panel_state else (self.operator_status_var.get().strip() if self._has_ui_attr("operator_status_var") else "대기 중")
+        self.sticky_runtime_context_var.set(f"{runtime_label} / watcher={watcher_status or '미확인'}")
+        self.sticky_next_step_var.set(self._current_next_step_summary())
+        action_spec = self._current_sticky_action_spec()
+        action_key = str(action_spec.get("action_key", "") or "").strip()
+        action_label = str(action_spec.get("label", "") or "").strip()
+        command_text = str(action_spec.get("command_text", "") or "")
+        read_only = bool(action_spec.get("read_only", False))
+        self._sticky_next_action_key = action_key
+        self._sticky_next_action_command_text = command_text
+        self.sticky_next_action_button_var.set(
+            f"실행: {action_label}" if action_key and action_label else "다음 단계 실행"
+        )
+        if self._has_ui_attr("sticky_next_action_button"):
+            button_state = "normal" if (action_key and (read_only or not self._busy)) else "disabled"
+            self.sticky_next_action_button.configure(state=button_state)
+        badge_spec = self._current_context_badge_spec()
+        self.sticky_context_badge_var.set(str(badge_spec.get("text", "") or "문맥 확인"))
+        if self._has_ui_attr("sticky_context_badge_label"):
+            try:
+                self.sticky_context_badge_label.configure(
+                    text=self.sticky_context_badge_var.get(),
+                    bg=str(badge_spec.get("background", "#6B7280")),
+                    fg=str(badge_spec.get("foreground", "#FFFFFF")),
+                )
+            except Exception:
+                pass
+        if self._has_ui_attr("sticky_apply_context_button"):
+            self.sticky_apply_context_button.configure(
+                state="normal" if bool(badge_spec.get("apply_enabled", False)) else "disabled"
+            )
+        self._apply_home_pair_tree_highlights()
+        self._refresh_pair_policy_card_focus_highlights()
+        self._refresh_pair_focus_strip()
+        self._apply_artifact_tree_highlights()
+
+    @staticmethod
+    def _message_editor_tab_meta(tab_key: str) -> dict[str, str]:
+        return dict(MESSAGE_EDITOR_TAB_METADATA.get(tab_key, {}))
+
+    def _register_message_editor_tab(self, notebook: ttk.Notebook, tab: ttk.Frame, *, tab_key: str) -> None:
+        metadata = self._message_editor_tab_meta(tab_key)
+        label = metadata.get("label", tab_key)
+        notebook.add(tab, text=label)
+        if "message_editor_tab_meta_by_widget" not in self.__dict__:
+            self.message_editor_tab_meta_by_widget = {}
+        self.message_editor_tab_meta_by_widget[str(tab)] = metadata
+
+    def _message_editor_tab_heading_for_widget(self, widget_id: str) -> tuple[str, str]:
+        metadata = self.__dict__.get("message_editor_tab_meta_by_widget", {}).get(widget_id, {})
+        title = metadata.get("title") or "탭 안내"
+        description = metadata.get("description") or "현재 선택 탭의 상세 정보를 표시합니다."
+        return title, description
+
+    def _refresh_message_editor_tab_heading(self) -> None:
+        default_title = MESSAGE_EDITOR_TAB_METADATA["context"]["title"]
+        default_description = MESSAGE_EDITOR_TAB_METADATA["context"]["description"]
+        title = default_title
+        description = default_description
+        if self._has_ui_attr("editor_right_notebook"):
+            try:
+                selected_tab = self.editor_right_notebook.select()
+            except TypeError:
+                selected_tab = ""
+            if selected_tab:
+                title, description = self._message_editor_tab_heading_for_widget(str(selected_tab))
+        if self._has_ui_attr("message_editor_tab_title_var"):
+            self.message_editor_tab_title_var.set(title)
+        if self._has_ui_attr("message_editor_tab_detail_var"):
+            self.message_editor_tab_detail_var.set(description)
+
+    def _on_message_editor_tab_changed(self, _event: object | None = None) -> None:
+        self._refresh_message_editor_tab_heading()
 
     def _on_watcher_start_option_changed(self, *_args) -> None:
         self._refresh_watcher_start_note()
@@ -466,6 +1040,25 @@ class RelayOperatorPanel(tk.Tk):
 
     def _current_context(self) -> AppContext:
         return self._action_context_state().as_app_context()
+
+    def _effective_refresh_context(self) -> AppContext:
+        context = self._action_context_state()
+        if self._run_root_override_state() != "override-active":
+            return ActionContextState(
+                config_path=context.config_path,
+                run_root="",
+                pair_id=context.pair_id,
+                target_id=context.target_id,
+                source=context.source,
+            ).as_app_context()
+        return context.as_app_context()
+
+    def _same_run_root_path(self, left: object, right: object) -> bool:
+        normalized_left = self._normalized_optional_path(left)
+        normalized_right = self._normalized_optional_path(right)
+        if not normalized_left or not normalized_right:
+            return False
+        return normalized_left == normalized_right
 
     def _action_context_state(self) -> ActionContextState:
         return ActionContextState(
@@ -619,6 +1212,66 @@ class RelayOperatorPanel(tk.Tk):
             self.runtime_workflow_service = service
         return service
 
+    def _resolve_run_prepare_config_path(self, *, pair_id: str, config_path: str) -> str:
+        resolved_config_path = str(config_path or "").strip()
+        if not resolved_config_path:
+            return resolved_config_path
+
+        config_file = Path(resolved_config_path)
+        if not config_file.exists():
+            return resolved_config_path
+
+        try:
+            document = self.message_config_service.load_config_document(resolved_config_path)
+            effective_policy = self.message_config_service.effective_pair_policy(document, pair_id)
+        except Exception:
+            return resolved_config_path
+
+        use_external_pair_roots = bool(
+            effective_policy.get("UseExternalWorkRepoRunRoot", False)
+            or effective_policy.get("UseExternalWorkRepoContractPaths", False)
+        )
+        pair_work_repo_root = str(effective_policy.get("DefaultSeedWorkRepoRoot", "") or "").strip()
+        if not use_external_pair_roots or not pair_work_repo_root:
+            return resolved_config_path
+
+        build_helper = getattr(self.command_service, "build_powershell_file_command", None)
+        if build_helper is None:
+            raise RuntimeError("pair-scoped externalized config helper를 사용할 수 없습니다.")
+
+        helper_command = build_helper(
+            str(ROOT / "tests" / "Write-PairExternalizedRelayConfigs.ps1"),
+            extra=[
+                "-BaseConfigPath",
+                resolved_config_path,
+                "-PairId",
+                pair_id,
+                "-AsJson",
+            ],
+        )
+        try:
+            if hasattr(self.command_service, "run_json"):
+                payload = self.command_service.run_json(helper_command)
+            else:
+                completed = self.command_service.run(helper_command)
+                payload = json.loads(completed.stdout)
+        except Exception as exc:
+            raise RuntimeError(f"{pair_id} pair-scoped externalized config 생성 실패: {exc}") from exc
+
+        generated_configs = list(payload.get("GeneratedConfigs", []) or [])
+        matched_config = next(
+            (
+                item
+                for item in generated_configs
+                if str((item or {}).get("PairId", "") or "").strip() == str(pair_id or "").strip()
+            ),
+            {},
+        )
+        output_config_path = str((matched_config or {}).get("OutputConfigPath", "") or "").strip()
+        if not output_config_path:
+            raise RuntimeError(f"{pair_id} externalized config 경로를 확인하지 못했습니다.")
+        return output_config_path
+
     def _watcher_workflow(self) -> PanelWatcherWorkflowService:
         service = self.__dict__.get("watcher_workflow_service")
         if (
@@ -674,6 +1327,7 @@ class RelayOperatorPanel(tk.Tk):
         if self._has_ui_attr("artifact_tree"):
             self.refresh_artifacts_tab()
         self.update_pair_button_states()
+        self._refresh_sticky_context_bar()
 
     def _set_mode_banner(self, label: str, detail: str) -> None:
         self._mode_banner_label = label
@@ -682,6 +1336,7 @@ class RelayOperatorPanel(tk.Tk):
             self.mode_banner_var.set(label)
         if self._has_ui_attr("mode_banner_detail_var"):
             self.mode_banner_detail_var.set(detail)
+        self._refresh_sticky_context_bar()
 
     def _set_visible_mode_banner(self, label: str, detail: str) -> None:
         self._last_visible_mode_label = label
@@ -706,6 +1361,7 @@ class RelayOperatorPanel(tk.Tk):
         if self._has_ui_attr("artifacts_tab") and selected_tab == str(self.artifacts_tab):
             self._set_mode_banner("MODE: Recovery", "artifact / receipt / watcher evidence 검토 및 복구 중심으로 작업합니다.")
             return
+        self._refresh_sticky_context_bar()
 
     def destroy(self) -> None:
         self._cancel_pending_ui_callbacks()
@@ -755,6 +1411,7 @@ class RelayOperatorPanel(tk.Tk):
 
         action_run_root = self._current_run_root_for_actions()
         explicit_run_root = self.run_root_var.get().strip()
+        override_state = self._run_root_override_state()
         snapshot = self._run_root_timing_snapshot(action_run_root)
         threshold = int(snapshot.get("ThresholdSec", 1800) or 1800)
         age_seconds = snapshot.get("AgeSeconds", None)
@@ -763,29 +1420,66 @@ class RelayOperatorPanel(tk.Tk):
             age_text = "{0:.0f}s/{1}s".format(float(age_seconds), threshold)
 
         if not action_run_root:
-            self.run_root_label_var.set("RunRoot")
-            self.run_root_status_var.set("없음")
+            self.run_root_label_var.set("RunRoot Override")
+            self.run_root_status_var.set("AUTO")
+            if "run_root_help_var" in self.__dict__:
+                self.run_root_help_var.set("비워두면 pair 정책 기준 selected/new RunRoot를 사용합니다.")
+            self._refresh_pair_policy_override_badges()
+            self._refresh_sticky_context_bar()
             return
 
         if self._run_root_is_stale(action_run_root):
-            self.run_root_label_var.set("RunRoot [stale]")
-            self.run_root_status_var.set("stale {0}".format(age_text or f"threshold={threshold}s"))
+            self.run_root_label_var.set("RunRoot Override")
+            self.run_root_status_var.set("STALE {0}".format(age_text or f"threshold={threshold}s"))
+            if "run_root_help_var" in self.__dict__:
+                if override_state == "override-active":
+                    self.run_root_help_var.set("입력한 runroot가 stale입니다. 새 RunRoot 준비 또는 입력 비우기")
+                elif override_state == "mirror-selected":
+                    self.run_root_help_var.set("selected runroot가 stale입니다. 새 RunRoot 준비 또는 입력 비우기")
+                else:
+                    self.run_root_help_var.set("현재 runroot가 stale입니다. 새 RunRoot 준비 또는 입력 비우기")
+            self._refresh_pair_policy_override_badges()
+            self._refresh_sticky_context_bar()
             return
 
-        if explicit_run_root:
-            self.run_root_label_var.set("RunRoot [override]")
-            self.run_root_status_var.set("override {0}".format(age_text or "selected"))
+        if override_state == "override-active":
+            self.run_root_label_var.set("RunRoot Override")
+            self.run_root_status_var.set("OVERRIDE ACTIVE {0}".format(age_text or "selected"))
+            if "run_root_help_var" in self.__dict__:
+                self.run_root_help_var.set("입력한 runroot가 pair 정책보다 우선합니다.")
+            self._refresh_pair_policy_override_badges()
+            self._refresh_sticky_context_bar()
             return
 
-        self.run_root_label_var.set("RunRoot")
-        self.run_root_status_var.set("selected {0}".format(age_text or "latest"))
+        if override_state == "mirror-selected":
+            self.run_root_label_var.set("RunRoot Override")
+            self.run_root_status_var.set("SELECTED MIRROR {0}".format(age_text or "selected"))
+            if "run_root_help_var" in self.__dict__:
+                self.run_root_help_var.set("현재 선택된 runroot를 그대로 보고 있습니다. pair 정책 기준으로 보려면 입력을 비우세요.")
+            self._refresh_pair_policy_override_badges()
+            self._refresh_sticky_context_bar()
+            return
+
+        self.run_root_label_var.set("RunRoot Override")
+        self.run_root_status_var.set("AUTO {0}".format(age_text or "latest"))
+        if "run_root_help_var" in self.__dict__:
+            self.run_root_help_var.set("비워두면 pair 정책 기준 selected/new RunRoot를 사용합니다.")
+        self._refresh_pair_policy_override_badges()
+        self._refresh_sticky_context_bar()
+
+    def _run_root_override_state(self) -> str:
+        explicit_run_root = str(self.run_root_var.get() or "").strip()
+        if not explicit_run_root:
+            return "auto"
+        selected_run_root = str((self.effective_data or {}).get("RunContext", {}).get("SelectedRunRoot", "") or "").strip()
+        if self._same_run_root_path(explicit_run_root, selected_run_root):
+            return "mirror-selected"
+        return "override-active"
 
     def _panel_runtime_hints(self) -> dict[str, object]:
         run_context = (self.effective_data or {}).get("RunContext", {}) or {}
-        selected_run_root = str(run_context.get("SelectedRunRoot", "") or "").strip()
         action_run_root = self._current_run_root_for_actions()
-        explicit_run_root = self.run_root_var.get().strip()
-        action_run_root_uses_override = bool(explicit_run_root and explicit_run_root != selected_run_root)
+        action_run_root_uses_override = (self._run_root_override_state() == "override-active")
         action_run_root_snapshot = self._run_root_timing_snapshot(action_run_root)
         wrapper_path = self._launcher_wrapper_path()
         return {
@@ -807,10 +1501,7 @@ class RelayOperatorPanel(tk.Tk):
         action_run_root = self._current_run_root_for_actions()
         if not action_run_root:
             return "(없음)"
-        run_context = (self.effective_data or {}).get("RunContext", {}) or {}
-        selected_run_root = str(run_context.get("SelectedRunRoot", "") or "").strip()
-        explicit_run_root = self.run_root_var.get().strip()
-        if explicit_run_root and explicit_run_root != selected_run_root:
+        if self._run_root_override_state() == "override-active":
             return "{0} (override)".format(action_run_root)
         return action_run_root
 
@@ -823,6 +1514,264 @@ class RelayOperatorPanel(tk.Tk):
             "RunRoot 입력 비움",
             "explicit RunRoot 입력을 비웠습니다. 이후 동작은 선택된 RunRoot를 다시 사용합니다.",
             "마지막 결과: RunRoot 입력칸 비움",
+        )
+
+    def _pair_policy_repo_source_badge_spec(self, policy: dict[str, object]) -> dict[str, str]:
+        source = str(policy.get("DefaultSeedWorkRepoRootSource", "") or "unset").strip()
+        if source == "pair-policy":
+            return {"text": "PAIR POLICY", "background": "#1D4ED8", "foreground": "#FFFFFF"}
+        if source == "global-default":
+            return {"text": "GLOBAL DEFAULT", "background": "#92400E", "foreground": "#FFFFFF"}
+        return {"text": "REPO UNSET", "background": "#6B7280", "foreground": "#FFFFFF"}
+
+    def _run_root_override_badge_spec(self) -> dict[str, str]:
+        state = self._run_root_override_state()
+        if state == "override-active":
+            return {"text": "RUNROOT OVERRIDE ACTIVE", "background": "#B45309", "foreground": "#FFFFFF"}
+        if state == "mirror-selected":
+            return {"text": "RUNROOT SELECTED MIRROR", "background": "#2563EB", "foreground": "#FFFFFF"}
+        return {"text": "RUNROOT AUTO", "background": "#6B7280", "foreground": "#FFFFFF"}
+
+    def _apply_pair_policy_source_feedback(self, *, pair_id: str, policy: dict[str, object]) -> None:
+        store = self._pair_policy_card_store(pair_id)
+        badge_spec = self._pair_policy_repo_source_badge_spec(policy)
+        store["repo_source_badge_var"].set(badge_spec["text"])
+        badge_label = self.__dict__.get("pair_policy_card_repo_source_badge_labels", {}).get(pair_id)
+        if badge_label is not None:
+            try:
+                badge_label.configure(
+                    text=badge_spec["text"],
+                    bg=badge_spec["background"],
+                    fg=badge_spec["foreground"],
+                )
+            except Exception:
+                pass
+
+    def _refresh_pair_policy_override_badges(self) -> None:
+        badge_spec = self._run_root_override_badge_spec()
+        for pair_id, store in self.pair_policy_card_vars.items():
+            store["override_badge_var"].set(badge_spec["text"])
+            badge_label = self.__dict__.get("pair_policy_card_override_badge_labels", {}).get(pair_id)
+            if badge_label is not None:
+                try:
+                    badge_label.configure(
+                        text=badge_spec["text"],
+                        bg=badge_spec["background"],
+                        fg=badge_spec["foreground"],
+                    )
+                except Exception:
+                    pass
+
+    def _current_parallel_wrapper_status_payload(self) -> dict | None:
+        run_root = str(self._current_run_root_for_actions() or "").strip()
+        if not run_root:
+            return None
+        wrapper_status_path = Path(run_root) / ".state" / "wrapper-status.json"
+        if not wrapper_status_path.exists():
+            return None
+        try:
+            payload = json.loads(wrapper_status_path.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+        if not isinstance(payload, dict):
+            return None
+        return payload
+
+    def _parallel_wrapper_pair_run_row(self, pair_id: str, wrapper_payload: dict | None) -> dict | None:
+        normalized_pair = str(pair_id or "").strip()
+        if not normalized_pair or not isinstance(wrapper_payload, dict):
+            return None
+        pair_runs = list(wrapper_payload.get("PairRuns", []) or [])
+        for row in pair_runs:
+            if str((row or {}).get("PairId", "") or "").strip() == normalized_pair:
+                return dict(row or {})
+        child_rows = list(wrapper_payload.get("ChildProcesses", []) or [])
+        for row in child_rows:
+            if str((row or {}).get("PairId", "") or "").strip() == normalized_pair:
+                return dict(row or {})
+        return None
+
+    @staticmethod
+    def _pair_runtime_status_badge_spec(snapshot: dict[str, object]) -> dict[str, str]:
+        watcher_state = str(snapshot.get("WatcherState", "") or "").strip().lower()
+        watcher_reason = str(snapshot.get("WatcherReason", "") or "").strip().lower()
+        phase = str(snapshot.get("CurrentPhase", "") or "").strip().lower()
+        next_action = str(snapshot.get("NextAction", "") or "").strip().lower()
+        final_result = str(snapshot.get("FinalResult", "") or "").strip().lower()
+        error_count = int(snapshot.get("ErrorPresentCount", 0) or 0)
+        roundtrip_count = int(snapshot.get("RoundtripCount", 0) or 0)
+
+        waiting_phase_markers = ("paused", "waiting", "resume-required")
+        waiting_next_markers = ("resume-required", "handoff-ready", "await")
+        running_phase_markers = ("partner-running", "seed-running")
+        if final_result == "failed" or error_count > 0 or "manual-review" in next_action or "error" in phase:
+            return {"text": "ERROR", "background": "#B91C1C", "foreground": "#FFFFFF"}
+        if (
+            final_result == "success"
+            or phase == "limit-reached"
+            or next_action == "limit-reached"
+            or watcher_reason == "pair-roundtrip-limit-reached"
+        ):
+            return {"text": "DONE", "background": "#15803D", "foreground": "#FFFFFF"}
+        if any(marker in phase for marker in running_phase_markers):
+            return {"text": "RUNNING", "background": "#2563EB", "foreground": "#FFFFFF"}
+        if any(marker in phase for marker in waiting_phase_markers):
+            return {"text": "WAITING", "background": "#CA8A04", "foreground": "#111827"}
+        if any(marker in next_action for marker in waiting_next_markers):
+            return {"text": "WAITING", "background": "#CA8A04", "foreground": "#111827"}
+        if watcher_state in {"pause_requested", "resume_requested", "stop_requested", "stopping"}:
+            return {"text": "WAITING", "background": "#CA8A04", "foreground": "#111827"}
+        if watcher_state in {"running", "starting"} or roundtrip_count > 0 or phase:
+            return {"text": "RUNNING", "background": "#2563EB", "foreground": "#FFFFFF"}
+        if watcher_state == "stopped":
+            return {"text": "STOPPED", "background": "#6B7280", "foreground": "#FFFFFF"}
+        return {"text": "STATE 미확인", "background": "#6B7280", "foreground": "#FFFFFF"}
+
+    def _build_pair_runtime_snapshot(self, pair_id: str) -> dict[str, object]:
+        route_snapshot = self._build_pair_route_snapshot(pair_id)
+        wrapper_payload = self._current_parallel_wrapper_status_payload()
+        wrapper_row = self._parallel_wrapper_pair_run_row(pair_id, wrapper_payload)
+        if wrapper_row is not None:
+            run_root = str(wrapper_row.get("RunRoot", "") or "").strip() or str(route_snapshot.get("PairRunRoot", "") or "").strip()
+            snapshot = {
+                "PairId": pair_id,
+                "StatusSource": "wrapper-status",
+                "RepoRoot": str(wrapper_row.get("WorkRepoRoot", "") or "").strip() or str(route_snapshot.get("PairWorkRepoRoot", "") or "").strip(),
+                "RunRoot": run_root,
+                "WatcherState": str(wrapper_row.get("WatcherState", "") or "").strip(),
+                "WatcherReason": str(wrapper_row.get("WatcherReason", "") or "").strip(),
+                "RoundtripCount": int(wrapper_row.get("RoundtripCount", 0) or 0),
+                "CurrentPhase": str(wrapper_row.get("CurrentPhase", "") or "").strip(),
+                "NextAction": str(wrapper_row.get("NextAction", "") or "").strip(),
+                "LastForwardedAt": str(wrapper_row.get("LastForwardedAt", "") or "").strip(),
+                "LastHeartbeatAt": str(wrapper_row.get("LastHeartbeatAt", "") or "").strip(),
+                "DonePresentCount": int(wrapper_row.get("DonePresentCount", 0) or 0),
+                "ErrorPresentCount": int(wrapper_row.get("ErrorPresentCount", 0) or 0),
+                "FinalResult": str(wrapper_row.get("FinalResult", "") or "").strip(),
+                "CompletionSource": str(wrapper_row.get("CompletionSource", "") or "").strip(),
+            }
+            snapshot["Badge"] = self._pair_runtime_status_badge_spec(snapshot)
+            return snapshot
+
+        pair_status = self._paired_pair_status_row(pair_id)
+        if pair_status is not None:
+            watcher = dict(((self.paired_status_data or {}).get("Watcher", {}) or {}))
+            snapshot = {
+                "PairId": pair_id,
+                "StatusSource": "paired-status",
+                "RepoRoot": str(route_snapshot.get("PairWorkRepoRoot", "") or "").strip(),
+                "RunRoot": str(route_snapshot.get("PairRunRoot", "") or "").strip(),
+                "WatcherState": str(watcher.get("Status", "") or "").strip(),
+                "WatcherReason": str(watcher.get("StatusReason", "") or watcher.get("Reason", "") or "").strip(),
+                "RoundtripCount": int(pair_status.get("RoundtripCount", 0) or 0),
+                "CurrentPhase": str(pair_status.get("CurrentPhase", "") or "").strip(),
+                "NextAction": str(pair_status.get("NextAction", "") or "").strip(),
+                "LastForwardedAt": str(pair_status.get("LastForwardedAt", "") or "").strip(),
+                "LastHeartbeatAt": str(watcher.get("HeartbeatAt", "") or "").strip(),
+                "DonePresentCount": 0,
+                "ErrorPresentCount": 0,
+                "FinalResult": "",
+                "CompletionSource": "",
+            }
+            snapshot["Badge"] = self._pair_runtime_status_badge_spec(snapshot)
+            return snapshot
+
+        snapshot = {
+            "PairId": pair_id,
+            "StatusSource": "route-only",
+            "RepoRoot": str(route_snapshot.get("PairWorkRepoRoot", "") or "").strip(),
+            "RunRoot": str(route_snapshot.get("PairRunRoot", "") or "").strip(),
+            "WatcherState": "",
+            "WatcherReason": "",
+            "RoundtripCount": 0,
+            "CurrentPhase": "",
+            "NextAction": "",
+            "LastForwardedAt": "",
+            "LastHeartbeatAt": "",
+            "DonePresentCount": 0,
+            "ErrorPresentCount": 0,
+            "FinalResult": "",
+            "CompletionSource": "",
+        }
+        snapshot["Badge"] = self._pair_runtime_status_badge_spec(snapshot)
+        return snapshot
+
+    def _pair_runtime_summary_text(self, snapshot: dict[str, object]) -> str:
+        run_root = str(snapshot.get("RunRoot", "") or "").strip()
+        run_leaf = os.path.basename(os.path.normpath(run_root)) if run_root else "(없음)"
+        heartbeat = str(snapshot.get("LastHeartbeatAt", "") or "").strip() or "(없음)"
+        forwarded = str(snapshot.get("LastForwardedAt", "") or "").strip() or "(없음)"
+        phase = str(snapshot.get("CurrentPhase", "") or "").strip() or "(없음)"
+        watcher_state = str(snapshot.get("WatcherState", "") or "").strip() or "(없음)"
+        lines = [
+            "source={0} / watcher={1} / rt={2}".format(
+                snapshot.get("StatusSource", "") or "unknown",
+                watcher_state,
+                int(snapshot.get("RoundtripCount", 0) or 0),
+            ),
+            "phase={0} / next={1}".format(
+                phase,
+                str(snapshot.get("NextAction", "") or "").strip() or "(없음)",
+            ),
+            "repo={0}".format(str(snapshot.get("RepoRoot", "") or "").strip() or "(없음)"),
+            "run={0} / forwarded={1}".format(run_leaf, forwarded),
+            "heartbeat={0}".format(heartbeat),
+        ]
+        final_result = str(snapshot.get("FinalResult", "") or "").strip()
+        if final_result:
+            lines.append(
+                "final={0} / completion={1}".format(
+                    final_result,
+                    str(snapshot.get("CompletionSource", "") or "").strip() or "(없음)",
+                )
+            )
+        return "\n".join(lines)
+
+    def _refresh_pair_policy_parallel_status_board(self) -> None:
+        counts = {
+            "RUNNING": 0,
+            "WAITING": 0,
+            "DONE": 0,
+            "ERROR": 0,
+            "STOPPED": 0,
+            "STATE 미확인": 0,
+        }
+        source_labels: set[str] = set()
+        for pair_id in PAIR_ID_OPTIONS:
+            if pair_id not in self.pair_policy_card_vars:
+                continue
+            snapshot = self._build_pair_runtime_snapshot(pair_id)
+            badge_spec = dict(snapshot.get("Badge") or self._pair_runtime_status_badge_spec(snapshot))
+            badge_text = str(badge_spec.get("text", "") or "STATE 미확인")
+            source_label = str(snapshot.get("StatusSource", "") or "").strip()
+            if source_label:
+                source_labels.add(source_label)
+            if badge_text in counts:
+                counts[badge_text] += 1
+            store = self._pair_policy_card_store(pair_id)
+            store["runtime_badge_var"].set(badge_text)
+            store["runtime_summary_var"].set(self._pair_runtime_summary_text(snapshot))
+            badge_label = self.__dict__.get("pair_policy_card_runtime_badge_labels", {}).get(pair_id)
+            if badge_label is not None:
+                try:
+                    badge_label.configure(
+                        text=badge_text,
+                        bg=badge_spec["background"],
+                        fg=badge_spec["foreground"],
+                    )
+                except Exception:
+                    pass
+
+        source_text = ", ".join(sorted(source_labels)) if source_labels else "route-only"
+        self.pair_policy_parallel_status_var.set(
+            "병렬 실행: pair 간 실행은 병렬, 같은 pair 내부 handoff는 순차 / source={0} / RUNNING={1} WAITING={2} DONE={3} ERROR={4} STOPPED={5}".format(
+                source_text,
+                counts["RUNNING"],
+                counts["WAITING"],
+                counts["DONE"],
+                counts["ERROR"],
+                counts["STOPPED"],
+            )
         )
 
     def _stage_by_key(self, stage_key: str):
@@ -854,6 +1803,23 @@ class RelayOperatorPanel(tk.Tk):
             expected_action_key="run_selected_pair",
             mismatch_message="선택 Pair Headless Drill 전 pair 활성화가 필요합니다.",
         )
+
+    def _selected_parallel_pair_execution_allowed(self, pair_ids: list[str] | None = None) -> tuple[bool, str]:
+        allowed, detail = self._stage_action_allowed(
+            "pair_action",
+            expected_action_key="run_selected_pair",
+            mismatch_message="선택 pair 병렬 Headless Drill 전 pair 활성화가 필요합니다.",
+        )
+        if not allowed:
+            return allowed, detail
+        target_pair_ids = list(pair_ids or self._selected_parallel_pair_ids())
+        if len(target_pair_ids) < 2:
+            return False, "병렬 실테스트를 실행하려면 최소 2개 pair를 체크하세요."
+        for pair_id in target_pair_ids:
+            scope_allowed, scope_detail = self._pair_scope_allowed(pair_id, action_label="선택 pair 병렬 Headless Drill")
+            if not scope_allowed:
+                return False, scope_detail
+        return True, ""
 
     def _runtime_active_pair_ids(self) -> list[str]:
         runtime = ((self.relay_status_data or {}).get("Runtime", {}) or {})
@@ -983,7 +1949,7 @@ class RelayOperatorPanel(tk.Tk):
         if not self.effective_data:
             self.load_effective_config()
             return
-        runtime_result = self.refresh_controller.refresh_runtime(self._current_context())
+        runtime_result = self.refresh_controller.refresh_runtime(self._effective_refresh_context())
         self._apply_runtime_refresh_result(runtime_result)
 
     def _apply_runtime_refresh_result(self, runtime_result) -> None:
@@ -994,8 +1960,8 @@ class RelayOperatorPanel(tk.Tk):
         self.render_target_board()
         self.update_pair_button_states()
 
-    def _runtime_refresh_command_preview(self) -> str:
-        context = self._current_context()
+    def _runtime_refresh_command_preview(self, context: AppContext | None = None) -> str:
+        context = context or self._effective_refresh_context()
         relay_command = self.command_service.build_script_command(
             script_name="show-relay-status.ps1",
             config_path=context.config_path,
@@ -1309,13 +2275,17 @@ class RelayOperatorPanel(tk.Tk):
                 self.notebook.hide(self.ops_tab)
             if self._has_ui_attr("snapshots_tab"):
                 self.notebook.hide(self.snapshots_tab)
-            self.set_operator_status("간단 모드", "홈, 8창 보드, 설정 편집, 산출물 중심으로 단순화했습니다. 하단 결과 패널은 계속 유지됩니다.")
+            if self._has_ui_attr("result_panel_collapsed_var"):
+                self.result_panel_collapsed_var.set(True)
+                self._apply_result_panel_visibility()
+            self.set_operator_status("간단 모드", "홈, 8창 보드, 설정 편집, 산출물 중심으로 단순화했습니다. 하단 결과 패널은 기본 축약 상태로 유지됩니다.")
         else:
             if self._has_ui_attr("ops_tab"):
-                self.notebook.add(self.ops_tab, text="원문 / 진단")
+                self.notebook.add(self.ops_tab, text="Headless Drill / 진단")
             if self._has_ui_attr("snapshots_tab"):
                 self.notebook.add(self.snapshots_tab, text="스냅샷")
-            self.set_operator_status("전체 모드", "고급 진단 탭까지 다시 표시했습니다. 하단 결과 패널은 계속 유지됩니다.")
+            self.set_operator_status("전체 모드", "고급 진단 탭까지 다시 표시했습니다. 하단 결과 패널은 필요할 때 직접 펼칠 수 있습니다.")
+        self._refresh_sticky_context_bar()
 
     def load_message_editor_document(self) -> None:
         config_path = self.config_path_var.get().strip()
@@ -1338,6 +2308,1835 @@ class RelayOperatorPanel(tk.Tk):
             dirty=False,
         )
         self.render_message_editor()
+        self.refresh_pair_policy_editor()
+
+    def _pair_policy_known_pair_ids(
+        self,
+        *,
+        document: dict | None = None,
+        effective_payload: dict | None = None,
+    ) -> list[str]:
+        pair_ids: list[str] = []
+        if document:
+            pair_ids.extend(
+                [
+                    str(item.get("PairId", "") or "").strip()
+                    for item in self.message_config_service.pair_definitions(document)
+                    if str(item.get("PairId", "") or "").strip()
+                ]
+            )
+        for item in (effective_payload or self.effective_data or {}).get("OverviewPairs", []) or []:
+            pair_id = str(item.get("PairId", "") or "").strip()
+            if pair_id:
+                pair_ids.append(pair_id)
+        ordered: list[str] = []
+        seen: set[str] = set()
+        for pair_id in pair_ids + list(PAIR_ID_OPTIONS):
+            if not pair_id or pair_id in seen:
+                continue
+            seen.add(pair_id)
+            ordered.append(pair_id)
+        return ordered
+
+    def _pair_policy_card_store(self, pair_id: str) -> dict[str, object]:
+        store = self.pair_policy_card_vars.get(str(pair_id or "").strip())
+        if store is None:
+            raise KeyError(f"Unknown pair policy card: {pair_id}")
+        return store
+
+    def _sync_pair_policy_effective_preview_widget(self, pair_id: str) -> None:
+        store = self.pair_policy_card_vars.get(str(pair_id or "").strip())
+        if store is None:
+            return
+        widget = getattr(self, "pair_policy_card_effective_preview_widgets", {}).get(str(pair_id or "").strip())
+        if widget is None:
+            return
+        try:
+            self.set_text(widget, str(store["effective_preview_var"].get() or ""))
+        except Exception:
+            pass
+
+    def _pair_policy_configured_pair_ids(self, document: dict) -> list[str]:
+        pair_ids = [
+            str(item.get("PairId", "") or "").strip()
+            for item in self.message_config_service.pair_definitions(document)
+            if str(item.get("PairId", "") or "").strip()
+        ]
+        if pair_ids:
+            return list(dict.fromkeys(pair_ids))
+        return self._pair_policy_known_pair_ids(document=document)
+
+    def _pair_policy_editor_all_repo_hints(self) -> dict[str, str]:
+        result: dict[str, str] = {}
+        for pair_id in self._pair_policy_known_pair_ids(document=self.message_config_doc):
+            store = self.pair_policy_card_vars.get(pair_id)
+            if not store:
+                continue
+            result[pair_id] = str(store["repo_root_var"].get() or "").strip()
+        return result
+
+    def _pair_policy_build_preview_text(
+        self,
+        *,
+        pair_id: str,
+        policy: dict[str, object],
+        route_snapshot: dict[str, object],
+        warnings: list[str] | None = None,
+    ) -> str:
+        lines = [
+            "pair={0} / seed={1} / repo={2} / repo-source={3}".format(
+                pair_id,
+                policy.get("DefaultSeedTargetId", "") or "(없음)",
+                policy.get("DefaultSeedWorkRepoRoot", "") or "(없음)",
+                policy.get("DefaultSeedWorkRepoRootSource", "") or "unset",
+            ),
+            f"runroot-input={self._run_root_override_state()}",
+            f"runroot={route_snapshot.get('PairRunRoot', '') or '(미리보기 없음)'}",
+            f"route={route_snapshot.get('RouteState', '') or '(미확인)'} / same-repo={route_snapshot.get('TargetsShareWorkRepoRoot', False)} / outbox-distinct={route_snapshot.get('TargetOutboxesDistinct', False)} / shared-with-other-pairs={route_snapshot.get('SharesWorkRepoRootWithOtherPairs', False)}",
+            f"top outbox={route_snapshot.get('TopSourceOutboxPath', '') or '(없음)'}",
+            f"bottom outbox={route_snapshot.get('BottomSourceOutboxPath', '') or '(없음)'}",
+            f"top publish={route_snapshot.get('TopPublishReadyPath', '') or '(없음)'}",
+            f"bottom publish={route_snapshot.get('BottomPublishReadyPath', '') or '(없음)'}",
+        ]
+        warning_items = [str(item).strip() for item in (warnings or []) if str(item).strip()]
+        if warning_items:
+            lines.append("warnings=" + "; ".join(warning_items[:3]))
+        return "\n".join(lines)
+
+    def _pair_policy_route_label(self, *, route_snapshot: dict[str, object], pair_work_repo_root: str) -> str:
+        route_state = str(route_snapshot.get("RouteState", "") or "saved-config-only")
+        pair_run_root = str(route_snapshot.get("PairRunRoot", "") or "")
+        repo_share_note = " / 다른 pair와 repo 공유" if bool(route_snapshot.get("SharesWorkRepoRootWithOtherPairs", False)) else ""
+        return "route={0}{1} / repo={2} / runroot={3}".format(
+            route_state,
+            repo_share_note,
+            pair_work_repo_root or "(없음)",
+            pair_run_root or "(미리보기 없음)",
+        )
+
+    def _pair_policy_route_badge_spec(self, *, route_snapshot: dict[str, object], pair_work_repo_root: str) -> dict[str, str]:
+        route_state = str(route_snapshot.get("RouteState", "") or "").strip()
+        has_repo_root = bool(str(pair_work_repo_root or "").strip())
+        shares_repo = bool(route_snapshot.get("SharesWorkRepoRootWithOtherPairs", False))
+        if route_state in {"", "saved-config-only"}:
+            return {"text": "ROUTE 미확인", "background": "#6B7280", "foreground": "#FFFFFF"}
+        if route_state == "preview-missing":
+            return {"text": "ROUTE 미리보기 없음", "background": "#6B7280", "foreground": "#FFFFFF"}
+        if route_state == "(미구성)" or not has_repo_root:
+            return {"text": "ROUTE 미구성", "background": "#6B7280", "foreground": "#FFFFFF"}
+        if route_state == "aligned":
+            if shares_repo:
+                return {"text": "SHARED REPO OK", "background": "#CA8A04", "foreground": "#111827"}
+            return {"text": "ROUTE OK", "background": "#15803D", "foreground": "#FFFFFF"}
+        return {"text": "ROUTE CHECK", "background": "#B91C1C", "foreground": "#FFFFFF"}
+
+    def _apply_pair_policy_route_feedback(
+        self,
+        *,
+        pair_id: str,
+        route_snapshot: dict[str, object],
+        pair_work_repo_root: str,
+    ) -> None:
+        store = self._pair_policy_card_store(pair_id)
+        store["route_state_var"].set(
+            self._pair_policy_route_label(
+                route_snapshot=route_snapshot,
+                pair_work_repo_root=pair_work_repo_root,
+            )
+        )
+        badge_spec = self._pair_policy_route_badge_spec(
+            route_snapshot=route_snapshot,
+            pair_work_repo_root=pair_work_repo_root,
+        )
+        store["route_badge_var"].set(badge_spec["text"])
+        badge_label = self.__dict__.get("pair_policy_card_badge_labels", {}).get(pair_id)
+        if badge_label is not None:
+            try:
+                badge_label.configure(
+                    text=badge_spec["text"],
+                    bg=badge_spec["background"],
+                    fg=badge_spec["foreground"],
+                )
+            except Exception:
+                pass
+
+    def _pair_policy_card_preview_route_snapshot(
+        self,
+        *,
+        rows: list[dict],
+        pair_id: str,
+        pair_work_repo_root: str,
+    ) -> dict[str, object]:
+        normalized_other_repo_hints = self._pair_policy_editor_all_repo_hints()
+        normalized_other_repo_hints[pair_id] = pair_work_repo_root
+        pair_rows = [row for row in rows if str(row.get("PairId", "") or "").strip() == str(pair_id or "").strip()]
+        if not pair_rows:
+            return {
+                "PairId": pair_id,
+                "PairWorkRepoRoot": pair_work_repo_root,
+                "PairRunRoot": "",
+                "TopSourceOutboxPath": "",
+                "BottomSourceOutboxPath": "",
+                "TopPublishReadyPath": "",
+                "BottomPublishReadyPath": "",
+                "TargetsShareWorkRepoRoot": True,
+                "TargetsSharePairRunRoot": False,
+                "TargetOutboxesDistinct": False,
+                "SharesWorkRepoRootWithOtherPairs": False,
+                "RouteState": "preview-missing",
+            }
+        top_row = next((row for row in pair_rows if str(row.get("RoleName", "") or "").strip() == "top"), pair_rows[0])
+        bottom_row = next((row for row in pair_rows if str(row.get("RoleName", "") or "").strip() == "bottom"), next((row for row in pair_rows if row is not top_row), {}))
+        pair_run_root_values: list[str] = []
+        for row in pair_rows:
+            pair_run_root = str(row.get("PairRunRoot", "") or "").strip()
+            if not pair_run_root:
+                target_folder = str(row.get("PairTargetFolder", "") or "").strip()
+                if target_folder:
+                    pair_run_root = os.path.dirname(target_folder)
+            if pair_run_root:
+                pair_run_root_values.append(pair_run_root)
+        unique_pair_run_roots = list(dict.fromkeys(pair_run_root_values))
+        source_outboxes = [
+            str(row.get("SourceOutboxPath", "") or "").strip()
+            for row in pair_rows
+            if str(row.get("SourceOutboxPath", "") or "").strip()
+        ]
+        normalized_pair_repo = self._normalized_optional_path(pair_work_repo_root)
+        shares_repo_with_other_pairs = False
+        if normalized_pair_repo:
+            for other_pair_id, other_repo in normalized_other_repo_hints.items():
+                if other_pair_id == pair_id:
+                    continue
+                if self._normalized_optional_path(other_repo) == normalized_pair_repo:
+                    shares_repo_with_other_pairs = True
+                    break
+        return {
+            "PairId": str(pair_id or "").strip(),
+            "PairWorkRepoRoot": pair_work_repo_root,
+            "PairRunRoot": unique_pair_run_roots[0] if len(unique_pair_run_roots) == 1 else "",
+            "TopSourceOutboxPath": str(top_row.get("SourceOutboxPath", "") or "").strip(),
+            "BottomSourceOutboxPath": str(bottom_row.get("SourceOutboxPath", "") or "").strip(),
+            "TopPublishReadyPath": str(top_row.get("PublishReadyPath", "") or "").strip(),
+            "BottomPublishReadyPath": str(bottom_row.get("PublishReadyPath", "") or "").strip(),
+            "TargetsShareWorkRepoRoot": True,
+            "TargetsSharePairRunRoot": len(unique_pair_run_roots) == 1 and len(unique_pair_run_roots) > 0,
+            "TargetOutboxesDistinct": len(source_outboxes) == len(pair_rows) and len(set(source_outboxes)) == len(source_outboxes),
+            "SharesWorkRepoRootWithOtherPairs": shares_repo_with_other_pairs,
+            "RouteState": self._pair_route_state(
+                targets_share_work_repo_root=True,
+                targets_share_pair_run_root=(len(unique_pair_run_roots) == 1 and len(unique_pair_run_roots) > 0),
+                target_outboxes_distinct=(len(source_outboxes) == len(pair_rows) and len(set(source_outboxes)) == len(source_outboxes)),
+            ),
+        }
+
+    def _collect_pair_route_matrix(self) -> list[dict[str, object]]:
+        matrix: list[dict[str, object]] = []
+        for pair_id in PAIR_ID_OPTIONS:
+            store = self._pair_policy_card_store(pair_id)
+            pair_work_repo_root = str(store["repo_root_var"].get() or "").strip()
+            route_snapshot = self._pair_policy_card_preview_route_snapshot(
+                rows=list(self.preview_rows or []),
+                pair_id=pair_id,
+                pair_work_repo_root=pair_work_repo_root,
+            )
+            badge_spec = self._pair_policy_route_badge_spec(
+                route_snapshot=route_snapshot,
+                pair_work_repo_root=pair_work_repo_root,
+            )
+            matrix.append(
+                {
+                    "PairId": pair_id,
+                    "Meta": str(store["meta_var"].get() or "").strip(),
+                    "PairWorkRepoRoot": pair_work_repo_root,
+                    "DefaultSeedTargetId": str(store["seed_target_var"].get() or "").strip(),
+                    "DefaultPairMaxRoundtripCount": str(store["roundtrip_var"].get() or "").strip(),
+                    "UseExternalWorkRepoRunRoot": bool(store["external_run_root_var"].get()),
+                    "UseExternalWorkRepoContractPaths": bool(store["external_contract_var"].get()),
+                    "RouteBadge": badge_spec["text"],
+                    "RouteStateLabel": str(store["route_state_var"].get() or "").strip(),
+                    "RouteSnapshot": route_snapshot,
+                }
+            )
+        return matrix
+
+    def _pair_route_matrix_payload(self) -> dict[str, object]:
+        return {
+            "GeneratedAt": self._utc_now_iso(),
+            "ConfigPath": self.config_path_var.get().strip(),
+            "PairRouteMatrix": self._collect_pair_route_matrix(),
+        }
+
+    def _pair_route_matrix_text(self, payload: dict[str, object]) -> str:
+        lines = [
+            "[pair-route-matrix]",
+            f"config={payload.get('ConfigPath', '') or '(없음)'}",
+        ]
+        for item in list(payload.get("PairRouteMatrix", []) or []):
+            snapshot = dict(item.get("RouteSnapshot") or {})
+            lines.extend(
+                [
+                    "",
+                    f"{item.get('PairId', '') or '(pair)'} / {item.get('RouteBadge', '') or '(badge)'}",
+                    f"meta={item.get('Meta', '') or '(없음)'}",
+                    f"repo={item.get('PairWorkRepoRoot', '') or '(없음)'}",
+                    f"route={snapshot.get('RouteState', '') or '(미확인)'}",
+                    f"runroot={snapshot.get('PairRunRoot', '') or '(미리보기 없음)'}",
+                    f"shared-with-other-pairs={snapshot.get('SharesWorkRepoRootWithOtherPairs', False)}",
+                    f"top-outbox={snapshot.get('TopSourceOutboxPath', '') or '(없음)'}",
+                    f"bottom-outbox={snapshot.get('BottomSourceOutboxPath', '') or '(없음)'}",
+                    f"top-publish={snapshot.get('TopPublishReadyPath', '') or '(없음)'}",
+                    f"bottom-publish={snapshot.get('BottomPublishReadyPath', '') or '(없음)'}",
+                ]
+            )
+        return "\n".join(lines)
+
+    def browse_pair_policy_repo_root(self, pair_id: str) -> None:
+        store = self._pair_policy_card_store(pair_id)
+        current_repo_root = str(store["repo_root_var"].get() or "").strip()
+        initialdir = current_repo_root or str(ROOT)
+        selected = filedialog.askdirectory(
+            title=f"{pair_id} RepoRoot 선택",
+            initialdir=initialdir,
+            mustexist=False,
+        )
+        if not selected:
+            return
+        store["repo_root_var"].set(selected)
+        self.pair_policy_editor_status_var.set(
+            f"{pair_id} RepoRoot 선택 완료: {selected} / 저장 전 '실효값'으로 경로를 확인하세요."
+        )
+
+    def open_pair_policy_repo_root(self, pair_id: str) -> None:
+        store = self._pair_policy_card_store(pair_id)
+        repo_root = str(store["repo_root_var"].get() or "").strip()
+        self._open_path(repo_root, kind=f"{pair_id} RepoRoot")
+
+    def browse_parallel_coordinator_repo_root(self) -> None:
+        current_repo_root = self.parallel_coordinator_repo_root_var.get().strip()
+        initialdir = current_repo_root or str(ROOT)
+        selected = filedialog.askdirectory(
+            title="병렬 drill coordinator repo 선택",
+            initialdir=initialdir,
+            mustexist=False,
+        )
+        if not selected:
+            return
+        self.parallel_coordinator_repo_root_var.set(selected)
+        self.pair_policy_editor_status_var.set(
+            f"병렬 coordinator repo 선택 완료: {selected}"
+        )
+
+    def open_parallel_coordinator_repo_root(self) -> None:
+        repo_root = self.parallel_coordinator_repo_root_var.get().strip()
+        self._open_path(repo_root, kind="병렬 drill coordinator repo")
+
+    def _selected_parallel_pair_ids(self) -> list[str]:
+        selected_pair_ids: list[str] = []
+        for pair_id in self._pair_policy_known_pair_ids(document=self.message_config_doc):
+            store = self.pair_policy_card_vars.get(pair_id)
+            if store is None:
+                continue
+            selected_var = store.get("parallel_selected_var")
+            try:
+                selected = bool(selected_var.get()) if selected_var is not None else False
+            except Exception:
+                selected = False
+            if selected:
+                selected_pair_ids.append(pair_id)
+        return selected_pair_ids
+
+    def _pair_policy_allowed_seed_target_ids(self, pair_id: str) -> list[str]:
+        config_path = self.config_path_var.get().strip()
+        if not config_path:
+            return []
+        try:
+            document = self.message_config_service.load_config_document(config_path)
+            policy = self.message_config_service.effective_pair_policy(document, pair_id)
+        except Exception:
+            return []
+        result: list[str] = []
+        for item in [
+            str(policy.get("TopTargetId", "") or "").strip(),
+            str(policy.get("BottomTargetId", "") or "").strip(),
+        ]:
+            if item and item not in result:
+                result.append(item)
+        return result
+
+    def clone_pair_policy_card_settings(self) -> None:
+        source_pair_id = self.pair_policy_clone_source_var.get().strip()
+        target_pair_id = self.pair_policy_clone_target_var.get().strip()
+        if not source_pair_id or not target_pair_id:
+            messagebox.showwarning("pair 선택 필요", "복제할 source/target pair를 먼저 선택하세요.")
+            return
+        if source_pair_id == target_pair_id:
+            messagebox.showwarning("pair 선택 오류", "source pair와 target pair는 달라야 합니다.")
+            return
+        source_store = self._pair_policy_card_store(source_pair_id)
+        target_store = self._pair_policy_card_store(target_pair_id)
+        target_allowed_seed_ids = self._pair_policy_allowed_seed_target_ids(target_pair_id)
+        source_seed_target_id = str(source_store["seed_target_var"].get() or "").strip()
+        current_target_seed_target_id = str(target_store["seed_target_var"].get() or "").strip()
+
+        target_store["repo_root_var"].set(str(source_store["repo_root_var"].get() or "").strip())
+        target_store["roundtrip_var"].set(str(source_store["roundtrip_var"].get() or "").strip())
+        target_store["external_run_root_var"].set(bool(source_store["external_run_root_var"].get()))
+        target_store["external_contract_var"].set(bool(source_store["external_contract_var"].get()))
+
+        if source_seed_target_id and source_seed_target_id in target_allowed_seed_ids:
+            target_store["seed_target_var"].set(source_seed_target_id)
+        elif current_target_seed_target_id and current_target_seed_target_id in target_allowed_seed_ids:
+            target_store["seed_target_var"].set(current_target_seed_target_id)
+        elif target_allowed_seed_ids:
+            target_store["seed_target_var"].set(target_allowed_seed_ids[0])
+
+        self.pair_policy_editor_status_var.set(
+            f"{source_pair_id} 설정을 {target_pair_id} 카드에 복제했습니다. 저장 전 '실효값'으로 pair별 경로를 확인하세요."
+        )
+
+    def open_pair_policy_pair_summary(self, pair_id: str) -> None:
+        store = self._pair_policy_card_store(pair_id)
+        route_snapshot = self._pair_policy_card_preview_route_snapshot(
+            rows=list(self.preview_rows or []),
+            pair_id=pair_id,
+            pair_work_repo_root=str(store["repo_root_var"].get() or "").strip(),
+        )
+        pair_run_root = str(route_snapshot.get("PairRunRoot", "") or "").strip()
+        if not pair_run_root:
+            messagebox.showwarning("pair runroot 없음", f"{pair_id} pair runroot를 아직 확인하지 못했습니다. 먼저 '실효값' 또는 runroot 요약을 확인하세요.")
+            return
+        path_value = str(Path(pair_run_root) / ".state" / "important-summary.txt")
+        if not Path(path_value).exists():
+            messagebox.showwarning(
+                "important-summary 없음",
+                f"{pair_id} pair runroot 아래 important-summary.txt가 없습니다. 먼저 해당 run 요약을 생성하세요.\n{path_value}",
+            )
+            return
+        self._open_path(path_value, kind=f"{pair_id} important-summary.txt")
+        self.set_text(self.output_text, f"{pair_id} important-summary 열기:\n{path_value}")
+
+    def _apply_pair_policy_card_values_to_document(self, document: dict, pair_id: str) -> dict[str, object]:
+        store = self._pair_policy_card_store(pair_id)
+        roundtrip_text = str(store["roundtrip_var"].get() or "").strip() or "0"
+        try:
+            roundtrip_count = int(roundtrip_text)
+        except ValueError as exc:
+            raise ValueError(f"{pair_id} roundtrip 값은 정수여야 합니다.") from exc
+        if roundtrip_count < 0:
+            raise ValueError(f"{pair_id} roundtrip 값은 0 이상이어야 합니다.")
+        policy = self.message_config_service.effective_pair_policy(document, pair_id)
+        allowed_seed_target_ids = [
+            item
+            for item in [
+                str(policy.get("TopTargetId", "") or "").strip(),
+                str(policy.get("BottomTargetId", "") or "").strip(),
+            ]
+            if item
+        ]
+        seed_target_id = str(store["seed_target_var"].get() or "").strip()
+        if seed_target_id and allowed_seed_target_ids and seed_target_id not in allowed_seed_target_ids:
+            raise ValueError(f"{pair_id} seed target는 {', '.join(allowed_seed_target_ids)} 중 하나여야 합니다.")
+        self.message_config_service.set_pair_policy_values(
+            document,
+            pair_id,
+            default_seed_work_repo_root=str(store["repo_root_var"].get() or "").strip(),
+            default_seed_target_id=seed_target_id or (allowed_seed_target_ids[0] if allowed_seed_target_ids else ""),
+            use_external_work_repo_run_root=bool(store["external_run_root_var"].get()),
+            use_external_work_repo_contract_paths=bool(store["external_contract_var"].get()),
+            default_pair_max_roundtrip_count=roundtrip_count,
+        )
+        return self.message_config_service.effective_pair_policy(document, pair_id)
+
+    def refresh_pair_policy_editor(self) -> None:
+        config_path = self.config_path_var.get().strip()
+        if not config_path:
+            self.pair_policy_editor_status_var.set("ConfigPath가 없어 pair 설정 카드를 불러오지 못했습니다.")
+            return
+        try:
+            document = self.message_config_service.load_config_document(config_path)
+        except Exception as exc:
+            self.pair_policy_editor_status_var.set(f"pair 설정 카드 로드 실패: {exc}")
+            return
+        active_pair_ids = self._pair_policy_known_pair_ids(document=document)
+        for pair_id in PAIR_ID_OPTIONS:
+            store = self.pair_policy_card_vars[pair_id]
+            if pair_id not in active_pair_ids:
+                store["meta_var"].set(f"{pair_id} / (미구성)")
+                store["repo_root_var"].set("")
+                store["seed_target_var"].set("")
+                store["roundtrip_var"].set("0")
+                store["external_run_root_var"].set(False)
+                store["external_contract_var"].set(False)
+                store["repo_source_badge_var"].set("REPO UNSET")
+                self._apply_pair_policy_route_feedback(
+                    pair_id=pair_id,
+                    route_snapshot={"RouteState": "(미구성)"},
+                    pair_work_repo_root="",
+                )
+                store["effective_preview_var"].set("PairDefinitions에 없는 pair입니다.")
+                self._sync_pair_policy_effective_preview_widget(pair_id)
+                if pair_id in self.pair_policy_card_seed_combos:
+                    self.pair_policy_card_seed_combos[pair_id].configure(values=[], state="disabled")
+                continue
+            policy = self.message_config_service.effective_pair_policy(document, pair_id)
+            self._apply_pair_policy_source_feedback(pair_id=pair_id, policy=policy)
+            seed_values = [
+                item
+                for item in [
+                    str(policy.get("TopTargetId", "") or "").strip(),
+                    str(policy.get("BottomTargetId", "") or "").strip(),
+                ]
+                if item
+            ]
+            store["meta_var"].set(
+                "{0} / top={1} / bottom={2}".format(
+                    pair_id,
+                    policy.get("TopTargetId", "") or "-",
+                    policy.get("BottomTargetId", "") or "-",
+                )
+            )
+            store["repo_root_var"].set(str(policy.get("DefaultSeedWorkRepoRoot", "") or ""))
+            store["seed_target_var"].set(str(policy.get("DefaultSeedTargetId", "") or (seed_values[0] if seed_values else "")))
+            store["roundtrip_var"].set(str(policy.get("DefaultPairMaxRoundtripCount", 0) or 0))
+            store["external_run_root_var"].set(bool(policy.get("UseExternalWorkRepoRunRoot", False)))
+            store["external_contract_var"].set(bool(policy.get("UseExternalWorkRepoContractPaths", False)))
+            if pair_id in self.pair_policy_card_seed_combos:
+                self.pair_policy_card_seed_combos[pair_id].configure(values=seed_values, state="readonly" if seed_values else "disabled")
+            route_snapshot = self._build_pair_route_snapshot(pair_id)
+            self._apply_pair_policy_route_feedback(
+                pair_id=pair_id,
+                route_snapshot=route_snapshot,
+                pair_work_repo_root=str(policy.get("DefaultSeedWorkRepoRoot", "") or ""),
+            )
+            store["effective_preview_var"].set(
+                self._pair_policy_build_preview_text(
+                    pair_id=pair_id,
+                    policy=policy,
+                    route_snapshot=route_snapshot,
+                    warnings=[],
+                )
+            )
+            self._sync_pair_policy_effective_preview_widget(pair_id)
+        self.pair_policy_editor_status_var.set("4 pair 설정 카드를 현재 config 기준으로 동기화했습니다. 저장 전 '실효값'으로 pair별 경로를 바로 확인하세요.")
+        self._refresh_pair_policy_override_badges()
+        self._refresh_pair_policy_parallel_status_board()
+        self.refresh_seed_kickoff_composer()
+
+    def preview_pair_policy_effective(self, pair_id: str) -> None:
+        config_path = self.config_path_var.get().strip()
+        if not config_path:
+            messagebox.showwarning("ConfigPath 없음", "ConfigPath를 먼저 확인하세요.")
+            return
+        try:
+            document = self.message_config_service.load_config_document(config_path)
+            for current_pair_id in self._pair_policy_known_pair_ids(document=document):
+                self._apply_pair_policy_card_values_to_document(document, current_pair_id)
+        except Exception as exc:
+            messagebox.showwarning("pair 설정 검증 실패", str(exc))
+            self.pair_policy_editor_status_var.set(f"pair 설정 검증 실패: {exc}")
+            return
+        try:
+            payload = self.message_config_service.render_effective_preview(
+                document,
+                config_path=config_path,
+                run_root=self._draft_message_preview_run_root(),
+                pair_id=pair_id,
+                target_id="",
+                mode="both",
+            )
+        except Exception as exc:
+            messagebox.showerror("실효값 미리보기 실패", str(exc))
+            self.pair_policy_editor_status_var.set(f"pair 실효값 미리보기 실패: {exc}")
+            return
+        policy = self.message_config_service.effective_pair_policy(document, pair_id)
+        self._apply_pair_policy_source_feedback(pair_id=pair_id, policy=policy)
+        rows = [row for row in list(payload.get("PreviewRows", []) or []) if str(row.get("PairId", "") or "").strip() == pair_id]
+        route_snapshot = self._pair_policy_card_preview_route_snapshot(
+            rows=rows,
+            pair_id=pair_id,
+            pair_work_repo_root=str(policy.get("DefaultSeedWorkRepoRoot", "") or ""),
+        )
+        warnings = [str(item) for item in list(payload.get("Warnings", []) or [])]
+        store = self._pair_policy_card_store(pair_id)
+        self._apply_pair_policy_route_feedback(
+            pair_id=pair_id,
+            route_snapshot=route_snapshot,
+            pair_work_repo_root=str(policy.get("DefaultSeedWorkRepoRoot", "") or ""),
+        )
+        store["effective_preview_var"].set(
+            self._pair_policy_build_preview_text(
+                pair_id=pair_id,
+                policy=policy,
+                route_snapshot=route_snapshot,
+                warnings=warnings,
+            )
+            )
+        self._sync_pair_policy_effective_preview_widget(pair_id)
+        self.pair_policy_editor_status_var.set(f"{pair_id} 실효값 미리보기 갱신 완료 / warnings={len(warnings)}")
+        self._refresh_pair_policy_parallel_status_board()
+        self.refresh_seed_kickoff_composer()
+
+    def preview_all_pair_policy_effective(self) -> None:
+        config_path = self.config_path_var.get().strip()
+        if not config_path:
+            messagebox.showwarning("ConfigPath 없음", "ConfigPath를 먼저 확인하세요.")
+            return
+        try:
+            document = self.message_config_service.load_config_document(config_path)
+            active_pair_ids = self._pair_policy_configured_pair_ids(document)
+            for current_pair_id in active_pair_ids:
+                self._apply_pair_policy_card_values_to_document(document, current_pair_id)
+        except Exception as exc:
+            messagebox.showwarning("pair 설정 검증 실패", str(exc))
+            self.pair_policy_editor_status_var.set(f"pair 설정 검증 실패: {exc}")
+            return
+        try:
+            payload = self.message_config_service.render_effective_preview(
+                document,
+                config_path=config_path,
+                run_root=self._draft_message_preview_run_root(),
+                pair_id="",
+                target_id="",
+                mode="both",
+            )
+        except Exception as exc:
+            messagebox.showerror("전체 실효값 미리보기 실패", str(exc))
+            self.pair_policy_editor_status_var.set(f"전체 pair 실효값 미리보기 실패: {exc}")
+            return
+        warnings = [str(item) for item in list(payload.get("Warnings", []) or [])]
+        rows = list(payload.get("PreviewRows", []) or [])
+        ok_count = 0
+        shared_count = 0
+        check_count = 0
+        for current_pair_id in active_pair_ids:
+            policy = self.message_config_service.effective_pair_policy(document, current_pair_id)
+            self._apply_pair_policy_source_feedback(pair_id=current_pair_id, policy=policy)
+            pair_rows = [row for row in rows if str(row.get("PairId", "") or "").strip() == current_pair_id]
+            route_snapshot = self._pair_policy_card_preview_route_snapshot(
+                rows=pair_rows,
+                pair_id=current_pair_id,
+                pair_work_repo_root=str(policy.get("DefaultSeedWorkRepoRoot", "") or ""),
+            )
+            self._apply_pair_policy_route_feedback(
+                pair_id=current_pair_id,
+                route_snapshot=route_snapshot,
+                pair_work_repo_root=str(policy.get("DefaultSeedWorkRepoRoot", "") or ""),
+            )
+            store = self._pair_policy_card_store(current_pair_id)
+            store["effective_preview_var"].set(
+                self._pair_policy_build_preview_text(
+                    pair_id=current_pair_id,
+                    policy=policy,
+                    route_snapshot=route_snapshot,
+                    warnings=warnings,
+                )
+            )
+            self._sync_pair_policy_effective_preview_widget(current_pair_id)
+            badge_text = str(store["route_badge_var"].get() or "")
+            if badge_text == "ROUTE OK":
+                ok_count += 1
+            elif badge_text == "SHARED REPO OK":
+                shared_count += 1
+            else:
+                check_count += 1
+        self.pair_policy_editor_status_var.set(
+            "전체 pair 실효값 갱신 완료 / active={0} / ok={1} / shared={2} / check={3} / warnings={4}".format(
+                len(active_pair_ids),
+                ok_count,
+                shared_count,
+                check_count,
+                len(warnings),
+            )
+        )
+        self._refresh_pair_policy_parallel_status_board()
+        self.refresh_seed_kickoff_composer()
+
+    def copy_pair_route_matrix(self) -> None:
+        payload = self._pair_route_matrix_payload()
+        text = self._pair_route_matrix_text(payload)
+        self._copy_to_clipboard(text)
+        self.set_text(self.output_text, f"pair route matrix 복사 완료:\n\n{text}")
+        self.pair_policy_editor_status_var.set("pair route matrix를 클립보드로 복사했습니다.")
+
+    def copy_pair_policy_effective_preview(self, pair_id: str) -> None:
+        store = self._pair_policy_card_store(pair_id)
+        text = str(store["effective_preview_var"].get() or "").strip()
+        if not text:
+            messagebox.showwarning("실효값 없음", f"{pair_id} 실효값이 아직 없습니다. 먼저 '실효값' 또는 '전체 실효값'을 실행하세요.")
+            return
+        self._copy_to_clipboard(text)
+        self.set_text(self.output_text, f"{pair_id} 실효값 복사 완료:\n\n{text}")
+        self.pair_policy_editor_status_var.set(f"{pair_id} 실효값을 클립보드로 복사했습니다.")
+
+    def save_pair_route_matrix_json(self) -> None:
+        payload = self._pair_route_matrix_payload()
+        initialdir = ROOT / "_tmp"
+        initialdir.mkdir(exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        selected = filedialog.asksaveasfilename(
+            title="pair route matrix JSON 저장",
+            initialdir=str(initialdir),
+            initialfile=f"pair-route-matrix.{timestamp}.json",
+            defaultextension=".json",
+            filetypes=[("JSON", "*.json"), ("All files", "*.*")],
+        )
+        if not selected:
+            return
+        Path(selected).write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        self.set_text(self.output_text, f"pair route matrix JSON 저장 완료:\n{selected}")
+        self.pair_policy_editor_status_var.set(f"pair route matrix JSON 저장 완료: {selected}")
+        messagebox.showinfo("저장 완료", selected)
+
+    def save_pair_policy_editor(self) -> None:
+        if self._message_editor_has_unsaved_changes():
+            messagebox.showwarning("저장 차단", "Initial/Handoff 문구 편집에 미저장 변경이 있습니다. 먼저 저장하거나 취소한 뒤 pair 설정을 저장하세요.")
+            self.pair_policy_editor_status_var.set("pair 설정 저장 차단: 문구 편집 미저장 변경이 있습니다.")
+            return
+        config_path = self.config_path_var.get().strip()
+        if not config_path:
+            messagebox.showwarning("ConfigPath 없음", "ConfigPath를 먼저 확인하세요.")
+            return
+        try:
+            document = self.message_config_service.load_config_document(config_path)
+            known_pair_ids = self._pair_policy_known_pair_ids(document=document)
+            previous_repo_roots = {
+                pair_id: str(self.message_config_service.effective_pair_policy(document, pair_id).get("DefaultSeedWorkRepoRoot", "") or "").strip()
+                for pair_id in known_pair_ids
+            }
+            for pair_id in known_pair_ids:
+                self._apply_pair_policy_card_values_to_document(document, pair_id)
+            changed_repo_pairs = [
+                pair_id
+                for pair_id in known_pair_ids
+                if str(self.message_config_service.effective_pair_policy(document, pair_id).get("DefaultSeedWorkRepoRoot", "") or "").strip()
+                != previous_repo_roots.get(pair_id, "")
+            ]
+            backup_path = self.message_config_service.save_document(config_path, document)
+        except Exception as exc:
+            messagebox.showerror("pair 설정 저장 실패", str(exc))
+            self.pair_policy_editor_status_var.set(f"pair 설정 저장 실패: {exc}")
+            return
+        cleared_run_root = False
+        if changed_repo_pairs and self.run_root_var.get().strip():
+            self.run_root_var.set("")
+            cleared_run_root = True
+        status_message = f"pair 설정 저장 완료 / 백업: {backup_path}"
+        if changed_repo_pairs:
+            status_message += " / repo 변경: " + ", ".join(changed_repo_pairs)
+        if cleared_run_root:
+            status_message += " / old RunRoot override 자동 비움"
+        self.load_message_editor_document()
+        self.load_effective_config()
+        applied_lines: list[str] = []
+        for pair_id in changed_repo_pairs or known_pair_ids[:1]:
+            policy = self.message_config_service.effective_pair_policy(self.message_config_doc or {}, pair_id)
+            route_snapshot = self._build_pair_route_snapshot(pair_id)
+            applied_lines.append(
+                "- {pair}: repo-source={source} / repo={repo} / next-runroot={runroot} / top-outbox={outbox}".format(
+                    pair=pair_id,
+                    source=policy.get("DefaultSeedWorkRepoRootSource", "") or "unset",
+                    repo=policy.get("DefaultSeedWorkRepoRoot", "") or "(없음)",
+                    runroot=route_snapshot.get("PairRunRoot", "") or "(미리보기 없음)",
+                    outbox=route_snapshot.get("TopSourceOutboxPath", "") or "(없음)",
+                )
+            )
+        if applied_lines:
+            status_message += "\n적용 확인:\n" + "\n".join(applied_lines)
+        self.pair_policy_editor_status_var.set(status_message)
+
+    def _pair_policy_card_matches_loaded_policy(self, pair_id: str) -> bool:
+        document = self.message_config_doc or {}
+        if not isinstance(document, dict) or not document:
+            return False
+        try:
+            policy = self.message_config_service.effective_pair_policy(document, pair_id)
+        except Exception:
+            return False
+        store = self._pair_policy_card_store(pair_id)
+        expected_repo_root = str(policy.get("DefaultSeedWorkRepoRoot", "") or "").strip()
+        expected_seed_target = str(policy.get("DefaultSeedTargetId", "") or "").strip()
+        expected_roundtrip = str(int(policy.get("DefaultPairMaxRoundtripCount", 0) or 0))
+        return (
+            str(store["repo_root_var"].get() or "").strip() == expected_repo_root
+            and str(store["seed_target_var"].get() or "").strip() == expected_seed_target
+            and str(store["roundtrip_var"].get() or "").strip() == expected_roundtrip
+            and bool(store["external_run_root_var"].get()) == bool(policy.get("UseExternalWorkRepoRunRoot", False))
+            and bool(store["external_contract_var"].get()) == bool(policy.get("UseExternalWorkRepoContractPaths", False))
+        )
+
+    def _seed_kickoff_known_pair_ids(self, document: dict | None = None) -> list[str]:
+        active = self._pair_policy_known_pair_ids(document=document or self.message_config_doc or {})
+        return [pair_id for pair_id in PAIR_ID_OPTIONS if pair_id in active]
+
+    def _seed_kickoff_target_ids(self, document: dict, pair_id: str) -> list[str]:
+        pair_definition = self.message_config_service.pair_definition_map(document).get(pair_id, {})
+        return [
+            item
+            for item in [
+                str(pair_definition.get("TopTargetId", "") or "").strip(),
+                str(pair_definition.get("BottomTargetId", "") or "").strip(),
+            ]
+            if item
+        ]
+
+    def _seed_kickoff_task_text_value(self) -> str:
+        widget = getattr(self, "seed_kickoff_task_text", None)
+        if widget is None:
+            return ""
+        try:
+            return str(widget.get("1.0", "end-1c") or "").strip()
+        except Exception:
+            return ""
+
+    def _seed_kickoff_role_for_target(self, document: dict, pair_id: str, target_id: str) -> str:
+        pair_definition = self.message_config_service.pair_definition_map(document).get(pair_id, {})
+        top_target_id = str(pair_definition.get("TopTargetId", "") or "").strip()
+        bottom_target_id = str(pair_definition.get("BottomTargetId", "") or "").strip()
+        normalized_target_id = str(target_id or "").strip()
+        if normalized_target_id and normalized_target_id == top_target_id:
+            return "top"
+        if normalized_target_id and normalized_target_id == bottom_target_id:
+            return "bottom"
+        return ""
+
+    def _seed_kickoff_queue_text(self, *, task_text: str, review_input_path: str) -> str:
+        lines: list[str] = []
+        if task_text:
+            lines.extend(["[초기 실행 작업 설명]", task_text])
+        if review_input_path:
+            if lines:
+                lines.append("")
+            lines.extend(
+                [
+                    "[추가 입력 파일]",
+                    "- 아래 파일을 먼저 확인하고 작업에 반영하세요.",
+                    review_input_path,
+                ]
+            )
+        return "\n".join(lines).strip()
+
+    def _seed_kickoff_contract_block(
+        self,
+        *,
+        pair_id: str,
+        target_id: str,
+        role_name: str,
+        work_repo_root: str,
+        next_run_root_preview: str,
+        pair_run_root: str,
+        pair_target_folder: str,
+        source_summary_path: str,
+        source_review_zip_path: str,
+        publish_ready_path: str,
+        review_input_path: str,
+    ) -> str:
+        lines = [
+            "[자동 계약 / 경로]",
+            f"- pair: {pair_id}",
+            f"- target: {target_id or '(없음)'}",
+            f"- role: {role_name or '(미확인)'}",
+            f"- work repo: {work_repo_root or '(없음)'}",
+            f"- next runroot preview: {next_run_root_preview or '(없음)'}",
+            f"- pair runroot: {pair_run_root or '(없음)'}",
+            f"- 내 작업 폴더: {pair_target_folder or '(없음)'}",
+        ]
+        if review_input_path:
+            lines.append(f"- 입력 파일: {review_input_path}")
+        lines.extend(
+            [
+                "",
+                "[반드시 생성해야 할 파일]",
+                f"summary.txt: {source_summary_path or '(없음)'}",
+                f"review.zip: {source_review_zip_path or '(없음)'}",
+                f"publish.ready.json: {publish_ready_path or '(없음)'}",
+                "",
+                "반드시 summary.txt와 review.zip을 먼저 만들고, 마지막에만 publish.ready.json을 생성하세요.",
+            ]
+        )
+        return "\n".join(lines)
+
+    def _seed_kickoff_helper_block(
+        self,
+        *,
+        check_cmd_path: str,
+        check_script_path: str,
+        submit_cmd_path: str,
+        submit_script_path: str,
+        publish_cmd_path: str,
+        publish_script_path: str,
+    ) -> str:
+        return "\n".join(
+            [
+                "[helper / wrapper]",
+                f"- check: {check_cmd_path or '(없음)'}",
+                f"- check script: {check_script_path or '(없음)'}",
+                f"- submit: {submit_cmd_path or '(없음)'}",
+                f"- submit script: {submit_script_path or '(없음)'}",
+                f"- publish: {publish_cmd_path or '(없음)'}",
+                f"- publish script: {publish_script_path or '(없음)'}",
+            ]
+        )
+
+    def _seed_kickoff_full_preview_text(
+        self,
+        *,
+        queue_text: str,
+        contract_text: str,
+        helper_text: str,
+        repo_source: str,
+        route_badge: str,
+    ) -> str:
+        queue_block = queue_text or "(입력된 작업 설명 없음)"
+        return "\n".join(
+            [
+                "[초기 실행 입력 합성 미리보기]",
+                f"repo-source={repo_source or 'unset'} / route={route_badge or '(미확인)'}",
+                "",
+                queue_block,
+                "",
+                contract_text,
+                "",
+                helper_text,
+                "",
+                "[시작 방법]",
+                "- 수동 시작: '수동 시작문 복사'로 전체 문구를 복사해 대상 PowerShell/셀 창에 직접 붙여넣습니다.",
+                "- 이후 대상이 summary.txt / review.zip / publish.ready.json 을 생성하면 watcher가 다음 단계부터 자동 진행합니다.",
+                "",
+                "[queue 등록 동작]",
+                "- '초기 입력 큐잉'은 위 작업 설명 블록만 1회성 queue에 등록합니다.",
+                "- 경로/파일 계약/helper 안내는 시스템이 seed/handoff scaffold로 별도 자동 추가합니다.",
+            ]
+        )
+
+    def _seed_kickoff_manual_start_text(
+        self,
+        *,
+        task_text: str,
+        review_input_path: str,
+        source_summary_path: str,
+        source_review_zip_path: str,
+        publish_ready_path: str,
+    ) -> str:
+        lines: list[str] = []
+        normalized_task = str(task_text or "").strip()
+        normalized_input = str(review_input_path or "").strip()
+        if normalized_task:
+            lines.extend(["[작업 내용]", normalized_task, ""])
+        if normalized_input:
+            lines.extend(["[먼저 확인할 입력 파일]", normalized_input, ""])
+        lines.extend(
+            [
+                "[생성해야 할 파일]",
+                f"1. summary.txt -> {source_summary_path or '(없음)'}",
+                f"2. review.zip -> {source_review_zip_path or '(없음)'}",
+                f"3. publish.ready.json -> {publish_ready_path or '(없음)'}",
+                "",
+                "[규칙]",
+                "- summary.txt와 review.zip을 먼저 생성하세요.",
+                "- publish.ready.json은 마지막에만 생성하세요.",
+                "- 최종 산출물은 위 경로 외 다른 위치에 두지 마세요.",
+            ]
+        )
+        return "\n".join(lines).strip()
+
+    def _seed_kickoff_target_banner_text(self, *, pair_id: str, target_id: str) -> str:
+        return f"붙여넣기 대상: {pair_id or '(pair 없음)'} / {target_id or '(target 없음)'} 실제 셀 창"
+
+    def _seed_kickoff_readiness_text(self, payload: dict[str, object] | None = None) -> str:
+        pair_id = str(self.seed_kickoff_pair_var.get() or "").strip() or "(pair 없음)"
+        target_id = str(self.seed_kickoff_target_var.get() or "").strip() or "(target 없음)"
+        route_badge = ""
+        repo_source = ""
+        if payload is not None:
+            route_badge = str(payload.get("RouteBadge", "") or "").strip()
+            repo_source = str((dict(payload.get("Policy", {}) or {})).get("DefaultSeedWorkRepoRootSource", "") or "").strip()
+        elif pair_id in self.pair_policy_card_vars:
+            store = self._pair_policy_card_store(pair_id)
+            route_badge = str(store["route_badge_var"].get() or "").strip()
+            repo_source = str(store["repo_source_badge_var"].get() or "").strip()
+
+        if self._message_editor_has_unsaved_changes():
+            return "차단: Initial/Handoff 미저장 변경"
+        if pair_id in self.pair_policy_card_vars and not self._pair_policy_card_matches_loaded_policy(pair_id):
+            return "차단: pair 카드 미저장"
+        if not target_id or target_id == "(target 없음)":
+            return "차단: SeedTarget 선택 필요"
+        if route_badge and route_badge not in {"ROUTE OK", "SHARED REPO OK"}:
+            return f"차단: route 비정상 ({route_badge})"
+        if payload is not None:
+            row = dict(payload.get("PreviewRow", {}) or {})
+            required_paths = [
+                str(row.get("SourceSummaryPath", "") or "").strip(),
+                str(row.get("SourceReviewZipPath", "") or "").strip(),
+                str(row.get("PublishReadyPath", "") or "").strip(),
+            ]
+            if any(not item for item in required_paths):
+                return "차단: 경로 계산 실패"
+        task_text = self._seed_kickoff_task_text_value()
+        review_input_path = str(self.seed_kickoff_review_input_var.get() or "").strip()
+        if not task_text and not review_input_path:
+            return "차단: 작업 설명 또는 입력 파일 필요"
+        readiness_tail = []
+        if repo_source:
+            readiness_tail.append(f"repo={repo_source}")
+        if route_badge:
+            readiness_tail.append(f"route={route_badge}")
+        tail = f" ({' / '.join(readiness_tail)})" if readiness_tail else ""
+        return f"준비됨: 시작문 복사 또는 초기 입력 큐잉 가능{tail}"
+
+    def _apply_seed_kickoff_detail_visibility(self) -> None:
+        visible = bool(self.seed_kickoff_detail_visible_var.get())
+        input_columns = self.__dict__.get("seed_kickoff_input_columns_frame")
+        detail_column = self.__dict__.get("seed_kickoff_detail_column_frame")
+        preview_stack = self.__dict__.get("seed_kickoff_preview_stack_frame")
+        preview_detail = self.__dict__.get("seed_kickoff_preview_detail_frame")
+        detail_actions = self.__dict__.get("seed_kickoff_detail_actions_frame")
+        if input_columns is not None:
+            try:
+                input_columns.columnconfigure(1, weight=1 if visible else 0)
+            except Exception:
+                pass
+        if detail_column is not None:
+            if visible:
+                detail_column.grid()
+            else:
+                detail_column.grid_remove()
+        if preview_stack is not None:
+            if visible:
+                preview_stack.grid()
+            else:
+                preview_stack.grid_remove()
+        if preview_detail is not None:
+            if visible:
+                preview_detail.grid()
+            else:
+                preview_detail.grid_remove()
+        if detail_actions is not None:
+            if visible:
+                detail_actions.grid()
+            else:
+                detail_actions.grid_remove()
+
+    def _sync_seed_kickoff_with_action_context(self) -> None:
+        if not self._has_ui_attr("seed_kickoff_pair_var"):
+            return
+        pair_id = self._selected_pair_id()
+        if not pair_id:
+            return
+        target_id = self.target_id_var.get().strip() or self._resolve_top_target_for_pair(pair_id)
+        self.seed_kickoff_pair_var.set(pair_id)
+        if target_id:
+            self.seed_kickoff_target_var.set(target_id)
+        self.refresh_seed_kickoff_composer()
+
+    def _artifact_home_browse_pair_scope_enabled(self) -> bool:
+        browse_var = self.__dict__.get("artifact_home_browse_pair_filter_var")
+        return bool(browse_var is not None and hasattr(browse_var, "get") and browse_var.get())
+
+    def _artifact_home_browse_target_scope_enabled(self) -> bool:
+        browse_var = self.__dict__.get("artifact_home_browse_target_filter_var")
+        return bool(browse_var is not None and hasattr(browse_var, "get") and browse_var.get())
+
+    def _selected_artifact_browse_pair_id(self) -> str:
+        home_pair = self._selected_home_pair_selection() if self._has_ui_attr("home_pair_tree") else ""
+        if home_pair:
+            return home_pair
+        return self._selected_pair_id()
+
+    def _selected_artifact_browse_target_id(self) -> str:
+        browse_pair = self._selected_artifact_browse_pair_id()
+        if not browse_pair:
+            return ""
+        inspection_target = self._selected_inspection_target_id()
+        if inspection_target:
+            preview_row = self._preview_row_for_target(inspection_target)
+            if preview_row is not None and str(preview_row.get("PairId", "") or "").strip() == browse_pair:
+                return inspection_target
+        action_target = self.target_id_var.get().strip()
+        if action_target:
+            preview_row = self._preview_row_for_target(action_target)
+            if preview_row is not None and str(preview_row.get("PairId", "") or "").strip() == browse_pair:
+                return action_target
+        selected_state = self._selected_artifact_state() if self._has_ui_attr("artifact_tree") else None
+        if selected_state is not None and str(selected_state.pair_id or "").strip() == browse_pair:
+            return str(selected_state.target_id or "").strip()
+        return self._resolve_top_target_for_pair(browse_pair)
+
+    def _update_artifact_home_browse_toggle_label(self) -> None:
+        label_var = self.__dict__.get("artifact_home_browse_toggle_var")
+        if label_var is None or not hasattr(label_var, "set"):
+            return
+        if self._artifact_home_browse_pair_scope_enabled():
+            pair_id = self._selected_artifact_browse_pair_id() or "(미선택)"
+            label_var.set(f"Home Pair 고정 해제 ({pair_id})")
+        else:
+            label_var.set("Home Pair만 보기")
+        target_label_var = self.__dict__.get("artifact_home_browse_target_toggle_var")
+        if target_label_var is None or not hasattr(target_label_var, "set"):
+            return
+        if self._artifact_home_browse_target_scope_enabled():
+            target_id = self._selected_artifact_browse_target_id() or "(target 없음)"
+            target_label_var.set(f"target 고정 해제 ({target_id})")
+        else:
+            target_label_var.set("보고 target 따라가기")
+
+    def _sync_artifact_filters_with_home_pair_selection(self, *, refresh: bool = True) -> None:
+        if not self._has_ui_attr("artifact_pair_filter_var"):
+            return
+        pair_id = self._selected_artifact_browse_pair_id()
+        self.artifact_pair_filter_var.set(pair_id)
+        target_id = self._selected_artifact_browse_target_id() if self._artifact_home_browse_target_scope_enabled() else ""
+        self.artifact_target_filter_var.set(target_id)
+        self._update_artifact_home_browse_toggle_label()
+        if refresh and self._has_ui_attr("artifact_tree"):
+            self.refresh_artifacts_tab()
+
+    def _disable_artifact_home_browse_pair_scope(self, *, restore_saved_filters: bool = False) -> None:
+        browse_var = self.__dict__.get("artifact_home_browse_pair_filter_var")
+        if browse_var is not None and hasattr(browse_var, "set"):
+            browse_var.set(False)
+        target_browse_var = self.__dict__.get("artifact_home_browse_target_filter_var")
+        if target_browse_var is not None and hasattr(target_browse_var, "set"):
+            target_browse_var.set(False)
+        if restore_saved_filters and self._has_ui_attr("artifact_pair_filter_var"):
+            saved_filters = self.__dict__.get("_artifact_manual_filters_before_browse")
+            if isinstance(saved_filters, tuple) and len(saved_filters) == 2:
+                self.artifact_pair_filter_var.set(str(saved_filters[0] or ""))
+                self.artifact_target_filter_var.set(str(saved_filters[1] or ""))
+        self.__dict__["_artifact_manual_filters_before_browse"] = None
+        self._update_artifact_home_browse_toggle_label()
+
+    def _sync_artifact_filters_with_action_context(self, *, include_target: bool = True, refresh: bool = True) -> None:
+        if not self._has_ui_attr("artifact_pair_filter_var"):
+            return
+        if self._artifact_home_browse_pair_scope_enabled():
+            self._sync_artifact_filters_with_home_pair_selection(refresh=refresh)
+            return
+        self.artifact_pair_filter_var.set(self._selected_pair_id())
+        target_id = self.target_id_var.get().strip() if include_target else ""
+        self.artifact_target_filter_var.set(target_id)
+        if refresh and self._has_ui_attr("artifact_tree"):
+            self.refresh_artifacts_tab()
+
+    def _sync_pair_scoped_views_with_action_context(self, *, refresh_artifacts: bool = True) -> None:
+        self._sync_seed_kickoff_with_action_context()
+        self._sync_artifact_filters_with_action_context(include_target=True, refresh=refresh_artifacts)
+
+    def sync_artifact_filters_to_action_context(self) -> None:
+        self._disable_artifact_home_browse_pair_scope(restore_saved_filters=False)
+        self._sync_artifact_filters_with_action_context(include_target=True, refresh=True)
+        self.set_query_result(
+            "마지막 조회: 현재 실행 Pair/Target 기준으로 결과 필터를 맞췄습니다.",
+            context=self._artifact_query_context_summary(),
+        )
+
+    def toggle_artifact_home_target_scope(self) -> None:
+        if not self._has_ui_attr("artifact_pair_filter_var"):
+            return
+        target_browse_var = self.__dict__.get("artifact_home_browse_target_filter_var")
+        if target_browse_var is None or not hasattr(target_browse_var, "set") or not hasattr(target_browse_var, "get"):
+            return
+        if bool(target_browse_var.get()):
+            target_browse_var.set(False)
+            self._sync_artifact_filters_with_home_pair_selection(refresh=True)
+            self.set_query_result(
+                "마지막 조회: browse target 고정을 해제했습니다.",
+                context=self._artifact_query_context_summary(),
+            )
+            return
+        if not self._artifact_home_browse_pair_scope_enabled():
+            self.__dict__["_artifact_manual_filters_before_browse"] = (
+                self.artifact_pair_filter_var.get().strip(),
+                self.artifact_target_filter_var.get().strip(),
+            )
+            browse_var = self.__dict__.get("artifact_home_browse_pair_filter_var")
+            if browse_var is not None and hasattr(browse_var, "set"):
+                browse_var.set(True)
+        target_browse_var.set(True)
+        self._sync_artifact_filters_with_home_pair_selection(refresh=True)
+        self.set_query_result(
+            "마지막 조회: Home Pair와 현재 보고 target 기준으로 결과 필터를 맞췄습니다.",
+            context=self._artifact_query_context_summary(),
+        )
+
+    def toggle_artifact_home_pair_scope(self) -> None:
+        if not self._has_ui_attr("artifact_pair_filter_var"):
+            return
+        browse_var = self.__dict__.get("artifact_home_browse_pair_filter_var")
+        if browse_var is None or not hasattr(browse_var, "set") or not hasattr(browse_var, "get"):
+            return
+        if bool(browse_var.get()):
+            self._disable_artifact_home_browse_pair_scope(restore_saved_filters=True)
+            if self._has_ui_attr("artifact_tree"):
+                self.refresh_artifacts_tab()
+            self.set_query_result(
+                "마지막 조회: Home Pair 고정 결과 필터를 해제했습니다.",
+                context=self._artifact_query_context_summary(),
+            )
+            return
+        self.__dict__["_artifact_manual_filters_before_browse"] = (
+            self.artifact_pair_filter_var.get().strip(),
+            self.artifact_target_filter_var.get().strip(),
+        )
+        browse_var.set(True)
+        self._sync_artifact_filters_with_home_pair_selection(refresh=True)
+        self.set_query_result(
+            "마지막 조회: Home에서 보고 있는 Pair 기준으로 결과 필터를 고정했습니다.",
+            context=self._artifact_query_context_summary(),
+        )
+
+    def clear_artifact_filters(self) -> None:
+        if not self._has_ui_attr("artifact_pair_filter_var"):
+            return
+        self._disable_artifact_home_browse_pair_scope(restore_saved_filters=False)
+        self.artifact_pair_filter_var.set("")
+        self.artifact_target_filter_var.set("")
+        if self._has_ui_attr("artifact_tree"):
+            self.refresh_artifacts_tab()
+
+    def _apply_artifact_tree_highlights(self) -> None:
+        tree = self.__dict__.get("artifact_tree")
+        if tree is None:
+            return
+        get_children = getattr(tree, "get_children", None)
+        item_method = getattr(tree, "item", None)
+        tag_configure_method = getattr(tree, "tag_configure", None)
+        if get_children is None or item_method is None:
+            return
+        action_pair = self._selected_pair_id()
+        action_target = self.target_id_var.get().strip()
+        inspection_target = self._selected_inspection_target_id()
+        browse_pair = self._selected_home_pair_selection() if self._has_ui_attr("home_pair_tree") else ""
+        if callable(tag_configure_method):
+            try:
+                tag_configure_method("artifact_action_pair", background="#DCFCE7", foreground="#111827")
+                tag_configure_method("artifact_action_target", background="#DBEAFE", foreground="#111827")
+                tag_configure_method("artifact_inspection_target", background="#FEF3C7", foreground="#111827")
+                tag_configure_method("artifact_browse_pair", background="#F3E8FF", foreground="#111827")
+            except Exception:
+                pass
+        target_to_pair = {state.target_id: state.pair_id for state in list(self.__dict__.get("artifact_states", []) or [])}
+        for item_id in get_children():
+            iid = str(item_id)
+            tags: list[str] = []
+            row_pair = target_to_pair.get(iid, "")
+            if iid == action_target:
+                tags.append("artifact_action_target")
+            elif inspection_target and iid == inspection_target:
+                tags.append("artifact_inspection_target")
+            elif browse_pair and browse_pair != action_pair and row_pair == browse_pair:
+                tags.append("artifact_browse_pair")
+            elif action_pair and row_pair == action_pair:
+                tags.append("artifact_action_pair")
+            try:
+                item_method(iid, tags=tuple(tags))
+            except Exception:
+                pass
+
+    @staticmethod
+    def _highlighted_button_text(base_text: str, *, active: bool) -> str:
+        text = str(base_text or "").strip()
+        if not text:
+            return text
+        return f"권장: {text}" if active else text
+
+    def _refresh_visible_next_action_highlights(self, visible_state: VisibleAcceptanceState | None = None) -> None:
+        state = visible_state
+        if state is None:
+            try:
+                state = self._build_visible_acceptance_state()
+            except Exception:
+                state = None
+        next_action_key = str(getattr(state, "next_action_key", "") or "").strip() if state is not None else ""
+        visible_button_specs = {
+            "visible_cleanup_dry": ("visible_cleanup_dry_button", "cleanup 미리보기"),
+            "visible_cleanup_apply": ("visible_cleanup_apply_button", "cleanup 적용"),
+            "visible_preflight": ("visible_preflight_button", "입력 전 점검"),
+            "visible_post_cleanup": ("visible_post_cleanup_button", "post-cleanup"),
+            "visible_clean_preflight": ("visible_clean_preflight_button", "clean preflight 재확인"),
+            "visible_active_acceptance": ("visible_active_acceptance_button", "실제 acceptance 실행"),
+            "visible_confirm": ("visible_confirm_button", "shared confirm"),
+            "visible_receipt_confirm": ("visible_receipt_confirm_button", "receipt 확인"),
+        }
+        for action_key, (attr_name, base_text) in visible_button_specs.items():
+            button = self.__dict__.get(attr_name)
+            if button is None:
+                continue
+            try:
+                button.configure(text=self._highlighted_button_text(base_text, active=(action_key == next_action_key)))
+            except Exception:
+                pass
+
+    @staticmethod
+    def _visible_primitive_button_labels() -> dict[str, str]:
+        return {
+            "visible_primitive_reuse": "공식 8창 재사용",
+            "visible_primitive_visibility": "typed-window 입력 점검",
+            "visible_primitive_partner": "상대 target 선택",
+            "visible_primitive_preview_refresh": "편집본 preview 갱신",
+            "visible_primitive_save": "고정문구 저장 + 새로고침",
+            "visible_primitive_export": "선택 target preview 저장",
+            "visible_primitive_submit": "선택 target 1회 submit",
+            "visible_primitive_publish": "publish 확인",
+            "visible_primitive_handoff": "handoff 확인",
+        }
+
+    def _refresh_visible_primitive_next_action_highlights(self, *, next_action_key: str = "") -> None:
+        labels = self._visible_primitive_button_labels()
+        button_specs = {
+            "visible_primitive_reuse": "visible_primitive_reuse_button",
+            "visible_primitive_visibility": "visible_primitive_visibility_button",
+            "visible_primitive_partner": "visible_primitive_partner_button",
+            "visible_primitive_preview_refresh": "visible_primitive_preview_refresh_button",
+            "visible_primitive_save": "visible_primitive_save_button",
+            "visible_primitive_export": "visible_primitive_export_button",
+            "visible_primitive_submit": "visible_primitive_submit_button",
+            "visible_primitive_publish": "visible_primitive_publish_button",
+            "visible_primitive_handoff": "visible_primitive_handoff_button",
+        }
+        normalized_next_action = str(next_action_key or "").strip()
+        self.__dict__["_visible_primitive_next_action_key"] = normalized_next_action
+        for action_key, attr_name in button_specs.items():
+            button = self.__dict__.get(attr_name)
+            if button is None:
+                continue
+            try:
+                button.configure(
+                    text=self._highlighted_button_text(
+                        labels.get(action_key, ""),
+                        active=(action_key == normalized_next_action),
+                    )
+                )
+            except Exception:
+                pass
+
+    def _set_visible_primitive_stage(
+        self,
+        *,
+        badge_text: str,
+        detail_text: str,
+        background: str = "#6B7280",
+        foreground: str = "#FFFFFF",
+    ) -> None:
+        badge_var = self.__dict__.get("visible_primitive_stage_badge_var")
+        if badge_var is not None and hasattr(badge_var, "set"):
+            badge_var.set(str(badge_text or ""))
+        detail_var = self.__dict__.get("visible_primitive_stage_detail_var")
+        if detail_var is not None and hasattr(detail_var, "set"):
+            detail_var.set(str(detail_text or ""))
+        badge_label = self.__dict__.get("visible_primitive_stage_badge_label")
+        if badge_label is not None:
+            try:
+                badge_label.configure(
+                    text=str(badge_text or ""),
+                    bg=str(background or "#6B7280"),
+                    fg=str(foreground or "#FFFFFF"),
+                )
+            except Exception:
+                pass
+
+    @staticmethod
+    def _normalize_visible_primitive_stage_detail(detail: str, *, category: str = "") -> str:
+        text = " ".join(str(detail or "").strip().split())
+        if not text:
+            return ""
+        normalized_category = str(category or "").strip().lower()
+        lowered = text.lower()
+        if normalized_category == "visibility":
+            if "no-visible-window" in lowered:
+                return "공식 8창을 찾지 못했습니다. 창 재사용 후 입력 점검을 다시 실행하세요."
+            if "submit-unconfirmed" in lowered:
+                return "submit 뒤 진행 신호가 확인되지 않았습니다. typed-window 상태와 publish 확인을 다시 보세요."
+            if "focus" in lowered and ("stolen" in lowered or "lost" in lowered):
+                return "포커스가 유지되지 않았습니다. 대상 창을 다시 전면에 두고 입력 점검을 다시 하세요."
+            if "typed-window" in lowered or "inject" in lowered:
+                return "typed-window 입력 가능 여부와 submit guard를 먼저 다시 확인하세요."
+            return f"입력 점검 차단: {text}"
+        if normalized_category == "scope":
+            if "partial reuse" in lowered:
+                return "현재 세션 재사용 범위 밖 pair입니다. 실행 pair나 창 구성을 다시 맞추세요."
+            if "비활성" in text or "disabled" in lowered:
+                return "이 pair는 비활성 상태입니다. 홈에서 pair 상태를 먼저 확인하세요."
+            if "stale" in lowered:
+                return "현재 실행 문맥이 오래된 runroot를 가리킬 수 있습니다. 새 RunRoot를 다시 준비하세요."
+            return f"실행 범위 확인: {text}"
+        if normalized_category == "run_root":
+            if "stale" in lowered:
+                return "현재 RunRoot가 오래됐습니다. 새 RunRoot를 준비하거나 override 입력을 비우세요."
+            if "없" in text or "필요" in text:
+                return "현재 pair 기준 RunRoot를 먼저 준비한 뒤 submit 또는 확인으로 넘어가세요."
+            return f"RunRoot 확인: {text}"
+        return text
+
+    def _refresh_pair_policy_card_focus_highlights(self) -> None:
+        selected_pair = self._selected_pair_id()
+        for pair_id, badge_label in self.__dict__.get("pair_policy_card_focus_badge_labels", {}).items():
+            if badge_label is None:
+                continue
+            try:
+                if pair_id == selected_pair:
+                    badge_label.configure(text="현재 실행 Pair", bg="#1D4ED8", fg="#FFFFFF")
+                    badge_label.grid()
+                else:
+                    badge_label.configure(text="")
+                    badge_label.grid_remove()
+            except Exception:
+                pass
+
+    def _apply_home_pair_tree_highlights(self) -> None:
+        tree = self.__dict__.get("home_pair_tree")
+        if tree is None:
+            return
+        self._update_artifact_home_browse_toggle_label()
+        get_children = getattr(tree, "get_children", None)
+        item_method = getattr(tree, "item", None)
+        tag_configure_method = getattr(tree, "tag_configure", None)
+        if get_children is None or item_method is None:
+            return
+        action_pair = self._selected_pair_id()
+        browse_pair = self._selected_home_pair_selection() if self._has_ui_attr("home_pair_tree") else ""
+        if callable(tag_configure_method):
+            try:
+                tag_configure_method("home_action_pair", background="#DBEAFE", foreground="#111827")
+                tag_configure_method("home_browse_pair", background="#F3E8FF", foreground="#111827")
+            except Exception:
+                pass
+        for item_id in get_children():
+            iid = str(item_id)
+            tags: list[str] = []
+            if action_pair and iid == action_pair:
+                tags.append("home_action_pair")
+            elif browse_pair and iid == browse_pair:
+                tags.append("home_browse_pair")
+            try:
+                item_method(iid, tags=tuple(tags))
+            except Exception:
+                pass
+
+    def _seed_kickoff_start_steps_text(
+        self,
+        *,
+        pair_id: str,
+        target_id: str,
+        repo_source: str,
+        route_badge: str,
+        source_summary_path: str,
+        source_review_zip_path: str,
+        publish_ready_path: str,
+    ) -> str:
+        return "\n".join(
+            [
+                "[권장 시작 순서]",
+                f"1. pair={pair_id} / target={target_id} 설정을 저장하고 repo-source={repo_source or 'unset'} / route={route_badge or '(미확인)'} 상태를 확인합니다.",
+                "2. '실효값' 또는 '미리보기'로 현재 repo/runroot/source-outbox 경로가 기대값과 일치하는지 확인합니다.",
+                "3. '수동 시작문 복사'로 전체 문구를 복사해 대상 PowerShell/셀 창에 직접 붙여넣습니다.",
+                "4. 대상은 아래 3파일을 같은 run 계약 경로에 생성해야 합니다.",
+                f"   - summary.txt: {source_summary_path or '(없음)'}",
+                f"   - review.zip: {source_review_zip_path or '(없음)'}",
+                f"   - publish.ready.json: {publish_ready_path or '(없음)'}",
+                "5. 순서는 summary.txt -> review.zip -> publish.ready.json 이고, publish.ready.json 은 마지막에만 생성합니다.",
+                "6. 위 3파일이 생성되면 watcher가 다음 단계부터 자동으로 handoff를 진행합니다.",
+            ]
+        )
+
+    def _seed_kickoff_preview_payload(self) -> dict[str, object]:
+        config_path = self.config_path_var.get().strip()
+        if not config_path:
+            raise ValueError("ConfigPath를 먼저 확인하세요.")
+        document = self.message_config_service.load_config_document(config_path)
+        known_pair_ids = self._seed_kickoff_known_pair_ids(document)
+        if not known_pair_ids:
+            raise ValueError("구성된 pair가 없어 초기 실행 준비를 만들 수 없습니다.")
+        for current_pair_id in known_pair_ids:
+            self._apply_pair_policy_card_values_to_document(document, current_pair_id)
+
+        requested_pair_id = str(self.seed_kickoff_pair_var.get() or "").strip()
+        pair_id = requested_pair_id if requested_pair_id in known_pair_ids else (self._selected_pair_id() if self._selected_pair_id() in known_pair_ids else known_pair_ids[0])
+        policy = self.message_config_service.effective_pair_policy(document, pair_id)
+        allowed_target_ids = self._seed_kickoff_target_ids(document, pair_id)
+        requested_target_id = str(self.seed_kickoff_target_var.get() or "").strip()
+        default_target_id = str(policy.get("DefaultSeedTargetId", "") or "").strip()
+        target_id = requested_target_id if requested_target_id in allowed_target_ids else (default_target_id if default_target_id in allowed_target_ids else (allowed_target_ids[0] if allowed_target_ids else ""))
+        if not target_id:
+            raise ValueError(f"{pair_id}의 seed target을 결정하지 못했습니다.")
+
+        payload = self.message_config_service.render_effective_preview(
+            document,
+            config_path=config_path,
+            run_root=self._draft_message_preview_run_root(),
+            pair_id=pair_id,
+            target_id=target_id,
+            mode="initial",
+        )
+        preview_rows = [
+            row
+            for row in list(payload.get("PreviewRows", []) or [])
+            if str(row.get("PairId", "") or "").strip() == pair_id
+        ]
+        if not preview_rows:
+            raise ValueError(f"{pair_id} preview row를 찾지 못했습니다.")
+        row = next(
+            (
+                item
+                for item in preview_rows
+                if str(item.get("TargetId", "") or "").strip() == target_id
+            ),
+            preview_rows[0],
+        )
+        target_id = str(row.get("TargetId", "") or target_id).strip()
+        role_name = str(row.get("RoleName", "") or self._seed_kickoff_role_for_target(document, pair_id, target_id)).strip()
+        work_repo_root = str(policy.get("DefaultSeedWorkRepoRoot", "") or row.get("WorkRepoRoot", "") or "").strip()
+        route_snapshot = self._pair_policy_card_preview_route_snapshot(
+            rows=preview_rows,
+            pair_id=pair_id,
+            pair_work_repo_root=work_repo_root,
+        )
+        route_badge = self._pair_policy_route_badge_spec(
+            route_snapshot=route_snapshot,
+            pair_work_repo_root=work_repo_root,
+        )["text"]
+        pair_target_folder = str(
+            row.get("OwnTargetFolder", "")
+            or row.get("PairTargetFolder", "")
+            or ""
+        ).strip()
+        source_summary_path = str(
+            (row.get("OutputFiles", {}) or {}).get("SummaryPath", "")
+            or row.get("SourceSummaryPath", "")
+            or ""
+        ).strip()
+        source_review_zip_path = str(
+            (row.get("OutputFiles", {}) or {}).get("ReviewZipPath", "")
+            or row.get("SourceReviewZipPath", "")
+            or ""
+        ).strip()
+        publish_ready_path = str(
+            (row.get("OutputFiles", {}) or {}).get("PublishReadyPath", "")
+            or row.get("PublishReadyPath", "")
+            or ""
+        ).strip()
+        check_script_path = str(row.get("CheckScriptPath", "") or (str(Path(pair_target_folder) / self._pair_test_file_name("CheckScriptFileName", "check-artifact.ps1")) if pair_target_folder else "")).strip()
+        check_cmd_path = str(row.get("CheckCmdPath", "") or (str(Path(pair_target_folder) / self._pair_test_file_name("CheckCmdFileName", "check-artifact.cmd")) if pair_target_folder else "")).strip()
+        submit_script_path = str(row.get("SubmitScriptPath", "") or (str(Path(pair_target_folder) / self._pair_test_file_name("SubmitScriptFileName", "submit-artifact.ps1")) if pair_target_folder else "")).strip()
+        submit_cmd_path = str(row.get("SubmitCmdPath", "") or (str(Path(pair_target_folder) / self._pair_test_file_name("SubmitCmdFileName", "submit-artifact.cmd")) if pair_target_folder else "")).strip()
+        publish_script_path = str(row.get("PublishScriptPath", "") or (str(Path(pair_target_folder) / self._pair_test_file_name("PublishScriptFileName", "publish-artifact.ps1")) if pair_target_folder else "")).strip()
+        publish_cmd_path = str(row.get("PublishCmdPath", "") or (str(Path(pair_target_folder) / self._pair_test_file_name("PublishCmdFileName", "publish-artifact.cmd")) if pair_target_folder else "")).strip()
+        review_input_path = str(self.seed_kickoff_review_input_var.get() or "").strip()
+        task_text = self._seed_kickoff_task_text_value()
+        queue_text = self._seed_kickoff_queue_text(task_text=task_text, review_input_path=review_input_path)
+        contract_text = self._seed_kickoff_contract_block(
+            pair_id=pair_id,
+            target_id=target_id,
+            role_name=role_name,
+            work_repo_root=work_repo_root,
+            next_run_root_preview=str(((payload.get("RunContext", {}) or {}).get("NextRunRootPreview", "") or "")).strip(),
+            pair_run_root=str(row.get("PairRunRoot", "") or "").strip(),
+            pair_target_folder=pair_target_folder,
+            source_summary_path=source_summary_path,
+            source_review_zip_path=source_review_zip_path,
+            publish_ready_path=publish_ready_path,
+            review_input_path=review_input_path,
+        )
+        helper_text = self._seed_kickoff_helper_block(
+            check_cmd_path=check_cmd_path,
+            check_script_path=check_script_path,
+            submit_cmd_path=submit_cmd_path,
+            submit_script_path=submit_script_path,
+            publish_cmd_path=publish_cmd_path,
+            publish_script_path=publish_script_path,
+        )
+        full_preview_text = self._seed_kickoff_full_preview_text(
+            queue_text=queue_text,
+            contract_text=contract_text,
+            helper_text=helper_text,
+            repo_source=str(policy.get("DefaultSeedWorkRepoRootSource", "") or "unset"),
+            route_badge=route_badge,
+        )
+        manual_start_text = self._seed_kickoff_manual_start_text(
+            task_text=task_text,
+            review_input_path=review_input_path,
+            source_summary_path=source_summary_path,
+            source_review_zip_path=source_review_zip_path,
+            publish_ready_path=publish_ready_path,
+        )
+        start_steps_text = self._seed_kickoff_start_steps_text(
+            pair_id=pair_id,
+            target_id=target_id,
+            repo_source=str(policy.get("DefaultSeedWorkRepoRootSource", "") or "unset"),
+            route_badge=route_badge,
+            source_summary_path=source_summary_path,
+            source_review_zip_path=source_review_zip_path,
+            publish_ready_path=publish_ready_path,
+        )
+        return {
+            "ConfigPath": config_path,
+            "PairId": pair_id,
+            "TargetId": target_id,
+            "RoleName": role_name,
+            "Policy": policy,
+            "RouteSnapshot": route_snapshot,
+            "RouteBadge": route_badge,
+            "PreviewPayload": payload,
+            "PreviewRow": row,
+            "ReviewInputPath": review_input_path,
+            "QueueText": queue_text,
+            "ContractText": contract_text,
+            "HelperText": helper_text,
+            "StartStepsText": start_steps_text,
+            "FullPreviewText": full_preview_text,
+            "ManualStartText": manual_start_text,
+            "Warnings": [str(item) for item in list(payload.get("Warnings", []) or [])],
+        }
+
+    def refresh_seed_kickoff_composer(self) -> None:
+        document = self.message_config_doc or {}
+        known_pair_ids = self._seed_kickoff_known_pair_ids(document)
+        if not known_pair_ids:
+            self.seed_kickoff_status_var.set("초기 실행 준비: 구성된 pair가 없어 사용할 수 없습니다.")
+            self.seed_kickoff_target_banner_var.set("붙여넣기 대상: (미확인)")
+            self.seed_kickoff_readiness_var.set("차단: 구성된 pair 없음")
+            self.seed_kickoff_last_preview = None
+            return
+        current_pair_id = str(self.seed_kickoff_pair_var.get() or "").strip()
+        if current_pair_id not in known_pair_ids:
+            current_pair_id = self._selected_pair_id() if self._selected_pair_id() in known_pair_ids else known_pair_ids[0]
+            self.seed_kickoff_pair_var.set(current_pair_id)
+        pair_target_ids = self._seed_kickoff_target_ids(document, current_pair_id)
+        effective_policy = self.message_config_service.effective_pair_policy(document, current_pair_id)
+        current_target_id = str(self.seed_kickoff_target_var.get() or "").strip()
+        if current_target_id not in pair_target_ids:
+            current_target_id = str(effective_policy.get("DefaultSeedTargetId", "") or "").strip()
+            if current_target_id not in pair_target_ids:
+                current_target_id = pair_target_ids[0] if pair_target_ids else ""
+            self.seed_kickoff_target_var.set(current_target_id)
+        pair_combo = getattr(self, "seed_kickoff_pair_combo", None)
+        if pair_combo is not None:
+            pair_combo.configure(values=known_pair_ids, state="readonly" if known_pair_ids else "disabled")
+        target_combo = getattr(self, "seed_kickoff_target_combo", None)
+        if target_combo is not None:
+            target_combo.configure(values=pair_target_ids, state="readonly" if pair_target_ids else "disabled")
+        store = self._pair_policy_card_store(current_pair_id)
+        self.seed_kickoff_status_var.set(
+            "초기 실행 준비: pair={pair} / target={target} / repo-source={repo_source} / route={route} / 수동 복붙 또는 queue 시작 가능".format(
+                pair=current_pair_id,
+                target=current_target_id or "(없음)",
+                repo_source=str(store["repo_source_badge_var"].get() or "REPO 미확인"),
+                route=str(store["route_badge_var"].get() or "ROUTE 미확인"),
+            )
+        )
+        self.seed_kickoff_target_banner_var.set(
+            self._seed_kickoff_target_banner_text(pair_id=current_pair_id, target_id=current_target_id)
+        )
+        self.seed_kickoff_readiness_var.set(self._seed_kickoff_readiness_text())
+        self._apply_seed_kickoff_detail_visibility()
+
+    def browse_seed_kickoff_review_input(self) -> None:
+        initialdir = str(ROOT / "reviewfile")
+        selected = filedialog.askopenfilename(
+            title="초기 실행 입력 파일 선택",
+            initialdir=initialdir,
+            filetypes=[("All files", "*.*")],
+        )
+        if not selected:
+            return
+        self.seed_kickoff_review_input_var.set(selected)
+        self.seed_kickoff_status_var.set(f"초기 실행 입력 파일 선택: {selected}")
+
+    def open_seed_kickoff_review_input(self) -> None:
+        path_value = str(self.seed_kickoff_review_input_var.get() or "").strip()
+        if not path_value:
+            messagebox.showwarning("입력 파일 없음", "먼저 입력 파일을 선택하세요.")
+            return
+        self._open_path(path_value, kind="초기 실행 입력 파일")
+
+    def preview_seed_kickoff_message(self) -> None:
+        try:
+            payload = self._seed_kickoff_preview_payload()
+        except Exception as exc:
+            messagebox.showwarning("초기 실행 미리보기 실패", str(exc))
+            self.seed_kickoff_status_var.set(f"초기 실행 미리보기 실패: {exc}")
+            return
+        self.seed_kickoff_last_preview = payload
+        contract_widget = getattr(self, "seed_kickoff_contract_text", None)
+        helper_widget = getattr(self, "seed_kickoff_helper_text", None)
+        steps_widget = getattr(self, "seed_kickoff_steps_text", None)
+        preview_widget = getattr(self, "seed_kickoff_preview_text", None)
+        if contract_widget is not None:
+            self.set_text(contract_widget, str(payload.get("ContractText", "") or ""))
+        if helper_widget is not None:
+            self.set_text(helper_widget, str(payload.get("HelperText", "") or ""))
+        if steps_widget is not None:
+            self.set_text(steps_widget, str(payload.get("StartStepsText", "") or ""))
+        if preview_widget is not None:
+            self.set_text(preview_widget, str(payload.get("FullPreviewText", "") or ""))
+        policy = dict(payload.get("Policy", {}) or {})
+        self.seed_kickoff_target_banner_var.set(
+            self._seed_kickoff_target_banner_text(
+                pair_id=str(payload.get("PairId", "") or ""),
+                target_id=str(payload.get("TargetId", "") or ""),
+            )
+        )
+        self.seed_kickoff_readiness_var.set(self._seed_kickoff_readiness_text(payload))
+        self.seed_kickoff_status_var.set(
+            "{pair} 초기 실행 미리보기 갱신 / target={target} / repo-source={repo_source} / route={route} / warnings={warnings}".format(
+                pair=payload.get("PairId", ""),
+                target=payload.get("TargetId", ""),
+                repo_source=policy.get("DefaultSeedWorkRepoRootSource", "") or "unset",
+                route=payload.get("RouteBadge", "") or "(미확인)",
+                warnings=len(list(payload.get("Warnings", []) or [])),
+            )
+        )
+        self._apply_seed_kickoff_detail_visibility()
+
+    def copy_seed_kickoff_full_text(self) -> None:
+        try:
+            payload = self._seed_kickoff_preview_payload()
+        except Exception as exc:
+            messagebox.showwarning("복사 실패", str(exc))
+            return
+        self.seed_kickoff_last_preview = payload
+        self._copy_to_clipboard(str(payload.get("ManualStartText", "") or ""))
+        self.seed_kickoff_target_banner_var.set(
+            self._seed_kickoff_target_banner_text(
+                pair_id=str(payload.get("PairId", "") or ""),
+                target_id=str(payload.get("TargetId", "") or ""),
+            )
+        )
+        self.seed_kickoff_readiness_var.set(self._seed_kickoff_readiness_text(payload))
+        self.seed_kickoff_status_var.set("수동 시작문을 클립보드로 복사했습니다. 대상 PowerShell/셀 창에 직접 붙여넣으세요.")
+        pair_id = str(payload.get("PairId", "") or "").strip() or "(pair 없음)"
+        target_id = str(payload.get("TargetId", "") or "").strip() or "(target 없음)"
+        self.set_text(
+            self.output_text,
+            "\n".join(
+                [
+                    "수동 시작문 복사 완료",
+                    f"대상: {pair_id} / {target_id} 실제 셀 창",
+                    "다음: 해당 창에 붙여넣고 summary.txt -> review.zip -> publish.ready.json 순서로 생성되게 진행하세요.",
+                ]
+            ),
+        )
+
+    def copy_seed_kickoff_path_block(self) -> None:
+        try:
+            payload = self._seed_kickoff_preview_payload()
+        except Exception as exc:
+            messagebox.showwarning("복사 실패", str(exc))
+            return
+        self.seed_kickoff_last_preview = payload
+        self._copy_to_clipboard(str(payload.get("ContractText", "") or ""))
+        self.seed_kickoff_status_var.set("초기 실행 경로/계약 블록을 클립보드로 복사했습니다.")
+        self.set_text(self.output_text, "초기 실행 경로/계약 블록 복사 완료:\n\n" + str(payload.get("ContractText", "") or ""))
+
+    def copy_seed_kickoff_start_steps(self) -> None:
+        try:
+            payload = self._seed_kickoff_preview_payload()
+        except Exception as exc:
+            messagebox.showwarning("복사 실패", str(exc))
+            return
+        self.seed_kickoff_last_preview = payload
+        self._copy_to_clipboard(str(payload.get("StartStepsText", "") or ""))
+        self.seed_kickoff_status_var.set("초기 실행 시작 순서를 클립보드로 복사했습니다.")
+        self.set_text(self.output_text, "초기 실행 시작 순서 복사 완료:\n\n" + str(payload.get("StartStepsText", "") or ""))
+
+    def copy_seed_kickoff_helper_block(self) -> None:
+        try:
+            payload = self._seed_kickoff_preview_payload()
+        except Exception as exc:
+            messagebox.showwarning("복사 실패", str(exc))
+            return
+        self.seed_kickoff_last_preview = payload
+        self._copy_to_clipboard(str(payload.get("HelperText", "") or ""))
+        self.seed_kickoff_status_var.set("초기 실행 helper 블록을 클립보드로 복사했습니다.")
+        self.set_text(self.output_text, "초기 실행 helper 블록 복사 완료:\n\n" + str(payload.get("HelperText", "") or ""))
+
+    def _seed_kickoff_enqueue_allowed(self, payload: dict[str, object]) -> tuple[bool, str]:
+        pair_id = str(payload.get("PairId", "") or "").strip()
+        route_badge = str(payload.get("RouteBadge", "") or "").strip()
+        row = dict(payload.get("PreviewRow", {}) or {})
+        if self._message_editor_has_unsaved_changes():
+            return False, "Initial/Handoff 문구 편집에 미저장 변경이 있습니다. 먼저 저장하거나 취소하세요."
+        if not pair_id or not self._pair_policy_card_matches_loaded_policy(pair_id):
+            return False, "현재 pair 카드에 미저장 설정이 있습니다. 먼저 'pair 설정 저장 + 새로고침'을 완료하세요."
+        if route_badge not in {"ROUTE OK", "SHARED REPO OK"}:
+            return False, f"{pair_id} route 상태가 아직 안전하지 않습니다. 현재 배지: {route_badge or '(미확인)'}"
+        required_paths = [
+            str(row.get("SourceSummaryPath", "") or "").strip(),
+            str(row.get("SourceReviewZipPath", "") or "").strip(),
+            str(row.get("PublishReadyPath", "") or "").strip(),
+        ]
+        if any(not item for item in required_paths):
+            return False, "summary/review/publish 경로를 아직 확인하지 못했습니다. 먼저 '실효값' 또는 초기 실행 미리보기를 다시 확인하세요."
+        if not str(payload.get("QueueText", "") or "").strip():
+            return False, "작업 설명 또는 입력 파일 경로가 비어 있습니다."
+        return True, ""
+
+    def enqueue_seed_kickoff_message(self) -> None:
+        try:
+            payload = self._seed_kickoff_preview_payload()
+        except Exception as exc:
+            messagebox.showwarning("초기 입력 큐잉 실패", str(exc))
+            self.seed_kickoff_status_var.set(f"초기 입력 큐잉 실패: {exc}")
+            return
+        allowed, detail = self._seed_kickoff_enqueue_allowed(payload)
+        if not allowed:
+            messagebox.showwarning("초기 입력 큐잉 차단", detail)
+            self.seed_kickoff_status_var.set(f"초기 입력 큐잉 차단: {detail}")
+            return
+        pair_id = str(payload.get("PairId", "") or "").strip()
+        target_id = str(payload.get("TargetId", "") or "").strip()
+        role_name = str(payload.get("RoleName", "") or "").strip()
+        applies_to = str(self.seed_kickoff_applies_to_var.get() or "initial").strip() or "initial"
+        placement = str(self.seed_kickoff_placement_var.get() or "one-time-prefix").strip() or "one-time-prefix"
+        command = self.command_service.build_powershell_file_command(
+            str(ROOT / "tests" / "Enqueue-OneTimeMessage.ps1"),
+            extra=[
+                "-ConfigPath",
+                self.config_path_var.get().strip(),
+                "-PairId",
+                pair_id,
+                "-TargetId",
+                target_id,
+                "-Role",
+                role_name,
+                "-AppliesTo",
+                applies_to,
+                "-Placement",
+                placement,
+                "-Text",
+                str(payload.get("QueueText", "") or ""),
+                "-AsJson",
+            ],
+        )
+        try:
+            result = self.command_service.run_json(command)
+        except Exception as exc:
+            messagebox.showerror("초기 입력 큐잉 실패", str(exc))
+            self.seed_kickoff_status_var.set(f"초기 입력 큐잉 실패: {exc}")
+            return
+        self.seed_kickoff_last_preview = payload
+        queue_path = str(result.get("QueuePath", "") or "").strip()
+        item_id = str(((result.get("Item", {}) or {}).get("Id", "")) or "").strip()
+        self.seed_kickoff_status_var.set(
+            "{pair}/{target} 초기 입력 queue 등록 완료 / applies-to={applies_to} / placement={placement}".format(
+                pair=pair_id,
+                target=target_id,
+                applies_to=applies_to,
+                placement=placement,
+            )
+        )
+        self.set_text(
+            self.output_text,
+            "초기 입력 큐잉 완료\n"
+            f"pair={pair_id}\n"
+            f"target={target_id}\n"
+            f"role={role_name or '(none)'}\n"
+            f"queue={queue_path or '(none)'}\n"
+            f"item={item_id or '(none)'}\n\n"
+            + str(payload.get("QueueText", "") or ""),
+        )
+        messagebox.showinfo("초기 입력 큐잉 완료", queue_path or item_id or f"{pair_id}/{target_id}")
 
     def _reset_message_preview_cache(self, status_message: str, *, bump_revision: bool = True, dirty: bool = True) -> None:
         if bump_revision:
@@ -3171,11 +5970,14 @@ class RelayOperatorPanel(tk.Tk):
             self._sync_message_scope_id_from_context()
             self.render_target_board()
             self.render_message_editor()
+            if self._artifact_home_browse_target_scope_enabled():
+                self._sync_artifact_filters_with_home_pair_selection(refresh=self._has_ui_attr("artifact_tree"))
             self.update_pair_button_states()
             self.rebuild_panel_state()
 
     def _build_ui(self) -> None:
         self.columnconfigure(0, weight=1)
+        self.columnconfigure(1, weight=0)
         self.rowconfigure(1, weight=1)
         self.rowconfigure(2, weight=1)
 
@@ -3184,6 +5986,7 @@ class RelayOperatorPanel(tk.Tk):
         controls.columnconfigure(1, weight=1)
         controls.columnconfigure(5, weight=0)
         controls.columnconfigure(6, weight=0)
+        controls.columnconfigure(7, weight=0)
 
         ttk.Label(controls, text="설정").grid(row=0, column=0, sticky="w", padx=(0, 8))
         self.config_combo = ttk.Combobox(
@@ -3196,6 +5999,7 @@ class RelayOperatorPanel(tk.Tk):
         ttk.Button(controls, text="빠른 새로고침", command=self.refresh_quick_status).grid(row=0, column=5, sticky="e", padx=(8, 0))
         ttk.Button(controls, text="전체 새로고침", command=self.load_effective_config).grid(row=0, column=6, sticky="e", padx=(8, 0))
         ttk.Checkbutton(controls, text="간단 모드", variable=self.simple_mode_var, command=self.toggle_simple_mode).grid(row=0, column=7, sticky="e", padx=(8, 0))
+        ttk.Button(controls, textvariable=self.header_toggle_button_var, command=self.toggle_header_compact).grid(row=0, column=8, sticky="e", padx=(8, 0))
 
         ttk.Label(controls, textvariable=self.run_root_label_var).grid(row=1, column=0, sticky="w", padx=(0, 8), pady=(8, 0))
         ttk.Entry(controls, textvariable=self.run_root_var).grid(row=1, column=1, sticky="ew", pady=(8, 0))
@@ -3206,12 +6010,77 @@ class RelayOperatorPanel(tk.Tk):
         ttk.Label(controls, text="대상").grid(row=1, column=6, sticky="e", padx=(12, 8), pady=(8, 0))
         ttk.Combobox(controls, textvariable=self.target_id_var, values=["", "target01", "target02", "target03", "target04", "target05", "target06", "target07", "target08"], width=12).grid(row=1, column=7, sticky="ew", pady=(8, 0))
 
-        ttk.Label(controls, text="마지막 명령").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=(8, 0))
-        ttk.Entry(controls, textvariable=self.last_command_var, state="readonly").grid(row=2, column=1, columnspan=5, sticky="ew", pady=(8, 0))
-        ttk.Button(controls, text="명령 복사", command=self.copy_last_command).grid(row=2, column=6, sticky="ew", pady=(8, 0), padx=(8, 0))
+        context_frame = ttk.LabelFrame(controls, text="현재 실행 문맥", padding=8)
+        context_frame.grid(row=2, column=0, columnspan=9, sticky="ew", pady=(10, 0))
+        for index in range(5):
+            context_frame.columnconfigure(index, weight=1)
+        ttk.Label(context_frame, text="실행 대상", font=("Segoe UI", 9, "bold")).grid(row=0, column=0, sticky="w")
+        ttk.Label(context_frame, text="보고 있는 대상", font=("Segoe UI", 9, "bold")).grid(row=0, column=1, sticky="w", padx=(8, 0))
+        ttk.Label(context_frame, text="RunRoot", font=("Segoe UI", 9, "bold")).grid(row=0, column=2, sticky="w", padx=(8, 0))
+        ttk.Label(context_frame, text="watcher / runtime", font=("Segoe UI", 9, "bold")).grid(row=0, column=3, sticky="w", padx=(8, 0))
+        ttk.Label(context_frame, text="다음 해야 할 일", font=("Segoe UI", 9, "bold")).grid(row=0, column=4, sticky="w", padx=(8, 0))
+        ttk.Label(context_frame, textvariable=self.sticky_action_context_var, wraplength=220, justify="left").grid(row=1, column=0, sticky="w")
+        ttk.Label(context_frame, textvariable=self.sticky_inspection_context_var, wraplength=220, justify="left").grid(row=1, column=1, sticky="w", padx=(8, 0))
+        ttk.Label(context_frame, textvariable=self.sticky_run_root_context_var, wraplength=260, justify="left").grid(row=1, column=2, sticky="w", padx=(8, 0))
+        ttk.Label(context_frame, textvariable=self.sticky_runtime_context_var, wraplength=260, justify="left").grid(row=1, column=3, sticky="w", padx=(8, 0))
+        ttk.Label(context_frame, textvariable=self.sticky_next_step_var, wraplength=260, justify="left").grid(row=1, column=4, sticky="w", padx=(8, 0))
+        sticky_context_badge_label = tk.Label(
+            context_frame,
+            textvariable=self.sticky_context_badge_var,
+            bg="#6B7280",
+            fg="#FFFFFF",
+            padx=8,
+            pady=3,
+        )
+        sticky_context_badge_label.grid(row=2, column=0, sticky="w", pady=(8, 0))
+        self.sticky_context_badge_label = sticky_context_badge_label
+        sticky_apply_context_button = ttk.Button(
+            context_frame,
+            text="보고 대상 실행 기준 반영",
+            command=self.apply_selected_inspection_context,
+        )
+        sticky_apply_context_button.grid(row=2, column=1, sticky="w", padx=(8, 0), pady=(8, 0))
+        self.sticky_apply_context_button = sticky_apply_context_button
+        sticky_next_action_button = ttk.Button(
+            context_frame,
+            textvariable=self.sticky_next_action_button_var,
+            command=self.run_sticky_recommended_action,
+        )
+        sticky_next_action_button.grid(row=2, column=4, sticky="w", padx=(8, 0), pady=(8, 0))
+        self.sticky_next_action_button = sticky_next_action_button
 
-        status_frame = ttk.LabelFrame(controls, text="운영 상태", padding=8)
-        status_frame.grid(row=3, column=0, columnspan=7, sticky="ew", pady=(10, 0))
+        pair_focus_frame = ttk.LabelFrame(controls, text="현재 실행 Pair", padding=8)
+        pair_focus_frame.grid(row=3, column=0, columnspan=9, sticky="ew", pady=(10, 0))
+        pair_focus_frame.columnconfigure(1, weight=1)
+        pair_focus_badge_label = tk.Label(
+            pair_focus_frame,
+            textvariable=self.pair_focus_badge_var,
+            bg="#6B7280",
+            fg="#FFFFFF",
+            padx=8,
+            pady=3,
+        )
+        pair_focus_badge_label.grid(row=0, column=0, sticky="w")
+        self.pair_focus_badge_label = pair_focus_badge_label
+        ttk.Label(pair_focus_frame, textvariable=self.pair_focus_summary_var, font=("Segoe UI", 9, "bold")).grid(row=0, column=1, sticky="w", padx=(8, 0))
+        ttk.Label(pair_focus_frame, textvariable=self.pair_focus_detail_var, wraplength=1180, justify="left").grid(row=1, column=0, columnspan=2, sticky="w", pady=(6, 0))
+
+        header_details_frame = ttk.Frame(controls)
+        header_details_frame.grid(row=4, column=0, columnspan=9, sticky="ew", pady=(10, 0))
+        header_details_frame.columnconfigure(0, weight=1)
+        self.header_details_frame = header_details_frame
+
+        ttk.Label(header_details_frame, textvariable=self.run_root_help_var, wraplength=1180, justify="left").grid(row=0, column=0, sticky="w")
+
+        last_command_row = ttk.Frame(header_details_frame)
+        last_command_row.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+        last_command_row.columnconfigure(1, weight=1)
+        ttk.Label(last_command_row, text="마지막 명령").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        ttk.Entry(last_command_row, textvariable=self.last_command_var, state="readonly").grid(row=0, column=1, sticky="ew")
+        ttk.Button(last_command_row, text="명령 복사", command=self.copy_last_command).grid(row=0, column=2, sticky="e", padx=(8, 0))
+
+        status_frame = ttk.LabelFrame(header_details_frame, text="운영 상태", padding=8)
+        status_frame.grid(row=2, column=0, sticky="ew", pady=(10, 0))
         status_frame.columnconfigure(1, weight=1)
         ttk.Label(status_frame, text="MODE").grid(row=0, column=0, sticky="w", padx=(0, 8))
         ttk.Label(status_frame, textvariable=self.mode_banner_var, font=("Segoe UI", 10, "bold")).grid(row=0, column=1, sticky="w")
@@ -3232,22 +6101,32 @@ class RelayOperatorPanel(tk.Tk):
         result_frame.grid(row=2, column=0, sticky="nsew", padx=10, pady=(0, 10))
         result_frame.columnconfigure(0, weight=1)
         result_frame.rowconfigure(1, weight=1)
+        self.result_frame = result_frame
         result_header = ttk.Frame(result_frame)
         result_header.grid(row=0, column=0, sticky="ew", pady=(0, 8))
         result_header.columnconfigure(0, weight=1)
         ttk.Label(
             result_header,
-            text="작업 출력과 조회 결과는 여기서 계속 표시됩니다. simple mode에서도 숨기지 않습니다.",
+            text="작업 출력과 조회 결과는 하단 공용 패널에서 확인합니다. 필요할 때만 펼치도록 축약할 수 있습니다.",
             justify="left",
         ).grid(row=0, column=0, sticky="w")
+        result_header_actions = ttk.Frame(result_header)
+        result_header_actions.grid(row=0, column=1, rowspan=2, sticky="ne")
+        ttk.Button(result_header_actions, textvariable=self.result_toggle_button_var, command=self.toggle_result_panel).grid(row=0, column=0, sticky="e")
+        ttk.Button(result_header_actions, textvariable=self.result_dock_button_var, command=self.toggle_result_panel_dock).grid(row=0, column=1, sticky="e", padx=(8, 0))
         ttk.Label(
             result_header,
             textvariable=self.query_history_var,
             wraplength=980,
             justify="left",
         ).grid(row=1, column=0, sticky="w", pady=(6, 0))
-        self.result_notebook = ttk.Notebook(result_frame)
-        self.result_notebook.grid(row=1, column=0, sticky="nsew")
+        result_body_frame = ttk.Frame(result_frame)
+        result_body_frame.grid(row=1, column=0, sticky="nsew")
+        result_body_frame.columnconfigure(0, weight=1)
+        result_body_frame.rowconfigure(0, weight=1)
+        self.result_body_frame = result_body_frame
+        self.result_notebook = ttk.Notebook(result_body_frame)
+        self.result_notebook.grid(row=0, column=0, sticky="nsew")
         self.ops_result_notebook = self.result_notebook
         action_output_tab = ttk.Frame(self.result_notebook, padding=6)
         action_output_tab.columnconfigure(0, weight=1)
@@ -3262,10 +6141,10 @@ class RelayOperatorPanel(tk.Tk):
         self.query_output_text = scrolledtext.ScrolledText(self.query_output_tab, wrap="word")
         self.query_output_text.grid(row=0, column=0, sticky="nsew")
 
-        home_tab = ttk.Frame(notebook, padding=10)
+        home_tab_container, home_tab = self._create_scrollable_tab(notebook, title="홈")
+        self.home_tab = home_tab_container
         home_tab.columnconfigure(0, weight=1)
         home_tab.rowconfigure(4, weight=1)
-        notebook.add(home_tab, text="홈")
 
         home_header = ttk.LabelFrame(home_tab, text="현재 문맥", padding=8)
         home_header.grid(row=0, column=0, sticky="ew")
@@ -3278,6 +6157,9 @@ class RelayOperatorPanel(tk.Tk):
 
         cards_frame = ttk.Frame(home_tab)
         cards_frame.grid(row=1, column=0, sticky="ew", pady=(10, 0))
+        cards_per_row = 4
+        for column in range(cards_per_row):
+            cards_frame.columnconfigure(column, weight=1)
         for idx, key_title in enumerate(
             [
                 ("windows", "세션 창 준비"),
@@ -3290,13 +6172,20 @@ class RelayOperatorPanel(tk.Tk):
             ]
         ):
             key, title = key_title
-            cards_frame.columnconfigure(idx, weight=1)
+            card_row = idx // cards_per_row
+            card_column = idx % cards_per_row
             frame = ttk.LabelFrame(cards_frame, text=title, padding=8)
-            frame.grid(row=0, column=idx, sticky="nsew", padx=(0, 8) if idx < 6 else (0, 0))
+            frame.grid(
+                row=card_row,
+                column=card_column,
+                sticky="nsew",
+                padx=(0, 8) if card_column < cards_per_row - 1 else (0, 0),
+                pady=(0, 8) if card_row == 0 else (0, 0),
+            )
             value_var = tk.StringVar(value="-")
             detail_var = tk.StringVar(value="-")
             ttk.Label(frame, textvariable=value_var, font=("Segoe UI", 12, "bold")).grid(row=0, column=0, sticky="w")
-            ttk.Label(frame, textvariable=detail_var, wraplength=180, justify="left").grid(row=1, column=0, sticky="w", pady=(4, 0))
+            ttk.Label(frame, textvariable=detail_var, wraplength=240, justify="left").grid(row=1, column=0, sticky="w", pady=(4, 0))
             self.home_card_vars[key] = {"value": value_var, "detail": detail_var}
 
         stage_frame = ttk.LabelFrame(home_tab, text="단계 진행판", padding=8)
@@ -3367,42 +6256,348 @@ class RelayOperatorPanel(tk.Tk):
 
         pair_actions = ttk.Frame(pair_frame)
         pair_actions.grid(row=1, column=0, sticky="ew", pady=(8, 0))
-        for idx, (label, callback, attr_name) in enumerate(
-            [
-                ("선택 Pair 반영", self.apply_selected_home_pair, "home_apply_pair_button"),
-                ("선택 Pair Headless Drill", self.run_selected_pair_drill, "home_run_pair_button"),
-                ("pair 활성화", self.enable_selected_pair, "home_enable_pair_button"),
-                ("pair 비활성화", self.disable_selected_pair, "home_disable_pair_button"),
-                ("watch 시작(기본)", self.start_watcher_detached, "home_start_watch_button"),
-                ("Pair 상태 보기", self.run_paired_status, "home_pair_status_button"),
-                ("runroot 요약", self.run_paired_summary, "home_pair_summary_button"),
-                ("important-summary 열기", self.open_important_summary_text, "home_open_important_summary_button"),
-                ("창/Attach/입력/RunRoot 준비", self.run_prepare_all, "home_prepare_all_button"),
-                ("기존 8창 재사용", self.reuse_existing_windows, "home_reuse_windows_button"),
-                ("열린 pair 재사용", self.reuse_active_pairs, "home_reuse_pairs_button"),
-            ]
-        ):
-            button = ttk.Button(pair_actions, text=label, command=callback)
-            button.grid(row=0, column=idx, padx=(0, 8))
-            self.long_task_widgets.append(button)
-            if label in {"Pair 상태 보기", "runroot 요약", "important-summary 열기"}:
-                self._register_read_only_widget(button)
-            setattr(self, attr_name, button)
+        for column in range(3):
+            pair_actions.columnconfigure(column, weight=1)
+
+        home_action_groups = [
+            (
+                "지금 시작",
+                [
+                    ("선택 Pair로 맞추기", self.apply_selected_home_pair, "home_apply_pair_button"),
+                    ("선택 Pair 실행", self.run_selected_pair_drill, "home_run_pair_button"),
+                    ("watch 시작", self.start_watcher_detached, "home_start_watch_button"),
+                    ("창/Attach/입력/RunRoot 준비", self.run_prepare_all, "home_prepare_all_button"),
+                ],
+            ),
+            (
+                "상태 확인",
+                [
+                    ("pair 상태", self.run_paired_status, "home_pair_status_button"),
+                    ("runroot 요약", self.run_paired_summary, "home_pair_summary_button"),
+                    ("요약 리포트 열기", self.open_important_summary_text, "home_open_important_summary_button"),
+                ],
+            ),
+            (
+                "복구 / 재사용",
+                [
+                    ("pair 활성화", self.enable_selected_pair, "home_enable_pair_button"),
+                    ("pair 비활성화", self.disable_selected_pair, "home_disable_pair_button"),
+                    ("공식 8창 재사용", self.reuse_existing_windows, "home_reuse_windows_button"),
+                    ("열린 pair 재사용", self.reuse_active_pairs, "home_reuse_pairs_button"),
+                ],
+            ),
+        ]
+        read_only_home_labels = {"pair 상태", "runroot 요약", "요약 리포트 열기"}
+        for column, (title, specs) in enumerate(home_action_groups):
+            group = ttk.LabelFrame(pair_actions, text=title, padding=8)
+            group.grid(row=0, column=column, sticky="nsew", padx=(0, 8) if column < 2 else (0, 0))
+            for idx, (label, callback, attr_name) in enumerate(specs):
+                button = ttk.Button(group, text=label, command=callback)
+                button.grid(row=idx // 2, column=idx % 2, sticky="ew", padx=(0, 8) if idx % 2 == 0 else (0, 0), pady=(0, 8))
+                self.long_task_widgets.append(button)
+                if label in read_only_home_labels:
+                    self._register_read_only_widget(button)
+                setattr(self, attr_name, button)
         ttk.Label(pair_frame, textvariable=self.home_pair_detail_var, wraplength=1200, justify="left").grid(row=2, column=0, sticky="w", pady=(8, 0))
 
-        preview_tab = ttk.Frame(notebook, padding=10)
+        preview_tab_container, preview_tab = self._create_scrollable_tab(notebook, title="설정 / 문구")
+        self.preview_tab = preview_tab_container
         preview_tab.columnconfigure(0, weight=1)
         preview_tab.columnconfigure(1, weight=2)
-        preview_tab.rowconfigure(1, weight=1)
-        preview_tab.rowconfigure(2, weight=1)
-        notebook.add(preview_tab, text="설정 / 문구")
+        preview_tab.rowconfigure(5, weight=1)
 
         self.summary_text = tk.Text(preview_tab, height=10, wrap="word")
         self.summary_text.grid(row=0, column=0, columnspan=2, sticky="nsew")
         self.summary_text.configure(state="disabled")
 
+        start_guide_frame = ttk.LabelFrame(preview_tab, text="시작하기", padding=8)
+        start_guide_frame.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        start_guide_frame.columnconfigure(0, weight=1)
+        for row_index, guide_text in enumerate(
+            [
+                "1. pair 설정 저장: 카드 값을 정리한 뒤 저장해서 현재 정책을 먼저 확정합니다.",
+                "2. 경로 확인: 선택 pair 또는 전체 경로 확인으로 repo / runroot / contract 경로를 확인합니다.",
+                "3. target 창용 시작문 복사: Kickoff Composer에서 실제 target 창에 붙여넣을 시작문만 복사합니다.",
+                "4. target 창 붙여넣기: 사용자가 보는 공식 창에 직접 붙여넣고 진행합니다.",
+            ]
+        ):
+            ttk.Label(start_guide_frame, text=guide_text, justify="left", wraplength=1180).grid(row=row_index, column=0, sticky="w", pady=(0, 4) if row_index < 3 else (0, 0))
+
+        pair_policy_frame = ttk.LabelFrame(preview_tab, text="4 Pair 설정 / 실효 경로", padding=8)
+        pair_policy_frame.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        for column in range(2):
+            pair_policy_frame.columnconfigure(column, weight=1)
+        pair_policy_frame.rowconfigure(1, weight=1)
+        pair_policy_frame.rowconfigure(2, weight=1)
+        pair_policy_actions = ttk.Frame(pair_policy_frame)
+        pair_policy_actions.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 8))
+        pair_policy_actions.columnconfigure(0, weight=1)
+        ttk.Label(pair_policy_actions, textvariable=self.pair_policy_editor_status_var, wraplength=1180, justify="left").grid(row=0, column=0, sticky="w")
+        ttk.Button(pair_policy_actions, text="Config에서 다시 읽기", command=self.refresh_pair_policy_editor).grid(row=0, column=1, padx=(12, 8))
+        ttk.Button(pair_policy_actions, text="전체 경로 확인", command=self.preview_all_pair_policy_effective).grid(row=0, column=2, padx=(0, 8))
+        ttk.Button(pair_policy_actions, text="pair 설정 저장 + 새로고침", command=self.save_pair_policy_editor).grid(row=0, column=3, padx=(0, 8))
+        ttk.Button(pair_policy_actions, text="pair 경로 상태 복사", command=self.copy_pair_route_matrix).grid(row=0, column=4, padx=(0, 8))
+        ttk.Button(pair_policy_actions, text="pair 경로 JSON 저장", command=self.save_pair_route_matrix_json).grid(row=0, column=5)
+        ttk.Label(pair_policy_actions, text="복제").grid(row=1, column=0, sticky="w", pady=(8, 0))
+        clone_controls = ttk.Frame(pair_policy_actions)
+        clone_controls.grid(row=1, column=1, columnspan=4, sticky="w", pady=(8, 0))
+        ttk.Combobox(clone_controls, textvariable=self.pair_policy_clone_source_var, values=PAIR_ID_OPTIONS, state="readonly", width=10).grid(row=0, column=0)
+        ttk.Label(clone_controls, text="→").grid(row=0, column=1, padx=6)
+        ttk.Combobox(clone_controls, textvariable=self.pair_policy_clone_target_var, values=PAIR_ID_OPTIONS, state="readonly", width=10).grid(row=0, column=2)
+        ttk.Button(clone_controls, text="설정 복제", command=self.clone_pair_policy_card_settings).grid(row=0, column=3, padx=(8, 0))
+        ttk.Label(pair_policy_actions, text="병렬 drill").grid(row=2, column=0, sticky="w", pady=(8, 0))
+        parallel_controls = ttk.Frame(pair_policy_actions)
+        parallel_controls.grid(row=2, column=1, columnspan=5, sticky="ew", pady=(8, 0))
+        parallel_controls.columnconfigure(1, weight=1)
+        parallel_drill_button = ttk.Button(parallel_controls, text="선택 pair 병렬 실테스트", command=self.run_selected_parallel_pair_drill)
+        parallel_drill_button.grid(row=0, column=0, sticky="w")
+        self.long_task_widgets.append(parallel_drill_button)
+        self.parallel_pair_drill_button = parallel_drill_button
+        ttk.Label(parallel_controls, text="coordinator repo").grid(row=0, column=1, sticky="e", padx=(12, 6))
+        ttk.Entry(parallel_controls, textvariable=self.parallel_coordinator_repo_root_var).grid(row=0, column=2, sticky="ew")
+        ttk.Button(parallel_controls, text="선택", command=self.browse_parallel_coordinator_repo_root).grid(row=0, column=3, padx=(6, 0))
+        ttk.Button(parallel_controls, text="열기", command=self.open_parallel_coordinator_repo_root).grid(row=0, column=4, padx=(4, 0))
+        ttk.Label(
+            pair_policy_actions,
+            textvariable=self.pair_policy_parallel_status_var,
+            wraplength=1180,
+            justify="left",
+        ).grid(row=3, column=0, columnspan=6, sticky="w", pady=(8, 0))
+
+        for index, pair_id in enumerate(PAIR_ID_OPTIONS):
+            card_vars = self.pair_policy_card_vars[pair_id]
+            card_row = 1 + (index // 2)
+            card_column = index % 2
+            card = ttk.LabelFrame(pair_policy_frame, text=pair_id, padding=6)
+            card.grid(
+                row=card_row,
+                column=card_column,
+                sticky="nsew",
+                padx=(0, 8) if card_column == 0 else (0, 0),
+                pady=(0, 8) if card_row == 1 else (0, 0),
+            )
+            card.columnconfigure(1, weight=1)
+            card.rowconfigure(12, weight=1)
+            ttk.Label(card, textvariable=card_vars["meta_var"], wraplength=420, justify="left").grid(row=0, column=0, columnspan=2, sticky="w")
+            badge_row = ttk.Frame(card)
+            badge_row.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+            source_badge_label = tk.Label(
+                badge_row,
+                textvariable=card_vars["repo_source_badge_var"],
+                bg="#6B7280",
+                fg="#FFFFFF",
+                padx=6,
+                pady=2,
+            )
+            source_badge_label.grid(row=0, column=0, sticky="w")
+            self.pair_policy_card_repo_source_badge_labels[pair_id] = source_badge_label
+            override_badge_label = tk.Label(
+                badge_row,
+                textvariable=card_vars["override_badge_var"],
+                bg="#6B7280",
+                fg="#FFFFFF",
+                padx=6,
+                pady=2,
+            )
+            override_badge_label.grid(row=0, column=1, sticky="w", padx=(6, 0))
+            self.pair_policy_card_override_badge_labels[pair_id] = override_badge_label
+            ttk.Checkbutton(badge_row, text="병렬 drill", variable=card_vars["parallel_selected_var"]).grid(row=0, column=2, sticky="w", padx=(8, 0))
+            focus_badge_label = tk.Label(
+                badge_row,
+                text="",
+                bg="#1D4ED8",
+                fg="#FFFFFF",
+                padx=6,
+                pady=2,
+            )
+            focus_badge_label.grid(row=0, column=3, sticky="w", padx=(6, 0))
+            focus_badge_label.grid_remove()
+            self.pair_policy_card_focus_badge_labels[pair_id] = focus_badge_label
+            ttk.Label(card, text="RepoRoot").grid(row=2, column=0, sticky="w", pady=(8, 0))
+            repo_row = ttk.Frame(card)
+            repo_row.grid(row=2, column=1, sticky="ew", pady=(8, 0))
+            repo_row.columnconfigure(0, weight=1)
+            ttk.Entry(repo_row, textvariable=card_vars["repo_root_var"]).grid(row=0, column=0, sticky="ew")
+            ttk.Button(repo_row, text="선택", width=6, command=lambda current_pair_id=pair_id: self.browse_pair_policy_repo_root(current_pair_id)).grid(row=0, column=1, padx=(6, 0))
+            ttk.Button(repo_row, text="열기", width=6, command=lambda current_pair_id=pair_id: self.open_pair_policy_repo_root(current_pair_id)).grid(row=0, column=2, padx=(4, 0))
+            ttk.Label(card, text="SeedTarget").grid(row=3, column=0, sticky="w", pady=(6, 0))
+            seed_combo = ttk.Combobox(card, textvariable=card_vars["seed_target_var"], values=[], state="disabled", width=12)
+            seed_combo.grid(row=3, column=1, sticky="ew", pady=(6, 0))
+            self.pair_policy_card_seed_combos[pair_id] = seed_combo
+            ttk.Label(card, text="Roundtrip").grid(row=4, column=0, sticky="w", pady=(6, 0))
+            ttk.Entry(card, textvariable=card_vars["roundtrip_var"], width=10).grid(row=4, column=1, sticky="ew", pady=(6, 0))
+            ttk.Checkbutton(card, text="external runroot", variable=card_vars["external_run_root_var"]).grid(row=5, column=0, columnspan=2, sticky="w", pady=(6, 0))
+            ttk.Checkbutton(card, text="external contract", variable=card_vars["external_contract_var"]).grid(row=6, column=0, columnspan=2, sticky="w", pady=(2, 0))
+            badge_label = tk.Label(
+                card,
+                textvariable=card_vars["route_badge_var"],
+                bg="#6B7280",
+                fg="#FFFFFF",
+                padx=8,
+                pady=2,
+            )
+            badge_label.grid(row=7, column=0, columnspan=2, sticky="w", pady=(8, 0))
+            self.pair_policy_card_badge_labels[pair_id] = badge_label
+            ttk.Label(card, textvariable=card_vars["route_state_var"], wraplength=420, justify="left").grid(row=8, column=0, columnspan=2, sticky="w", pady=(6, 0))
+            runtime_badge_label = tk.Label(
+                card,
+                textvariable=card_vars["runtime_badge_var"],
+                bg="#6B7280",
+                fg="#FFFFFF",
+                padx=8,
+                pady=2,
+            )
+            runtime_badge_label.grid(row=9, column=0, columnspan=2, sticky="w", pady=(6, 0))
+            self.pair_policy_card_runtime_badge_labels[pair_id] = runtime_badge_label
+            ttk.Label(card, textvariable=card_vars["runtime_summary_var"], wraplength=420, justify="left").grid(row=10, column=0, columnspan=2, sticky="w", pady=(6, 0))
+            ttk.Label(card, text="실효값 상세").grid(row=11, column=0, columnspan=2, sticky="w", pady=(6, 0))
+            effective_preview_text = scrolledtext.ScrolledText(card, height=8, wrap="char")
+            effective_preview_text.grid(row=12, column=0, columnspan=2, sticky="nsew", pady=(4, 0))
+            self.pair_policy_card_effective_preview_widgets[pair_id] = effective_preview_text
+            self.set_text(effective_preview_text, str(card_vars["effective_preview_var"].get() or ""))
+            card_actions = ttk.Frame(card)
+            card_actions.grid(row=13, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+            card_actions.columnconfigure(0, weight=1)
+            ttk.Button(card_actions, text="요약 보기", command=lambda current_pair_id=pair_id: self.open_pair_policy_pair_summary(current_pair_id)).grid(row=0, column=0, sticky="w")
+            ttk.Button(card_actions, text="경로 확인", command=lambda current_pair_id=pair_id: self.preview_pair_policy_effective(current_pair_id)).grid(row=0, column=1, sticky="e")
+            ttk.Button(card_actions, text="경로 확인 복사", command=lambda current_pair_id=pair_id: self.copy_pair_policy_effective_preview(current_pair_id)).grid(row=0, column=2, sticky="e", padx=(8, 0))
+
+        seed_kickoff_frame = ttk.LabelFrame(preview_tab, text="초기 실행 준비 / Seed Kickoff Composer", padding=8)
+        seed_kickoff_frame.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        seed_kickoff_frame.columnconfigure(0, weight=1)
+        seed_kickoff_frame.columnconfigure(1, weight=1)
+        ttk.Label(
+            seed_kickoff_frame,
+            textvariable=self.seed_kickoff_status_var,
+            wraplength=1180,
+            justify="left",
+        ).grid(row=0, column=0, columnspan=2, sticky="w")
+
+        kickoff_controls = ttk.Frame(seed_kickoff_frame)
+        kickoff_controls.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        kickoff_controls.columnconfigure(3, weight=1)
+        kickoff_controls.columnconfigure(7, weight=1)
+        ttk.Label(kickoff_controls, text="Pair").grid(row=0, column=0, sticky="w")
+        self.seed_kickoff_pair_combo = ttk.Combobox(
+            kickoff_controls,
+            textvariable=self.seed_kickoff_pair_var,
+            values=PAIR_ID_OPTIONS,
+            state="readonly",
+            width=10,
+        )
+        self.seed_kickoff_pair_combo.grid(row=0, column=1, sticky="w", padx=(6, 12))
+        self.seed_kickoff_pair_combo.bind("<<ComboboxSelected>>", lambda _event: self.refresh_seed_kickoff_composer())
+        ttk.Label(kickoff_controls, text="SeedTarget").grid(row=0, column=2, sticky="e")
+        self.seed_kickoff_target_combo = ttk.Combobox(
+            kickoff_controls,
+            textvariable=self.seed_kickoff_target_var,
+            values=[],
+            state="disabled",
+            width=14,
+        )
+        self.seed_kickoff_target_combo.grid(row=0, column=3, sticky="ew", padx=(6, 12))
+        ttk.Label(kickoff_controls, text="적용").grid(row=0, column=4, sticky="e")
+        ttk.Combobox(
+            kickoff_controls,
+            textvariable=self.seed_kickoff_applies_to_var,
+            values=["initial", "handoff", "both"],
+            state="readonly",
+            width=12,
+        ).grid(row=0, column=5, sticky="w", padx=(6, 12))
+        ttk.Label(kickoff_controls, text="배치").grid(row=0, column=6, sticky="e")
+        ttk.Combobox(
+            kickoff_controls,
+            textvariable=self.seed_kickoff_placement_var,
+            values=["one-time-prefix", "one-time-suffix"],
+            state="readonly",
+            width=16,
+        ).grid(row=0, column=7, sticky="ew", padx=(6, 0))
+
+        kickoff_input_row = ttk.Frame(seed_kickoff_frame)
+        kickoff_input_row.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        kickoff_input_row.columnconfigure(1, weight=1)
+        ttk.Label(kickoff_input_row, text="입력 파일").grid(row=0, column=0, sticky="w")
+        ttk.Entry(kickoff_input_row, textvariable=self.seed_kickoff_review_input_var).grid(row=0, column=1, sticky="ew", padx=(6, 6))
+        ttk.Button(kickoff_input_row, text="선택", command=self.browse_seed_kickoff_review_input).grid(row=0, column=2, padx=(0, 4))
+        ttk.Button(kickoff_input_row, text="열기", command=self.open_seed_kickoff_review_input).grid(row=0, column=3)
+
+        kickoff_badges = ttk.Frame(seed_kickoff_frame)
+        kickoff_badges.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        kickoff_badges.columnconfigure(0, weight=1)
+        ttk.Label(kickoff_badges, textvariable=self.seed_kickoff_target_banner_var, wraplength=1180, justify="left").grid(row=0, column=0, sticky="w")
+        ttk.Label(kickoff_badges, textvariable=self.seed_kickoff_readiness_var, wraplength=1180, justify="left").grid(row=1, column=0, sticky="w", pady=(4, 0))
+
+        kickoff_quick_actions = ttk.Frame(seed_kickoff_frame)
+        kickoff_quick_actions.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        ttk.Label(kickoff_quick_actions, text="빠른 시작").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        ttk.Button(kickoff_quick_actions, text="현재 Pair/Target 반영", command=self._sync_seed_kickoff_with_action_context).grid(row=0, column=1, padx=(0, 8))
+        ttk.Button(kickoff_quick_actions, text="미리보기", command=self.preview_seed_kickoff_message).grid(row=0, column=2, padx=(0, 8))
+        ttk.Button(kickoff_quick_actions, text="target 창용 시작문 복사", command=self.copy_seed_kickoff_full_text).grid(row=0, column=3, padx=(0, 8))
+        ttk.Button(kickoff_quick_actions, text="초기 입력 큐잉", command=self.enqueue_seed_kickoff_message).grid(row=0, column=4, padx=(0, 8))
+        ttk.Checkbutton(
+            kickoff_quick_actions,
+            text="세부 블록 표시",
+            variable=self.seed_kickoff_detail_visible_var,
+            command=self._apply_seed_kickoff_detail_visibility,
+        ).grid(row=0, column=5, padx=(12, 0))
+
+        input_columns = ttk.Frame(seed_kickoff_frame)
+        self.seed_kickoff_input_columns_frame = input_columns
+        input_columns.grid(row=5, column=0, columnspan=2, sticky="nsew", pady=(10, 0))
+        input_columns.columnconfigure(0, weight=1)
+        input_columns.columnconfigure(1, weight=1)
+        ttk.Label(input_columns, text="작업 설명 (사용자 직접 입력)").grid(row=0, column=0, sticky="w")
+        self.seed_kickoff_task_text = scrolledtext.ScrolledText(input_columns, height=8, wrap="word")
+        self.seed_kickoff_task_text.grid(row=1, column=0, sticky="nsew", padx=(0, 10))
+
+        detail_column = ttk.Frame(input_columns)
+        self.seed_kickoff_detail_column_frame = detail_column
+        detail_column.grid(row=0, column=1, rowspan=2, sticky="nsew")
+        detail_column.columnconfigure(0, weight=1)
+        ttk.Label(detail_column, text="자동 계약 / helper / 최종 미리보기").grid(row=0, column=0, sticky="w")
+
+        preview_stack = ttk.Frame(detail_column)
+        self.seed_kickoff_preview_stack_frame = preview_stack
+        preview_stack.grid(row=1, column=0, sticky="nsew")
+        preview_stack.columnconfigure(0, weight=1)
+        ttk.Label(preview_stack, text="자동 계약 블록").grid(row=0, column=0, sticky="w")
+        self.seed_kickoff_contract_text = scrolledtext.ScrolledText(preview_stack, height=7, wrap="word")
+        self.seed_kickoff_contract_text.grid(row=1, column=0, sticky="nsew")
+        ttk.Label(preview_stack, text="helper 블록").grid(row=2, column=0, sticky="w", pady=(8, 0))
+        self.seed_kickoff_helper_text = scrolledtext.ScrolledText(preview_stack, height=5, wrap="word")
+        self.seed_kickoff_helper_text.grid(row=3, column=0, sticky="nsew")
+        ttk.Label(preview_stack, text="권장 시작 순서").grid(row=4, column=0, sticky="w", pady=(8, 0))
+        self.seed_kickoff_steps_text = scrolledtext.ScrolledText(preview_stack, height=7, wrap="word")
+        self.seed_kickoff_steps_text.grid(row=5, column=0, sticky="nsew")
+
+        preview_detail_frame = ttk.Frame(seed_kickoff_frame)
+        self.seed_kickoff_preview_detail_frame = preview_detail_frame
+        preview_detail_frame.grid(row=6, column=0, columnspan=2, sticky="nsew", pady=(10, 0))
+        preview_detail_frame.columnconfigure(0, weight=1)
+        ttk.Label(preview_detail_frame, text="운영자 확인용 미리보기").grid(row=0, column=0, sticky="w")
+        ttk.Label(
+            preview_detail_frame,
+            text="주의: 아래 미리보기에는 operator 확인용 안내가 포함됩니다. 실제 target 전달문은 'target 창용 시작문 복사'가 설명 블록을 제외한 전달문만 복사합니다.",
+            foreground="#555555",
+            wraplength=900,
+            justify="left",
+        ).grid(row=1, column=0, sticky="w", pady=(2, 0))
+        self.seed_kickoff_preview_text = scrolledtext.ScrolledText(preview_detail_frame, height=10, wrap="word")
+        self.seed_kickoff_preview_text.grid(row=2, column=0, sticky="nsew")
+
+        kickoff_actions = ttk.Frame(seed_kickoff_frame)
+        self.seed_kickoff_detail_actions_frame = kickoff_actions
+        kickoff_actions.grid(row=7, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        ttk.Button(kickoff_actions, text="미리보기", command=self.preview_seed_kickoff_message).grid(row=0, column=0, padx=(0, 8))
+        ttk.Button(kickoff_actions, text="target 창용 시작문 복사", command=self.copy_seed_kickoff_full_text).grid(row=0, column=1, padx=(0, 8))
+        ttk.Button(kickoff_actions, text="계약 경로 복사", command=self.copy_seed_kickoff_path_block).grid(row=0, column=2, padx=(0, 8))
+        ttk.Button(kickoff_actions, text="시작 순서 복사", command=self.copy_seed_kickoff_start_steps).grid(row=0, column=3, padx=(0, 8))
+        ttk.Button(kickoff_actions, text="helper 명령 복사", command=self.copy_seed_kickoff_helper_block).grid(row=0, column=4, padx=(0, 8))
+        ttk.Button(kickoff_actions, text="초기 입력 큐잉", command=self.enqueue_seed_kickoff_message).grid(row=0, column=5)
+        self._apply_seed_kickoff_detail_visibility()
+
         preview_actions = ttk.Frame(preview_tab)
-        preview_actions.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        preview_actions.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(10, 0))
         for idx, (label, callback) in enumerate(
             [
                 ("선택 row 실행 기준 반영", self.apply_selected_inspection_context),
@@ -3432,11 +6627,11 @@ class RelayOperatorPanel(tk.Tk):
         ):
             self.row_tree.heading(column, text=heading)
             self.row_tree.column(column, width=width, stretch=False)
-        self.row_tree.grid(row=2, column=0, rowspan=2, sticky="nsew", pady=(10, 0), padx=(0, 10))
+        self.row_tree.grid(row=5, column=0, sticky="nsew", pady=(10, 0), padx=(0, 10))
         self.row_tree.bind("<<TreeviewSelect>>", self.on_row_selected)
 
         right_side = ttk.Notebook(preview_tab)
-        right_side.grid(row=2, column=1, rowspan=2, sticky="nsew", pady=(10, 0))
+        right_side.grid(row=5, column=1, sticky="nsew", pady=(10, 0))
 
         details_tab = ttk.Frame(right_side, padding=6)
         details_tab.columnconfigure(0, weight=1)
@@ -3513,8 +6708,8 @@ class RelayOperatorPanel(tk.Tk):
             board_grid.columnconfigure(column, weight=1)
 
         editor_tab = ttk.Frame(notebook, padding=10)
-        editor_tab.columnconfigure(0, weight=2)
-        editor_tab.columnconfigure(1, weight=3)
+        editor_tab.columnconfigure(0, weight=2, minsize=520)
+        editor_tab.columnconfigure(1, weight=3, minsize=680)
         editor_tab.rowconfigure(1, weight=1)
         notebook.add(editor_tab, text="Initial/Handoff 문구 편집")
         self.editor_tab = editor_tab
@@ -3648,42 +6843,63 @@ class RelayOperatorPanel(tk.Tk):
         ttk.Button(fixed_frame, text="Target 고정문구 반영", command=self.apply_target_fixed_suffix).grid(row=2, column=2, sticky="w", pady=(8, 0))
         ttk.Label(fixed_frame, text="아래 Target 고정문구 대상은 상단 대상/slot 편집 문맥과 별도입니다.", justify="left").grid(row=3, column=2, columnspan=2, sticky="w", pady=(8, 0))
 
-        editor_right = ttk.Notebook(editor_tab)
-        editor_right.grid(row=1, column=1, sticky="nsew")
+        editor_right_frame = ttk.Frame(editor_tab)
+        editor_right_frame.grid(row=1, column=1, sticky="nsew")
+        editor_right_frame.columnconfigure(0, weight=1)
+        editor_right_frame.rowconfigure(1, weight=1)
+        editor_right_header = ttk.LabelFrame(editor_right_frame, text="오른쪽 탭 안내", padding=8)
+        editor_right_header.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        editor_right_header.columnconfigure(0, weight=1)
+        ttk.Label(
+            editor_right_header,
+            textvariable=self.message_editor_tab_title_var,
+            font=("Segoe UI", 10, "bold"),
+        ).grid(row=0, column=0, sticky="w")
+        ttk.Label(
+            editor_right_header,
+            textvariable=self.message_editor_tab_detail_var,
+            wraplength=760,
+            justify="left",
+        ).grid(row=1, column=0, sticky="w", pady=(4, 0))
+        editor_right_style = ttk.Style(self)
+        editor_right_style.configure("EditorTabs.TNotebook.Tab", padding=(8, 4))
+        editor_right = ttk.Notebook(editor_right_frame, style="EditorTabs.TNotebook")
+        editor_right.grid(row=1, column=0, sticky="nsew")
+        editor_right.bind("<<NotebookTabChanged>>", self._on_message_editor_tab_changed)
         self.editor_right_notebook = editor_right
 
         editor_context_tab = ttk.Frame(editor_right, padding=6)
         editor_context_tab.columnconfigure(0, weight=1)
         editor_context_tab.rowconfigure(0, weight=1)
-        editor_right.add(editor_context_tab, text="현재 문맥")
+        self._register_message_editor_tab(editor_right, editor_context_tab, tab_key="context")
         self.message_context_text = scrolledtext.ScrolledText(editor_context_tab, wrap="word")
         self.message_context_text.grid(row=0, column=0, sticky="nsew")
 
         editor_plan_tab = ttk.Frame(editor_right, padding=6)
         editor_plan_tab.columnconfigure(0, weight=1)
         editor_plan_tab.rowconfigure(0, weight=1)
-        editor_right.add(editor_plan_tab, text="적용 source / plan")
+        self._register_message_editor_tab(editor_right, editor_plan_tab, tab_key="plan")
         self.message_plan_text = scrolledtext.ScrolledText(editor_plan_tab, wrap="word")
         self.message_plan_text.grid(row=0, column=0, sticky="nsew")
 
         editor_initial_preview_tab = ttk.Frame(editor_right, padding=6)
         editor_initial_preview_tab.columnconfigure(0, weight=1)
         editor_initial_preview_tab.rowconfigure(0, weight=1)
-        editor_right.add(editor_initial_preview_tab, text="Initial Preview")
+        self._register_message_editor_tab(editor_right, editor_initial_preview_tab, tab_key="initial_preview")
         self.message_initial_preview_text = scrolledtext.ScrolledText(editor_initial_preview_tab, wrap="word")
         self.message_initial_preview_text.grid(row=0, column=0, sticky="nsew")
 
         editor_handoff_preview_tab = ttk.Frame(editor_right, padding=6)
         editor_handoff_preview_tab.columnconfigure(0, weight=1)
         editor_handoff_preview_tab.rowconfigure(0, weight=1)
-        editor_right.add(editor_handoff_preview_tab, text="Handoff Preview")
+        self._register_message_editor_tab(editor_right, editor_handoff_preview_tab, tab_key="handoff_preview")
         self.message_handoff_preview_text = scrolledtext.ScrolledText(editor_handoff_preview_tab, wrap="word")
         self.message_handoff_preview_text.grid(row=0, column=0, sticky="nsew")
 
         editor_final_delivery_tab = ttk.Frame(editor_right, padding=6)
         editor_final_delivery_tab.columnconfigure(0, weight=1)
         editor_final_delivery_tab.rowconfigure(1, weight=1)
-        editor_right.add(editor_final_delivery_tab, text="최종 전달문")
+        self._register_message_editor_tab(editor_right, editor_final_delivery_tab, tab_key="final_delivery")
         final_delivery_actions = ttk.Frame(editor_final_delivery_tab)
         final_delivery_actions.grid(row=0, column=0, sticky="ew", pady=(0, 8))
         ttk.Button(final_delivery_actions, text="완성본 복사", command=self.copy_current_final_delivery_preview).grid(row=0, column=0, padx=(0, 8))
@@ -3693,7 +6909,7 @@ class RelayOperatorPanel(tk.Tk):
         editor_path_summary_tab = ttk.Frame(editor_right, padding=6)
         editor_path_summary_tab.columnconfigure(0, weight=1)
         editor_path_summary_tab.rowconfigure(1, weight=1)
-        editor_right.add(editor_path_summary_tab, text="경로 요약")
+        self._register_message_editor_tab(editor_right, editor_path_summary_tab, tab_key="path_summary")
         path_summary_actions = ttk.Frame(editor_path_summary_tab)
         path_summary_actions.grid(row=0, column=0, sticky="ew", pady=(0, 8))
         ttk.Button(path_summary_actions, text="경로 요약 복사", command=self.copy_current_path_summary).grid(row=0, column=0, padx=(0, 8))
@@ -3705,35 +6921,35 @@ class RelayOperatorPanel(tk.Tk):
         editor_one_time_tab = ttk.Frame(editor_right, padding=6)
         editor_one_time_tab.columnconfigure(0, weight=1)
         editor_one_time_tab.rowconfigure(0, weight=1)
-        editor_right.add(editor_one_time_tab, text="1회성 문구")
+        self._register_message_editor_tab(editor_right, editor_one_time_tab, tab_key="one_time")
         self.message_one_time_preview_text = scrolledtext.ScrolledText(editor_one_time_tab, wrap="word")
         self.message_one_time_preview_text.grid(row=0, column=0, sticky="nsew")
 
         self.editor_validation_tab = ttk.Frame(editor_right, padding=6)
         self.editor_validation_tab.columnconfigure(0, weight=1)
         self.editor_validation_tab.rowconfigure(0, weight=1)
-        editor_right.add(self.editor_validation_tab, text="저장 전 검증")
+        self._register_message_editor_tab(editor_right, self.editor_validation_tab, tab_key="validation")
         self.message_validation_text = scrolledtext.ScrolledText(self.editor_validation_tab, wrap="word")
         self.message_validation_text.grid(row=0, column=0, sticky="nsew")
 
         editor_summary_tab = ttk.Frame(editor_right, padding=6)
         editor_summary_tab.columnconfigure(0, weight=1)
         editor_summary_tab.rowconfigure(0, weight=1)
-        editor_right.add(editor_summary_tab, text="편집 요약")
+        self._register_message_editor_tab(editor_right, editor_summary_tab, tab_key="summary")
         self.message_summary_text = scrolledtext.ScrolledText(editor_summary_tab, wrap="word")
         self.message_summary_text.grid(row=0, column=0, sticky="nsew")
 
         self.editor_diff_tab = ttk.Frame(editor_right, padding=6)
         self.editor_diff_tab.columnconfigure(0, weight=1)
         self.editor_diff_tab.rowconfigure(0, weight=1)
-        editor_right.add(self.editor_diff_tab, text="Diff")
+        self._register_message_editor_tab(editor_right, self.editor_diff_tab, tab_key="diff")
         self.message_diff_text = scrolledtext.ScrolledText(self.editor_diff_tab, wrap="none")
         self.message_diff_text.grid(row=0, column=0, sticky="nsew")
 
         editor_backup_tab = ttk.Frame(editor_right, padding=6)
         editor_backup_tab.columnconfigure(0, weight=1)
         editor_backup_tab.rowconfigure(2, weight=1)
-        editor_right.add(editor_backup_tab, text="백업")
+        self._register_message_editor_tab(editor_right, editor_backup_tab, tab_key="backup")
         backup_action_row = ttk.Frame(editor_backup_tab)
         backup_action_row.grid(row=0, column=0, sticky="ew", pady=(0, 8))
         ttk.Button(backup_action_row, text="백업 새로고침", command=self.refresh_message_backup_list).grid(row=0, column=0, padx=(0, 8))
@@ -3744,13 +6960,13 @@ class RelayOperatorPanel(tk.Tk):
         self.message_backup_list.grid(row=1, column=0, sticky="nsew", pady=(0, 8))
         self.message_backup_text = scrolledtext.ScrolledText(editor_backup_tab, wrap="word")
         self.message_backup_text.grid(row=2, column=0, sticky="nsew")
+        self._refresh_message_editor_tab_heading()
 
-        artifacts_tab = ttk.Frame(notebook, padding=10)
+        artifacts_tab_container, artifacts_tab = self._create_scrollable_tab(notebook, title="결과 / 산출물")
         artifacts_tab.columnconfigure(0, weight=3)
         artifacts_tab.columnconfigure(1, weight=2)
         artifacts_tab.rowconfigure(2, weight=1)
-        notebook.add(artifacts_tab, text="결과 / 산출물")
-        self.artifacts_tab = artifacts_tab
+        self.artifacts_tab = artifacts_tab_container
 
         artifact_filters = ttk.LabelFrame(artifacts_tab, text="필터", padding=8)
         artifact_filters.grid(row=0, column=0, columnspan=2, sticky="ew")
@@ -3781,6 +6997,20 @@ class RelayOperatorPanel(tk.Tk):
             variable=self.artifact_include_missing_var,
             command=self.refresh_artifacts_tab,
         ).grid(row=1, column=3, sticky="w", pady=(8, 0))
+        artifact_scope_actions = ttk.Frame(artifact_filters)
+        artifact_scope_actions.grid(row=2, column=0, columnspan=5, sticky="w", pady=(8, 0))
+        ttk.Button(artifact_scope_actions, text="현재 실행 Pair/Target 반영", command=self.sync_artifact_filters_to_action_context).grid(row=0, column=0, padx=(0, 8))
+        ttk.Button(
+            artifact_scope_actions,
+            textvariable=self.artifact_home_browse_toggle_var,
+            command=self.toggle_artifact_home_pair_scope,
+        ).grid(row=0, column=1, padx=(0, 8))
+        ttk.Button(
+            artifact_scope_actions,
+            textvariable=self.artifact_home_browse_target_toggle_var,
+            command=self.toggle_artifact_home_target_scope,
+        ).grid(row=0, column=2, padx=(0, 8))
+        ttk.Button(artifact_scope_actions, text="필터 지우기", command=self.clear_artifact_filters).grid(row=0, column=3)
         ttk.Label(artifact_filters, textvariable=self.artifact_status_var, wraplength=820, justify="left").grid(
             row=1,
             column=5,
@@ -3817,44 +7047,59 @@ class RelayOperatorPanel(tk.Tk):
         artifact_right.rowconfigure(1, weight=1)
         artifact_right.rowconfigure(2, weight=1)
 
-        artifact_actions = ttk.LabelFrame(artifact_right, text="열기 / 복사", padding=8)
+        artifact_actions = ttk.LabelFrame(artifact_right, text="상태 확인 / 열기", padding=8)
         artifact_actions.grid(row=0, column=0, sticky="ew")
-        for idx, (label, kind) in enumerate(
-            [
-                ("summary 열기", "summary"),
-                ("latest zip 열기", "review_zip"),
-                ("watch 시작", "watch_start"),
-                ("target check 실행", "artifact_check"),
-                ("target submit 실행", "artifact_import"),
-                ("error 열기", "error"),
-                ("result 열기", "result"),
-                ("request 열기", "request"),
-                ("done 열기", "done"),
-                ("target 폴더", "target_folder"),
-                ("review 폴더", "review_folder"),
-            ]
-        ):
-            if kind == "watch_start":
-                command = self.start_watcher_detached
-            elif kind == "artifact_check":
-                command = self.check_selected_external_artifact
-            elif kind == "artifact_import":
-                command = self.import_selected_external_artifact
-            else:
-                command = (lambda kind=kind: self.open_selected_artifact_path(kind))
-            button = ttk.Button(
-                artifact_actions,
-                text=label,
-                command=command,
-            )
-            button.grid(row=idx // 4, column=idx % 4, padx=(0, 8), pady=(0, 6), sticky="ew")
-            if kind in {"watch_start", "artifact_check", "artifact_import"}:
-                self.long_task_widgets.append(button)
+        for column in range(3):
+            artifact_actions.columnconfigure(column, weight=1)
+        artifact_action_groups = [
+            (
+                "상태 확인",
+                [
+                    ("summary 열기", "summary"),
+                    ("latest zip 열기", "review_zip"),
+                    ("error 열기", "error"),
+                    ("result 열기", "result"),
+                ],
+            ),
+            (
+                "작업 실행",
+                [
+                    ("watch 시작", "watch_start"),
+                    ("target check 실행", "artifact_check"),
+                    ("target submit 실행", "artifact_import"),
+                ],
+            ),
+            (
+                "경로 / 폴더",
+                [
+                    ("request 열기", "request"),
+                    ("done 열기", "done"),
+                    ("target 폴더", "target_folder"),
+                    ("review 폴더", "review_folder"),
+                ],
+            ),
+        ]
+        for column, (title, specs) in enumerate(artifact_action_groups):
+            group = ttk.LabelFrame(artifact_actions, text=title, padding=8)
+            group.grid(row=0, column=column, sticky="nsew", padx=(0, 8) if column < 2 else (0, 0))
+            for idx, (label, kind) in enumerate(specs):
                 if kind == "watch_start":
-                    self.artifact_watch_button = button
+                    command = self.start_watcher_detached
+                elif kind == "artifact_check":
+                    command = self.check_selected_external_artifact
+                elif kind == "artifact_import":
+                    command = self.import_selected_external_artifact
+                else:
+                    command = (lambda kind=kind: self.open_selected_artifact_path(kind))
+                button = ttk.Button(group, text=label, command=command)
+                button.grid(row=idx // 2, column=idx % 2, padx=(0, 8) if idx % 2 == 0 else (0, 0), pady=(0, 6), sticky="ew")
+                if kind in {"watch_start", "artifact_check", "artifact_import"}:
+                    self.long_task_widgets.append(button)
+                    if kind == "watch_start":
+                        self.artifact_watch_button = button
 
         copy_row = ttk.Frame(artifact_actions)
-        copy_row.grid(row=2, column=0, columnspan=4, sticky="ew", pady=(4, 0))
+        copy_row.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(8, 0))
         copy_row.columnconfigure(0, weight=1)
         ttk.Combobox(
             copy_row,
@@ -3868,22 +7113,41 @@ class RelayOperatorPanel(tk.Tk):
         artifact_summary_frame = ttk.LabelFrame(artifact_right, text="summary 미리보기", padding=6)
         artifact_summary_frame.grid(row=1, column=0, sticky="nsew", pady=(10, 0))
         artifact_summary_frame.columnconfigure(0, weight=1)
-        artifact_summary_frame.rowconfigure(0, weight=1)
-        self.artifact_summary_text = scrolledtext.ScrolledText(artifact_summary_frame, wrap="word")
+        artifact_summary_frame.rowconfigure(1, weight=1)
+        artifact_summary_header = ttk.Frame(artifact_summary_frame)
+        artifact_summary_header.grid(row=0, column=0, sticky="ew", pady=(0, 6))
+        artifact_summary_header.columnconfigure(0, weight=1)
+        ttk.Label(artifact_summary_header, text="핵심 summary만 먼저 보고, 경로/상태는 아래에서 필요할 때 펼칩니다.").grid(row=0, column=0, sticky="w")
+        ttk.Button(artifact_summary_header, textvariable=self.artifact_summary_toggle_var, command=self.toggle_artifact_summary_section).grid(row=0, column=1, sticky="e")
+        artifact_summary_body_frame = ttk.Frame(artifact_summary_frame)
+        artifact_summary_body_frame.grid(row=1, column=0, sticky="nsew")
+        artifact_summary_body_frame.columnconfigure(0, weight=1)
+        artifact_summary_body_frame.rowconfigure(0, weight=1)
+        self.artifact_summary_body_frame = artifact_summary_body_frame
+        self.artifact_summary_text = scrolledtext.ScrolledText(artifact_summary_body_frame, wrap="word")
         self.artifact_summary_text.grid(row=0, column=0, sticky="nsew")
 
         artifact_details_frame = ttk.LabelFrame(artifact_right, text="경로 / 상태", padding=6)
         artifact_details_frame.grid(row=2, column=0, sticky="nsew", pady=(10, 0))
         artifact_details_frame.columnconfigure(0, weight=1)
-        artifact_details_frame.rowconfigure(0, weight=1)
-        self.artifact_details_text = scrolledtext.ScrolledText(artifact_details_frame, wrap="word")
+        artifact_details_frame.rowconfigure(1, weight=1)
+        artifact_details_header = ttk.Frame(artifact_details_frame)
+        artifact_details_header.grid(row=0, column=0, sticky="ew", pady=(0, 6))
+        artifact_details_header.columnconfigure(0, weight=1)
+        ttk.Label(artifact_details_header, text="RunRoot 차이, contract 경로, wrapper 경로는 필요할 때만 펼칩니다.").grid(row=0, column=0, sticky="w")
+        ttk.Button(artifact_details_header, textvariable=self.artifact_details_toggle_var, command=self.toggle_artifact_details_section).grid(row=0, column=1, sticky="e")
+        artifact_details_body_frame = ttk.Frame(artifact_details_frame)
+        artifact_details_body_frame.grid(row=1, column=0, sticky="nsew")
+        artifact_details_body_frame.columnconfigure(0, weight=1)
+        artifact_details_body_frame.rowconfigure(0, weight=1)
+        self.artifact_details_body_frame = artifact_details_body_frame
+        self.artifact_details_text = scrolledtext.ScrolledText(artifact_details_body_frame, wrap="word")
         self.artifact_details_text.grid(row=0, column=0, sticky="nsew")
 
-        visible_tab = ttk.Frame(notebook, padding=10)
+        visible_tab_container, visible_tab = self._create_scrollable_tab(notebook, title="Visible Acceptance")
         visible_tab.columnconfigure(0, weight=1)
         visible_tab.rowconfigure(3, weight=1)
-        notebook.add(visible_tab, text="Visible Acceptance")
-        self.visible_acceptance_tab = visible_tab
+        self.visible_acceptance_tab = visible_tab_container
 
         visible_header = ttk.LabelFrame(visible_tab, text="shared visible 공식 절차", padding=8)
         visible_header.grid(row=0, column=0, sticky="ew")
@@ -3902,15 +7166,17 @@ class RelayOperatorPanel(tk.Tk):
         visible_actions.columnconfigure(0, weight=1)
         visible_actions.columnconfigure(1, weight=1)
 
-        visible_gate_frame = ttk.LabelFrame(visible_actions, text="실행 전 게이트", padding=8)
+        visible_gate_frame = ttk.LabelFrame(visible_actions, text="지금 시작 / 게이트", padding=8)
         visible_gate_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+        for column in range(3):
+            visible_gate_frame.columnconfigure(column, weight=1)
         for idx, (label, callback, attr_name) in enumerate(
             [
-                ("queue cleanup dry-run", self.run_visible_queue_cleanup_dry_run, "visible_cleanup_dry_button"),
-                ("queue cleanup apply", self.run_visible_queue_cleanup_apply, "visible_cleanup_apply_button"),
-                ("visible preflight-only", self.run_visible_acceptance_preflight, "visible_preflight_button"),
+                ("cleanup 미리보기", self.run_visible_queue_cleanup_dry_run, "visible_cleanup_dry_button"),
+                ("cleanup 적용", self.run_visible_queue_cleanup_apply, "visible_cleanup_apply_button"),
+                ("입력 전 점검", self.run_visible_acceptance_preflight, "visible_preflight_button"),
                 ("post-cleanup", self.run_visible_post_cleanup, "visible_post_cleanup_button"),
-                ("clean preflight recheck", self.run_visible_clean_preflight_recheck, "visible_clean_preflight_button"),
+                ("clean preflight 재확인", self.run_visible_clean_preflight_recheck, "visible_clean_preflight_button"),
             ]
         ):
             button = ttk.Button(visible_gate_frame, text=label, command=callback)
@@ -3918,13 +7184,13 @@ class RelayOperatorPanel(tk.Tk):
             self.long_task_widgets.append(button)
             setattr(self, attr_name, button)
 
-        visible_exec_frame = ttk.LabelFrame(visible_actions, text="실행 / 판정", padding=8)
+        visible_exec_frame = ttk.LabelFrame(visible_actions, text="상태 확인 / 판정", padding=8)
         visible_exec_frame.grid(row=0, column=1, sticky="nsew")
         for idx, (label, callback, attr_name) in enumerate(
             [
-                ("active visible acceptance", self.run_active_visible_acceptance, "visible_active_acceptance_button"),
-                ("shared visible confirm", self.run_shared_visible_confirm, "visible_confirm_button"),
-                ("receipt confirm", self.run_visible_receipt_confirm, "visible_receipt_confirm_button"),
+                ("실제 acceptance 실행", self.run_active_visible_acceptance, "visible_active_acceptance_button"),
+                ("shared confirm", self.run_shared_visible_confirm, "visible_confirm_button"),
+                ("receipt 확인", self.run_visible_receipt_confirm, "visible_receipt_confirm_button"),
             ]
         ):
             button = ttk.Button(visible_exec_frame, text=label, command=callback)
@@ -3938,7 +7204,7 @@ class RelayOperatorPanel(tk.Tk):
             justify="left",
         ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(8, 0))
 
-        visible_primitive_frame = ttk.LabelFrame(visible_tab, text="pair primitive / 수동 단계", padding=8)
+        visible_primitive_frame = ttk.LabelFrame(visible_tab, text="복구 / 수동 단계", padding=8)
         visible_primitive_frame.grid(row=2, column=0, sticky="ew", pady=(10, 0))
         visible_primitive_frame.columnconfigure(0, weight=1)
         visible_primitive_frame.columnconfigure(1, weight=1)
@@ -3954,30 +7220,70 @@ class RelayOperatorPanel(tk.Tk):
             wraplength=1200,
             justify="left",
         ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        primitive_stage_row = ttk.Frame(visible_primitive_frame)
+        primitive_stage_row.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(6, 0))
+        primitive_stage_badge_label = tk.Label(
+            primitive_stage_row,
+            textvariable=self.visible_primitive_stage_badge_var,
+            bg="#6B7280",
+            fg="#FFFFFF",
+            padx=8,
+            pady=2,
+        )
+        primitive_stage_badge_label.grid(row=0, column=0, sticky="w")
+        self.visible_primitive_stage_badge_label = primitive_stage_badge_label
+        ttk.Label(
+            primitive_stage_row,
+            textvariable=self.visible_primitive_stage_detail_var,
+            wraplength=1020,
+            justify="left",
+        ).grid(row=0, column=1, sticky="w", padx=(8, 0))
 
-        for idx, (label, callback, attr_name) in enumerate(
-            [
-                ("공식 8창 재사용", self.reuse_existing_windows, "visible_primitive_reuse_button"),
-                ("typed-window 입력 점검", self.run_visibility_check, "visible_primitive_visibility_button"),
-                ("편집본 preview 갱신", self.refresh_message_editor_preview, "visible_primitive_preview_refresh_button"),
-                ("고정문구 저장 + 새로고침", self.save_message_editor, "visible_primitive_save_button"),
-                ("선택 target preview 저장", self.export_selected_row_messages, "visible_primitive_export_button"),
-                ("선택 target 1회 submit", self.run_selected_target_seed_submit, "visible_primitive_submit_button"),
-                ("publish 확인", self.inspect_selected_target_publish_status, "visible_primitive_publish_button"),
-                ("상대 target 선택", self.select_partner_target_from_context, "visible_primitive_partner_button"),
-                ("handoff 확인", self.inspect_selected_pair_handoff_status, "visible_primitive_handoff_button"),
-            ]
-        ):
-            button = ttk.Button(visible_primitive_frame, text=label, command=callback)
-            button.grid(row=2 + (idx // 3), column=idx % 3, padx=(0, 8), pady=(8, 0), sticky="ew")
-            self.long_task_widgets.append(button)
-            setattr(self, attr_name, button)
+        primitive_action_groups = [
+            (
+                "문맥 준비",
+                "공식 창 재사용, 입력 가능 여부, 상대 target 문맥부터 맞춥니다.",
+                [
+                    ("공식 8창 재사용", self.reuse_existing_windows, "visible_primitive_reuse_button"),
+                    ("typed-window 입력 점검", self.run_visibility_check, "visible_primitive_visibility_button"),
+                    ("상대 target 선택", self.select_partner_target_from_context, "visible_primitive_partner_button"),
+                ],
+            ),
+            (
+                "문구 / preview",
+                "현재 편집본을 다시 계산하거나 저장한 뒤 선택 target preview를 따로 남깁니다.",
+                [
+                    ("편집본 preview 갱신", self.refresh_message_editor_preview, "visible_primitive_preview_refresh_button"),
+                    ("고정문구 저장 + 새로고침", self.save_message_editor, "visible_primitive_save_button"),
+                    ("선택 target preview 저장", self.export_selected_row_messages, "visible_primitive_export_button"),
+                ],
+            ),
+            (
+                "수동 submit / 확인",
+                "실제 1회 submit 뒤 publish 상태와 handoff 결과를 순서대로 확인합니다.",
+                [
+                    ("선택 target 1회 submit", self.run_selected_target_seed_submit, "visible_primitive_submit_button"),
+                    ("publish 확인", self.inspect_selected_target_publish_status, "visible_primitive_publish_button"),
+                    ("handoff 확인", self.inspect_selected_pair_handoff_status, "visible_primitive_handoff_button"),
+                ],
+            ),
+        ]
+        for column, (title, description, specs) in enumerate(primitive_action_groups):
+            group = ttk.LabelFrame(visible_primitive_frame, text=title, padding=8)
+            group.grid(row=3, column=column, sticky="nsew", padx=(0, 8) if column < 2 else (0, 0), pady=(8, 0))
+            group.columnconfigure(0, weight=1)
+            ttk.Label(group, text=description, wraplength=340, justify="left").grid(row=0, column=0, sticky="w", pady=(0, 8))
+            for row_index, (label, callback, attr_name) in enumerate(specs, start=1):
+                button = ttk.Button(group, text=label, command=callback)
+                button.grid(row=row_index, column=0, sticky="ew", pady=(0, 8) if row_index < len(specs) else (0, 0))
+                self.long_task_widgets.append(button)
+                setattr(self, attr_name, button)
         ttk.Label(
             visible_primitive_frame,
             text="매크로를 대체하지 않습니다. 현재 선택 pair/target 기준으로 preview/apply -> submit -> publish/handoff를 잘라 디버깅하는 보조 버튼입니다.",
             wraplength=1200,
             justify="left",
-        ).grid(row=5, column=0, columnspan=3, sticky="w", pady=(8, 0))
+        ).grid(row=4, column=0, columnspan=3, sticky="w", pady=(8, 0))
 
         visible_result_frame = ttk.LabelFrame(visible_tab, text="결과 / receipt 요약", padding=6)
         visible_result_frame.grid(row=3, column=0, sticky="nsew", pady=(10, 0))
@@ -3992,62 +7298,65 @@ class RelayOperatorPanel(tk.Tk):
         self.visible_acceptance_text = scrolledtext.ScrolledText(visible_result_frame, wrap="word")
         self.visible_acceptance_text.grid(row=1, column=0, sticky="nsew")
 
-        ops_tab = ttk.Frame(notebook, padding=10)
+        ops_tab_container, ops_tab = self._create_scrollable_tab(notebook, title="Headless Drill / 진단")
         ops_tab.columnconfigure(0, weight=1)
         ops_tab.rowconfigure(2, weight=1)
-        notebook.add(ops_tab, text="Headless Drill / 진단")
-        self.ops_tab = ops_tab
+        self.ops_tab = ops_tab_container
 
-        button_row = ttk.Frame(ops_tab)
-        button_row.grid(row=0, column=0, sticky="ew")
-        for idx, (label, callback) in enumerate(
-            [
-                ("pair01 Preset Drill", self.run_fixed_pair01_drill),
-                ("선택된 Pair Headless Drill 실행", self.run_selected_pair_drill),
-                ("watch 시작(기본)", self.start_watcher_detached),
-                ("watch 시작(입력값)", self.start_watcher_with_options),
-                ("watch 일시중지", self.request_pause_watcher),
-                ("watch 재개", self.request_resume_watcher),
-                ("watch 정지 요청", self.request_stop_watcher),
-                ("watch 재시작", self.restart_watcher),
-                ("watch stale 정리", self.recover_stale_watcher_state),
-                ("watch 진단", self.show_watcher_diagnostics),
-                ("watch 권장 조치", self.apply_watcher_recommended_action),
-                ("watch audit 로그", self.open_watcher_audit_log),
-                ("watch status 파일", self.open_watcher_status_file),
-                ("watch control 파일", self.open_watcher_control_file),
-                ("릴레이 상태", self.run_relay_status),
-                ("페어 상태", self.run_paired_status),
-                ("runroot 요약", self.run_paired_summary),
-                ("important-summary 열기", self.open_important_summary_text),
-                ("창 입력 가능 확인", self.run_visibility_check),
-                ("Headless 준비 확인", self.run_headless_readiness),
-                ("적용 설정 JSON", self.run_effective_json),
-            ]
-        ):
-            button = ttk.Button(button_row, text=label, command=callback)
-            button.grid(row=0, column=idx, padx=(0, 8))
-            self.long_task_widgets.append(button)
-            if label in READ_ONLY_OPS_BUTTON_LABELS:
-                self._register_read_only_widget(button)
-            if label == "pair01 Preset Drill":
-                self.fixed_pair01_button = button
-            elif label == "선택된 Pair Headless Drill 실행":
-                self.selected_pair_button = button
-            elif label == "watch 시작(기본)":
-                self.ops_quick_start_watch_button = button
-            elif label == "watch 시작(입력값)":
-                self.ops_start_watch_button = button
-            elif label == "watch 일시중지":
-                self.ops_pause_watch_button = button
-            elif label == "watch 재개":
-                self.ops_resume_watch_button = button
-            elif label == "watch 정지 요청":
-                self.ops_stop_watch_button = button
-            elif label == "watch 재시작":
-                self.ops_restart_watch_button = button
-            elif label == "watch stale 정리":
-                self.ops_recover_watch_button = button
+        ops_action_groups = ttk.Frame(ops_tab)
+        ops_action_groups.grid(row=0, column=0, sticky="ew")
+        for column in range(3):
+            ops_action_groups.columnconfigure(column, weight=1)
+        grouped_ops_buttons = [
+            (
+                "지금 시작",
+                [
+                    ("pair01 preset 실행", self.run_fixed_pair01_drill, "fixed_pair01_button"),
+                    ("선택 Pair 실행", self.run_selected_pair_drill, "selected_pair_button"),
+                    ("watch 시작", self.start_watcher_detached, "ops_quick_start_watch_button"),
+                    ("watch 시작(입력값)", self.start_watcher_with_options, "ops_start_watch_button"),
+                    ("창 입력 가능 확인", self.run_visibility_check, ""),
+                    ("Headless 준비 확인", self.run_headless_readiness, ""),
+                ],
+            ),
+            (
+                "상태 확인",
+                [
+                    ("릴레이 상태", self.run_relay_status, ""),
+                    ("페어 상태", self.run_paired_status, ""),
+                    ("runroot 요약", self.run_paired_summary, ""),
+                    ("요약 리포트 열기", self.open_important_summary_text, ""),
+                    ("적용 설정 JSON", self.run_effective_json, ""),
+                ],
+            ),
+            (
+                "복구 / 제어",
+                [
+                    ("watch 일시중지", self.request_pause_watcher, "ops_pause_watch_button"),
+                    ("watch 재개", self.request_resume_watcher, "ops_resume_watch_button"),
+                    ("watch 정지 요청", self.request_stop_watcher, "ops_stop_watch_button"),
+                    ("watch 재시작", self.restart_watcher, "ops_restart_watch_button"),
+                    ("watch stale 정리", self.recover_stale_watcher_state, "ops_recover_watch_button"),
+                    ("watch 진단", self.show_watcher_diagnostics, ""),
+                    ("watch 권장 조치", self.apply_watcher_recommended_action, ""),
+                    ("watch audit 로그", self.open_watcher_audit_log, ""),
+                    ("watch status 파일", self.open_watcher_status_file, ""),
+                    ("watch control 파일", self.open_watcher_control_file, ""),
+                ],
+            ),
+        ]
+        read_only_ops_labels = {"릴레이 상태", "페어 상태", "runroot 요약", "요약 리포트 열기", "Headless 준비 확인", "적용 설정 JSON", "watch 진단", "watch audit 로그", "watch status 파일", "watch control 파일"}
+        for column, (title, specs) in enumerate(grouped_ops_buttons):
+            group = ttk.LabelFrame(ops_action_groups, text=title, padding=8)
+            group.grid(row=0, column=column, sticky="nsew", padx=(0, 8) if column < 2 else (0, 0))
+            for idx, (label, callback, attr_name) in enumerate(specs):
+                button = ttk.Button(group, text=label, command=callback)
+                button.grid(row=idx // 2, column=idx % 2, sticky="ew", padx=(0, 8) if idx % 2 == 0 else (0, 0), pady=(0, 8))
+                self.long_task_widgets.append(button)
+                if label in read_only_ops_labels:
+                    self._register_read_only_widget(button)
+                if attr_name:
+                    setattr(self, attr_name, button)
 
         watcher_options_frame = ttk.LabelFrame(ops_tab, text="watch 시작 / 재시작 입력값", padding=8)
         watcher_options_frame.grid(row=1, column=0, sticky="ew", pady=(10, 0))
@@ -4091,6 +7400,12 @@ class RelayOperatorPanel(tk.Tk):
             wraplength=920,
             justify="left",
         ).grid(row=3, column=0, columnspan=8, sticky="w", pady=(6, 0))
+        ttk.Label(
+            watcher_options_frame,
+            textvariable=self.watcher_control_note_var,
+            wraplength=920,
+            justify="left",
+        ).grid(row=4, column=0, columnspan=8, sticky="w", pady=(6, 0))
 
         for child in controls.winfo_children():
             if isinstance(child, ttk.Combobox):
@@ -4162,6 +7477,11 @@ class RelayOperatorPanel(tk.Tk):
         self.message_slot_order_list.bind("<ButtonPress-1>", self.on_message_slot_press)
         self.message_slot_order_list.bind("<B1-Motion>", self.on_message_slot_drag)
         self.message_slot_order_list.bind("<ButtonRelease-1>", self.on_message_slot_release)
+        self._apply_header_compact_mode()
+        self._apply_result_panel_dock_mode()
+        self._apply_result_panel_visibility()
+        self._apply_artifact_section_visibility()
+        self._refresh_sticky_context_bar()
 
     def browse_config(self) -> None:
         selected = filedialog.askopenfilename(
@@ -4185,6 +7505,7 @@ class RelayOperatorPanel(tk.Tk):
             self.operator_hint_var.set(hint)
         if last_result:
             self.last_result_var.set(last_result)
+        self._refresh_sticky_context_bar()
 
     def _apply_watcher_panel_update(self, update: WatcherPanelUpdate) -> None:
         if update.command_text:
@@ -4476,6 +7797,10 @@ class RelayOperatorPanel(tk.Tk):
             enabled, _detail = self._selected_pair_execution_allowed()
             self.home_run_pair_button.configure(state="normal" if enabled else "disabled")
 
+        if self._has_ui_attr("parallel_pair_drill_button"):
+            enabled, _detail = self._selected_parallel_pair_execution_allowed()
+            self.parallel_pair_drill_button.configure(state="normal" if enabled else "disabled")
+
         if self._has_ui_attr("home_apply_pair_button"):
             enabled = bool(home_pair_id) and home_pair_id != selected_pair
             self.home_apply_pair_button.configure(state="normal" if enabled else "disabled")
@@ -4542,20 +7867,21 @@ class RelayOperatorPanel(tk.Tk):
             self.visible_receipt_open_button.configure(state="normal" if (bool(receipt_path) and Path(receipt_path).exists()) else "disabled")
         if self._has_ui_attr("visible_receipt_copy_button"):
             self.visible_receipt_copy_button.configure(state="normal" if bool(receipt_path) else "disabled")
+        self._refresh_visible_next_action_highlights(visible_state)
 
         primitive_row = self._resolve_visible_primitive_row()
         primitive_pair_id = str((primitive_row or {}).get("PairId", "") or self._selected_pair_id() or "").strip()
         primitive_target_id = str((primitive_row or {}).get("TargetId", "") or self.target_id_var.get().strip() or "").strip()
         primitive_partner_target_id = str((primitive_row or {}).get("PartnerTargetId", "") or "").strip()
-        primitive_scope_allowed, _primitive_scope_detail = self._pair_scope_allowed(
+        primitive_scope_allowed, primitive_scope_detail = self._pair_scope_allowed(
             primitive_pair_id,
             action_label="pair primitive",
         )
-        primitive_active_run_root, _primitive_active_run_root_detail = self._resolve_manifest_run_root_for_visible_acceptance(
+        primitive_active_run_root, primitive_active_run_root_detail = self._resolve_manifest_run_root_for_visible_acceptance(
             action_label="pair primitive submit",
             allow_stale=False,
         )
-        primitive_confirm_run_root, _primitive_confirm_run_root_detail = self._resolve_manifest_run_root_for_visible_acceptance(
+        primitive_confirm_run_root, primitive_confirm_run_root_detail = self._resolve_manifest_run_root_for_visible_acceptance(
             action_label="pair primitive 확인",
             allow_stale=True,
         )
@@ -4563,6 +7889,11 @@ class RelayOperatorPanel(tk.Tk):
         primitive_injectable = primitive_visibility_row is None or bool(primitive_visibility_row.get("Injectable", False))
         primitive_context_ready = bool(primitive_row and primitive_pair_id and primitive_target_id)
         primitive_message_ready = primitive_context_ready and self.__dict__.get("message_config_doc") is not None
+        primitive_target_status = self._paired_target_status_row(primitive_target_id) if primitive_target_id else None
+        primitive_pair_status = self._paired_pair_status_row(primitive_pair_id) if primitive_pair_id else None
+        submit_enabled = False
+        publish_enabled = False
+        handoff_enabled = False
         if self._has_ui_attr("visible_primitive_reuse_button"):
             self.visible_primitive_reuse_button.configure(state="normal" if config_present else "disabled")
         if self._has_ui_attr("visible_primitive_visibility_button"):
@@ -4590,7 +7921,142 @@ class RelayOperatorPanel(tk.Tk):
         if self._has_ui_attr("visible_primitive_handoff_button"):
             handoff_enabled = config_present and bool(primitive_pair_id) and bool(primitive_confirm_run_root)
             self.visible_primitive_handoff_button.configure(state="normal" if handoff_enabled else "disabled")
+        primitive_submit_state = str((primitive_target_status or {}).get("SubmitState", "") or "").strip().lower()
+        primitive_latest_state = str((primitive_target_status or {}).get("LatestState", "") or "").strip().lower()
+        primitive_outbox_action = str((primitive_target_status or {}).get("SourceOutboxNextAction", "") or "").strip().lower()
+        primitive_pair_next_action = str((primitive_pair_status or {}).get("NextAction", "") or "").strip().lower()
+        primitive_handoff_ready_count = int((primitive_pair_status or {}).get("HandoffReadyCount", 0) or 0)
+        handoff_transition_states = {"ready-to-forward", "forwarded", "duplicate-skipped"}
+        handoff_transition_actions = {"handoff-ready", "already-forwarded", "duplicate-skipped"}
+        publish_progress_markers = {
+            "submitted",
+            "unconfirmed",
+            "confirmed",
+            "typed-window-submit-unconfirmed",
+            "typed-window-stalled-after-submit",
+        }
+        primitive_next_action_key = ""
+        primitive_stage_badge = "문맥 준비"
+        primitive_stage_detail = "현재 preview row, pair/target, RunRoot 기준을 먼저 맞춥니다."
+        primitive_stage_background = "#6B7280"
+        primitive_partner_transition_needed = bool(
+            primitive_partner_target_id
+            and primitive_pair_next_action == "await-partner-output"
+            and primitive_target_id != primitive_partner_target_id
+            and (
+                primitive_latest_state in handoff_transition_states
+                or primitive_outbox_action in handoff_transition_actions
+                or primitive_submit_state in publish_progress_markers
+            )
+        )
+        primitive_handoff_ready_now = bool(
+            handoff_enabled
+            and (
+                primitive_latest_state in handoff_transition_states
+                or primitive_outbox_action in handoff_transition_actions
+                or primitive_pair_next_action == "handoff-ready"
+                or primitive_handoff_ready_count > 0
+            )
+        )
+        primitive_publish_check_needed = bool(
+            publish_enabled
+            and (
+                primitive_submit_state in publish_progress_markers
+                or (
+                    primitive_latest_state
+                    and primitive_latest_state not in {"no-zip", "missing", "none", "(없음)"}
+                )
+                or (
+                    primitive_outbox_action
+                    and primitive_outbox_action not in {"no-zip", "missing", "none", "(없음)"}
+                )
+            )
+        )
+        if not config_present:
+            primitive_stage_badge = "Config 필요"
+            primitive_stage_detail = "Visible primitive는 ConfigPath가 있어야 현재 pair/target 메시지와 contract 경로를 계산할 수 있습니다."
+            primitive_stage_background = "#B45309"
+        elif not primitive_context_ready:
+            primitive_stage_badge = "대상 선택"
+            primitive_stage_detail = "preview row 또는 pair/target 문맥이 비어 있습니다. 현재 점검할 target을 먼저 고르세요."
+            primitive_stage_background = "#B45309"
+        if config_present and primitive_context_ready:
+            if primitive_visibility_row is None or not primitive_injectable:
+                primitive_next_action_key = "visible_primitive_visibility"
+                primitive_stage_badge = "입력 점검"
+                primitive_stage_detail = self._normalize_visible_primitive_stage_detail(
+                    str(primitive_visibility_row.get("InjectionReason", "") or "").strip()
+                    if primitive_visibility_row is not None and not primitive_injectable
+                    else "typed-window 입력 가능 여부와 submit guard를 먼저 확인해야 합니다."
+                ,
+                    category="visibility",
+                ) or "typed-window 입력 가능 여부와 submit guard를 먼저 확인해야 합니다."
+                primitive_stage_background = "#B45309" if primitive_injectable else "#B91C1C"
+            elif not primitive_message_ready:
+                primitive_next_action_key = "visible_primitive_preview_refresh"
+                primitive_stage_badge = "preview 준비"
+                primitive_stage_detail = "현재 target 편집본을 다시 계산하거나 저장해서 submit 전에 실제 payload를 먼저 확인하세요."
+                primitive_stage_background = "#0F766E"
+            elif primitive_partner_transition_needed:
+                primitive_next_action_key = "visible_primitive_partner"
+                primitive_stage_badge = "partner 전환"
+                primitive_stage_detail = (
+                    f"{primitive_partner_target_id} 쪽으로 시점을 옮겨 다음 응답 대상을 확인합니다."
+                )
+                primitive_stage_background = "#7C3AED"
+            elif primitive_handoff_ready_now:
+                primitive_next_action_key = "visible_primitive_handoff"
+                primitive_stage_badge = "handoff 확인"
+                primitive_stage_detail = "source-outbox와 pair 상태가 다음 전달 준비로 넘어갔는지 확인합니다."
+                primitive_stage_background = "#15803D"
+            elif primitive_publish_check_needed:
+                primitive_next_action_key = "visible_primitive_publish"
+                primitive_stage_badge = "publish 확인"
+                primitive_stage_detail = "submit 뒤 publish.ready / source-outbox 상태를 먼저 확인합니다."
+                primitive_stage_background = "#2563EB"
+            elif submit_enabled:
+                primitive_next_action_key = "visible_primitive_submit"
+                primitive_stage_badge = "1회 submit"
+                primitive_stage_detail = "현재 공식 창에 payload를 1회 전송하고 진행 신호가 생기는지 확인합니다."
+                primitive_stage_background = "#1D4ED8"
+            elif bool(primitive_partner_target_id):
+                primitive_next_action_key = "visible_primitive_partner"
+                primitive_stage_badge = "partner 확인"
+                primitive_stage_detail = f"필요하면 {primitive_partner_target_id} 쪽 문맥으로 전환해 상대 target 상태를 확인합니다."
+                primitive_stage_background = "#92400E"
+            elif not primitive_scope_allowed and primitive_scope_detail:
+                primitive_stage_badge = "실행 대기"
+                primitive_stage_detail = self._normalize_visible_primitive_stage_detail(
+                    primitive_scope_detail,
+                    category="scope",
+                )
+                primitive_stage_background = "#B45309"
+            elif not primitive_active_run_root and primitive_active_run_root_detail:
+                primitive_stage_badge = "RunRoot 준비"
+                primitive_stage_detail = self._normalize_visible_primitive_stage_detail(
+                    primitive_active_run_root_detail,
+                    category="run_root",
+                )
+                primitive_stage_background = "#B45309"
+            elif not primitive_confirm_run_root and primitive_confirm_run_root_detail:
+                primitive_stage_badge = "확인 경로 준비"
+                primitive_stage_detail = self._normalize_visible_primitive_stage_detail(
+                    primitive_confirm_run_root_detail,
+                    category="run_root",
+                )
+                primitive_stage_background = "#B45309"
+            else:
+                primitive_stage_badge = "submit 준비"
+                primitive_stage_detail = "문맥과 편집본은 준비됐습니다. RunRoot와 pair scope를 확인한 뒤 실제 submit으로 넘어갑니다."
+                primitive_stage_background = "#1D4ED8"
+        self._set_visible_primitive_stage(
+            badge_text=primitive_stage_badge,
+            detail_text=primitive_stage_detail,
+            background=primitive_stage_background,
+        )
+        self._refresh_visible_primitive_next_action_highlights(next_action_key=primitive_next_action_key)
         self._refresh_visible_primitive_summary()
+        self._refresh_sticky_context_bar()
 
     def on_pair_or_target_changed(self, _event: object | None = None) -> None:
         self.action_context_source = "controls"
@@ -4602,11 +8068,13 @@ class RelayOperatorPanel(tk.Tk):
         if preview_synced:
             self._sync_message_scope_id_from_context()
             self._sync_home_pair_selection(selected_pair)
+            self._sync_pair_scoped_views_with_action_context(refresh_artifacts=True)
             self.update_pair_button_states()
             self.rebuild_panel_state()
             return
         self._sync_message_scope_id_from_context()
         self._sync_home_pair_selection(self._selected_pair_id())
+        self._sync_pair_scoped_views_with_action_context(refresh_artifacts=True)
         self.render_target_board()
         self.render_message_editor()
         self.update_pair_button_states()
@@ -5426,8 +8894,47 @@ class RelayOperatorPanel(tk.Tk):
     def _home_pair_detail_text(self, summary: PairSummaryModel | None) -> str:
         detail = self.pair_controller.build_summary_detail(summary)
         if summary and summary.pair_id != self._selected_pair_id():
-            detail += " / 실행 기준은 현재 선택 Pair를 유지합니다. 이 Pair로 실행하려면 '선택 Pair 반영'을 누르세요."
+            detail += " / 실행 기준은 현재 선택 Pair를 유지합니다. 이 Pair로 실행하려면 '선택 Pair 반영'을 누르세요. 결과 탭에서는 이 Pair를 보조 강조합니다."
         return detail
+
+    def _action_pair_summary(self) -> PairSummaryModel | None:
+        if not self.panel_state:
+            return None
+        selected_pair = self._selected_pair_id()
+        return next((summary for summary in self.panel_state.pairs if summary.pair_id == selected_pair), None)
+
+    def _refresh_pair_focus_strip(self) -> None:
+        if not self._has_ui_attr("pair_focus_summary_var"):
+            return
+        pair_id = self._selected_pair_id()
+        summary = self._action_pair_summary()
+        snapshot = self._build_pair_runtime_snapshot(pair_id) if pair_id else {}
+        badge_spec = dict(snapshot.get("Badge") or self._pair_runtime_status_badge_spec(snapshot or {"PairId": pair_id}))
+        targets = summary.targets if summary else "(targets 미확인)"
+        latest_state = summary.latest_state if summary and summary.latest_state else "(상태 미확인)"
+        run_root = str(snapshot.get("RunRoot", "") or "").strip()
+        run_leaf = os.path.basename(os.path.normpath(run_root)) if run_root else "(runroot 없음)"
+        self.pair_focus_badge_var.set(str(badge_spec.get("text", "") or "STATE 미확인"))
+        self.pair_focus_summary_var.set(f"{pair_id} / {targets} / latest={latest_state}")
+        detail_parts = [
+            "phase={0}".format(str(snapshot.get("CurrentPhase", "") or summary.current_phase if summary else "").strip() or "(없음)"),
+            "next={0}".format(str(snapshot.get("NextAction", "") or summary.next_action if summary else "").strip() or "(없음)"),
+            "rt={0}".format(int(snapshot.get("RoundtripCount", 0) or (summary.roundtrip_count if summary else 0))),
+            "handoff={0}".format(int(summary.handoff_ready_count if summary else 0)),
+            "zip={0}".format(int(summary.zip_count if summary else 0)),
+            "fail={0}".format(int(summary.failure_count if summary else 0)),
+            "run={0}".format(run_leaf),
+        ]
+        self.pair_focus_detail_var.set(" / ".join(detail_parts))
+        if self._has_ui_attr("pair_focus_badge_label"):
+            try:
+                self.pair_focus_badge_label.configure(
+                    text=self.pair_focus_badge_var.get(),
+                    bg=str(badge_spec.get("background", "#6B7280")),
+                    fg=str(badge_spec.get("foreground", "#FFFFFF")),
+                )
+            except Exception:
+                pass
 
     def _launcher_wrapper_path(self) -> str:
         if self.effective_data:
@@ -5551,6 +9058,7 @@ class RelayOperatorPanel(tk.Tk):
             vars_by_key["value"].set(card.value)
             vars_by_key["detail"].set(card.detail)
         self._refresh_visible_acceptance_summary()
+        next_action_key = str(self.panel_state.next_actions[0].action_key if self.panel_state.next_actions else "").strip()
 
         for stage in self.panel_state.stages:
             vars_by_key = self.home_stage_vars.get(stage.key)
@@ -5559,7 +9067,10 @@ class RelayOperatorPanel(tk.Tk):
                 vars_by_key["status"].set("상태: {0}".format(stage.status_text))
                 vars_by_key["detail"].set(stage.detail)
             if button:
-                button.configure(text=stage.action_label, state="disabled" if self._busy or not stage.enabled else "normal")
+                button.configure(
+                    text=self._highlighted_button_text(stage.action_label, active=(stage.action_key == next_action_key)),
+                    state="disabled" if self._busy or not stage.enabled else "normal",
+                )
 
         self._render_action_frame(self.home_next_actions_frame, self.panel_state.next_actions)
         self._render_issue_frame(self.home_issue_frame, self.panel_state.issues)
@@ -5594,6 +9105,7 @@ class RelayOperatorPanel(tk.Tk):
             )
 
         self._sync_home_pair_selection(selected_home_pair)
+        self._apply_home_pair_tree_highlights()
         summary = self._selected_pair_summary()
         if summary:
             self.home_pair_detail_var.set(self._home_pair_detail_text(summary))
@@ -5629,6 +9141,8 @@ class RelayOperatorPanel(tk.Tk):
             self.artifact_target_filter_var.set("")
 
     def refresh_artifacts_tab(self, _event: object | None = None) -> None:
+        if self._artifact_home_browse_pair_scope_enabled():
+            self._sync_artifact_filters_with_home_pair_selection(refresh=False)
         current_state = self._selected_artifact_state()
         selected_target = current_state.target_id if current_state else ""
         if not self.effective_data:
@@ -5640,6 +9154,7 @@ class RelayOperatorPanel(tk.Tk):
             self.artifact_status_var.set(self.artifact_status_base_text)
             self.set_text(self.artifact_summary_text, "")
             self.set_text(self.artifact_details_text, "")
+            self._refresh_sticky_context_bar()
             return
 
         query = self._artifact_query()
@@ -5684,6 +9199,7 @@ class RelayOperatorPanel(tk.Tk):
             self.artifact_tree.selection_set(self.artifact_tree.get_children()[0])
 
         self.on_artifact_row_selected()
+        self._refresh_sticky_context_bar()
 
     def on_artifact_row_selected(self, _event: object | None = None) -> None:
         state = self._selected_artifact_state()
@@ -5691,6 +9207,7 @@ class RelayOperatorPanel(tk.Tk):
             self._apply_artifact_status_text(base_text=self.artifact_status_base_text)
             self.set_text(self.artifact_summary_text, "")
             self.set_text(self.artifact_details_text, "")
+            self._refresh_sticky_context_bar()
             return
 
         preview = self.artifact_controller.get_preview(self.artifact_states, state.target_id)
@@ -5698,6 +9215,7 @@ class RelayOperatorPanel(tk.Tk):
             self._apply_artifact_status_text(base_text=self.artifact_status_base_text)
             self.set_text(self.artifact_summary_text, "")
             self.set_text(self.artifact_details_text, "")
+            self._refresh_sticky_context_bar()
             return
 
         contract_paths = self._resolve_artifact_contract_paths(state)
@@ -5780,6 +9298,7 @@ class RelayOperatorPanel(tk.Tk):
         else:
             detail_lines.append("- (없음)")
         self.set_text(self.artifact_details_text, "\n".join(detail_lines))
+        self._refresh_sticky_context_bar()
 
     def open_selected_artifact_path(self, kind: str) -> None:
         state = self._selected_artifact_state()
@@ -6037,11 +9556,8 @@ class RelayOperatorPanel(tk.Tk):
 
         run_context = (self.effective_data or {}).get("RunContext", {}) or {}
         selected_run_root = str(run_context.get("SelectedRunRoot", "") or "").strip()
-        if selected_run_root:
-            normalized_candidate = os.path.normcase(os.path.normpath(candidate))
-            normalized_selected = os.path.normcase(os.path.normpath(selected_run_root))
-            if normalized_candidate == normalized_selected:
-                return bool(run_context.get("SelectedRunRootIsStale", False))
+        if selected_run_root and self._same_run_root_path(candidate, selected_run_root):
+            return bool(run_context.get("SelectedRunRootIsStale", False))
 
         threshold = int(run_context.get("StaleRunThresholdSec", 1800) or 1800)
         run_root_path = Path(candidate)
@@ -6073,7 +9589,7 @@ class RelayOperatorPanel(tk.Tk):
         if ignored_run_root:
             lines.extend(
                 [
-                    "오래된 explicit RunRoot 무시 후 새 RunRoot 생성",
+                    "오래된 RunRoot 입력 무시 후 새 RunRoot 생성",
                     f"IgnoredRunRoot: {ignored_run_root}",
                     "",
                 ]
@@ -6092,10 +9608,10 @@ class RelayOperatorPanel(tk.Tk):
     def _run_root_prepare_last_result(self, *, ignored_run_root: str = "", prepared_run_root: str = "") -> str:
         if prepared_run_root:
             if ignored_run_root:
-                return "마지막 결과: stale explicit RunRoot 무시 후 새 RunRoot 준비 및 입력칸 갱신 완료"
+                return "마지막 결과: stale RunRoot 입력 무시 후 새 RunRoot 준비 및 입력칸 갱신 완료"
             return "마지막 결과: 새 RunRoot 준비 및 입력칸 갱신 완료"
         if ignored_run_root:
-            return "마지막 결과: stale explicit RunRoot 무시 후 RunRoot 준비 완료"
+            return "마지막 결과: stale RunRoot 입력 무시 후 RunRoot 준비 완료"
         return "마지막 결과: RunRoot 준비 완료"
 
     @staticmethod
@@ -6120,6 +9636,8 @@ class RelayOperatorPanel(tk.Tk):
         )
 
     def _requested_run_root_for_prepare(self) -> str:
+        if self._run_root_override_state() != "override-active":
+            return ""
         if self._prepare_run_root_override_to_ignore():
             return ""
         return self.run_root_var.get().strip()
@@ -6153,6 +9671,16 @@ class RelayOperatorPanel(tk.Tk):
         contract_paths: dict[str, object] | None = None,
     ) -> None:
         status_text = self.artifact_controller.decorate_status_text(base_text, preview)
+        artifact_run_root = self._current_run_root_for_artifacts()
+        action_run_root = self._current_run_root_for_actions()
+        if artifact_run_root or action_run_root:
+            status_prefix = "조회={0} | 실행={1}".format(
+                Path(artifact_run_root).name if artifact_run_root else "(없음)",
+                Path(action_run_root).name if action_run_root else "(없음)",
+            )
+            if artifact_run_root != action_run_root:
+                status_prefix += " | 컨텍스트 분리"
+            status_text = " | ".join(part for part in [status_prefix, status_text] if part)
         badges = self._artifact_warning_badges(state=state, contract_paths=contract_paths)
         if badges:
             status_text = " ".join(badges + [status_text])
@@ -6842,6 +10370,10 @@ class RelayOperatorPanel(tk.Tk):
 
     def on_home_pair_selected(self, _event: object | None = None) -> None:
         summary = self._selected_pair_summary()
+        self._apply_home_pair_tree_highlights()
+        if self._artifact_home_browse_pair_scope_enabled():
+            self._sync_artifact_filters_with_home_pair_selection(refresh=self._has_ui_attr("artifact_tree"))
+        self._apply_artifact_tree_highlights()
         if not summary:
             self.home_pair_detail_var.set(self._home_pair_detail_text(summary))
             return
@@ -6857,6 +10389,7 @@ class RelayOperatorPanel(tk.Tk):
             source="home-pair-apply",
         )
         self._sync_home_pair_selection(pair_id)
+        self._sync_pair_scoped_views_with_action_context(refresh_artifacts=True)
         self.render_target_board()
         self.update_pair_button_states()
         self.rebuild_panel_state()
@@ -6880,6 +10413,7 @@ class RelayOperatorPanel(tk.Tk):
             source="inspection-apply",
         )
         self._sync_home_pair_selection(self._selected_pair_id())
+        self._sync_pair_scoped_views_with_action_context(refresh_artifacts=True)
         self.render_target_board()
         self.update_pair_button_states()
         self.rebuild_panel_state()
@@ -6908,6 +10442,7 @@ class RelayOperatorPanel(tk.Tk):
             selected_pair=self._selected_pair_id(),
         )
         self.render_home_dashboard()
+        self._refresh_sticky_context_bar()
 
     def run_script(
         self,
@@ -6966,8 +10501,9 @@ class RelayOperatorPanel(tk.Tk):
         )
 
     def load_effective_config(self) -> None:
+        prior_override_state = self._run_root_override_state()
         try:
-            bundle = self.refresh_controller.refresh_full(self._current_context())
+            bundle = self.refresh_controller.refresh_full(self._effective_refresh_context())
         except Exception as exc:
             messagebox.showerror("불러오기 실패", str(exc))
             self.set_operator_status("불러오기 실패", "상태 JSON 수집에 실패했습니다.", f"마지막 결과: 실패 ({exc})")
@@ -6987,14 +10523,17 @@ class RelayOperatorPanel(tk.Tk):
         self.paired_status_error = paired_error
         self.preview_rows = list(effective_payload.get("PreviewRows", []))
 
-        if not self.run_root_var.get().strip():
+        if prior_override_state != "override-active":
             run_root_source = effective_payload.get("RunContext", {}).get("SelectedRunRootSource", "") or ""
             if selected_run_root and run_root_source != "next-preview":
                 self.run_root_var.set(selected_run_root)
+            else:
+                self.run_root_var.set("")
         self._update_run_root_controls()
 
         self.render_summary(effective_payload)
         self.render_rows(self.preview_rows)
+        self.refresh_pair_policy_editor()
         self._coerce_selected_pair_into_runtime_scope()
         self._sync_message_scope_id_from_context()
         self._refresh_watcher_notes()
@@ -7028,6 +10567,8 @@ class RelayOperatorPanel(tk.Tk):
         run_context = payload.get("RunContext", {})
         pair_test = payload.get("PairTest", {})
         dispatch = payload.get("Dispatch", {})
+        run_root_override = str(self.run_root_var.get() or "").strip()
+        run_root_override_state = self._run_root_override_state()
         allowed_window_visibility_methods = pair_test.get("AllowedWindowVisibilityMethods", []) or []
         submit_retry_modes = dispatch.get("SubmitRetryModes", []) or pair_test.get("SubmitRetryModes", []) or []
         lines = [
@@ -7047,6 +10588,8 @@ class RelayOperatorPanel(tk.Tk):
             f"stale 기준 초: {run_context.get('StaleRunThresholdSec', '')}",
             f"최신 existing run: {run_context.get('LatestExistingRunRoot', '')}",
             f"다음 RunRoot 미리보기: {run_context.get('NextRunRootPreview', '')}",
+            f"패널 RunRoot Override 입력: {run_root_override or '(비어 있음)'}",
+            f"패널 RunRoot Override 상태: {run_root_override_state}",
             f"manifest 경로: {run_context.get('ManifestPath', '')}",
             f"Pair 정의 출처: {payload.get('PairDefinitionSource', '')}",
             f"Pair 정의 출처 상세: {payload.get('PairDefinitionSourceDetail', '')}",
@@ -7083,6 +10626,20 @@ class RelayOperatorPanel(tk.Tk):
                     reason=item.get("DisableReason", "") or "(none)",
                 )
             )
+        lines.append("")
+        lines.append("Pair repo/path 정책:")
+        for pair in payload.get("OverviewPairs", []):
+            policy = pair.get("Policy", {}) or {}
+            lines.append(
+                "- {pair}: seed={seed} / repo={repo} / repo-source={source} / external-runroot={runroot} / external-contract={contract}".format(
+                    pair=pair.get("PairId", "") or "",
+                    seed=pair.get("SeedTargetId", "") or "(없음)",
+                    repo=policy.get("DefaultSeedWorkRepoRoot", "") or "(없음)",
+                    source=policy.get("DefaultSeedWorkRepoRootSource", "") or "unset",
+                    runroot=policy.get("UseExternalWorkRepoRunRoot", False),
+                    contract=policy.get("UseExternalWorkRepoContractPaths", False),
+                )
+            )
         warnings = payload.get("Warnings", [])
         warning_details = payload.get("WarningDetails", [])
         requested_filters = payload.get("RequestedFilters", {})
@@ -7117,10 +10674,114 @@ class RelayOperatorPanel(tk.Tk):
                 ),
             )
 
+    def _normalized_optional_path(self, value: object) -> str:
+        text = str(value or "").strip()
+        if not text:
+            return ""
+        try:
+            return os.path.normcase(os.path.normpath(text))
+        except Exception:
+            return text.casefold()
+
+    def _pair_route_state(
+        self,
+        *,
+        targets_share_work_repo_root: bool,
+        targets_share_pair_run_root: bool,
+        target_outboxes_distinct: bool,
+    ) -> str:
+        if not targets_share_work_repo_root:
+            return "mismatched-workrepo"
+        if not targets_share_pair_run_root:
+            return "mismatched-pair-runroot"
+        if not target_outboxes_distinct:
+            return "outbox-collision-risk"
+        return "aligned"
+
+    def _build_pair_route_snapshot(self, pair_id: str) -> dict[str, object]:
+        pair_rows = [row for row in self.preview_rows if str(row.get("PairId", "") or "").strip() == str(pair_id or "").strip()]
+        if not pair_rows:
+            return {}
+
+        top_row = next((row for row in pair_rows if str(row.get("RoleName", "") or "").strip() == "top"), pair_rows[0])
+        bottom_row = next(
+            (row for row in pair_rows if str(row.get("RoleName", "") or "").strip() == "bottom"),
+            next((row for row in pair_rows if row is not top_row), {}),
+        )
+
+        def unique_non_empty(values: list[str]) -> list[str]:
+            result: list[str] = []
+            seen: set[str] = set()
+            for item in values:
+                text = str(item or "").strip()
+                if not text:
+                    continue
+                key = self._normalized_optional_path(text) or text.casefold()
+                if key in seen:
+                    continue
+                seen.add(key)
+                result.append(text)
+            return result
+
+        work_repo_values = [str(row.get("WorkRepoRoot", "") or "").strip() for row in pair_rows]
+        pair_run_root_values = []
+        for row in pair_rows:
+            pair_run_root = str(row.get("PairRunRoot", "") or "").strip()
+            if not pair_run_root:
+                target_folder = str(row.get("PairTargetFolder", "") or "").strip()
+                if target_folder:
+                    pair_run_root = os.path.dirname(target_folder)
+            pair_run_root_values.append(pair_run_root)
+        outbox_values = [str(row.get("SourceOutboxPath", "") or "").strip() for row in pair_rows]
+
+        work_repo_roots = unique_non_empty(work_repo_values)
+        pair_run_roots = unique_non_empty(pair_run_root_values)
+        source_outboxes = unique_non_empty(outbox_values)
+
+        pair_work_repo_root = work_repo_roots[0] if len(work_repo_roots) == 1 else ""
+        pair_run_root = pair_run_roots[0] if len(pair_run_roots) == 1 else ""
+        targets_share_work_repo_root = len(work_repo_roots) == 1
+        targets_share_pair_run_root = len(pair_run_roots) == 1
+        target_outboxes_distinct = len(source_outboxes) == len(pair_rows)
+
+        shares_work_repo_root_with_other_pairs = False
+        if pair_work_repo_root:
+            normalized_repo = self._normalized_optional_path(pair_work_repo_root)
+            for other_row in self.preview_rows:
+                other_pair_id = str(other_row.get("PairId", "") or "").strip()
+                if not other_pair_id or other_pair_id == pair_id:
+                    continue
+                other_repo = str(other_row.get("WorkRepoRoot", "") or "").strip()
+                if other_repo and self._normalized_optional_path(other_repo) == normalized_repo:
+                    shares_work_repo_root_with_other_pairs = True
+                    break
+
+        return {
+            "PairId": str(pair_id or "").strip(),
+            "TopTargetId": str(top_row.get("TargetId", "") or "").strip(),
+            "BottomTargetId": str(bottom_row.get("TargetId", "") or "").strip(),
+            "PairWorkRepoRoot": pair_work_repo_root,
+            "PairRunRoot": pair_run_root,
+            "TopSourceOutboxPath": str(top_row.get("SourceOutboxPath", "") or "").strip(),
+            "BottomSourceOutboxPath": str(bottom_row.get("SourceOutboxPath", "") or "").strip(),
+            "TopPublishReadyPath": str(top_row.get("PublishReadyPath", "") or "").strip(),
+            "BottomPublishReadyPath": str(bottom_row.get("PublishReadyPath", "") or "").strip(),
+            "TargetsShareWorkRepoRoot": targets_share_work_repo_root,
+            "TargetsSharePairRunRoot": targets_share_pair_run_root,
+            "TargetOutboxesDistinct": target_outboxes_distinct,
+            "SharesWorkRepoRootWithOtherPairs": shares_work_repo_root_with_other_pairs,
+            "RouteState": self._pair_route_state(
+                targets_share_work_repo_root=targets_share_work_repo_root,
+                targets_share_pair_run_root=targets_share_pair_run_root,
+                target_outboxes_distinct=target_outboxes_distinct,
+            ),
+        }
+
     def on_row_selected(self, _event: object | None = None, *, source: str = "preview-row") -> None:
         selection = self.row_tree.selection()
         if not selection:
             self.clear_details()
+            self._refresh_sticky_context_bar()
             return
         row = self.preview_rows[int(selection[0])]
         self._set_inspection_context(
@@ -7138,6 +10799,7 @@ class RelayOperatorPanel(tk.Tk):
         action_target = self.target_id_var.get().strip()
         allowed_window_visibility_methods = row.get("AllowedWindowVisibilityMethods", []) or []
         submit_retry_modes = row.get("SubmitRetryModes", []) or []
+        pair_route = self._build_pair_route_snapshot(str(row.get("PairId", "") or ""))
         details_lines = [
             f"inspection source: {self._context_source_label(inspection_context.source)}",
             f"Pair: {row.get('PairId', '')}",
@@ -7165,6 +10827,19 @@ class RelayOperatorPanel(tk.Tk):
             f"source review zip: {row.get('SourceReviewZipPath', '')}",
             f"publish ready: {row.get('PublishReadyPath', '')}",
             f"published archive: {row.get('PublishedArchivePath', '')}",
+            "",
+            "[pair route snapshot]",
+            f"route state: {pair_route.get('RouteState', '') or '(없음)'}",
+            f"same pair work repo root: {pair_route.get('PairWorkRepoRoot', '') or '(없음)'}",
+            f"same pair run root: {pair_route.get('PairRunRoot', '') or '(없음)'}",
+            f"same pair targets share repo root: {pair_route.get('TargetsShareWorkRepoRoot', False)}",
+            f"same pair targets share pair run root: {pair_route.get('TargetsSharePairRunRoot', False)}",
+            f"same pair target outboxes distinct: {pair_route.get('TargetOutboxesDistinct', False)}",
+            f"other pairs share this repo root: {pair_route.get('SharesWorkRepoRootWithOtherPairs', False)}",
+            f"top source outbox: {pair_route.get('TopSourceOutboxPath', '') or '(없음)'}",
+            f"bottom source outbox: {pair_route.get('BottomSourceOutboxPath', '') or '(없음)'}",
+            f"top publish ready: {pair_route.get('TopPublishReadyPath', '') or '(없음)'}",
+            f"bottom publish ready: {pair_route.get('BottomPublishReadyPath', '') or '(없음)'}",
             f"검토 zip 미리보기: {row.get('ReviewZipPreviewPath', '')}",
             f"초기 지시문 경로: {row.get('InitialInstructionPath', '')}",
             f"초기 메시지 경로: {row.get('InitialMessagePath', '')}",
@@ -7236,6 +10911,9 @@ class RelayOperatorPanel(tk.Tk):
             self.format_one_time_items(row.get("Handoff", {}).get("PendingOneTimeItems", [])),
         ]
         self.set_text(self.one_time_text, "\n".join(one_time_lines))
+        if self._artifact_home_browse_target_scope_enabled():
+            self._sync_artifact_filters_with_home_pair_selection(refresh=self._has_ui_attr("artifact_tree"))
+        self._refresh_sticky_context_bar()
 
     def clear_details(self) -> None:
         self.set_text(self.details_text, "")
@@ -7243,6 +10921,7 @@ class RelayOperatorPanel(tk.Tk):
         self.set_text(self.handoff_text, "")
         self.set_text(self.plan_text, "")
         self.set_text(self.one_time_text, "")
+        self._refresh_sticky_context_bar()
 
     def format_path_state(self, state: dict | None) -> str:
         if not state:
@@ -7461,6 +11140,7 @@ class RelayOperatorPanel(tk.Tk):
             "open_watcher_audit": self.open_watcher_audit_log,
             "focus_ready_to_forward_artifact": self.focus_ready_to_forward_artifact,
             "start_router": self.start_router_detached,
+            "visible_cleanup_apply": self.run_visible_queue_cleanup_apply,
             "visible_preflight": self.run_visible_acceptance_preflight,
             "visible_active_acceptance": self.run_active_visible_acceptance,
             "visible_post_cleanup": self.run_visible_post_cleanup,
@@ -7649,6 +11329,13 @@ class RelayOperatorPanel(tk.Tk):
     def prepare_run_root(self) -> None:
         pair_id = self._selected_pair_id()
         config_path = self.config_path_var.get().strip()
+        try:
+            prepare_config_path = self._resolve_run_prepare_config_path(pair_id=pair_id, config_path=config_path)
+        except Exception as exc:
+            messagebox.showerror("RunRoot 준비 실패", str(exc))
+            self.set_text(self.output_text, str(exc))
+            self.last_result_var.set(f"마지막 결과: 실패 ({exc})")
+            return
         workflow = self._runtime_workflow()
         scope_allowed, scope_detail = self._selected_pair_scope_allowed(action_label="run 준비")
         if not scope_allowed:
@@ -7659,7 +11346,7 @@ class RelayOperatorPanel(tk.Tk):
         current_context = self._prepare_run_root_action_context(ignored_run_root=ignored_run_root)
         command = self.command_service.build_script_command(
             "tests/Start-PairedExchangeTest.ps1",
-            config_path=config_path,
+            config_path=prepare_config_path,
             run_root=requested_run_root,
             extra=["-IncludePairId", pair_id],
         )
@@ -7672,6 +11359,7 @@ class RelayOperatorPanel(tk.Tk):
                     pair_id=pair_id,
                     requested_run_root=requested_run_root,
                     summary_fallback_run_root=current_context.run_root,
+                    prepare_config_path=prepare_config_path,
                 )
             )
 
@@ -7714,6 +11402,13 @@ class RelayOperatorPanel(tk.Tk):
         wrapper_path = self._launcher_wrapper_path()
         config_path = self.config_path_var.get().strip()
         pair_id = self._selected_pair_id()
+        try:
+            prepare_config_path = self._resolve_run_prepare_config_path(pair_id=pair_id, config_path=config_path)
+        except Exception as exc:
+            messagebox.showerror("창/Attach/입력/RunRoot 준비 실패", str(exc))
+            self.set_text(self.output_text, str(exc))
+            self.last_result_var.set(f"마지막 결과: 실패 ({exc})")
+            return
         scope_allowed, scope_detail = self._selected_pair_scope_allowed(action_label="창/Attach/입력/RunRoot 준비")
         if not scope_allowed:
             messagebox.showwarning("창/Attach/입력/RunRoot 준비 대기", scope_detail)
@@ -7731,6 +11426,7 @@ class RelayOperatorPanel(tk.Tk):
                     config_path=config_path,
                     pair_id=pair_id,
                     explicit_run_root=explicit_run_root,
+                    prepare_config_path=prepare_config_path,
                     wrapper_path=wrapper_path,
                     launch_windows_needed=bool(stage_map.get("launch_windows") and stage_map["launch_windows"].status_text != "완료"),
                     attach_windows_needed=bool(stage_map.get("attach_windows") and stage_map["attach_windows"].status_text != "완료"),
@@ -8910,6 +12606,13 @@ class RelayOperatorPanel(tk.Tk):
         )
 
     def set_text(self, widget: tk.Text, value: str) -> None:
+        if self._has_ui_attr("result_panel_collapsed_var") and widget in {
+            self.__dict__.get("output_text"),
+            self.__dict__.get("query_output_text"),
+        }:
+            if not (self._has_ui_attr("simple_mode_var") and self.simple_mode_var.get()):
+                self.result_panel_collapsed_var.set(False)
+                self._apply_result_panel_visibility()
         widget.configure(state="normal")
         widget.delete("1.0", "end")
         widget.insert("1.0", value)
@@ -9073,6 +12776,131 @@ class RelayOperatorPanel(tk.Tk):
             failure_hint="출력 영역과 마지막 명령을 확인한 뒤 다시 시도하세요.",
         )
 
+    def run_selected_parallel_pair_drill(self) -> None:
+        self._set_mode_banner("MODE: Parallel Headless Drill", "선택 pair들은 병렬, 같은 pair 내부 handoff는 순차로 검사합니다.")
+        selected_pair_ids = self._selected_parallel_pair_ids()
+        parallel_allowed, parallel_detail = self._selected_parallel_pair_execution_allowed(selected_pair_ids)
+        if not parallel_allowed:
+            messagebox.showwarning("병렬 Drill 대기", parallel_detail)
+            return
+        config_path = self.config_path_var.get().strip()
+        if not config_path:
+            messagebox.showwarning("설정 필요", "Config를 먼저 선택하세요.")
+            return
+        request = self._build_watcher_start_request_from_controls(
+            config_path=config_path,
+            run_root=self._current_run_root_for_actions(),
+            show_error=True,
+        )
+        if request is None:
+            return
+
+        disabled_pairs: list[str] = []
+        for pair_id in selected_pair_ids:
+            activation = self.get_pair_activation_state(pair_id)
+            if activation and not bool(activation.get("EffectiveEnabled", True)):
+                disabled_pairs.append(
+                    "{0}({1})".format(pair_id, activation.get("DisableReason", "") or "disabled")
+                )
+        if disabled_pairs:
+            messagebox.showwarning(
+                "Pair 비활성",
+                "선택된 pair 중 비활성 상태가 있습니다.\n" + "\n".join(disabled_pairs),
+            )
+            return
+
+        coordinator_repo_root = self.parallel_coordinator_repo_root_var.get().strip() or str((ROOT / "_tmp" / "pair-parallel-coordinator").resolve())
+        extra = [
+            "-BaseConfigPath",
+            config_path,
+            "-CoordinatorWorkRepoRoot",
+            coordinator_repo_root,
+            "-PairMaxRoundtripCount",
+            str(request.pair_max_roundtrip_count),
+            "-RunDurationSec",
+            str(request.run_duration_sec),
+        ]
+        for pair_id in selected_pair_ids:
+            extra.extend(["-PairId", pair_id])
+        extra.append("-AsJson")
+
+        command = self.command_service.build_powershell_file_command(
+            str(ROOT / "tests" / "Run-ParallelPairScopedHeadlessDrill.ps1"),
+            extra=extra,
+        )
+        self.last_command_var.set(subprocess.list2cmdline(command))
+
+        def worker() -> subprocess.CompletedProcess[str]:
+            return run_command(command)
+
+        def on_success(completed: subprocess.CompletedProcess[str]) -> None:
+            payload = json.loads(completed.stdout)
+            coordinator_run_root = str(payload.get("CoordinatorRunRoot", "") or "").strip()
+            if coordinator_run_root:
+                self.run_root_var.set(coordinator_run_root)
+                self._set_action_context(
+                    pair_id=selected_pair_ids[0],
+                    run_root=coordinator_run_root,
+                    source="parallel-pair-drill",
+                )
+            if selected_pair_ids:
+                self.pair_id_var.set(selected_pair_ids[0])
+                self._sync_preview_selection_with_pair(selected_pair_ids[0])
+            lines = [
+                "선택 pair 병렬 Headless Drill 완료",
+                f"Pairs: {', '.join(selected_pair_ids)}",
+                f"Coordinator Repo: {payload.get('CoordinatorWorkRepoRoot', '')}",
+                f"Coordinator RunRoot: {coordinator_run_root or '(none)'}",
+                f"PairMaxRoundtripCount: {payload.get('PairMaxRoundtripCount', '')}",
+                f"RunDurationSec: {payload.get('RunDurationSec', '')}",
+                "",
+            ]
+            for row in payload.get("PairRuns", []):
+                lines.extend(
+                    [
+                        "[{0}] watcher={1} done={2} error={3} forwarded={4}".format(
+                            row.get("PairId", ""),
+                            row.get("WatcherStatus", ""),
+                            row.get("DonePresentCount", ""),
+                            row.get("ErrorPresentCount", ""),
+                            row.get("ForwardedStateCount", ""),
+                        ),
+                        "repo={0}".format(row.get("WorkRepoRoot", "")),
+                        "run={0}".format(row.get("RunRoot", "")),
+                        "",
+                    ]
+                )
+            wrapper_status_path = str(payload.get("CoordinatorWrapperStatusPath", "") or "").strip()
+            if wrapper_status_path:
+                lines.extend(["wrapper-status:", wrapper_status_path])
+            self.set_text(self.output_text, "\n".join(lines).rstrip())
+            self.refresh_pair_policy_editor()
+            self.load_effective_config()
+            self.last_result_var.set(
+                "마지막 결과: parallel drill pairs={0} coordinator={1}".format(
+                    ",".join(selected_pair_ids),
+                    coordinator_run_root or "(none)",
+                )
+            )
+
+        pair_summary = ", ".join(selected_pair_ids)
+        self.set_text(
+            self.output_text,
+            "선택 pair 병렬 Headless Drill 실행 중...\n"
+            f"pairs={pair_summary}\n"
+            f"coordinator={coordinator_repo_root}",
+        )
+        self.run_background_task(
+            state="병렬 Headless Drill 실행 중",
+            hint=f"{pair_summary} pair를 병렬로 실행 중입니다. 같은 pair 내부 handoff만 순차입니다.",
+            worker=worker,
+            on_success=on_success,
+            success_state="병렬 Headless Drill 완료",
+            success_hint="Coordinator RunRoot가 현재 컨텍스트로 반영됐습니다. pair 병렬 상태판과 important-summary를 확인하세요.",
+            failure_state="병렬 Headless Drill 실패",
+            failure_hint="출력 영역과 wrapper-status, 마지막 명령을 확인한 뒤 다시 시도하세요.",
+        )
+
     def run_fixed_pair01_drill(self) -> None:
         self._set_mode_banner("MODE: Headless Drill", "pair01 preset shortcut 기준 headless drill을 실행합니다.")
         activation = self.get_pair_activation_state("pair01")
@@ -9158,8 +12986,8 @@ class RelayOperatorPanel(tk.Tk):
         self.set_text(self.output_text, f"important-summary 열기:\n{path_value}")
 
     def run_visibility_check(self) -> None:
-        self.last_command_var.set(self._runtime_refresh_command_preview())
-        current_context = self._snapshot_context()
+        current_context = self._effective_refresh_context()
+        self.last_command_var.set(self._runtime_refresh_command_preview(current_context))
 
         def worker():
             return self.refresh_controller.refresh_runtime(current_context)

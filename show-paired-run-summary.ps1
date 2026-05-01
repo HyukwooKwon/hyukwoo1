@@ -197,6 +197,34 @@ function Normalize-DisplayPath {
     }
 }
 
+function Get-NormalizedFullPath {
+    param([string]$Path)
+
+    if (-not (Test-NonEmptyString $Path)) {
+        return ''
+    }
+
+    try {
+        return [System.IO.Path]::GetFullPath($Path).ToLowerInvariant()
+    }
+    catch {
+        return ([string]$Path).ToLowerInvariant()
+    }
+}
+
+function Test-NormalizedPathMatch {
+    param(
+        [string]$Left,
+        [string]$Right
+    )
+
+    if (-not (Test-NonEmptyString $Left) -or -not (Test-NonEmptyString $Right)) {
+        return $false
+    }
+
+    return ((Get-NormalizedFullPath -Path $Left) -eq (Get-NormalizedFullPath -Path $Right))
+}
+
 function ConvertTo-UtcDateTimeOrNull {
     param([string]$Value)
 
@@ -224,6 +252,24 @@ function ConvertTo-UtcDateTimeOrNull {
             return $null
         }
     }
+}
+
+function ConvertTo-IntOrDefault {
+    param(
+        $Value,
+        [int]$DefaultValue = 0
+    )
+
+    if ($null -eq $Value) {
+        return $DefaultValue
+    }
+
+    $parsed = 0
+    if ([int]::TryParse([string]$Value, [ref]$parsed)) {
+        return $parsed
+    }
+
+    return $DefaultValue
 }
 
 function New-EventRecord {
@@ -335,6 +381,396 @@ function Get-FilePreviewText {
     return $preview
 }
 
+function Get-RequestAttemptInfo {
+    param(
+        [string]$RequestPath,
+        $ManifestTarget = $null
+    )
+
+    $request = Read-JsonObjectSafe -Path $RequestPath
+    $attemptId = [string](Get-ObjectPropertyValue -Object $request -Name 'AttemptId' -DefaultValue ([string](Get-ObjectPropertyValue -Object $ManifestTarget -Name 'AttemptId' -DefaultValue '')))
+    $attemptStartedAt = [string](Get-ObjectPropertyValue -Object $request -Name 'AttemptStartedAt' -DefaultValue ([string](Get-ObjectPropertyValue -Object $request -Name 'CreatedAt' -DefaultValue ([string](Get-ObjectPropertyValue -Object $ManifestTarget -Name 'AttemptStartedAt' -DefaultValue ([string](Get-ObjectPropertyValue -Object $ManifestTarget -Name 'ContractReferenceTimeUtc' -DefaultValue '')))))))
+
+    return [pscustomobject]@{
+        AttemptId        = $attemptId
+        AttemptStartedAt = $attemptStartedAt
+        Request          = $request
+    }
+}
+
+function ConvertFrom-AhkLogTimestamp {
+    param([string]$RawTimestamp)
+
+    $text = [string]$RawTimestamp
+    if (-not (Test-NonEmptyString $text) -or $text -notmatch '^\d{14}$') {
+        return ''
+    }
+
+    try {
+        $parsed = [datetime]::ParseExact($text, 'yyyyMMddHHmmss', [System.Globalization.CultureInfo]::InvariantCulture)
+        $offset = [System.TimeZoneInfo]::Local.GetUtcOffset($parsed)
+        return ([datetimeoffset]::new($parsed, $offset)).ToString('o')
+    }
+    catch {
+        return ''
+    }
+}
+
+function Get-AhkLifecycleSummary {
+    param([string]$LogPath)
+
+    $result = [ordered]@{
+        SendBeginAt       = ''
+        PayloadEnteredAt  = ''
+        SubmitStartedAt   = ''
+        SubmitCompletedAt = ''
+        SendCompletedAt   = ''
+    }
+
+    if (-not (Test-NonEmptyString $LogPath) -or -not (Test-Path -LiteralPath $LogPath -PathType Leaf)) {
+        return [pscustomobject]$result
+    }
+
+    try {
+        $lines = @(Get-Content -LiteralPath $LogPath -Encoding UTF8)
+    }
+    catch {
+        return [pscustomobject]$result
+    }
+
+    foreach ($line in $lines) {
+        $text = [string]$line
+        if (-not (Test-NonEmptyString $text)) {
+            continue
+        }
+
+        if ($text -notmatch '^\[(\d{14})\]\s+') {
+            continue
+        }
+
+        $timestamp = ConvertFrom-AhkLogTimestamp -RawTimestamp $matches[1]
+        if (-not (Test-NonEmptyString $timestamp)) {
+            continue
+        }
+
+        if (-not (Test-NonEmptyString $result.SendBeginAt) -and $text -match '\bsend_begin\b') {
+            $result.SendBeginAt = $timestamp
+        }
+        if (-not (Test-NonEmptyString $result.PayloadEnteredAt) -and $text -match '\bterminal_paste bytes=|\bterminal_sendtext\b|\bcontrol_sendtext\b') {
+            $result.PayloadEnteredAt = $timestamp
+        }
+        if (-not (Test-NonEmptyString $result.SubmitStartedAt) -and $text -match '\bsubmit_attempt\b') {
+            $result.SubmitStartedAt = $timestamp
+        }
+        if (-not (Test-NonEmptyString $result.SubmitCompletedAt) -and $text -match '\bsubmit_complete\b') {
+            $result.SubmitCompletedAt = $timestamp
+        }
+        if (-not (Test-NonEmptyString $result.SendCompletedAt) -and $text -match '\bsend_complete\b') {
+            $result.SendCompletedAt = $timestamp
+        }
+    }
+
+    return [pscustomobject]$result
+}
+
+function Test-DateTimeOnOrAfter {
+    param(
+        [string]$Later,
+        [string]$Earlier
+    )
+
+    $laterValue = ConvertTo-UtcDateTimeOrNull -Value $Later
+    $earlierValue = ConvertTo-UtcDateTimeOrNull -Value $Earlier
+    if ($null -eq $laterValue -or $null -eq $earlierValue) {
+        return $null
+    }
+
+    return ($laterValue.UtcDateTime.Ticks -ge $earlierValue.UtcDateTime.Ticks)
+}
+
+function Get-LatestTimestamp {
+    param([string[]]$Values)
+
+    $latest = $null
+    foreach ($value in @($Values)) {
+        $parsed = ConvertTo-UtcDateTimeOrNull -Value ([string]$value)
+        if ($null -eq $parsed) {
+            continue
+        }
+        if ($null -eq $latest -or $parsed.UtcDateTime.Ticks -gt $latest.UtcDateTime.Ticks) {
+            $latest = $parsed
+        }
+    }
+
+    if ($null -eq $latest) {
+        return ''
+    }
+
+    return $latest.ToString('o')
+}
+
+function Get-FirstOrderingViolation {
+    param(
+        [string]$SummaryWrittenAt = '',
+        [string]$ReviewZipWrittenAt = '',
+        [string]$PublishReadyWrittenAt = '',
+        [string]$ImportedReviewCopyCreatedAt = '',
+        [string]$ImportedSummaryCreatedAt = '',
+        [string]$TriggerArtifactsCompletedAt = '',
+        [bool]$CurrentArtifactsAheadOfObservedPublish = $false,
+        $TimelineChecks = $null
+    )
+
+    if ($null -eq $TimelineChecks) {
+        return ''
+    }
+
+    $publishAfterArtifacts = Get-ObjectPropertyValue -Object $TimelineChecks -Name 'PublishAfterArtifacts' -DefaultValue $null
+    if ($publishAfterArtifacts -is [bool] -and -not [bool]$publishAfterArtifacts) {
+        if ($CurrentArtifactsAheadOfObservedPublish) {
+            return 'unpublished-artifacts-after-observed-publish'
+        }
+
+        if ((Test-NonEmptyString $SummaryWrittenAt) -and -not (Test-DateTimeOnOrAfter -Later $PublishReadyWrittenAt -Earlier $SummaryWrittenAt)) {
+            return 'publish-before-summary'
+        }
+
+        if ((Test-NonEmptyString $ReviewZipWrittenAt) -and -not (Test-DateTimeOnOrAfter -Later $PublishReadyWrittenAt -Earlier $ReviewZipWrittenAt)) {
+            return 'publish-before-reviewzip'
+        }
+
+        return 'publish-before-artifacts'
+    }
+
+    $watcherObservedAfterPublish = Get-ObjectPropertyValue -Object $TimelineChecks -Name 'WatcherObservedAfterPublish' -DefaultValue $null
+    if ($watcherObservedAfterPublish -is [bool] -and -not [bool]$watcherObservedAfterPublish) {
+        return 'watcher-observed-before-publish'
+    }
+
+    $handoffOpenedAfterPublish = Get-ObjectPropertyValue -Object $TimelineChecks -Name 'HandoffOpenedAfterPublish' -DefaultValue $null
+    if ($handoffOpenedAfterPublish -is [bool] -and -not [bool]$handoffOpenedAfterPublish) {
+        return 'handoff-before-publish'
+    }
+
+    $importedCopyAfterTrigger = Get-ObjectPropertyValue -Object $TimelineChecks -Name 'ImportedCopyAfterTrigger' -DefaultValue $null
+    if ($importedCopyAfterTrigger -is [bool] -and -not [bool]$importedCopyAfterTrigger) {
+        return 'import-copy-before-trigger'
+    }
+
+    $importedSummaryAfterTrigger = Get-ObjectPropertyValue -Object $TimelineChecks -Name 'ImportedSummaryAfterTrigger' -DefaultValue $null
+    if ($importedSummaryAfterTrigger -is [bool] -and -not [bool]$importedSummaryAfterTrigger) {
+        return 'import-summary-before-trigger'
+    }
+
+    return ''
+}
+
+function Get-ForbiddenArtifactPolicyFromConfig {
+    param($Config)
+
+    $pairTest = Get-ObjectPropertyValue -Object $Config -Name 'PairTest' -DefaultValue $null
+    $defaultLiterals = @(
+        '여기에 고정문구 입력'
+    )
+    $defaultRegexes = @(
+        '이렇게 계획개선해봤어',
+        '더 개선해야될 부분이 있어\??',
+        '이런부분도 참고해봐'
+    )
+
+    $literalValues = @()
+    $literalSource = Get-ObjectPropertyValue -Object $pairTest -Name 'ForbiddenArtifactLiterals' -DefaultValue @($defaultLiterals)
+    foreach ($item in @($literalSource)) {
+        if (Test-NonEmptyString ([string]$item)) {
+            $literalValues += [string]$item
+        }
+    }
+
+    $regexValues = @()
+    $regexSource = Get-ObjectPropertyValue -Object $pairTest -Name 'ForbiddenArtifactRegexes' -DefaultValue @($defaultRegexes)
+    foreach ($item in @($regexSource)) {
+        if (Test-NonEmptyString ([string]$item)) {
+            $regexValues += [string]$item
+        }
+    }
+
+    return [pscustomobject]@{
+        Literals = @($literalValues)
+        Regexes  = @($regexValues)
+    }
+}
+
+function Get-ForbiddenArtifactMatchFromText {
+    param(
+        [string]$Text,
+        $Policy
+    )
+
+    if (-not (Test-NonEmptyString $Text)) {
+        return [pscustomobject]@{
+            Found = $false
+            MatchKind = ''
+            MatchText = ''
+            Pattern = ''
+            EntryPath = ''
+        }
+    }
+
+    foreach ($literal in @((Get-ObjectPropertyValue -Object $Policy -Name 'Literals' -DefaultValue @()))) {
+        if (-not (Test-NonEmptyString ([string]$literal))) {
+            continue
+        }
+        if ($Text.Contains([string]$literal)) {
+            return [pscustomobject]@{
+                Found = $true
+                MatchKind = 'literal'
+                MatchText = [string]$literal
+                Pattern = [string]$literal
+                EntryPath = ''
+            }
+        }
+    }
+
+    foreach ($pattern in @((Get-ObjectPropertyValue -Object $Policy -Name 'Regexes' -DefaultValue @()))) {
+        if (-not (Test-NonEmptyString ([string]$pattern))) {
+            continue
+        }
+
+        try {
+            $match = [regex]::Match(
+                $Text,
+                [string]$pattern,
+                [System.Text.RegularExpressions.RegexOptions]::IgnoreCase
+            )
+        }
+        catch {
+            continue
+        }
+
+        if ($match.Success) {
+            $matchText = [string]$match.Value
+            if ($matchText.Length -gt 120) {
+                $matchText = ($matchText.Substring(0, 120) + ' ...')
+            }
+
+            return [pscustomobject]@{
+                Found = $true
+                MatchKind = 'regex'
+                MatchText = $matchText
+                Pattern = [string]$pattern
+                EntryPath = ''
+            }
+        }
+    }
+
+    return [pscustomobject]@{
+        Found = $false
+        MatchKind = ''
+        MatchText = ''
+        Pattern = ''
+        EntryPath = ''
+    }
+}
+
+function Get-ForbiddenArtifactMatchFromFile {
+    param(
+        [string]$Path,
+        $Policy
+    )
+
+    if (-not (Test-NonEmptyString $Path) -or -not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        return [pscustomobject]@{
+            Found = $false
+            MatchKind = ''
+            MatchText = ''
+            Pattern = ''
+            EntryPath = ''
+        }
+    }
+
+    try {
+        $raw = Get-Content -LiteralPath $Path -Raw -Encoding UTF8 -ErrorAction Stop
+    }
+    catch {
+        return [pscustomobject]@{
+            Found = $false
+            MatchKind = ''
+            MatchText = ''
+            Pattern = ''
+            EntryPath = ''
+        }
+    }
+
+    return (Get-ForbiddenArtifactMatchFromText -Text $raw -Policy $Policy)
+}
+
+function Get-ForbiddenArtifactMatchFromZip {
+    param(
+        [string]$Path,
+        $Policy
+    )
+
+    try {
+        Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction SilentlyContinue
+    }
+    catch {
+    }
+
+    if (-not (Test-NonEmptyString $Path) -or -not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        return [pscustomobject]@{
+            Found = $false
+            MatchKind = ''
+            MatchText = ''
+            Pattern = ''
+            EntryPath = ''
+        }
+    }
+
+    try {
+        $archive = [System.IO.Compression.ZipFile]::OpenRead($Path)
+        try {
+            foreach ($entry in $archive.Entries) {
+                if ($entry.Length -le 0 -or $entry.Length -gt 1MB) {
+                    continue
+                }
+
+                $reader = $null
+                try {
+                    $reader = [System.IO.StreamReader]::new($entry.Open(), [System.Text.Encoding]::UTF8, $true)
+                    $content = $reader.ReadToEnd()
+                    $match = Get-ForbiddenArtifactMatchFromText -Text $content -Policy $Policy
+                    if ([bool]$match.Found) {
+                        $match | Add-Member -NotePropertyName 'EntryPath' -NotePropertyValue ([string]$entry.FullName) -Force
+                        return $match
+                    }
+                }
+                catch {
+                }
+                finally {
+                    if ($null -ne $reader) {
+                        $reader.Dispose()
+                    }
+                }
+            }
+        }
+        finally {
+            if ($null -ne $archive) {
+                $archive.Dispose()
+            }
+        }
+    }
+    catch {
+    }
+
+    return [pscustomobject]@{
+        Found = $false
+        MatchKind = ''
+        MatchText = ''
+        Pattern = ''
+        EntryPath = ''
+    }
+}
+
 function Get-LatestMatchingFilePath {
     param(
         [string]$DirectoryPath,
@@ -355,6 +791,33 @@ function Get-LatestMatchingFilePath {
     return $latest.FullName
 }
 
+function Get-LatestArchivedPublishReadyPath {
+    param([string]$PublishReadyPath)
+
+    if (-not (Test-NonEmptyString $PublishReadyPath)) {
+        return ''
+    }
+
+    $publishDir = Split-Path -Parent $PublishReadyPath
+    if (-not (Test-NonEmptyString $publishDir)) {
+        return ''
+    }
+
+    $archiveDir = Join-Path $publishDir '.published'
+    if (-not (Test-Path -LiteralPath $archiveDir -PathType Container)) {
+        return ''
+    }
+
+    $latest = Get-ChildItem -LiteralPath $archiveDir -Filter '*.json' -File -ErrorAction SilentlyContinue |
+        Sort-Object LastWriteTimeUtc -Descending |
+        Select-Object -First 1
+    if ($null -eq $latest) {
+        return ''
+    }
+
+    return [string]$latest.FullName
+}
+
 function Get-StatusTargetLookup {
     param([object[]]$Targets)
 
@@ -373,6 +836,24 @@ function Get-StatusTargetLookup {
     }
 
     return $lookup
+}
+
+function Get-SourceOutboxStatusSummary {
+    param([string]$RunRoot)
+
+    $statusPath = Join-Path (Join-Path $RunRoot '.state') 'source-outbox-status.json'
+    $statusDocument = Read-JsonObjectSafe -Path $statusPath
+    $targets = @()
+    if ($null -ne $statusDocument) {
+        $targets = @((Get-ObjectPropertyValue -Object $statusDocument -Name 'Targets' -DefaultValue @()))
+    }
+
+    return [pscustomobject]@{
+        Exists  = ($null -ne $statusDocument)
+        Path    = $statusPath
+        Data    = $statusDocument
+        Targets = $targets
+    }
 }
 
 function Get-ManifestSummary {
@@ -454,7 +935,9 @@ function Get-ImportantTargetSummary {
     param(
         $ManifestTarget,
         $StatusTarget,
-        [string]$LogsRoot = ''
+        $SourceOutboxStatusTarget = $null,
+        [string]$LogsRoot = '',
+        $ForbiddenArtifactPolicy = $null
     )
 
     $targetId = [string](Get-ObjectPropertyValue -Object $ManifestTarget -Name 'TargetId' -DefaultValue '')
@@ -467,13 +950,33 @@ function Get-ImportantTargetSummary {
     $workRepoRoot = [string](Get-ObjectPropertyValue -Object $ManifestTarget -Name 'WorkRepoRoot' -DefaultValue '')
     $reviewInputPath = [string](Get-ObjectPropertyValue -Object $ManifestTarget -Name 'ReviewInputPath' -DefaultValue '')
     $processedPath = [string](Get-ObjectPropertyValue -Object $StatusTarget -Name 'ProcessedPath' -DefaultValue '')
+    $targetFolder = [string](Get-ObjectPropertyValue -Object $StatusTarget -Name 'TargetFolder' -DefaultValue '')
     $sourceSummaryPath = [string](Get-ObjectPropertyValue -Object $ManifestTarget -Name 'SourceSummaryPath' -DefaultValue '')
     $sourceReviewZipPath = [string](Get-ObjectPropertyValue -Object $ManifestTarget -Name 'SourceReviewZipPath' -DefaultValue '')
     $publishReadyPath = [string](Get-ObjectPropertyValue -Object $ManifestTarget -Name 'PublishReadyPath' -DefaultValue '')
+    $sourceOutboxPath = [string](Get-ObjectPropertyValue -Object $ManifestTarget -Name 'SourceOutboxPath' -DefaultValue '')
+    if (-not (Test-NonEmptyString $sourceOutboxPath) -and (Test-NonEmptyString $sourceSummaryPath)) {
+        try {
+            $sourceOutboxPath = Split-Path -LiteralPath $sourceSummaryPath -Parent
+        }
+        catch {
+            $sourceOutboxPath = ''
+        }
+    }
+    $pairRunRoot = [string](Get-ObjectPropertyValue -Object $ManifestTarget -Name 'PairRunRoot' -DefaultValue '')
+    if (-not (Test-NonEmptyString $pairRunRoot) -and (Test-NonEmptyString $targetFolder)) {
+        try {
+            $pairRunRoot = Split-Path -LiteralPath $targetFolder -Parent
+        }
+        catch {
+            $pairRunRoot = ''
+        }
+    }
     $initialRoleMode = [string](Get-ObjectPropertyValue -Object $ManifestTarget -Name 'InitialRoleMode' -DefaultValue '')
     $contractPathMode = [string](Get-ObjectPropertyValue -Object $ManifestTarget -Name 'ContractPathMode' -DefaultValue '')
     $contractRootPath = [string](Get-ObjectPropertyValue -Object $ManifestTarget -Name 'ContractRootPath' -DefaultValue '')
     $contractReferenceTimeUtc = [string](Get-ObjectPropertyValue -Object $ManifestTarget -Name 'ContractReferenceTimeUtc' -DefaultValue '')
+    $attemptInfo = Get-RequestAttemptInfo -RequestPath $requestPath -ManifestTarget $ManifestTarget
 
     $latestPrepareLogPath = ''
     $latestAhkLogPath = ''
@@ -484,7 +987,33 @@ function Get-ImportantTargetSummary {
 
     $sourceSummary = Get-FileSnapshot -Path $sourceSummaryPath
     $sourceReviewZip = Get-FileSnapshot -Path $sourceReviewZipPath
-    $publishReady = Get-FileSnapshot -Path $publishReadyPath
+    $triggerPublishReady = Get-FileSnapshot -Path $publishReadyPath
+    $archivedPublishReadyPath = ''
+    if (-not [bool]$triggerPublishReady.Exists) {
+        $archivedPublishReadyPath = Get-LatestArchivedPublishReadyPath -PublishReadyPath $publishReadyPath
+        if (Test-NonEmptyString $archivedPublishReadyPath) {
+            $triggerPublishReady = Get-FileSnapshot -Path $archivedPublishReadyPath
+        }
+    }
+    $triggerPublishReadyDocument = Read-JsonObjectSafe -Path ([string]$triggerPublishReady.Path)
+    $triggerPublishedAt = [string](Get-ObjectPropertyValue -Object $triggerPublishReadyDocument -Name 'PublishedAt' -DefaultValue '')
+    $triggerPublishAttemptId = [string](Get-ObjectPropertyValue -Object $triggerPublishReadyDocument -Name 'AttemptId' -DefaultValue '')
+    $triggerPublishSequence = ConvertTo-IntOrDefault -Value (Get-ObjectPropertyValue -Object $triggerPublishReadyDocument -Name 'PublishSequence' -DefaultValue 0)
+    $triggerPublishCycleId = [string](Get-ObjectPropertyValue -Object $triggerPublishReadyDocument -Name 'PublishCycleId' -DefaultValue '')
+    $observedPublishReadyPath = [string](Get-ObjectPropertyValue -Object $SourceOutboxStatusTarget -Name 'ArchivedReadyPath' -DefaultValue '')
+    if (-not (Test-NonEmptyString $observedPublishReadyPath)) {
+        $observedPublishReadyPath = [string](Get-ObjectPropertyValue -Object $SourceOutboxStatusTarget -Name 'PublishReadyPath' -DefaultValue '')
+    }
+    if (-not (Test-NonEmptyString $observedPublishReadyPath)) {
+        $observedPublishReadyPath = if (Test-NonEmptyString ([string]$triggerPublishReady.Path)) { [string]$triggerPublishReady.Path } else { $publishReadyPath }
+    }
+    $observedPublishReady = Get-FileSnapshot -Path $observedPublishReadyPath
+    $observedPublishReadyDocument = Read-JsonObjectSafe -Path $observedPublishReadyPath
+    $observedPublishedAt = [string](Get-ObjectPropertyValue -Object $observedPublishReadyDocument -Name 'PublishedAt' -DefaultValue ([string](Get-ObjectPropertyValue -Object $SourceOutboxStatusTarget -Name 'PublishedAt' -DefaultValue '')))
+    $observedPublishAttemptId = [string](Get-ObjectPropertyValue -Object $observedPublishReadyDocument -Name 'AttemptId' -DefaultValue '')
+    $observedPublishSequence = ConvertTo-IntOrDefault -Value (Get-ObjectPropertyValue -Object $observedPublishReadyDocument -Name 'PublishSequence' -DefaultValue (Get-ObjectPropertyValue -Object $SourceOutboxStatusTarget -Name 'PublishSequence' -DefaultValue 0))
+    $observedPublishCycleId = [string](Get-ObjectPropertyValue -Object $observedPublishReadyDocument -Name 'PublishCycleId' -DefaultValue ([string](Get-ObjectPropertyValue -Object $SourceOutboxStatusTarget -Name 'PublishCycleId' -DefaultValue '')))
+    $sourceOutboxUpdatedAt = [string](Get-ObjectPropertyValue -Object $SourceOutboxStatusTarget -Name 'UpdatedAt' -DefaultValue ([string](Get-ObjectPropertyValue -Object $StatusTarget -Name 'SourceOutboxUpdatedAt' -DefaultValue '')))
     $messageFile = Get-FileSnapshot -Path $messagePath
     $requestFile = Get-FileSnapshot -Path $requestPath
     $processedFile = Get-FileSnapshot -Path $processedPath
@@ -492,6 +1021,141 @@ function Get-ImportantTargetSummary {
     $processedPayloadSnapshot = Get-FileSnapshot -Path $processedPayloadSnapshotPath
     $latestPrepareLog = Get-FileSnapshot -Path $latestPrepareLogPath
     $latestAhkLog = Get-FileSnapshot -Path $latestAhkLogPath
+    $ahkLifecycle = Get-AhkLifecycleSummary -LogPath $latestAhkLogPath
+    $payloadForbiddenArtifact = Get-ForbiddenArtifactMatchFromFile -Path $processedPayloadSnapshotPath -Policy $ForbiddenArtifactPolicy
+    $sourceSummaryForbiddenArtifact = Get-ForbiddenArtifactMatchFromFile -Path $sourceSummaryPath -Policy $ForbiddenArtifactPolicy
+    $sourceReviewZipForbiddenArtifact = Get-ForbiddenArtifactMatchFromZip -Path $sourceReviewZipPath -Policy $ForbiddenArtifactPolicy
+    $resultPathCandidate = if (Test-NonEmptyString $targetFolder) { Join-Path $targetFolder 'result.json' } else { '' }
+    $resultDocument = Read-JsonObjectSafe -Path $resultPathCandidate
+    $resultCompletedAt = [string](Get-ObjectPropertyValue -Object $resultDocument -Name 'CompletedAt' -DefaultValue '')
+    $resultSummaryPath = [string](Get-ObjectPropertyValue -Object $resultDocument -Name 'SummaryPath' -DefaultValue '')
+    $resultLatestZipPath = [string](Get-ObjectPropertyValue -Object $resultDocument -Name 'LatestZipPath' -DefaultValue ([string](Get-ObjectPropertyValue -Object $resultDocument -Name 'ImportedZipPath' -DefaultValue '')))
+    $resultSourcePublishReadyPath = [string](Get-ObjectPropertyValue -Object $resultDocument -Name 'SourcePublishReadyPath' -DefaultValue '')
+    $resultSourcePublishedAt = [string](Get-ObjectPropertyValue -Object $resultDocument -Name 'SourcePublishedAt' -DefaultValue '')
+    $resultSourcePublishAttemptId = [string](Get-ObjectPropertyValue -Object $resultDocument -Name 'SourcePublishAttemptId' -DefaultValue '')
+    $resultSourcePublishSequence = ConvertTo-IntOrDefault -Value (Get-ObjectPropertyValue -Object $resultDocument -Name 'SourcePublishSequence' -DefaultValue 0)
+    $resultSourcePublishCycleId = [string](Get-ObjectPropertyValue -Object $resultDocument -Name 'SourcePublishCycleId' -DefaultValue '')
+    $effectiveWorkingDirectory = [string](Get-ObjectPropertyValue -Object $resultDocument -Name 'EffectiveWorkingDirectory' -DefaultValue '')
+    if (-not (Test-NonEmptyString $effectiveWorkingDirectory)) {
+        $effectiveWorkingDirectory = if (Test-NonEmptyString $workRepoRoot) { $workRepoRoot } else { $targetFolder }
+    }
+    $importedSummaryPath = [string](Get-ObjectPropertyValue -Object $StatusTarget -Name 'SummaryPath' -DefaultValue $resultSummaryPath)
+    $importedReviewCopyPath = [string](Get-ObjectPropertyValue -Object $StatusTarget -Name 'LatestZipPath' -DefaultValue $resultLatestZipPath)
+    $importedSummarySnapshot = Get-FileSnapshot -Path $importedSummaryPath
+    $importedReviewCopySnapshot = Get-FileSnapshot -Path $importedReviewCopyPath
+    $importedCopyMatchesObservedPublish = $null
+    if ((Test-NonEmptyString $resultSourcePublishCycleId) -and (Test-NonEmptyString $observedPublishCycleId)) {
+        $importedCopyMatchesObservedPublish = ([string]$resultSourcePublishCycleId -eq [string]$observedPublishCycleId)
+    }
+    elseif (($resultSourcePublishSequence -gt 0) -and ($observedPublishSequence -gt 0)) {
+        $importedCopyMatchesObservedPublish = ([int]$resultSourcePublishSequence -eq [int]$observedPublishSequence)
+    }
+    elseif ((Test-NonEmptyString $resultSourcePublishedAt) -and (Test-NonEmptyString $observedPublishedAt)) {
+        $importedCopyMatchesObservedPublish = ([string]$resultSourcePublishedAt -eq [string]$observedPublishedAt)
+    }
+    elseif ((Test-NonEmptyString $resultSourcePublishAttemptId) -and (Test-NonEmptyString $observedPublishAttemptId)) {
+        $importedCopyMatchesObservedPublish = ([string]$resultSourcePublishAttemptId -eq [string]$observedPublishAttemptId)
+    }
+    elseif ((Test-NonEmptyString $resultSourcePublishReadyPath) -and (Test-NonEmptyString $observedPublishReadyPath)) {
+        $importedCopyMatchesObservedPublish = (Test-NormalizedPathMatch -Left $resultSourcePublishReadyPath -Right $observedPublishReadyPath)
+    }
+    $currentTriggerAheadOfObservedCycle = $false
+    if (($triggerPublishSequence -gt 0) -and ($observedPublishSequence -gt 0) -and ($triggerPublishSequence -ne $observedPublishSequence)) {
+        $currentTriggerAheadOfObservedCycle = ($triggerPublishSequence -gt $observedPublishSequence)
+    }
+    elseif ((Test-NonEmptyString $triggerPublishedAt) -and (Test-NonEmptyString $observedPublishedAt) -and ([string]$triggerPublishedAt -ne [string]$observedPublishedAt)) {
+        $currentTriggerAheadOfObservedCycle = [bool](Test-DateTimeOnOrAfter -Later $triggerPublishedAt -Earlier $observedPublishedAt)
+    }
+    elseif (
+        [bool]$triggerPublishReady.Exists -and
+        [bool]$observedPublishReady.Exists -and
+        -not (Test-NormalizedPathMatch -Left ([string]$triggerPublishReady.Path) -Right ([string]$observedPublishReady.Path))
+    ) {
+        $currentTriggerAheadOfObservedCycle = [bool](Test-DateTimeOnOrAfter -Later ([string]$triggerPublishReady.LastWriteAt) -Earlier ([string]$observedPublishReady.LastWriteAt))
+    }
+    $importedSummaryCreatedAt = if (
+        (Test-NonEmptyString $resultCompletedAt) -and
+        (Test-NonEmptyString $resultSummaryPath) -and
+        (Test-NormalizedPathMatch -Left $importedSummaryPath -Right $resultSummaryPath)
+    ) {
+        $resultCompletedAt
+    }
+    elseif ([bool]$importedSummarySnapshot.Exists) {
+        [string]$importedSummarySnapshot.LastWriteAt
+    }
+    else {
+        [string](Get-ObjectPropertyValue -Object $StatusTarget -Name 'SummaryModifiedAt' -DefaultValue '')
+    }
+    $importedReviewCopyCreatedAt = if (
+        (Test-NonEmptyString $resultCompletedAt) -and
+        (Test-NonEmptyString $resultLatestZipPath) -and
+        (Test-NormalizedPathMatch -Left $importedReviewCopyPath -Right $resultLatestZipPath)
+    ) {
+        $resultCompletedAt
+    }
+    elseif ([bool]$importedReviewCopySnapshot.Exists) {
+        [string]$importedReviewCopySnapshot.LastWriteAt
+    }
+    else {
+        [string](Get-ObjectPropertyValue -Object $StatusTarget -Name 'LatestZipModifiedAt' -DefaultValue '')
+    }
+    $doneWrittenAt = [string](Get-ObjectPropertyValue -Object $StatusTarget -Name 'DoneModifiedAt' -DefaultValue '')
+    $resultWrittenAt = [string](Get-ObjectPropertyValue -Object $StatusTarget -Name 'ResultModifiedAt' -DefaultValue '')
+    $watcherReadyObservedAt = $sourceOutboxUpdatedAt
+    $handoffOpenedAt = [string](Get-ObjectPropertyValue -Object $StatusTarget -Name 'ForwardedAt' -DefaultValue '')
+    $summaryWrittenAt = [string]$sourceSummary.LastWriteAt
+    $reviewZipWrittenAt = [string]$sourceReviewZip.LastWriteAt
+    $publishReadyWrittenAt = if ([bool]$observedPublishReady.Exists) { [string]$observedPublishReady.LastWriteAt } else { [string]$triggerPublishReady.LastWriteAt }
+    $triggerArtifactsCompletedAt = if ($currentTriggerAheadOfObservedCycle -and (Test-NonEmptyString $observedPublishedAt)) {
+        $observedPublishedAt
+    }
+    else {
+        Get-LatestTimestamp -Values @($summaryWrittenAt, $reviewZipWrittenAt, $publishReadyWrittenAt)
+    }
+    $currentArtifactsAheadOfObservedPublish = $false
+    $latestArtifactWriteAt = Get-LatestTimestamp -Values @($summaryWrittenAt, $reviewZipWrittenAt)
+    if ((Test-NonEmptyString $latestArtifactWriteAt) -and (Test-NonEmptyString $publishReadyWrittenAt)) {
+        $currentArtifactsAheadOfObservedPublish = -not (Test-DateTimeOnOrAfter -Later $publishReadyWrittenAt -Earlier $latestArtifactWriteAt)
+    }
+    $timeline = [pscustomobject]@{
+        AttemptId                  = [string]$attemptInfo.AttemptId
+        AttemptStartedAt           = [string]$attemptInfo.AttemptStartedAt
+        SummaryWrittenAt           = $summaryWrittenAt
+        ReviewZipWrittenAt         = $reviewZipWrittenAt
+        PublishReadyWrittenAt      = $publishReadyWrittenAt
+        TriggerArtifactsCompletedAt = $triggerArtifactsCompletedAt
+        WatcherReadyObservedAt     = $watcherReadyObservedAt
+        HandoffOpenedAt            = $handoffOpenedAt
+        RouterProcessedAt          = [string]$processedFile.LastWriteAt
+        SendBeginAt                = [string]$ahkLifecycle.SendBeginAt
+        PayloadEnteredAt           = [string]$ahkLifecycle.PayloadEnteredAt
+        SubmitStartedAt            = [string]$ahkLifecycle.SubmitStartedAt
+        SubmitCompletedAt          = [string]$ahkLifecycle.SubmitCompletedAt
+        SendCompletedAt            = [string]$ahkLifecycle.SendCompletedAt
+        ImportedSummaryCreatedAt   = $importedSummaryCreatedAt
+        ImportedReviewCopyCreatedAt = $importedReviewCopyCreatedAt
+        ImportCompletedAt          = $resultCompletedAt
+        DoneWrittenAt              = $doneWrittenAt
+        ResultWrittenAt            = $resultWrittenAt
+    }
+    $timelineChecks = [pscustomobject]@{
+        PublishAfterArtifacts         = if ($currentTriggerAheadOfObservedCycle) { $null } else { (Test-DateTimeOnOrAfter -Later $publishReadyWrittenAt -Earlier (Get-LatestTimestamp -Values @($summaryWrittenAt, $reviewZipWrittenAt))) }
+        CurrentArtifactsAheadOfObservedPublish = $currentArtifactsAheadOfObservedPublish
+        WatcherObservedAfterPublish   = (Test-DateTimeOnOrAfter -Later $watcherReadyObservedAt -Earlier $publishReadyWrittenAt)
+        HandoffOpenedAfterPublish     = (Test-DateTimeOnOrAfter -Later $handoffOpenedAt -Earlier $publishReadyWrittenAt)
+        ImportedCopyAfterTrigger      = if ($importedCopyMatchesObservedPublish -is [bool] -and -not $importedCopyMatchesObservedPublish) { $null } else { (Test-DateTimeOnOrAfter -Later $importedReviewCopyCreatedAt -Earlier $triggerArtifactsCompletedAt) }
+        ImportedSummaryAfterTrigger   = if ($importedCopyMatchesObservedPublish -is [bool] -and -not $importedCopyMatchesObservedPublish) { $null } else { (Test-DateTimeOnOrAfter -Later $importedSummaryCreatedAt -Earlier $triggerArtifactsCompletedAt) }
+        SubmitCompletedAfterAttempt   = (Test-DateTimeOnOrAfter -Later ([string]$ahkLifecycle.SubmitCompletedAt) -Earlier ([string]$attemptInfo.AttemptStartedAt))
+    }
+    $firstOrderingViolation = Get-FirstOrderingViolation `
+        -SummaryWrittenAt $summaryWrittenAt `
+        -ReviewZipWrittenAt $reviewZipWrittenAt `
+        -PublishReadyWrittenAt $publishReadyWrittenAt `
+        -ImportedReviewCopyCreatedAt $importedReviewCopyCreatedAt `
+        -ImportedSummaryCreatedAt $importedSummaryCreatedAt `
+        -TriggerArtifactsCompletedAt $triggerArtifactsCompletedAt `
+        -CurrentArtifactsAheadOfObservedPublish:$currentArtifactsAheadOfObservedPublish `
+        -TimelineChecks $timelineChecks
     $missingContractFiles = New-Object System.Collections.Generic.List[string]
     if (-not [bool]$sourceSummary.Exists) {
         $missingContractFiles.Add('summary.txt')
@@ -499,7 +1163,7 @@ function Get-ImportantTargetSummary {
     if (-not [bool]$sourceReviewZip.Exists) {
         $missingContractFiles.Add('review.zip')
     }
-    if (-not [bool]$publishReady.Exists) {
+    if (-not [bool]$triggerPublishReady.Exists) {
         $missingContractFiles.Add('publish.ready.json')
     }
 
@@ -508,6 +1172,8 @@ function Get-ImportantTargetSummary {
         PartnerTargetId    = [string](Get-ObjectPropertyValue -Object $StatusTarget -Name 'PartnerTargetId' -DefaultValue (Get-ObjectPropertyValue -Object $ManifestTarget -Name 'PartnerTargetId' -DefaultValue ''))
         TargetId           = $targetId
         RoleName           = [string](Get-ObjectPropertyValue -Object $StatusTarget -Name 'RoleName' -DefaultValue (Get-ObjectPropertyValue -Object $ManifestTarget -Name 'RoleName' -DefaultValue ''))
+        AttemptId          = [string]$attemptInfo.AttemptId
+        AttemptStartedAt   = [string]$attemptInfo.AttemptStartedAt
         LatestState        = [string](Get-ObjectPropertyValue -Object $StatusTarget -Name 'LatestState' -DefaultValue '')
         SourceOutboxState  = [string](Get-ObjectPropertyValue -Object $StatusTarget -Name 'SourceOutboxState' -DefaultValue '')
         SourceOutboxNextAction = [string](Get-ObjectPropertyValue -Object $StatusTarget -Name 'SourceOutboxNextAction' -DefaultValue '')
@@ -525,20 +1191,49 @@ function Get-ImportantTargetSummary {
         ContractRootPath   = $contractRootPath
         ContractReferenceTimeUtc = $contractReferenceTimeUtc
         WorkRepoRoot       = $workRepoRoot
+        PairRunRoot        = $pairRunRoot
+        EffectiveWorkingDirectory = $effectiveWorkingDirectory
         ReviewInputPath    = $reviewInputPath
         MessagePath        = $messagePath
         MessageFile        = $messageFile
         MessagePreview     = Get-FilePreviewText -Path $messagePath
         RequestPath        = $requestPath
         RequestFile        = $requestFile
+        CurrentTriggerSummaryPath = $sourceSummaryPath
+        CurrentTriggerReviewZipPath = $sourceReviewZipPath
+        CurrentTriggerPublishReadyPath = $publishReadyPath
+        CurrentTriggerSourceOutboxPath = $sourceOutboxPath
+        CurrentObservedPublishReadyPath = if (Test-NonEmptyString ([string]$observedPublishReady.Path)) { [string]$observedPublishReady.Path } else { $observedPublishReadyPath }
+        CurrentArchivedPublishReadyPath = $archivedPublishReadyPath
+        CurrentTriggerPublishSequence = $triggerPublishSequence
+        CurrentTriggerPublishCycleId = $triggerPublishCycleId
+        CurrentObservedPublishSequence = $observedPublishSequence
+        CurrentObservedPublishCycleId = $observedPublishCycleId
+        CurrentImportedSummaryPath = $importedSummaryPath
+        CurrentImportedReviewCopyPath = $importedReviewCopyPath
+        CurrentImportedSourcePublishSequence = $resultSourcePublishSequence
+        CurrentImportedSourcePublishCycleId = $resultSourcePublishCycleId
+        CurrentTriggerAheadOfObservedCycle = $currentTriggerAheadOfObservedCycle
+        CurrentArtifactsAheadOfObservedPublish = $currentArtifactsAheadOfObservedPublish
+        ImportedCopyMatchesObservedPublish = $importedCopyMatchesObservedPublish
         ProcessedPath      = $processedPath
         ProcessedFile      = $processedFile
         ProcessedPayloadSnapshotPath = $processedPayloadSnapshotPath
         ProcessedPayloadSnapshot = $processedPayloadSnapshot
         ProcessedPayloadSnapshotPreview = Get-FilePreviewText -Path $processedPayloadSnapshotPath
+        PayloadContainsForbiddenLiteral = [bool]$payloadForbiddenArtifact.Found
+        PayloadForbiddenArtifact = $payloadForbiddenArtifact
+        SourceSummaryContainsForbiddenLiteral = [bool]$sourceSummaryForbiddenArtifact.Found
+        SourceSummaryForbiddenArtifact = $sourceSummaryForbiddenArtifact
+        SourceReviewZipContainsForbiddenLiteral = [bool]$sourceReviewZipForbiddenArtifact.Found
+        SourceReviewZipForbiddenArtifact = $sourceReviewZipForbiddenArtifact
+        ForwardBlockedByForbiddenLiteral = ([string](Get-ObjectPropertyValue -Object $StatusTarget -Name 'SourceOutboxState' -DefaultValue '') -in @('source-summary-forbidden-literal', 'source-reviewzip-forbidden-literal'))
         SourceSummary      = $sourceSummary
         SourceReviewZip    = $sourceReviewZip
-        PublishReady       = $publishReady
+        PublishReady       = $triggerPublishReady
+        Timeline           = $timeline
+        TimelineChecks     = $timelineChecks
+        FirstOrderingViolation = $firstOrderingViolation
         ContractArtifactsReady = ($missingContractFiles.Count -eq 0)
         MissingContractFiles = @($missingContractFiles)
         LatestPrepareLog   = $latestPrepareLog
@@ -546,6 +1241,205 @@ function Get-ImportantTargetSummary {
         LatestAhkLog       = $latestAhkLog
         LatestAhkLogPath   = $latestAhkLogPath
     }
+}
+
+function Get-UniqueNonEmptyStrings {
+    param([object[]]$Values)
+
+    $seen = @{}
+    $items = New-Object System.Collections.Generic.List[string]
+    foreach ($value in @($Values)) {
+        $text = [string]$value
+        if (-not (Test-NonEmptyString $text)) {
+            continue
+        }
+
+        $key = $text.ToLowerInvariant()
+        if ($seen.ContainsKey($key)) {
+            continue
+        }
+
+        $seen[$key] = $true
+        $items.Add($text)
+    }
+
+    return @($items)
+}
+
+function Get-PairRouteState {
+    param(
+        [bool]$TargetsShareWorkRepoRoot,
+        [bool]$TargetsSharePairRunRoot,
+        [bool]$TargetOutboxesDistinct
+    )
+
+    if (-not $TargetsShareWorkRepoRoot) {
+        return 'mismatched-workrepo'
+    }
+    if (-not $TargetsSharePairRunRoot) {
+        return 'mismatched-pair-runroot'
+    }
+    if (-not $TargetOutboxesDistinct) {
+        return 'outbox-collision-risk'
+    }
+
+    return 'aligned'
+}
+
+function Get-ImportantPairRouteMatrix {
+    param(
+        [object[]]$Pairs,
+        [object[]]$Targets
+    )
+
+    $pairRefs = @()
+    foreach ($pair in @($Pairs)) {
+        if ($null -eq $pair) {
+            continue
+        }
+
+        $pairId = [string](Get-ObjectPropertyValue -Object $pair -Name 'PairId' -DefaultValue '')
+        if (-not (Test-NonEmptyString $pairId)) {
+            continue
+        }
+
+        $pairRefs += [pscustomobject]@{
+            PairId = $pairId
+            Pair   = $pair
+        }
+    }
+    foreach ($target in @($Targets)) {
+        if ($null -eq $target) {
+            continue
+        }
+
+        $pairId = [string](Get-ObjectPropertyValue -Object $target -Name 'PairId' -DefaultValue '')
+        if (-not (Test-NonEmptyString $pairId)) {
+            continue
+        }
+        if ((@($pairRefs | Where-Object { [string]$_.PairId -eq $pairId })).Count -gt 0) {
+            continue
+        }
+
+        $pairRefs += [pscustomobject]@{
+            PairId = $pairId
+            Pair   = $null
+        }
+    }
+
+    $matrix = @()
+    foreach ($pairRef in @($pairRefs)) {
+        $pairId = [string](Get-ObjectPropertyValue -Object $pairRef -Name 'PairId' -DefaultValue '')
+        if (-not (Test-NonEmptyString $pairId)) {
+            continue
+        }
+
+        $pairTargets = @()
+        foreach ($candidateTarget in @($Targets)) {
+            if ($null -eq $candidateTarget) {
+                continue
+            }
+            if ([string](Get-ObjectPropertyValue -Object $candidateTarget -Name 'PairId' -DefaultValue '') -eq $pairId) {
+                $pairTargets += $candidateTarget
+            }
+        }
+        if ($pairTargets.Count -eq 0) {
+            continue
+        }
+
+        $top = $null
+        $bottom = $null
+        foreach ($pairTarget in @($pairTargets)) {
+            $roleName = [string](Get-ObjectPropertyValue -Object $pairTarget -Name 'RoleName' -DefaultValue '')
+            if ($null -eq $top -and $roleName -eq 'top') {
+                $top = $pairTarget
+                continue
+            }
+            if ($null -eq $bottom -and $roleName -eq 'bottom') {
+                $bottom = $pairTarget
+                continue
+            }
+        }
+        if ($null -eq $top -and $pairTargets.Count -gt 0) {
+            $top = $pairTargets[0]
+        }
+        if ($null -eq $bottom) {
+            foreach ($pairTarget in @($pairTargets)) {
+                if ($pairTarget -ne $top) {
+                    $bottom = $pairTarget
+                    break
+                }
+            }
+        }
+
+        $workRepoRootValues = @()
+        $pairRunRootValues = @()
+        $sourceOutboxValues = @()
+        foreach ($pairTarget in @($pairTargets)) {
+            $workRepoRootValues += [string](Get-ObjectPropertyValue -Object $pairTarget -Name 'WorkRepoRoot' -DefaultValue '')
+            $pairRunRootValues += [string](Get-ObjectPropertyValue -Object $pairTarget -Name 'PairRunRoot' -DefaultValue '')
+            $sourceOutboxValues += [string](Get-ObjectPropertyValue -Object $pairTarget -Name 'CurrentTriggerSourceOutboxPath' -DefaultValue '')
+        }
+
+        $workRepoRoots = @(Get-UniqueNonEmptyStrings -Values $workRepoRootValues)
+        $pairRunRoots = @(Get-UniqueNonEmptyStrings -Values $pairRunRootValues)
+        $sourceOutboxes = @(Get-UniqueNonEmptyStrings -Values $sourceOutboxValues)
+
+        $targetsShareWorkRepoRoot = ($workRepoRoots.Count -eq 1)
+        $targetsSharePairRunRoot = ($pairRunRoots.Count -eq 1)
+        $targetOutboxesDistinct = ($sourceOutboxes.Count -eq $pairTargets.Count)
+        $sharedWorkRepoRoot = ''
+        if ($workRepoRoots.Count -eq 1) {
+            $sharedWorkRepoRoot = [string]$workRepoRoots[0]
+        }
+        $pairRunRootValue = ''
+        if ($pairRunRoots.Count -eq 1) {
+            $pairRunRootValue = [string]$pairRunRoots[0]
+        }
+
+        $sharesWorkRepoRootWithOtherPairs = $false
+        if (Test-NonEmptyString $sharedWorkRepoRoot) {
+            foreach ($otherTarget in @($Targets)) {
+                if ($null -eq $otherTarget) {
+                    continue
+                }
+
+                $otherPairId = [string](Get-ObjectPropertyValue -Object $otherTarget -Name 'PairId' -DefaultValue '')
+                if (-not (Test-NonEmptyString $otherPairId) -or $otherPairId -eq $pairId) {
+                    continue
+                }
+
+                $otherWorkRepoRoot = [string](Get-ObjectPropertyValue -Object $otherTarget -Name 'WorkRepoRoot' -DefaultValue '')
+                if (Test-NormalizedPathMatch -Left $sharedWorkRepoRoot -Right $otherWorkRepoRoot) {
+                    $sharesWorkRepoRootWithOtherPairs = $true
+                    break
+                }
+            }
+        }
+
+        $matrix += [pscustomobject]@{
+                PairId                      = $pairId
+                TopTargetId                 = [string](Get-ObjectPropertyValue -Object $top -Name 'TargetId' -DefaultValue '')
+                BottomTargetId              = [string](Get-ObjectPropertyValue -Object $bottom -Name 'TargetId' -DefaultValue '')
+                PairWorkRepoRoot            = $sharedWorkRepoRoot
+                PairRunRoot                 = $pairRunRootValue
+                TopWorkRepoRoot             = [string](Get-ObjectPropertyValue -Object $top -Name 'WorkRepoRoot' -DefaultValue '')
+                BottomWorkRepoRoot          = [string](Get-ObjectPropertyValue -Object $bottom -Name 'WorkRepoRoot' -DefaultValue '')
+                TopPairRunRoot              = [string](Get-ObjectPropertyValue -Object $top -Name 'PairRunRoot' -DefaultValue '')
+                BottomPairRunRoot           = [string](Get-ObjectPropertyValue -Object $bottom -Name 'PairRunRoot' -DefaultValue '')
+                TopSourceOutboxPath         = [string](Get-ObjectPropertyValue -Object $top -Name 'CurrentTriggerSourceOutboxPath' -DefaultValue '')
+                BottomSourceOutboxPath      = [string](Get-ObjectPropertyValue -Object $bottom -Name 'CurrentTriggerSourceOutboxPath' -DefaultValue '')
+                TopPublishReadyPath         = [string](Get-ObjectPropertyValue -Object $top -Name 'CurrentTriggerPublishReadyPath' -DefaultValue '')
+                BottomPublishReadyPath      = [string](Get-ObjectPropertyValue -Object $bottom -Name 'CurrentTriggerPublishReadyPath' -DefaultValue '')
+                TargetsShareWorkRepoRoot    = $targetsShareWorkRepoRoot
+                TargetsSharePairRunRoot     = $targetsSharePairRunRoot
+                TargetOutboxesDistinct      = $targetOutboxesDistinct
+                SharesWorkRepoRootWithOtherPairs = $sharesWorkRepoRootWithOtherPairs
+                RouteState                  = Get-PairRouteState -TargetsShareWorkRepoRoot $targetsShareWorkRepoRoot -TargetsSharePairRunRoot $targetsSharePairRunRoot -TargetOutboxesDistinct $targetOutboxesDistinct
+            }
+    }
+
+    return @($matrix)
 }
 
 function Get-ImportantPairSummaries {
@@ -868,6 +1762,9 @@ function Get-ImportantRecentEvents {
         Add-EventRecord -List $events -At ([string](Get-ObjectPropertyValue -Object $target.SourceSummary -Name 'LastWriteAt' -DefaultValue '')) -Text ('{0} summary.txt created' -f $targetId) -Source ($targetId + ':summary') -Priority 14 -EventClass 'contract-artifact' -PairId $pairId -TargetId $targetId -IsProgressSignal:$true
         Add-EventRecord -List $events -At ([string](Get-ObjectPropertyValue -Object $target.SourceReviewZip -Name 'LastWriteAt' -DefaultValue '')) -Text ('{0} review.zip created' -f $targetId) -Source ($targetId + ':review-zip') -Priority 13 -EventClass 'contract-artifact' -PairId $pairId -TargetId $targetId -IsProgressSignal:$true
         Add-EventRecord -List $events -At ([string](Get-ObjectPropertyValue -Object $target.PublishReady -Name 'LastWriteAt' -DefaultValue '')) -Text ('{0} publish.ready.json created' -f $targetId) -Source ($targetId + ':publish-ready') -Priority 12 -EventClass 'contract-artifact' -PairId $pairId -TargetId $targetId -IsProgressSignal:$true
+        Add-EventRecord -List $events -At ([string](Get-ObjectPropertyValue -Object $target.Timeline -Name 'SubmitStartedAt' -DefaultValue '')) -Text ('{0} submit started' -f $targetId) -Source ($targetId + ':submit-start') -Priority 20 -EventClass 'dispatch' -PairId $pairId -TargetId $targetId -IsProgressSignal:$true
+        Add-EventRecord -List $events -At ([string](Get-ObjectPropertyValue -Object $target.Timeline -Name 'SubmitCompletedAt' -DefaultValue '')) -Text ('{0} submit completed' -f $targetId) -Source ($targetId + ':submit-complete') -Priority 16 -EventClass 'dispatch' -PairId $pairId -TargetId $targetId -IsProgressSignal:$true
+        Add-EventRecord -List $events -At ([string](Get-ObjectPropertyValue -Object $target.Timeline -Name 'ImportedReviewCopyCreatedAt' -DefaultValue '')) -Text ('{0} imported review copy created' -f $targetId) -Source ($targetId + ':imported-review') -Priority 15 -EventClass 'import' -PairId $pairId -TargetId $targetId -IsProgressSignal:$true
     }
 
     $results = New-Object System.Collections.ArrayList
@@ -1000,21 +1897,28 @@ function New-ImportantSummaryData {
     $manifestSummary = Get-ManifestSummary -RunRoot $RunRoot
     $contractSummary = Get-ContractSummary -AcceptanceReceipt $AcceptanceReceipt
     $config = Read-ConfigObjectSafe -Path $ConfigPath
+    $forbiddenArtifactPolicy = Get-ForbiddenArtifactPolicyFromConfig -Config $config
     $logsRoot = Normalize-DisplayPath -Path ([string](Get-ObjectPropertyValue -Object $config -Name 'LogsRoot' -DefaultValue ''))
     $runtimeRoot = Normalize-DisplayPath -Path ([string](Get-ObjectPropertyValue -Object $config -Name 'RuntimeRoot' -DefaultValue ''))
     $inboxRoot = Normalize-DisplayPath -Path ([string](Get-ObjectPropertyValue -Object $config -Name 'InboxRoot' -DefaultValue ''))
     $processedRoot = Normalize-DisplayPath -Path ([string](Get-ObjectPropertyValue -Object $config -Name 'ProcessedRoot' -DefaultValue ''))
     $statusTargetLookup = Get-StatusTargetLookup -Targets @($Status.Targets)
+    $sourceOutboxStatusSummary = Get-SourceOutboxStatusSummary -RunRoot $RunRoot
+    $sourceOutboxTargetLookup = Get-StatusTargetLookup -Targets @($sourceOutboxStatusSummary.Targets)
 
     $importantTargets = @()
     foreach ($manifestTarget in @($manifestSummary.Targets)) {
         $targetId = [string](Get-ObjectPropertyValue -Object $manifestTarget -Name 'TargetId' -DefaultValue '')
         $statusTarget = $null
+        $sourceOutboxStatusTarget = $null
         if (Test-NonEmptyString $targetId -and $statusTargetLookup.ContainsKey($targetId)) {
             $statusTarget = $statusTargetLookup[$targetId]
         }
+        if (Test-NonEmptyString $targetId -and $sourceOutboxTargetLookup.ContainsKey($targetId)) {
+            $sourceOutboxStatusTarget = $sourceOutboxTargetLookup[$targetId]
+        }
 
-        $importantTargets += Get-ImportantTargetSummary -ManifestTarget $manifestTarget -StatusTarget $statusTarget -LogsRoot $logsRoot
+        $importantTargets += Get-ImportantTargetSummary -ManifestTarget $manifestTarget -StatusTarget $statusTarget -SourceOutboxStatusTarget $sourceOutboxStatusTarget -LogsRoot $logsRoot -ForbiddenArtifactPolicy $forbiddenArtifactPolicy
     }
 
     $generatedAt = (Get-Date).ToString('o')
@@ -1028,6 +1932,7 @@ function New-ImportantSummaryData {
         -Targets @($importantTargets)
     $importantPairs = Sort-ImportantPairSummaries -Pairs @($importantPairs) -FocusPairId ([string]$operatorFocus.FocusPairId)
     $importantTargets = Sort-ImportantTargets -Targets @($importantTargets) -FocusPairId ([string]$operatorFocus.FocusPairId)
+    $pairRouteMatrix = Get-ImportantPairRouteMatrix -Pairs @($importantPairs) -Targets @($importantTargets)
     $recentEvents = Get-ImportantRecentEvents `
         -GeneratedAt $generatedAt `
         -AcceptanceSummary $AcceptanceSummary `
@@ -1069,6 +1974,7 @@ function New-ImportantSummaryData {
         }
         RecentEvents = @($recentEvents)
         Pairs = @($importantPairs)
+        PairRouteMatrix = @($pairRouteMatrix)
         Targets = @($importantTargets)
     }
 }
@@ -1160,6 +2066,30 @@ function Format-ImportantSummaryText {
         }
     }
 
+    $lines.Add('')
+    $lines.Add('[pair-route-matrix]')
+    if ((@($ImportantSummary.PairRouteMatrix)).Count -eq 0) {
+        $lines.Add('(none)')
+    }
+    else {
+        foreach ($route in @($ImportantSummary.PairRouteMatrix)) {
+            $pairId = [string](Get-ObjectPropertyValue -Object $route -Name 'PairId' -DefaultValue '')
+            $topTargetId = [string](Get-ObjectPropertyValue -Object $route -Name 'TopTargetId' -DefaultValue '')
+            $bottomTargetId = [string](Get-ObjectPropertyValue -Object $route -Name 'BottomTargetId' -DefaultValue '')
+            $lines.Add(('[pair {0}] routeState={1} top={2} bottom={3}' -f $pairId, [string]$route.RouteState, $topTargetId, $bottomTargetId))
+            $lines.Add(('PairWorkRepoRoot: {0}' -f [string]$route.PairWorkRepoRoot))
+            $lines.Add(('PairRunRoot: {0}' -f [string]$route.PairRunRoot))
+            $lines.Add(('TargetsShareWorkRepoRoot: {0}' -f [bool]$route.TargetsShareWorkRepoRoot))
+            $lines.Add(('TargetsSharePairRunRoot: {0}' -f [bool]$route.TargetsSharePairRunRoot))
+            $lines.Add(('TargetOutboxesDistinct: {0}' -f [bool]$route.TargetOutboxesDistinct))
+            $lines.Add(('SharesWorkRepoRootWithOtherPairs: {0}' -f [bool]$route.SharesWorkRepoRootWithOtherPairs))
+            $lines.Add(('TopSourceOutboxPath: {0}' -f [string]$route.TopSourceOutboxPath))
+            $lines.Add(('BottomSourceOutboxPath: {0}' -f [string]$route.BottomSourceOutboxPath))
+            $lines.Add(('TopPublishReadyPath: {0}' -f [string]$route.TopPublishReadyPath))
+            $lines.Add(('BottomPublishReadyPath: {0}' -f [string]$route.BottomPublishReadyPath))
+        }
+    }
+
     foreach ($pair in @($ImportantSummary.Pairs)) {
         $pairId = [string]$pair.PairId
         if (-not (Test-NonEmptyString $pairId)) {
@@ -1181,6 +2111,8 @@ function Format-ImportantSummaryText {
         $lines.Add(('InitialRoleMode: {0}' -f [string]$target.InitialRoleMode))
         $lines.Add(('ManualAttentionRequired: {0}' -f [bool]$target.ManualAttentionRequired))
         $lines.Add(('WorkRepoRoot: {0}' -f [string]$target.WorkRepoRoot))
+        $lines.Add(('PairRunRoot: {0}' -f [string]$target.PairRunRoot))
+        $lines.Add(('EffectiveWorkingDirectory: {0}' -f [string]$target.EffectiveWorkingDirectory))
         $lines.Add(('ReviewInputPath: {0}' -f [string]$target.ReviewInputPath))
         $lines.Add(('MessagePath: {0}' -f [string]$target.MessagePath))
         $lines.Add(('RequestPath: {0}' -f [string]$target.RequestPath))
@@ -1191,6 +2123,39 @@ function Format-ImportantSummaryText {
         $lines.Add(('ContractRootPath: {0}' -f [string]$target.ContractRootPath))
         $lines.Add(('ContractReferenceTimeUtc: {0}' -f [string]$target.ContractReferenceTimeUtc))
         $lines.Add(('ContractArtifactsReady: {0}' -f [bool]$target.ContractArtifactsReady))
+        $lines.Add(('CurrentTriggerSourceOutboxPath: {0}' -f [string]$target.CurrentTriggerSourceOutboxPath))
+        $lines.Add(('CurrentTriggerSummaryPath: {0}' -f [string]$target.CurrentTriggerSummaryPath))
+        $lines.Add(('CurrentTriggerReviewZipPath: {0}' -f [string]$target.CurrentTriggerReviewZipPath))
+        $lines.Add(('CurrentTriggerPublishReadyPath: {0}' -f [string]$target.CurrentTriggerPublishReadyPath))
+        $lines.Add(('CurrentObservedPublishReadyPath: {0}' -f [string]$target.CurrentObservedPublishReadyPath))
+        if (Test-NonEmptyString ([string]$target.CurrentArchivedPublishReadyPath)) {
+            $lines.Add(('CurrentArchivedPublishReadyPath: {0}' -f [string]$target.CurrentArchivedPublishReadyPath))
+        }
+        if ([int]$target.CurrentTriggerPublishSequence -gt 0) {
+            $lines.Add(('CurrentTriggerPublishSequence: {0}' -f [int]$target.CurrentTriggerPublishSequence))
+        }
+        if (Test-NonEmptyString ([string]$target.CurrentTriggerPublishCycleId)) {
+            $lines.Add(('CurrentTriggerPublishCycleId: {0}' -f [string]$target.CurrentTriggerPublishCycleId))
+        }
+        if ([int]$target.CurrentObservedPublishSequence -gt 0) {
+            $lines.Add(('CurrentObservedPublishSequence: {0}' -f [int]$target.CurrentObservedPublishSequence))
+        }
+        if (Test-NonEmptyString ([string]$target.CurrentObservedPublishCycleId)) {
+            $lines.Add(('CurrentObservedPublishCycleId: {0}' -f [string]$target.CurrentObservedPublishCycleId))
+        }
+        if (Test-NonEmptyString ([string]$target.CurrentImportedSummaryPath)) {
+            $lines.Add(('CurrentImportedSummaryPath: {0}' -f [string]$target.CurrentImportedSummaryPath))
+        }
+        $lines.Add(('CurrentImportedReviewCopyPath: {0}' -f [string]$target.CurrentImportedReviewCopyPath))
+        if ([int]$target.CurrentImportedSourcePublishSequence -gt 0) {
+            $lines.Add(('CurrentImportedSourcePublishSequence: {0}' -f [int]$target.CurrentImportedSourcePublishSequence))
+        }
+        if (Test-NonEmptyString ([string]$target.CurrentImportedSourcePublishCycleId)) {
+            $lines.Add(('CurrentImportedSourcePublishCycleId: {0}' -f [string]$target.CurrentImportedSourcePublishCycleId))
+        }
+        $lines.Add(('CurrentTriggerAheadOfObservedCycle: {0}' -f [string]$target.CurrentTriggerAheadOfObservedCycle))
+        $lines.Add(('CurrentArtifactsAheadOfObservedPublish: {0}' -f [string]$target.CurrentArtifactsAheadOfObservedPublish))
+        $lines.Add(('ImportedCopyMatchesObservedPublish: {0}' -f [string]$target.ImportedCopyMatchesObservedPublish))
         $missingContractFiles = @($target.MissingContractFiles | Where-Object { Test-NonEmptyString ([string]$_) })
         if ($missingContractFiles.Count -gt 0) {
             $lines.Add(('MissingContractFiles: {0}' -f ($missingContractFiles -join ', ')))
@@ -1208,6 +2173,26 @@ function Format-ImportantSummaryText {
             $lines.Add(('ProcessedPayloadSnapshotPath: {0}' -f [string]$target.ProcessedPayloadSnapshotPath))
             $lines.Add(('ProcessedPayloadSnapshotExists: {0}' -f [bool]$target.ProcessedPayloadSnapshot.Exists))
         }
+        $lines.Add(('AttemptId: {0}' -f [string]$target.AttemptId))
+        $lines.Add(('AttemptStartedAt: {0}' -f [string]$target.AttemptStartedAt))
+        $lines.Add(('Timeline: summaryAt={0} reviewZipAt={1} publishReadyAt={2} watcherReadyAt={3} handoffOpenedAt={4}' -f [string]$target.Timeline.SummaryWrittenAt, [string]$target.Timeline.ReviewZipWrittenAt, [string]$target.Timeline.PublishReadyWrittenAt, [string]$target.Timeline.WatcherReadyObservedAt, [string]$target.Timeline.HandoffOpenedAt))
+        $lines.Add(('TimelineDispatch: routerProcessedAt={0} sendBeginAt={1} payloadEnteredAt={2} submitStartedAt={3} submitCompletedAt={4}' -f [string]$target.Timeline.RouterProcessedAt, [string]$target.Timeline.SendBeginAt, [string]$target.Timeline.PayloadEnteredAt, [string]$target.Timeline.SubmitStartedAt, [string]$target.Timeline.SubmitCompletedAt))
+        $lines.Add(('TimelineImport: importedSummaryAt={0} importedReviewCopyAt={1} doneAt={2} resultAt={3}' -f [string]$target.Timeline.ImportedSummaryCreatedAt, [string]$target.Timeline.ImportedReviewCopyCreatedAt, [string]$target.Timeline.DoneWrittenAt, [string]$target.Timeline.ResultWrittenAt))
+        $lines.Add(('TimelineChecks: publishAfterArtifacts={0} currentArtifactsAheadOfObservedPublish={1} watcherObservedAfterPublish={2} handoffOpenedAfterPublish={3} importedCopyAfterTrigger={4}' -f [string]$target.TimelineChecks.PublishAfterArtifacts, [string]$target.TimelineChecks.CurrentArtifactsAheadOfObservedPublish, [string]$target.TimelineChecks.WatcherObservedAfterPublish, [string]$target.TimelineChecks.HandoffOpenedAfterPublish, [string]$target.TimelineChecks.ImportedCopyAfterTrigger))
+        $lines.Add(('FirstOrderingViolation: {0}' -f [string]$target.FirstOrderingViolation))
+        $lines.Add(('PayloadContainsForbiddenLiteral: {0}' -f [bool]$target.PayloadContainsForbiddenLiteral))
+        if ([bool]$target.PayloadContainsForbiddenLiteral) {
+            $lines.Add(('PayloadForbiddenArtifact: type={0} pattern={1} match={2}' -f [string]$target.PayloadForbiddenArtifact.MatchKind, [string]$target.PayloadForbiddenArtifact.Pattern, [string]$target.PayloadForbiddenArtifact.MatchText))
+        }
+        $lines.Add(('SourceSummaryContainsForbiddenLiteral: {0}' -f [bool]$target.SourceSummaryContainsForbiddenLiteral))
+        if ([bool]$target.SourceSummaryContainsForbiddenLiteral) {
+            $lines.Add(('SourceSummaryForbiddenArtifact: type={0} pattern={1} match={2}' -f [string]$target.SourceSummaryForbiddenArtifact.MatchKind, [string]$target.SourceSummaryForbiddenArtifact.Pattern, [string]$target.SourceSummaryForbiddenArtifact.MatchText))
+        }
+        $lines.Add(('SourceReviewZipContainsForbiddenLiteral: {0}' -f [bool]$target.SourceReviewZipContainsForbiddenLiteral))
+        if ([bool]$target.SourceReviewZipContainsForbiddenLiteral) {
+            $lines.Add(('SourceReviewZipForbiddenArtifact: type={0} pattern={1} match={2} entry={3}' -f [string]$target.SourceReviewZipForbiddenArtifact.MatchKind, [string]$target.SourceReviewZipForbiddenArtifact.Pattern, [string]$target.SourceReviewZipForbiddenArtifact.MatchText, [string]$target.SourceReviewZipForbiddenArtifact.EntryPath))
+        }
+        $lines.Add(('ForwardBlockedByForbiddenLiteral: {0}' -f [bool]$target.ForwardBlockedByForbiddenLiteral))
         $preview = [string]$target.MessagePreview
         if (Test-NonEmptyString $preview) {
             $lines.Add('MessagePreview:')

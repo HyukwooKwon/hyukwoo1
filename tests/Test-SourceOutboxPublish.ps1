@@ -99,7 +99,10 @@ function New-ReadyPayload {
         [int64]$ReviewZipSizeBytes,
         [string]$SummarySha256 = '',
         [string]$ReviewZipSha256 = '',
-        [string]$SourceContext = ''
+        [string]$SourceContext = '',
+        [string]$PublishedBy = 'publish-paired-exchange-artifact.ps1',
+        [bool]$ValidationPassed = $true,
+        [string]$ValidationCompletedAt = ''
     )
 
     $payload = [ordered]@{
@@ -111,6 +114,9 @@ function New-ReadyPayload {
         PublishedAt = $PublishedAt
         SummarySizeBytes = $SummarySizeBytes
         ReviewZipSizeBytes = $ReviewZipSizeBytes
+        PublishedBy = $PublishedBy
+        ValidationPassed = $ValidationPassed
+        ValidationCompletedAt = $(if ([string]::IsNullOrWhiteSpace($ValidationCompletedAt) -eq $false) { $ValidationCompletedAt } else { $PublishedAt })
     }
 
     if ([string]::IsNullOrWhiteSpace($SummarySha256) -eq $false) {
@@ -128,7 +134,13 @@ function New-ReadyPayload {
 
 $root = Split-Path -Parent $PSScriptRoot
 if ([string]::IsNullOrWhiteSpace($ConfigPath)) {
-    $ConfigPath = Join-Path $root 'config\settings.bottest-live-visible.psd1'
+    $preferredExternalizedConfigPath = 'C:\dev\python\relay-workrepo-visible-smoke\.relay-config\bottest-live-visible\settings.externalized.psd1'
+    if (Test-Path -LiteralPath $preferredExternalizedConfigPath -PathType Leaf) {
+        $ConfigPath = $preferredExternalizedConfigPath
+    }
+    else {
+        $ConfigPath = Join-Path $root 'config\settings.bottest-live-visible.psd1'
+    }
 }
 
 $resolvedConfigPath = (Resolve-Path -LiteralPath $ConfigPath).Path
@@ -142,37 +154,33 @@ $contractRunRoot = Join-Path $pairRunRootBase ('run_contract_source_outbox_publi
     -IncludePairId pair01 | Out-Null
 
 $target01Root = Join-Path $contractRunRoot 'pair01\target01'
-$target01Outbox = Join-Path $target01Root 'source-outbox'
-$target01SourceSummaryPath = Join-Path $target01Outbox 'summary.txt'
-$target01SourceZipPath = Join-Path $target01Outbox 'review.zip'
-$target01PublishReadyPath = Join-Path $target01Outbox 'publish.ready.json'
-$target01ArchiveRoot = Join-Path $target01Outbox '.published'
+$target01Request = Get-Content -LiteralPath (Join-Path $target01Root 'request.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+$target01Outbox = Split-Path -Parent ([string]$target01Request.SourceSummaryPath)
+$target01SourceSummaryPath = [string]$target01Request.SourceSummaryPath
+$target01SourceZipPath = [string]$target01Request.SourceReviewZipPath
+$target01PublishReadyPath = [string]$target01Request.PublishReadyPath
+$target01ArchiveRoot = [string]$target01Request.PublishedArchivePath
 $target01ZipContentPath = Join-Path $target01Outbox 'target01-note.txt'
+$target01PublishScriptPath = Join-Path $target01Root 'publish-artifact.ps1'
 
+New-Item -ItemType Directory -Path $target01Outbox -Force | Out-Null
 [System.IO.File]::WriteAllText($target01SourceSummaryPath, 'source outbox publish summary', (New-Utf8NoBomEncoding))
 [System.IO.File]::WriteAllText($target01ZipContentPath, 'source outbox publish zip content', (New-Utf8NoBomEncoding))
 Compress-Archive -LiteralPath $target01ZipContentPath -DestinationPath $target01SourceZipPath -Force
-$target01PublishedAt = (Get-Date).ToString('o')
-$target01ReadyPayload = New-ReadyPayload `
-    -PairId 'pair01' `
-    -TargetId 'target01' `
-    -SummaryPath $target01SourceSummaryPath `
-    -ReviewZipPath $target01SourceZipPath `
-    -PublishedAt $target01PublishedAt `
-    -SummarySizeBytes ([int64](Get-Item -LiteralPath $target01SourceSummaryPath -ErrorAction Stop).Length) `
-    -ReviewZipSizeBytes ([int64](Get-Item -LiteralPath $target01SourceZipPath -ErrorAction Stop).Length) `
-    -SummarySha256 (Get-FileHashHex -Path $target01SourceSummaryPath) `
-    -ReviewZipSha256 (Get-FileHashHex -Path $target01SourceZipPath) `
-    -SourceContext 'source-outbox-test-target01'
-$target01ReadyPayload | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $target01PublishReadyPath -Encoding UTF8
+$target01Publish = Invoke-PowerShellJson -ScriptPath $target01PublishScriptPath -Arguments @('-AsJson')
+Assert-True ($target01Publish.ExitCode -eq 0) 'target01 publish wrapper should succeed.'
+Assert-True ([bool]$target01Publish.Json.PublishReadyCreated) 'target01 publish wrapper should create ready marker.'
+$target01ReadyPayload = $target01Publish.Json.Marker
 
 $target05Root = Join-Path $contractRunRoot 'pair01\target05'
-$target05Outbox = Join-Path $target05Root 'source-outbox'
-$target05SourceSummaryPath = Join-Path $target05Outbox 'summary.txt'
-$target05SourceZipPath = Join-Path $target05Outbox 'review.zip'
-$target05PublishReadyPath = Join-Path $target05Outbox 'publish.ready.json'
+$target05Request = Get-Content -LiteralPath (Join-Path $target05Root 'request.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+$target05Outbox = Split-Path -Parent ([string]$target05Request.SourceSummaryPath)
+$target05SourceSummaryPath = [string]$target05Request.SourceSummaryPath
+$target05SourceZipPath = [string]$target05Request.SourceReviewZipPath
+$target05PublishReadyPath = [string]$target05Request.PublishReadyPath
 $target05ZipContentPath = Join-Path $target05Outbox 'target05-note.txt'
 
+New-Item -ItemType Directory -Path $target05Outbox -Force | Out-Null
 [System.IO.File]::WriteAllText($target05SourceSummaryPath, 'invalid source outbox publish summary', (New-Utf8NoBomEncoding))
 [System.IO.File]::WriteAllText($target05ZipContentPath, 'invalid source outbox publish zip content', (New-Utf8NoBomEncoding))
 Compress-Archive -LiteralPath $target05ZipContentPath -DestinationPath $target05SourceZipPath -Force
@@ -211,6 +219,14 @@ $target01Result = Get-Content -LiteralPath $target01ResultPath -Raw -Encoding UT
 $target01Done = Get-Content -LiteralPath $target01DonePath -Raw -Encoding UTF8 | ConvertFrom-Json
 Assert-True ([string]$target01Result.Mode -eq 'source-outbox-publish') 'target01 result should record source-outbox-publish mode.'
 Assert-True ([string]$target01Done.Mode -eq 'source-outbox-publish') 'target01 done should record source-outbox-publish mode.'
+Assert-True ([string]$target01Result.SourcePublishReadyPath -eq $target01PublishReadyPath) 'target01 result should record source publish marker path.'
+Assert-True ([string]$target01Result.SourcePublishedAt -eq [string]$target01ReadyPayload.PublishedAt) 'target01 result should record source publish marker publishedAt.'
+Assert-True ([string]$target01Result.SourcePublishAttemptId -eq [string]$target01ReadyPayload.AttemptId) 'target01 result should record source publish attempt id.'
+Assert-True ([int]$target01Result.SourcePublishSequence -eq [int]$target01ReadyPayload.PublishSequence) 'target01 result should record source publish sequence.'
+Assert-True ([string]$target01Result.SourcePublishCycleId -eq [string]$target01ReadyPayload.PublishCycleId) 'target01 result should record source publish cycle id.'
+Assert-True ([string]$target01Result.SourceValidationCompletedAt -eq [string]$target01ReadyPayload.ValidationCompletedAt) 'target01 result should record source validation completion time.'
+Assert-True ([string]$target01Result.SourceSummarySha256 -eq [string]$target01ReadyPayload.SummarySha256) 'target01 result should record source summary hash.'
+Assert-True ([string]$target01Result.SourceReviewZipSha256 -eq [string]$target01ReadyPayload.ReviewZipSha256) 'target01 result should record source review zip hash.'
 
 $messagesRoot = Join-Path $contractRunRoot 'messages'
 $handoffMessage = Get-ChildItem -LiteralPath $messagesRoot -Filter 'handoff_target01_to_target05_*.txt' -File -ErrorAction SilentlyContinue |
@@ -247,6 +263,10 @@ $target01OutboxStatus = @($sourceOutboxStatus.Targets | Where-Object { [string]$
 Assert-True ([string]$target01OutboxStatus.State -in @('imported', 'imported-archive-pending', 'forwarded', 'duplicate-marker-archived')) 'target01 source-outbox status should report import success.'
 Assert-True ([string]$target01OutboxStatus.ContractLatestState -eq 'ready-to-forward') 'target01 source-outbox status should surface contract latest state.'
 Assert-True ([string]$target01OutboxStatus.NextAction -eq 'handoff-ready') 'target01 source-outbox status should surface next handoff action.'
+Assert-True ([int]$target01OutboxStatus.PublishSequence -eq [int]$target01ReadyPayload.PublishSequence) 'target01 source-outbox status should surface publish sequence.'
+Assert-True ([string]$target01OutboxStatus.PublishCycleId -eq [string]$target01ReadyPayload.PublishCycleId) 'target01 source-outbox status should surface publish cycle id.'
+Assert-True ([int]$target01OutboxStatus.ImportedSourcePublishSequence -eq [int]$target01ReadyPayload.PublishSequence) 'target01 source-outbox status should surface imported source publish sequence.'
+Assert-True ([string]$target01OutboxStatus.ImportedSourcePublishCycleId -eq [string]$target01ReadyPayload.PublishCycleId) 'target01 source-outbox status should surface imported source publish cycle id.'
 Assert-True (@($sourceOutboxStatus.Targets | Where-Object { [string]$_.TargetId -eq 'target05' }).Count -eq 0) 'watcher should stop before processing target05 source-outbox marker when max forward count is reached.'
 
 $sourceOutboxProcessedPath = Join-Path $contractRunRoot '.state\source-outbox-processed.json'

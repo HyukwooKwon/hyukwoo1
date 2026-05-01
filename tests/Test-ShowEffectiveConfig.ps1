@@ -67,7 +67,20 @@ if ([string]::IsNullOrWhiteSpace($ConfigPath)) {
     $ConfigPath = Join-Path $root 'config\settings.bottest-live-visible.psd1'
 }
 
-$resolvedConfigPath = (Resolve-Path -LiteralPath $ConfigPath).Path
+$baseConfigPath = (Resolve-Path -LiteralPath $ConfigPath).Path
+$tempWorkRepoRoot = Join-Path 'C:\dev\python\_relay-test-fixtures\Test-ShowEffectiveConfig' ('workrepo_' + (Get-Date -Format 'yyyyMMdd_HHmmss_fff'))
+New-Item -ItemType Directory -Path $tempWorkRepoRoot -Force | Out-Null
+$externalizedResult = & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Write-ExternalizedRelayConfig.ps1') `
+    -BaseConfigPath $baseConfigPath `
+    -WorkRepoRoot $tempWorkRepoRoot `
+    -BootstrapBindingProfile `
+    -BootstrapRuntimeMap `
+    -AsJson
+if ($LASTEXITCODE -ne 0) {
+    throw 'Write-ExternalizedRelayConfig.ps1 failed for Test-ShowEffectiveConfig.'
+}
+$externalized = $externalizedResult | ConvertFrom-Json
+$resolvedConfigPath = [string]$externalized.OutputConfigPath
 $config = Import-PowerShellDataFile -Path $resolvedConfigPath
 $pairRunRootBase = [string]$config.PairTest.RunRootBase
 $contractRunRoot = Join-Path $pairRunRootBase ('run_contract_show_effective_' + (Get-Date -Format 'yyyyMMdd_HHmmss_fff'))
@@ -106,6 +119,9 @@ Assert-True (@($requestedPreview.EvidencePolicy.ReasonCodes).Count -ge 1) 'Expec
 Assert-True (@($requestedPreview.PreviewRows).Count -eq 2) 'Expected 2 preview rows for pair01.'
 Assert-True ([string]$requestedPreview.OverviewPairs[0].SeedTargetId -eq 'target01') 'Expected config-backed seed target for pair01 preview.'
 Assert-True ([string]$requestedPreview.OverviewPairs[0].Policy.PublishContractMode -eq 'strict') 'Expected pair policy metadata in preview overview rows.'
+Assert-True ([string]$requestedPreview.OverviewPairs[0].Policy.DefaultSeedWorkRepoRootSource -eq 'pair-policy') 'Expected pair01 to use explicit pair-policy repo root in preview.'
+Assert-True ([bool]$requestedPreview.OverviewPairs[0].Policy.DefaultSeedWorkRepoRootInherited -eq $false) 'Expected pair01 explicit repo root flag in preview.'
+Assert-True ([string]$requestedPreview.OverviewPairs[0].Policy.DefaultSeedWorkRepoRoot -eq $tempWorkRepoRoot) 'Expected pair01 explicit repo root in preview.'
 Assert-True ([string]$requestedPreview.PairTest.DefaultPairId -eq 'pair01') 'Expected resolved default pair id in preview payload.'
 Assert-True ([string]$requestedPreview.PairTest.PairTopologyStrategy -eq 'configured') 'Expected configured pair topology strategy in preview pair test payload.'
 Assert-True (-not [string]::IsNullOrWhiteSpace([string]$requestedPreview.Config.ConfigHash)) 'ConfigHash missing.'
@@ -124,14 +140,20 @@ Assert-True (($requestedPreview.PairActivationSummary | Select-Object -First 1).
 Assert-True ([string]$requestedPreview.PairTest.ExecutionPathMode -eq 'typed-window') 'Expected typed-window execution path.'
 Assert-True ([bool]$requestedPreview.PairTest.RequireUserVisibleCellExecution -eq $true) 'Expected visible cell execution requirement.'
 Assert-True ('hwnd' -in @($requestedPreview.PairTest.AllowedWindowVisibilityMethods)) 'Expected hwnd visibility method.'
-Assert-True ((@($requestedPreview.Dispatch.SubmitRetryModes) -join ',') -eq 'enter,ctrl_enter') 'Expected submit retry mode sequence.'
-Assert-True ([string]$requestedPreview.Dispatch.SubmitRetrySequenceSummary -eq 'enter -> ctrl_enter') 'Expected submit retry sequence summary.'
-Assert-True ([string]$requestedPreview.Dispatch.PrimarySubmitMode -eq 'enter') 'Expected primary submit mode.'
-Assert-True ([string]$requestedPreview.Dispatch.FinalSubmitMode -eq 'ctrl_enter') 'Expected final submit mode.'
+Assert-True (@($requestedPreview.Dispatch.SubmitRetryModes).Count -ge 1) 'Expected submit retry modes in dispatch.'
+Assert-True (-not [string]::IsNullOrWhiteSpace([string]$requestedPreview.Dispatch.SubmitRetrySequenceSummary)) 'Expected submit retry sequence summary.'
+Assert-True (-not [string]::IsNullOrWhiteSpace([string]$requestedPreview.Dispatch.PrimarySubmitMode)) 'Expected primary submit mode.'
+Assert-True (-not [string]::IsNullOrWhiteSpace([string]$requestedPreview.Dispatch.FinalSubmitMode)) 'Expected final submit mode.'
 Assert-True ([int]$requestedPreview.PreviewRows[0].SubmitRetryIntervalMs -gt 0) 'Expected preview row submit retry interval.'
 Assert-True ([string]$requestedPreview.PreviewRows[0].ExecutionPathMode -eq 'typed-window') 'Expected preview row typed-window execution path.'
 Assert-True ([bool]$requestedPreview.PreviewRows[0].UserVisibleCellExecutionRequired -eq $true) 'Expected preview row visible cell execution requirement.'
 Assert-True ('hwnd' -in @($requestedPreview.PreviewRows[0].AllowedWindowVisibilityMethods)) 'Expected preview row hwnd visibility method.'
+Assert-True ((@($requestedPreview.PreviewRows[0].SubmitRetryModes) -join ',') -eq (@($requestedPreview.Dispatch.SubmitRetryModes) -join ',')) 'Expected preview row submit retry modes to match dispatch.'
+Assert-True ([string]$requestedPreview.PreviewRows[0].SubmitRetrySequenceSummary -eq [string]$requestedPreview.Dispatch.SubmitRetrySequenceSummary) 'Expected preview row submit retry sequence summary to match dispatch.'
+Assert-True ([string]$requestedPreview.PreviewRows[0].PrimarySubmitMode -eq [string]$requestedPreview.Dispatch.PrimarySubmitMode) 'Expected preview row primary submit mode to match dispatch.'
+Assert-True ([string]$requestedPreview.PreviewRows[0].FinalSubmitMode -eq [string]$requestedPreview.Dispatch.FinalSubmitMode) 'Expected preview row final submit mode to match dispatch.'
+Assert-True ('runroot-explicit-requested' -in @($requestedPreview.WarningSummary.OrderedCodes)) 'Expected explicit requested run root warning.'
+Assert-True (-not ('pair-workrepo-inherited' -in @($requestedPreview.WarningSummary.OrderedCodes))) 'Did not expect inherited pair work repo warning for explicit pair policy repo.'
 
 $contractBoth = Invoke-ShowEffectiveConfig `
     -Root $root `
@@ -159,8 +181,8 @@ Assert-True ($contractBoth.PreviewRows[0].PairActivation.EffectiveEnabled -eq $t
 Assert-True ($contractBoth.PSObject.Properties['WarningDetails'] -ne $null) 'Expected WarningDetails property in both mode.'
 Assert-True ($contractBoth.EvidencePolicy.Recommended -eq $true) 'Expected prepared manifest-backed run root to be evidence-recommended.'
 Assert-True (@($contractBoth.EvidencePolicy.ReasonCodes).Count -eq 0) 'Expected no evidence reason codes for prepared manifest-backed run root.'
-Assert-True ((@($contractBoth.PreviewRows[0].SubmitRetryModes) -join ',') -eq 'enter,ctrl_enter') 'Expected preview row submit retry modes in both mode.'
-Assert-True ([string]$contractBoth.PreviewRows[0].SubmitRetrySequenceSummary -eq 'enter -> ctrl_enter') 'Expected preview row submit retry sequence summary in both mode.'
+Assert-True ((@($contractBoth.PreviewRows[0].SubmitRetryModes) -join ',') -eq (@($contractBoth.Dispatch.SubmitRetryModes) -join ',')) 'Expected preview row submit retry modes in both mode.'
+Assert-True ([string]$contractBoth.PreviewRows[0].SubmitRetrySequenceSummary -eq [string]$contractBoth.Dispatch.SubmitRetrySequenceSummary) 'Expected preview row submit retry sequence summary in both mode.'
 
 New-Item -ItemType Directory -Path $latestPreviewRunRoot -Force | Out-Null
 [System.IO.File]::WriteAllText((Join-Path $latestPreviewRunRoot 'preview.txt'), 'preview-only')

@@ -143,6 +143,14 @@
         ExternalWorkRepoRunRootRelativeRoot = '.relay-runs\bottest-live-visible'
         UseExternalWorkRepoContractPaths = $true
         ExternalWorkRepoContractRelativeRoot = '.relay-contract\bottest-live-visible'
+        ForbiddenArtifactLiterals = @(
+            '여기에 고정문구 입력'
+        )
+        ForbiddenArtifactRegexes = @(
+            '이렇게 계획개선해봤어',
+            '더 개선해야될 부분이 있어\??',
+            '이런부분도 참고해봐'
+        )
         TypedWindow = @{
             SubmitProbeSeconds = 10
             SubmitProbePollMs = 1000
@@ -303,6 +311,8 @@ summary.txt 에는 간단한 smoke 결과 2~4줄만 적고, review.zip 에는 sm
 
             pair01 = @{
                 DefaultSeedTargetId = 'target01'
+                DefaultSeedWorkRepoRoot = 'C:\dev\python\bot-test\gptgpt1-dev'
+                DefaultSeedReviewInputPath = 'C:\dev\python\bot-test\gptgpt1-dev\reviewfile\seed_review_input_latest.zip'
                 UseExternalWorkRepoRunRoot = $true
                 RequireExternalRunRoot = $true
                 UseExternalWorkRepoContractPaths = $true

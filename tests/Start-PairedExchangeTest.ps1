@@ -374,6 +374,45 @@ Set-StrictMode -Version Latest
 "@
 }
 
+function New-TargetPublishScriptContent {
+    param(
+        [Parameter(Mandatory)][string]$Root,
+        [Parameter(Mandatory)][string]$ResolvedConfigPath,
+        [Parameter(Mandatory)][string]$RunRoot,
+        [Parameter(Mandatory)][string]$TargetId
+    )
+
+    $rootLiteral = ConvertTo-PowerShellSingleQuotedLiteral -Value $Root
+    $configLiteral = ConvertTo-PowerShellSingleQuotedLiteral -Value $ResolvedConfigPath
+    $runRootLiteral = ConvertTo-PowerShellSingleQuotedLiteral -Value $RunRoot
+    $targetLiteral = ConvertTo-PowerShellSingleQuotedLiteral -Value $TargetId
+
+    return @"
+[CmdletBinding()]
+param(
+    [string]`$PublishedAt = '',
+    [string]`$SourceContext = '',
+    [switch]`$Overwrite,
+    [switch]`$AsJson
+)
+
+Set-StrictMode -Version Latest
+`$ErrorActionPreference = 'Stop'
+`$repoRoot = '$rootLiteral'
+`$arguments = @{
+    ConfigPath   = '$configLiteral'
+    RunRoot      = '$runRootLiteral'
+    TargetId     = '$targetLiteral'
+    PublishedAt  = `$PublishedAt
+    SourceContext = `$SourceContext
+    Overwrite    = [bool]`$Overwrite
+    AsJson       = [bool]`$AsJson
+}
+
+& (Join-Path `$repoRoot 'publish-paired-exchange-artifact.ps1') @arguments
+"@
+}
+
 function New-TargetCmdLauncherContent {
     param([Parameter(Mandatory)][string]$Ps1FileName)
 
@@ -398,8 +437,10 @@ function Write-TargetAutomationScripts {
 
     $checkScriptPath = Join-Path $TargetFolder ([string]$PairTest.CheckScriptFileName)
     $submitScriptPath = Join-Path $TargetFolder ([string]$PairTest.SubmitScriptFileName)
+    $publishScriptPath = Join-Path $TargetFolder ([string]$PairTest.PublishScriptFileName)
     $checkCmdPath = Join-Path $TargetFolder ([string]$PairTest.CheckCmdFileName)
     $submitCmdPath = Join-Path $TargetFolder ([string]$PairTest.SubmitCmdFileName)
+    $publishCmdPath = Join-Path $TargetFolder ([string]$PairTest.PublishCmdFileName)
 
     [System.IO.File]::WriteAllText(
         $checkScriptPath,
@@ -412,6 +453,11 @@ function Write-TargetAutomationScripts {
         (New-Utf8NoBomEncoding)
     )
     [System.IO.File]::WriteAllText(
+        $publishScriptPath,
+        (New-TargetPublishScriptContent -Root $Root -ResolvedConfigPath $ResolvedConfigPath -RunRoot $RunRoot -TargetId $TargetId),
+        (New-Utf8NoBomEncoding)
+    )
+    [System.IO.File]::WriteAllText(
         $checkCmdPath,
         (New-TargetCmdLauncherContent -Ps1FileName ([string]$PairTest.CheckScriptFileName)),
         (New-Utf8NoBomEncoding)
@@ -421,12 +467,19 @@ function Write-TargetAutomationScripts {
         (New-TargetCmdLauncherContent -Ps1FileName ([string]$PairTest.SubmitScriptFileName)),
         (New-Utf8NoBomEncoding)
     )
+    [System.IO.File]::WriteAllText(
+        $publishCmdPath,
+        (New-TargetCmdLauncherContent -Ps1FileName ([string]$PairTest.PublishScriptFileName)),
+        (New-Utf8NoBomEncoding)
+    )
 
     return [pscustomobject]@{
         CheckScriptPath  = $checkScriptPath
         SubmitScriptPath = $submitScriptPath
+        PublishScriptPath = $publishScriptPath
         CheckCmdPath     = $checkCmdPath
         SubmitCmdPath    = $submitCmdPath
+        PublishCmdPath   = $publishCmdPath
     }
 }
 
@@ -771,8 +824,10 @@ function Get-TargetInstructionText {
         [Parameter(Mandatory)][string]$PublishedArchivePath,
         [Parameter(Mandatory)][string]$CheckScriptPath,
         [Parameter(Mandatory)][string]$SubmitScriptPath,
+        [Parameter(Mandatory)][string]$PublishScriptPath,
         [Parameter(Mandatory)][string]$CheckCmdPath,
         [Parameter(Mandatory)][string]$SubmitCmdPath,
+        [Parameter(Mandatory)][string]$PublishCmdPath,
         [Parameter(Mandatory)][string]$InitialRoleMode,
         [string]$WorkRepoRoot = '',
         [string]$ReviewInputPath = '',
@@ -885,20 +940,23 @@ $pathGuideBlock
 - PublishedArchivePath: $PublishedArchivePath
 - CheckScriptPath: $CheckScriptPath
 - SubmitScriptPath: $SubmitScriptPath
+- PublishScriptPath: $PublishScriptPath
 - CheckCmdPath: $CheckCmdPath
 - SubmitCmdPath: $SubmitCmdPath
+- PublishCmdPath: $PublishCmdPath
 
 이번 테스트에서는 아래 규칙으로 움직이세요.
 1. 프로젝트 작업은 현재 work repo 또는 '$WorkFolderPath' 아래에서 자유롭게 진행합니다.
 2. 최종 source 산출물은 '$SourceOutboxPath' 아래의 '$sourceSummaryFileName' 와 '$sourceReviewZipFileName' 으로만 정리합니다.
-3. publish 완료 신호는 '$PublishReadyPath' 파일입니다. 이 파일은 반드시 summary/zip 작성이 끝난 뒤 마지막에 생성합니다.
-4. '$publishReadyFileName' 필수 필드는 SchemaVersion, PairId, TargetId, SummaryPath, ReviewZipPath, PublishedAt, SummarySizeBytes, ReviewZipSizeBytes 입니다. SchemaVersion 값은 정확히 '1.0.0' 으로 작성합니다. SummarySha256, ReviewZipSha256, SourceContext 는 선택입니다.
-5. marker의 SummaryPath / ReviewZipPath 는 '$SourceSummaryPath' 와 '$SourceReviewZipPath' 를 가리켜야 합니다. 크기나 선택 해시가 실제 파일과 다르면 자동 publish가 거부됩니다.
+3. publish 완료 신호는 '$PublishReadyPath' 파일입니다. 이 파일은 반드시 summary/zip 작성이 끝난 뒤 마지막에 '$PublishCmdPath' 또는 '$PublishScriptPath' helper로만 생성합니다.
+4. publish helper는 '$publishReadyFileName' 에 SchemaVersion, PairId, TargetId, SummaryPath, ReviewZipPath, PublishedAt, SummarySizeBytes, ReviewZipSizeBytes, SummarySha256, ReviewZipSha256, PublishedBy, ValidationPassed, ValidationCompletedAt 를 자동 기록합니다.
+5. marker의 SummaryPath / ReviewZipPath 는 '$SourceSummaryPath' 와 '$SourceReviewZipPath' 를 가리켜야 합니다. 크기/해시/validation stamp가 실제 파일과 다르면 자동 publish가 거부됩니다.
 6. 직접 paired contract 경로(SummaryPath / ReviewFolderPath / Done/Result)에 복사하지 마세요. watcher가 source-outbox marker를 감지하면 기존 import를 자동 호출합니다.
 7. 자동 publish가 성공하면 ready marker는 '$PublishedArchivePath' 아래로 archive 되고, 기존 handoff는 contract folder 기준으로 계속 진행됩니다.
 8. 자동 publish가 실패하거나 legacy RunRoot 복구가 필요할 때만 '$CheckCmdPath' 또는 '$SubmitCmdPath' / PowerShell wrapper를 수동 recovery 용도로 사용합니다.
 9. 일반 프로젝트 폴더나 다른 target 폴더에만 파일을 만들고 끝내면 watcher가 인식하지 않습니다.
 10. handoff를 받으면 상대 폴더의 '$summaryFileName' 와 '$reviewFolderName' zip을 읽고 다음 작업을 이어갑니다.
+11. publish 전 사전 점검이 필요하면 '$CheckCmdPath' 또는 '$CheckScriptPath' 를 먼저 실행할 수 있지만, 실제 marker 생성은 항상 '$PublishCmdPath' 또는 '$PublishScriptPath' helper만 사용하세요.
 "@
 
     $blocks = Get-OrderedMessageBlocks -TemplateBlocks $templateBlocks -BodyText $bodyBlock -OneTimeItems $OneTimeItems
@@ -922,6 +980,8 @@ function Get-TargetInitialSeedMessageText {
         [Parameter(Mandatory)][string]$SourceSummaryPath,
         [Parameter(Mandatory)][string]$SourceReviewZipPath,
         [Parameter(Mandatory)][string]$PublishReadyPath,
+        [Parameter(Mandatory)][string]$PublishScriptPath,
+        [Parameter(Mandatory)][string]$PublishCmdPath,
         [string]$WorkRepoRoot = '',
         [string]$ReviewInputPath = '',
         [string]$SeedTaskText = '',
@@ -972,20 +1032,14 @@ partner: $PartnerTargetId
 $pathGuideBlock
 
 지금은 이 target만 먼저 시작합니다. partner는 handoff를 받은 뒤 자동으로 이어집니다.
-WorkRepoRoot: $WorkRepoRoot
-ReviewInputPath: $ReviewInputPath
-최종 결과는 아래 source-outbox 계약만 따르세요.
+최종 결과는 위 source-outbox 계약만 따르세요.
 - SourceOutboxPath: $SourceOutboxPath
-- summary.txt: $SourceSummaryPath
-- review.zip: $SourceReviewZipPath
-- publish.ready.json: $PublishReadyPath
+- publish helper: $PublishCmdPath
 
 규칙:
-1. summary.txt 와 review.zip 작성이 끝난 뒤 마지막에 publish.ready.json 을 생성합니다.
-2. publish.ready.json 최소 필드는 SchemaVersion, PairId, TargetId, SummaryPath, ReviewZipPath, PublishedAt, SummarySizeBytes, ReviewZipSizeBytes 입니다. SchemaVersion 값은 정확히 '1.0.0' 으로 작성합니다.
-3. marker의 SummaryPath / ReviewZipPath 는 위 source-outbox 파일을 가리켜야 합니다.
-4. 직접 target contract 경로에 복사하거나 별도 submit 명령을 다시 실행하지 마세요.
-5. 상세 계약과 recovery 경로는 instructions.txt 를 확인하세요: $InstructionPath
+1. summary.txt 와 review.zip 작성이 끝나면 마지막에 '$PublishCmdPath' 또는 '$PublishScriptPath' helper를 실행해서 publish.ready.json 을 생성합니다.
+2. 직접 target contract 경로에 복사하거나 별도 submit 명령을 다시 실행하지 마세요.
+3. 상세 계약과 recovery 경로는 instructions.txt 를 확인하세요: $InstructionPath
 $(if (Test-NonEmptyString $SeedTaskText) { "`r`nTask:`r`n$SeedTaskText" } else { '' })
 "@
         }
@@ -1001,11 +1055,9 @@ $pathGuideBlock
 지금은 초기 seed 대상이 아닙니다.
 partner handoff message가 오기 전까지 작업을 시작하지 마세요.
 handoff를 받으면 partner가 넘긴 summary/review zip을 입력으로 사용하세요.
-내 최종 결과는 아래 source-outbox 계약만 따르세요.
+내 최종 결과는 위 source-outbox 계약만 따르세요.
 - SourceOutboxPath: $SourceOutboxPath
-- summary.txt: $SourceSummaryPath
-- review.zip: $SourceReviewZipPath
-- publish.ready.json: $PublishReadyPath
+- publish helper: $PublishCmdPath
 
 상세 계약은 instructions.txt 를 확인하세요: $InstructionPath
 "@
@@ -1157,18 +1209,8 @@ $runRootPolicy = $null
 $runRootWorkRepoRoot = ''
 $externalRunRootPairs = @($pairRows | Where-Object { [bool]$_.UseExternalWorkRepoRunRoot })
 if ($externalRunRootPairs.Count -gt 0) {
-    $distinctWorkRepoRoots = @(
-        $externalRunRootPairs |
-            ForEach-Object { [string]$_.PairWorkRepoRoot } |
-            Where-Object { Test-NonEmptyString $_ } |
-            Sort-Object -Unique
-    )
-    if ($distinctWorkRepoRoots.Count -ne 1) {
-        throw ('external run root requires exactly one shared WorkRepoRoot for the selected pairs. actual={0}' -f ($distinctWorkRepoRoots -join ', '))
-    }
-
     $runRootPolicy = $externalRunRootPairs[0].Policy
-    $runRootWorkRepoRoot = [string]$distinctWorkRepoRoots[0]
+    $runRootWorkRepoRoot = [string]$externalRunRootPairs[0].PairWorkRepoRoot
 }
 elseif ($pairRows.Count -gt 0) {
     $runRootPolicy = $pairRows[0].Policy
@@ -1181,12 +1223,40 @@ $RunRoot = Resolve-PairRunRootPath `
     -PairPolicy $runRootPolicy `
     -WorkRepoRoot $runRootWorkRepoRoot
 
+$runLeafName = Split-Path -Leaf $RunRoot
+$coordinatorWorkRepoRoot = if ($externalRunRootPairs.Count -gt 0) {
+    Resolve-ExternalRunRootOwnerRoot `
+        -PairTest $pairTest `
+        -PairPolicy $runRootPolicy `
+        -RunRoot $RunRoot `
+        -WorkRepoRoot $runRootWorkRepoRoot
+}
+else {
+    ''
+}
+$allowedBookkeepingRoots = @(
+    @($pairRows | ForEach-Object { [string]$_.PairWorkRepoRoot }) +
+    @($coordinatorWorkRepoRoot)
+) | Where-Object { Test-NonEmptyString $_ } | Sort-Object -Unique
+
 foreach ($pairRow in @($pairRows)) {
+    $pairRunRoot = if ([bool]$pairRow.UseExternalWorkRepoRunRoot) {
+        $pairRunRootBase = Resolve-ExternalWorkRepoRunRootBase -PairTest $pairTest -PairPolicy $pairRow.Policy -WorkRepoRoot ([string]$pairRow.PairWorkRepoRoot)
+        Join-Path (Join-Path $pairRunRootBase $runLeafName) ([string]$pairRow.PairId)
+    }
+    else {
+        Join-Path $RunRoot ([string]$pairRow.PairId)
+    }
+    Add-Member -InputObject $pairRow -MemberType NoteProperty -Name 'PairRunRoot' -Value $pairRunRoot -Force
+}
+
+foreach ($pairRow in @($pairRows)) {
+    $effectivePairRunRoot = if (Test-NonEmptyString ([string]$pairRow.PairRunRoot)) { [string]$pairRow.PairRunRoot } else { $RunRoot }
     Assert-RunRootPolicy `
         -PairTest $pairTest `
         -PairPolicy $pairRow.Policy `
         -AutomationRoot $root `
-        -RunRoot $RunRoot `
+        -RunRoot $effectivePairRunRoot `
         -WorkRepoRoot ([string]$pairRow.PairWorkRepoRoot)
 
     Assert-BookkeepingRootsPolicy `
@@ -1195,7 +1265,8 @@ foreach ($pairRow in @($pairRows)) {
         -PairPolicy $pairRow.Policy `
         -AutomationRoot $root `
         -BasePath $root `
-        -WorkRepoRoot ([string]$pairRow.PairWorkRepoRoot)
+        -WorkRepoRoot ([string]$pairRow.PairWorkRepoRoot) `
+        -AllowedRootPaths @($allowedBookkeepingRoots)
 }
 
 Ensure-Directory -Path $RunRoot
@@ -1204,14 +1275,17 @@ Ensure-Directory -Path $messagesRoot
 
 $targetFolderMap = @{}
 $targetContractPathMap = @{}
+$pairRunRootMap = @{}
 
 foreach ($pair in @($selectedPairs)) {
     $pairId = [string]$pair.PairId
-    $pairPolicy = Get-PairPolicyForPair -PairTest $pairTest -PairId $pairId
-    $pairWorkRepoRoot = Resolve-PairWorkRepoRoot -PairPolicy $pairPolicy -ExplicitSeedWorkRepoRoot $SeedWorkRepoRoot
-    $pairUsesExternalContractPaths = Test-UseExternalWorkRepoContractPaths -PairTest $pairTest -PairPolicy $pairPolicy -PairWorkRepoRoot $pairWorkRepoRoot
+    $pairRow = @($pairRows | Where-Object { [string]$_.PairId -eq $pairId } | Select-Object -First 1)
+    $pairPolicy = $pairRow.Policy
+    $pairWorkRepoRoot = [string]$pairRow.PairWorkRepoRoot
+    $pairUsesExternalContractPaths = [bool]$pairRow.UseExternalWorkRepoContractPaths
     $pairActivationSummary += @(Assert-PairActivationEnabled -Root $root -Config $config -PairId $pairId)
-    $pairRoot = Join-Path $RunRoot $pairId
+    $pairRoot = [string]$pairRow.PairRunRoot
+    $pairRunRootMap[$pairId] = $pairRoot
     Ensure-Directory -Path $pairRoot
 
     foreach ($entry in @(
@@ -1377,8 +1451,10 @@ foreach ($pair in $pairRows) {
             -PublishedArchivePath $publishedArchivePath `
             -CheckScriptPath ([string]$automationPaths.CheckScriptPath) `
             -SubmitScriptPath ([string]$automationPaths.SubmitScriptPath) `
+            -PublishScriptPath ([string]$automationPaths.PublishScriptPath) `
             -CheckCmdPath ([string]$automationPaths.CheckCmdPath) `
             -SubmitCmdPath ([string]$automationPaths.SubmitCmdPath) `
+            -PublishCmdPath ([string]$automationPaths.PublishCmdPath) `
             -InitialRoleMode $initialRoleMode `
             -WorkRepoRoot $effectiveTargetWorkRepoRoot `
             -ReviewInputPath $targetReviewInputPath `
@@ -1404,6 +1480,8 @@ foreach ($pair in $pairRows) {
             -SourceSummaryPath $sourceSummaryPath `
             -SourceReviewZipPath $sourceReviewZipPath `
             -PublishReadyPath $publishReadyPath `
+            -PublishScriptPath ([string]$automationPaths.PublishScriptPath) `
+            -PublishCmdPath ([string]$automationPaths.PublishCmdPath) `
             -WorkRepoRoot $effectiveTargetWorkRepoRoot `
             -ReviewInputPath $targetReviewInputPath `
             -SeedTaskText $targetSeedTaskText `
@@ -1430,7 +1508,10 @@ foreach ($pair in $pairRows) {
 
         $requestPath = Join-Path $targetFolder ([string]$pairTest.HeadlessExec.RequestFileName)
         $requestCreatedAt = (Get-Date).ToString('o')
+        $requestAttemptId = ('{0}-{1}-{2}' -f [string]$entry.PairId, [string]$entry.TargetId, (Get-Date -Format 'yyyyMMdd_HHmmss_fff'))
         $requestPayload = [pscustomobject]@{
+            AttemptId              = $requestAttemptId
+            AttemptStartedAt       = $requestCreatedAt
             CreatedAt              = $requestCreatedAt
             PairId                 = [string]$entry.PairId
             RoleName               = [string]$entry.RoleName
@@ -1479,6 +1560,7 @@ foreach ($pair in $pairRows) {
             SeedTargetIds          = @($requestedSeedTargetIds)
             InitialRoleMode        = $initialRoleMode
             PairPolicy             = $pairPolicy
+            PairRunRoot            = [string]$pairRunRootMap[[string]$entry.PairId]
             WorkRepoRoot           = $effectiveTargetWorkRepoRoot
             ReviewInputPath        = $targetReviewInputPath
             ReviewInputSelectionMode = if ($isSeedTarget) { [string]$targetReviewInputSelection.SelectionMode } else { '' }
@@ -1491,8 +1573,10 @@ foreach ($pair in $pairRows) {
             RequestFilePath        = $requestPath
             CheckScriptPath        = [string]$automationPaths.CheckScriptPath
             SubmitScriptPath       = [string]$automationPaths.SubmitScriptPath
+            PublishScriptPath      = [string]$automationPaths.PublishScriptPath
             CheckCmdPath           = [string]$automationPaths.CheckCmdPath
             SubmitCmdPath          = [string]$automationPaths.SubmitCmdPath
+            PublishCmdPath         = [string]$automationPaths.PublishCmdPath
             DoneFilePath           = $doneFilePath
             ErrorFilePath          = $errorFilePath
             ResultFilePath         = $resultFilePath
@@ -1539,6 +1623,7 @@ foreach ($pair in $pairRows) {
             SeedTargetIds   = @($requestedSeedTargetIds)
             InitialRoleMode = $initialRoleMode
             PairPolicy      = $pairPolicy
+            PairRunRoot     = [string]$pairRunRootMap[[string]$entry.PairId]
             WorkRepoRoot    = $effectiveTargetWorkRepoRoot
             ReviewInputPath = $targetReviewInputPath
             ReviewInputSelectionMode = if ($isSeedTarget) { [string]$targetReviewInputSelection.SelectionMode } else { '' }
@@ -1549,11 +1634,15 @@ foreach ($pair in $pairRows) {
             SeedTaskText    = $targetSeedTaskText
             CheckScriptPath = [string]$automationPaths.CheckScriptPath
             SubmitScriptPath = [string]$automationPaths.SubmitScriptPath
+            PublishScriptPath = [string]$automationPaths.PublishScriptPath
             CheckCmdPath    = [string]$automationPaths.CheckCmdPath
             SubmitCmdPath   = [string]$automationPaths.SubmitCmdPath
+            PublishCmdPath  = [string]$automationPaths.PublishCmdPath
             MessagePath     = $messagePath
             MessageMetadataPath = $messageMetadataPath
             RequestPath     = $requestPath
+            AttemptId       = $requestAttemptId
+            AttemptStartedAt = $requestCreatedAt
             PendingOneTimeItemIds = @($effectiveInitialOneTimeItems | ForEach-Object { [string](Get-ConfigValue -Object $_ -Name 'Id' -DefaultValue '') } | Where-Object { Test-NonEmptyString $_ })
         }
     }
@@ -1574,6 +1663,7 @@ $manifest = [pscustomobject]@{
     ExternalContractPathsValidated = $externalContractPathsValidated
     RunRootPathValidated = $true
     InternalResidualRoots = @(Get-BookkeepingResidualRootsEvidence -Config $config -BasePath $root)
+    CoordinatorWorkRepoRoot = $coordinatorWorkRepoRoot
     PairTest   = $pairTest
     PairActivationSummary = @($pairActivationSummary)
     SeedTargetId = $seedTargetId

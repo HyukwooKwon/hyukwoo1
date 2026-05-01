@@ -68,6 +68,7 @@ class RunRootPrepareRequest:
     pair_id: str
     requested_run_root: str
     summary_fallback_run_root: str
+    prepare_config_path: str = ""
 
 
 @dataclass(frozen=True)
@@ -87,6 +88,7 @@ class PrepareAllRequest:
     wrapper_path: str
     launch_windows_needed: bool
     attach_windows_needed: bool
+    prepare_config_path: str = ""
 
 
 @dataclass(frozen=True)
@@ -158,9 +160,10 @@ class PanelRuntimeWorkflowService:
         return "[runroot 요약]\n" + output
 
     def prepare_run_root(self, request: RunRootPrepareRequest) -> RunRootPrepareResult:
+        resolved_config_path = str(request.prepare_config_path or request.config_path or "").strip()
         command = self.command_service.build_script_command(
             "tests/Start-PairedExchangeTest.ps1",
-            config_path=request.config_path,
+            config_path=resolved_config_path,
             run_root=request.requested_run_root,
             extra=["-IncludePairId", request.pair_id],
         )
@@ -178,7 +181,7 @@ class PanelRuntimeWorkflowService:
             summary_run_root=summary_run_root,
             summary_text=self.load_run_root_summary_text(
                 run_root=summary_run_root,
-                config_path=request.config_path,
+                config_path=resolved_config_path,
             ),
         )
 
@@ -209,6 +212,7 @@ class PanelRuntimeWorkflowService:
                 pair_id=request.pair_id,
                 requested_run_root=request.explicit_run_root,
                 summary_fallback_run_root=request.context.run_root,
+                prepare_config_path=request.prepare_config_path,
             )
         )
         return PrepareAllResult(

@@ -16,6 +16,7 @@ env/
 
 # Runtime and generated artifacts
 _tmp/
+_tmp*.ahk
 .tmp-smoke/
 logs/
 runtime/
@@ -26,3 +27,9 @@ retry-pending/
 pair-test/
 reviewfile/
 evidence/
+out/
+
+# Browser/PowerShell pair local generated assets
+.browser-ps-pair/generated/
+.browser-ps-pair/processor/real/
+.browser-ps-pair/prompts/real/

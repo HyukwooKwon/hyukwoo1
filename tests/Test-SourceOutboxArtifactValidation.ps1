@@ -100,7 +100,10 @@ function New-ReadyPayload {
         [int64]$ReviewZipSizeBytes,
         [string]$SummarySha256 = '',
         [string]$ReviewZipSha256 = '',
-        [string]$SourceContext = ''
+        [string]$SourceContext = '',
+        [string]$PublishedBy = 'publish-paired-exchange-artifact.ps1',
+        [bool]$ValidationPassed = $true,
+        [string]$ValidationCompletedAt = ''
     )
 
     $payload = [ordered]@{
@@ -112,6 +115,9 @@ function New-ReadyPayload {
         PublishedAt = $PublishedAt
         SummarySizeBytes = $SummarySizeBytes
         ReviewZipSizeBytes = $ReviewZipSizeBytes
+        PublishedBy = $PublishedBy
+        ValidationPassed = $ValidationPassed
+        ValidationCompletedAt = $(if ([string]::IsNullOrWhiteSpace($ValidationCompletedAt) -eq $false) { $ValidationCompletedAt } else { $PublishedAt })
     }
 
     if ([string]::IsNullOrWhiteSpace($SummarySha256) -eq $false) {
@@ -129,7 +135,13 @@ function New-ReadyPayload {
 
 $root = Split-Path -Parent $PSScriptRoot
 if ([string]::IsNullOrWhiteSpace($ConfigPath)) {
-    $ConfigPath = Join-Path $root 'config\settings.bottest-live-visible.psd1'
+    $preferredExternalizedConfigPath = 'C:\dev\python\relay-workrepo-visible-smoke\.relay-config\bottest-live-visible\settings.externalized.psd1'
+    if (Test-Path -LiteralPath $preferredExternalizedConfigPath -PathType Leaf) {
+        $ConfigPath = $preferredExternalizedConfigPath
+    }
+    else {
+        $ConfigPath = Join-Path $root 'config\settings.bottest-live-visible.psd1'
+    }
 }
 
 $resolvedConfigPath = (Resolve-Path -LiteralPath $ConfigPath).Path
@@ -143,11 +155,13 @@ $contractRunRoot = Join-Path $pairRunRootBase ('run_contract_source_outbox_valid
     -IncludePairId pair01 | Out-Null
 
 $target01Root = Join-Path $contractRunRoot 'pair01\target01'
-$target01Outbox = Join-Path $target01Root 'source-outbox'
-$target01SummaryPath = Join-Path $target01Outbox 'summary.txt'
-$target01ReviewZipPath = Join-Path $target01Outbox 'review.zip'
-$target01PublishReadyPath = Join-Path $target01Outbox 'publish.ready.json'
+$target01Request = Get-Content -LiteralPath (Join-Path $target01Root 'request.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+$target01Outbox = Split-Path -Parent ([string]$target01Request.SourceSummaryPath)
+$target01SummaryPath = [string]$target01Request.SourceSummaryPath
+$target01ReviewZipPath = [string]$target01Request.SourceReviewZipPath
+$target01PublishReadyPath = [string]$target01Request.PublishReadyPath
 
+New-Item -ItemType Directory -Path $target01Outbox -Force | Out-Null
 [System.IO.File]::WriteAllText($target01SummaryPath, 'invalid zip waiting test', (New-Utf8NoBomEncoding))
 [System.IO.File]::WriteAllText($target01ReviewZipPath, 'this is not a valid zip archive', (New-Utf8NoBomEncoding))
 $target01Ready = New-ReadyPayload `
@@ -165,12 +179,14 @@ $target01Ready = New-ReadyPayload `
 $target01Ready | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $target01PublishReadyPath -Encoding UTF8
 
 $target05Root = Join-Path $contractRunRoot 'pair01\target05'
-$target05Outbox = Join-Path $target05Root 'source-outbox'
-$target05SummaryPath = Join-Path $target05Outbox 'summary.txt'
-$target05ReviewZipPath = Join-Path $target05Outbox 'review.zip'
-$target05PublishReadyPath = Join-Path $target05Outbox 'publish.ready.json'
+$target05Request = Get-Content -LiteralPath (Join-Path $target05Root 'request.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+$target05Outbox = Split-Path -Parent ([string]$target05Request.SourceSummaryPath)
+$target05SummaryPath = [string]$target05Request.SourceSummaryPath
+$target05ReviewZipPath = [string]$target05Request.SourceReviewZipPath
+$target05PublishReadyPath = [string]$target05Request.PublishReadyPath
 $target05ZipContentPath = Join-Path $target05Outbox 'target05-note.txt'
 
+New-Item -ItemType Directory -Path $target05Outbox -Force | Out-Null
 [System.IO.File]::WriteAllText($target05SummaryPath, 'unsupported schema waiting test', (New-Utf8NoBomEncoding))
 [System.IO.File]::WriteAllText($target05ZipContentPath, 'schema validation zip content', (New-Utf8NoBomEncoding))
 Compress-Archive -LiteralPath $target05ZipContentPath -DestinationPath $target05ReviewZipPath -Force

@@ -14,6 +14,8 @@ $ErrorActionPreference = 'Stop'
 $SupportedSourceOutboxSchemaVersions = @('1.0.0', '1.0')
 $CurrentPairStateSchemaVersion = '1.0.0'
 $SupportedPairStateSchemaVersions = @('1.0.0', '1.0')
+$ForbiddenArtifactLiterals = @()
+$ForbiddenArtifactRegexes = @()
 
 if ($PSVersionTable.PSEdition -ne 'Core') {
     $currentVersion = [string]$PSVersionTable.PSVersion
@@ -63,6 +65,18 @@ function Test-ZipArchiveReadable {
             ErrorMessage = $_.Exception.Message
         }
     }
+}
+
+function Get-TextFileForbiddenArtifactMatch {
+    param([Parameter(Mandatory)][string]$Path)
+
+    return (Get-ForbiddenArtifactTextFileMatch -Path $Path -LiteralList @($ForbiddenArtifactLiterals) -RegexPatternList @($ForbiddenArtifactRegexes))
+}
+
+function Get-ZipArchiveForbiddenArtifactMatch {
+    param([Parameter(Mandatory)][string]$Path)
+
+    return (Get-ForbiddenArtifactZipMatch -Path $Path -LiteralList @($ForbiddenArtifactLiterals) -RegexPatternList @($ForbiddenArtifactRegexes))
 }
 
 function Write-JsonFileAtomically {
@@ -886,7 +900,7 @@ function Test-SourceOutboxReady {
     }
 
     $marker = $markerDoc.Data
-    foreach ($requiredField in @('SchemaVersion', 'PairId', 'TargetId', 'SummaryPath', 'ReviewZipPath', 'PublishedAt', 'SummarySizeBytes', 'ReviewZipSizeBytes')) {
+    foreach ($requiredField in @('SchemaVersion', 'PairId', 'TargetId', 'SummaryPath', 'ReviewZipPath', 'PublishedAt', 'SummarySizeBytes', 'ReviewZipSizeBytes', 'PublishedBy', 'ValidationCompletedAt')) {
         if (-not (Test-NonEmptyString ([string](Get-ConfigValue -Object $marker -Name $requiredField -DefaultValue '')))) {
             return [pscustomobject]@{
                 MarkerPresent = $true
@@ -899,6 +913,34 @@ function Test-SourceOutboxReady {
                 ZipItem = $null
                 StateKey = (New-SourceOutboxStateKey -TargetId ([string]$Item.TargetId) -Reason ('marker-missing-field-' + $requiredField) -PublishReadyPath $readyPath -PublishReadyTicks ([int64]$readyItem.LastWriteTimeUtc.Ticks))
             }
+        }
+    }
+
+    $validationPassed = Get-ConfigValue -Object $marker -Name 'ValidationPassed' -DefaultValue $null
+    if ($validationPassed -isnot [bool]) {
+        return [pscustomobject]@{
+            MarkerPresent = $true
+            IsReady = $false
+            Reason = 'marker-validation-flag-invalid'
+            Paths = $paths
+            Marker = $marker
+            PublishedAt = [string](Get-ConfigValue -Object $marker -Name 'PublishedAt' -DefaultValue '')
+            SummaryItem = $null
+            ZipItem = $null
+            StateKey = (New-SourceOutboxStateKey -TargetId ([string]$Item.TargetId) -Reason 'marker-validation-flag-invalid' -PublishReadyPath $readyPath -PublishReadyTicks ([int64]$readyItem.LastWriteTimeUtc.Ticks))
+        }
+    }
+    if (-not [bool]$validationPassed) {
+        return [pscustomobject]@{
+            MarkerPresent = $true
+            IsReady = $false
+            Reason = 'marker-validation-not-passed'
+            Paths = $paths
+            Marker = $marker
+            PublishedAt = [string](Get-ConfigValue -Object $marker -Name 'PublishedAt' -DefaultValue '')
+            SummaryItem = $null
+            ZipItem = $null
+            StateKey = (New-SourceOutboxStateKey -TargetId ([string]$Item.TargetId) -Reason 'marker-validation-not-passed' -PublishReadyPath $readyPath -PublishReadyTicks ([int64]$readyItem.LastWriteTimeUtc.Ticks))
         }
     }
 
@@ -915,6 +957,21 @@ function Test-SourceOutboxReady {
             ZipItem = $null
             ErrorMessage = ('unsupported schema version: ' + $markerSchemaVersion)
             StateKey = (New-SourceOutboxStateKey -TargetId ([string]$Item.TargetId) -Reason 'marker-schema-version-unsupported' -PublishReadyPath $readyPath -PublishReadyTicks ([int64]$readyItem.LastWriteTimeUtc.Ticks))
+        }
+    }
+
+    $publishedBy = [string](Get-ConfigValue -Object $marker -Name 'PublishedBy' -DefaultValue '')
+    if ($publishedBy -ne 'publish-paired-exchange-artifact.ps1') {
+        return [pscustomobject]@{
+            MarkerPresent = $true
+            IsReady = $false
+            Reason = 'marker-publisher-unsupported'
+            Paths = $paths
+            Marker = $marker
+            PublishedAt = [string](Get-ConfigValue -Object $marker -Name 'PublishedAt' -DefaultValue '')
+            SummaryItem = $null
+            ZipItem = $null
+            StateKey = (New-SourceOutboxStateKey -TargetId ([string]$Item.TargetId) -Reason 'marker-publisher-unsupported' -PublishReadyPath $readyPath -PublishReadyTicks ([int64]$readyItem.LastWriteTimeUtc.Ticks))
         }
     }
 
@@ -1050,6 +1107,22 @@ function Test-SourceOutboxReady {
             }
         }
     }
+
+    $summaryForbiddenMatch = Get-TextFileForbiddenArtifactMatch -Path $paths.SourceSummaryPath
+    if ([bool]$summaryForbiddenMatch.Found) {
+        return [pscustomobject]@{
+            MarkerPresent = $true
+            IsReady = $false
+            Reason = 'source-summary-forbidden-literal'
+            Paths = $paths
+            Marker = $marker
+            PublishedAt = [string](Get-ConfigValue -Object $marker -Name 'PublishedAt' -DefaultValue '')
+            SummaryItem = $summaryItem
+            ZipItem = $zipItem
+            ErrorMessage = ('forbidden summary artifact detected type={0} pattern={1} match={2}' -f [string]$summaryForbiddenMatch.MatchKind, [string]$summaryForbiddenMatch.Pattern, [string]$summaryForbiddenMatch.MatchText)
+            StateKey = (New-SourceOutboxStateKey -TargetId ([string]$Item.TargetId) -Reason 'source-summary-forbidden-literal' -PublishReadyPath $readyPath -PublishReadyTicks ([int64]$readyItem.LastWriteTimeUtc.Ticks) -SummaryTicks ([int64]$summaryItem.LastWriteTimeUtc.Ticks) -ZipTicks ([int64]$zipItem.LastWriteTimeUtc.Ticks))
+        }
+    }
     $zipValidation = Test-ZipArchiveReadable -Path $paths.SourceReviewZipPath
     if (-not [bool]$zipValidation.Ok) {
         return [pscustomobject]@{
@@ -1063,6 +1136,22 @@ function Test-SourceOutboxReady {
             ZipItem = $zipItem
             ErrorMessage = [string]$zipValidation.ErrorMessage
             StateKey = (New-SourceOutboxStateKey -TargetId ([string]$Item.TargetId) -Reason 'source-reviewzip-invalid' -PublishReadyPath $readyPath -PublishReadyTicks ([int64]$readyItem.LastWriteTimeUtc.Ticks) -SummaryTicks ([int64]$summaryItem.LastWriteTimeUtc.Ticks) -ZipTicks ([int64]$zipItem.LastWriteTimeUtc.Ticks))
+        }
+    }
+
+    $zipForbiddenMatch = Get-ZipArchiveForbiddenArtifactMatch -Path $paths.SourceReviewZipPath
+    if ([bool]$zipForbiddenMatch.Found) {
+        return [pscustomobject]@{
+            MarkerPresent = $true
+            IsReady = $false
+            Reason = 'source-reviewzip-forbidden-literal'
+            Paths = $paths
+            Marker = $marker
+            PublishedAt = [string](Get-ConfigValue -Object $marker -Name 'PublishedAt' -DefaultValue '')
+            SummaryItem = $summaryItem
+            ZipItem = $zipItem
+            ErrorMessage = ('forbidden review zip artifact detected entry={0} type={1} pattern={2} match={3}' -f [string]$zipForbiddenMatch.EntryPath, [string]$zipForbiddenMatch.MatchKind, [string]$zipForbiddenMatch.Pattern, [string]$zipForbiddenMatch.MatchText)
+            StateKey = (New-SourceOutboxStateKey -TargetId ([string]$Item.TargetId) -Reason 'source-reviewzip-forbidden-literal' -PublishReadyPath $readyPath -PublishReadyTicks ([int64]$readyItem.LastWriteTimeUtc.Ticks) -SummaryTicks ([int64]$summaryItem.LastWriteTimeUtc.Ticks) -ZipTicks ([int64]$zipItem.LastWriteTimeUtc.Ticks))
         }
     }
 
@@ -1260,7 +1349,15 @@ function Invoke-SourceOutboxImport {
         [Parameter(Mandatory)][string]$RunRoot,
         [Parameter(Mandatory)][string]$TargetId,
         [Parameter(Mandatory)][string]$SummarySourcePath,
-        [Parameter(Mandatory)][string]$ReviewZipSourcePath
+        [Parameter(Mandatory)][string]$ReviewZipSourcePath,
+        [string]$SourcePublishReadyPath = '',
+        [string]$SourcePublishedAt = '',
+        [string]$SourcePublishAttemptId = '',
+        [int]$SourcePublishSequence = 0,
+        [string]$SourcePublishCycleId = '',
+        [string]$SourceValidationCompletedAt = '',
+        [string]$SourceSummarySha256 = '',
+        [string]$SourceReviewZipSha256 = ''
     )
 
     $powershellPath = Resolve-PowerShellExecutable
@@ -1273,6 +1370,14 @@ function Invoke-SourceOutboxImport {
         '-TargetId' $TargetId `
         '-SummarySourcePath' $SummarySourcePath `
         '-ReviewZipSourcePath' $ReviewZipSourcePath `
+        '-SourcePublishReadyPath' $SourcePublishReadyPath `
+        '-SourcePublishedAt' $SourcePublishedAt `
+        '-SourcePublishAttemptId' $SourcePublishAttemptId `
+        '-SourcePublishSequence' ([string]$SourcePublishSequence) `
+        '-SourcePublishCycleId' $SourcePublishCycleId `
+        '-SourceValidationCompletedAt' $SourceValidationCompletedAt `
+        '-SourceSummarySha256' $SourceSummarySha256 `
+        '-SourceReviewZipSha256' $SourceReviewZipSha256 `
         '-ImportMode' 'source-outbox-publish' `
         '-Overwrite' `
         '-AsJson'
@@ -2001,6 +2106,8 @@ function Get-HandoffMessageText {
     if (-not (Test-NonEmptyString $recipientPublishReadyPath)) {
         $recipientPublishReadyPath = Join-Path $recipientSourceOutboxPath ([string]$PairTest.PublishReadyFileName)
     }
+    $recipientPublishScriptPath = [string](Get-ConfigValue -Object $RecipientItem -Name 'PublishScriptPath' -DefaultValue '')
+    $recipientPublishCmdPath = [string](Get-ConfigValue -Object $RecipientItem -Name 'PublishCmdPath' -DefaultValue '')
     $availableReviewInputPaths = @()
     foreach ($candidate in @($SummaryPath, $ZipPath)) {
         if (-not (Test-NonEmptyString $candidate)) {
@@ -2050,6 +2157,9 @@ function Get-HandoffMessageText {
         '2. 필요한 수정이나 검토를 진행합니다.'
         '3. 최종 결과만 내 SourceOutboxPath 아래의 summary.txt 와 review.zip 으로 생성합니다.'
         '4. summary.txt 와 review.zip 작성이 끝난 뒤 마지막에 publish.ready.json 을 생성합니다.'
+        ('   publish helper: {0}{1}' -f `
+            $(if (Test-NonEmptyString $recipientPublishCmdPath) { ("'" + $recipientPublishCmdPath + "'") } else { 'publish helper' }), `
+            $(if (Test-NonEmptyString $recipientPublishScriptPath) { (' / ''' + $recipientPublishScriptPath + '''') } else { '' }))
         '5. 직접 target contract 경로에 복사하거나 별도 submit 명령을 다시 실행하지 마세요.'
     ) -join "`r`n"
 
@@ -2118,6 +2228,8 @@ try {
 
     $manifest = ConvertFrom-RelayJsonText -Json (Get-Content -LiteralPath $manifestPath -Raw -Encoding UTF8)
     $pairTest = Resolve-PairTestConfig -Root $root -ConfigPath $resolvedConfigPath -ManifestPairTest (Get-ConfigValue -Object $manifest -Name 'PairTest' -DefaultValue $null)
+    $script:ForbiddenArtifactLiterals = @($pairTest.ForbiddenArtifactLiterals)
+    $script:ForbiddenArtifactRegexes = @($pairTest.ForbiddenArtifactRegexes)
     $targetItems = @($manifest.Targets)
     $targetItemsById = @{}
     foreach ($targetItem in @($targetItems)) {
@@ -2363,7 +2475,15 @@ try {
                                 -RunRoot $resolvedRunRoot `
                                 -TargetId ([string]$item.TargetId) `
                                 -SummarySourcePath ([string]$sourceOutboxReadiness.Paths.SourceSummaryPath) `
-                                -ReviewZipSourcePath ([string]$sourceOutboxReadiness.Paths.SourceReviewZipPath)
+                                -ReviewZipSourcePath ([string]$sourceOutboxReadiness.Paths.SourceReviewZipPath) `
+                                -SourcePublishReadyPath ([string]$sourceOutboxReadiness.Paths.EffectivePublishReadyPath) `
+                                -SourcePublishedAt ([string]$sourceOutboxReadiness.PublishedAt) `
+                                -SourcePublishAttemptId ([string](Get-ConfigValue -Object $sourceOutboxReadiness.Marker -Name 'AttemptId' -DefaultValue '')) `
+                                -SourcePublishSequence ([int](Get-ConfigValue -Object $sourceOutboxReadiness.Marker -Name 'PublishSequence' -DefaultValue 0)) `
+                                -SourcePublishCycleId ([string](Get-ConfigValue -Object $sourceOutboxReadiness.Marker -Name 'PublishCycleId' -DefaultValue '')) `
+                                -SourceValidationCompletedAt ([string](Get-ConfigValue -Object $sourceOutboxReadiness.Marker -Name 'ValidationCompletedAt' -DefaultValue '')) `
+                                -SourceSummarySha256 ([string](Get-ConfigValue -Object $sourceOutboxReadiness.Marker -Name 'SummarySha256' -DefaultValue '')) `
+                                -SourceReviewZipSha256 ([string](Get-ConfigValue -Object $sourceOutboxReadiness.Marker -Name 'ReviewZipSha256' -DefaultValue ''))
                         }
                         catch {
                             $sourceImportFailure = $_.Exception.Message
@@ -2409,6 +2529,8 @@ try {
                                 SourceReviewZipPath = [string]$sourceOutboxReadiness.Paths.SourceReviewZipPath
                                 PublishReadyPath    = [string]$sourceOutboxReadiness.Paths.EffectivePublishReadyPath
                                 PublishedAt         = [string]$sourceOutboxReadiness.PublishedAt
+                                PublishSequence     = [int](Get-ConfigValue -Object $sourceOutboxReadiness.Marker -Name 'PublishSequence' -DefaultValue 0)
+                                PublishCycleId      = [string](Get-ConfigValue -Object $sourceOutboxReadiness.Marker -Name 'PublishCycleId' -DefaultValue '')
                                 ContractLatestState = ''
                                 NextAction          = ''
                             }
@@ -2461,7 +2583,11 @@ try {
                                 PublishReadyPath    = [string]$sourceOutboxReadiness.Paths.EffectivePublishReadyPath
                                 PublishedAt         = [string]$sourceOutboxReadiness.PublishedAt
                                 ArchivedReadyPath   = $archivedReadyPath
+                                PublishSequence     = [int](Get-ConfigValue -Object $sourceOutboxReadiness.Marker -Name 'PublishSequence' -DefaultValue 0)
+                                PublishCycleId      = [string](Get-ConfigValue -Object $sourceOutboxReadiness.Marker -Name 'PublishCycleId' -DefaultValue '')
                                 ImportedZipPath     = if ($null -ne $sourceImportResult.Json -and $null -ne $sourceImportResult.Json.Contract) { [string]$sourceImportResult.Json.Contract.DestinationZipPath } else { '' }
+                                ImportedSourcePublishSequence = if ($null -ne $sourceImportResult.Json -and $null -ne $sourceImportResult.Json.SourcePublish) { [int](Get-ConfigValue -Object $sourceImportResult.Json.SourcePublish -Name 'PublishSequence' -DefaultValue 0) } else { [int](Get-ConfigValue -Object $sourceOutboxReadiness.Marker -Name 'PublishSequence' -DefaultValue 0) }
+                                ImportedSourcePublishCycleId  = if ($null -ne $sourceImportResult.Json -and $null -ne $sourceImportResult.Json.SourcePublish) { [string](Get-ConfigValue -Object $sourceImportResult.Json.SourcePublish -Name 'PublishCycleId' -DefaultValue '') } else { [string](Get-ConfigValue -Object $sourceOutboxReadiness.Marker -Name 'PublishCycleId' -DefaultValue '') }
                                 LatestState         = $contractLatestState
                                 ContractLatestState = $contractLatestState
                                 NextAction          = Get-ContractNextAction -LatestState $contractLatestState
@@ -2507,6 +2633,8 @@ try {
                             PublishReadyPath    = [string]$sourceOutboxReadiness.Paths.EffectivePublishReadyPath
                             PublishedAt         = [string]$sourceOutboxReadiness.PublishedAt
                             ArchivedReadyPath   = $duplicateArchivePath
+                            PublishSequence     = [int](Get-ConfigValue -Object $sourceOutboxReadiness.Marker -Name 'PublishSequence' -DefaultValue 0)
+                            PublishCycleId      = [string](Get-ConfigValue -Object $sourceOutboxReadiness.Marker -Name 'PublishCycleId' -DefaultValue '')
                             ImportedZipPath     = ''
                             LatestState         = 'duplicate-skipped'
                             ContractLatestState = ''

@@ -212,7 +212,7 @@ function Test-SourceOutboxMarkerContract {
         }
     }
 
-    foreach ($requiredField in @('SchemaVersion', 'PairId', 'TargetId', 'SummaryPath', 'ReviewZipPath', 'PublishedAt', 'SummarySizeBytes', 'ReviewZipSizeBytes')) {
+    foreach ($requiredField in @('SchemaVersion', 'PairId', 'TargetId', 'SummaryPath', 'ReviewZipPath', 'PublishedAt', 'SummarySizeBytes', 'ReviewZipSizeBytes', 'PublishedBy', 'ValidationCompletedAt')) {
         if (-not (Test-NonEmptyString ([string](Get-ConfigValue -Object $marker -Name $requiredField -DefaultValue '')))) {
             return [pscustomobject]@{
                 Ok = $false
@@ -222,12 +222,36 @@ function Test-SourceOutboxMarkerContract {
         }
     }
 
+    $validationPassed = Get-ConfigValue -Object $marker -Name 'ValidationPassed' -DefaultValue $null
+    if ($validationPassed -isnot [bool]) {
+        return [pscustomobject]@{
+            Ok = $false
+            Reason = 'marker-validation-flag-invalid'
+            ErrorMessage = ''
+        }
+    }
+    if (-not [bool]$validationPassed) {
+        return [pscustomobject]@{
+            Ok = $false
+            Reason = 'marker-validation-not-passed'
+            ErrorMessage = ''
+        }
+    }
+
     $markerSchemaVersion = [string](Get-ConfigValue -Object $marker -Name 'SchemaVersion' -DefaultValue '')
     if ($markerSchemaVersion -notin $SupportedSourceOutboxSchemaVersions) {
         return [pscustomobject]@{
             Ok = $false
             Reason = 'marker-schema-version-unsupported'
             ErrorMessage = ('unsupported schema version: ' + $markerSchemaVersion)
+        }
+    }
+
+    if ([string](Get-ConfigValue -Object $marker -Name 'PublishedBy' -DefaultValue '') -ne 'publish-paired-exchange-artifact.ps1') {
+        return [pscustomobject]@{
+            Ok = $false
+            Reason = 'marker-publisher-unsupported'
+            ErrorMessage = ''
         }
     }
 
@@ -987,6 +1011,19 @@ else {
 $promptText = Get-Content -LiteralPath $effectivePromptSourcePath -Raw -Encoding UTF8
 $headlessPromptPath = if (Test-NonEmptyString ([string]$request.HeadlessPromptFilePath)) { [string]$request.HeadlessPromptFilePath } else { Join-Path $targetFolder ([string]$pairTest.HeadlessExec.PromptFileName) }
 $outputLastMessagePath = if (Test-NonEmptyString ([string]$request.OutputLastMessagePath)) { [string]$request.OutputLastMessagePath } else { Join-Path $targetFolder ([string]$pairTest.HeadlessExec.OutputLastMessageFileName) }
+$workRepoRoot = if (Test-NonEmptyString ([string]$request.WorkRepoRoot)) {
+    [string]$request.WorkRepoRoot
+}
+else {
+    [string](Get-ConfigValue -Object $targetEntry -Name 'WorkRepoRoot' -DefaultValue '')
+}
+$effectiveWorkingDirectory = $targetFolder
+if (Test-NonEmptyString $workRepoRoot) {
+    $effectiveWorkingDirectory = [System.IO.Path]::GetFullPath($workRepoRoot)
+    if (-not (Test-Path -LiteralPath $effectiveWorkingDirectory -PathType Container)) {
+        throw "configured WorkRepoRoot not found: $effectiveWorkingDirectory"
+    }
+}
 $reviewFolderPath = [string]$contract.ReviewFolderPath
 $donePath = [string]$contract.DonePath
 $errorPath = [string]$contract.ErrorPath
@@ -1000,7 +1037,7 @@ $publishReadyPath = if (Test-NonEmptyString ([string]$request.PublishReadyPath))
 $timeoutSeconds = if ($TimeoutSec -gt 0) { $TimeoutSec } else { [int]$pairTest.HeadlessExec.MaxRunSeconds }
 $timeoutMilliseconds = [Math]::Max(1, ($timeoutSeconds * 1000))
 $argumentList = @([string[]]$pairTest.HeadlessExec.Arguments)
-$argumentList += @('-C', $targetFolder, '-o', $outputLastMessagePath, '--color', 'never')
+$argumentList += @('-C', $effectiveWorkingDirectory, '-o', $outputLastMessagePath, '--color', 'never')
 $launchResolveError = ''
 $launchCommand = $null
 if ($DryRun) {
@@ -1033,6 +1070,8 @@ $status = [ordered]@{
     TargetId              = [string]$targetEntry.TargetId
     PartnerTargetId       = [string]$targetEntry.PartnerTargetId
     TargetFolder          = $targetFolder
+    WorkRepoRoot          = $workRepoRoot
+    EffectiveWorkingDirectory = $effectiveWorkingDirectory
     RequestPath           = $requestPath
     SummaryPath           = $summaryPath
     ReviewFolderPath      = $reviewFolderPath
@@ -1099,7 +1138,7 @@ try {
     [System.IO.File]::WriteAllText($headlessPromptPath, $promptText, (New-Utf8NoBomEncoding))
     $mutex = Acquire-Mutex -Name $mutexName
     $executionStartedAtUtc = (Get-Date).ToUniversalTime()
-    $invocationResult = Invoke-ProcessWithStdin -FilePath ([string]$launchCommand.FilePath) -Arguments @($launchCommand.Arguments) -WorkingDirectory $targetFolder -InputText $promptText -TimeoutMilliseconds $timeoutMilliseconds
+    $invocationResult = Invoke-ProcessWithStdin -FilePath ([string]$launchCommand.FilePath) -Arguments @($launchCommand.Arguments) -WorkingDirectory $effectiveWorkingDirectory -InputText $promptText -TimeoutMilliseconds $timeoutMilliseconds
     Set-StatusFromProcessInvocationResult -Status $status -Result $invocationResult
     $status.CompletedAt = (Get-Date).ToString('o')
 

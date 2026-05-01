@@ -209,13 +209,25 @@ function Test-SourceOutboxPublishReadyValid {
         return $false
     }
 
-    foreach ($requiredField in @('SchemaVersion', 'PairId', 'TargetId', 'SummaryPath', 'ReviewZipPath', 'PublishedAt', 'SummarySizeBytes', 'ReviewZipSizeBytes')) {
+    foreach ($requiredField in @('SchemaVersion', 'PairId', 'TargetId', 'SummaryPath', 'ReviewZipPath', 'PublishedAt', 'SummarySizeBytes', 'ReviewZipSizeBytes', 'PublishedBy', 'ValidationCompletedAt')) {
         if (-not (Test-NonEmptyString ([string](Get-ConfigValue -Object $marker -Name $requiredField -DefaultValue '')))) {
             return $false
         }
     }
 
+    $validationPassed = Get-ConfigValue -Object $marker -Name 'ValidationPassed' -DefaultValue $null
+    if ($validationPassed -isnot [bool]) {
+        return $false
+    }
+    if (-not [bool]$validationPassed) {
+        return $false
+    }
+
     if ([string](Get-ConfigValue -Object $marker -Name 'SchemaVersion' -DefaultValue '') -notin @('1.0.0', '1.0')) {
+        return $false
+    }
+
+    if ([string](Get-ConfigValue -Object $marker -Name 'PublishedBy' -DefaultValue '') -ne 'publish-paired-exchange-artifact.ps1') {
         return $false
     }
 

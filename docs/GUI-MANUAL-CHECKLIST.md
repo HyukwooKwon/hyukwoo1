@@ -17,7 +17,7 @@
 1. `8창 보드` 탭에서 아무 target 셀을 클릭한다.
 2. `고정문구 / 순서 편집` 탭으로 자동 전환되는지 확인한다.
 3. `Pair`, `Target`, 편집 scope가 선택 target 기준으로 바뀌는지 확인한다.
-4. 편집기 우측 `최종 전달문`, `경로 요약`, `현재 문맥`, `Initial/Handoff Preview`가 선택한 target 기준으로 갱신되는지 확인한다.
+4. 편집기 우측 compact 탭 `현재`, `적용`, `Initial`, `Handoff`, `전달문`, `경로`와 상단 `오른쪽 탭 안내`가 선택한 target 기준으로 함께 갱신되는지 확인한다.
 
 ### 2. preview freshness 가드
 

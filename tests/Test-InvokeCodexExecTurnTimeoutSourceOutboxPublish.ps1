@@ -113,15 +113,19 @@ $notePath = Join-Path $outboxPath 'source-outbox-timeout-note.txt'
 Compress-Archive -LiteralPath $notePath -DestinationPath $reviewZipPath -Force
 $summaryItem = Get-Item -LiteralPath $summaryPath -ErrorAction Stop
 $zipItem = Get-Item -LiteralPath $reviewZipPath -ErrorAction Stop
+$publishedAt = (Get-Date).ToString('o')
 $payload = [ordered]@{
     SchemaVersion = '1.0.0'
     PairId = [string]$request.PairId
     TargetId = [string]$request.TargetId
     SummaryPath = $summaryPath
     ReviewZipPath = $reviewZipPath
-    PublishedAt = (Get-Date).ToString('o')
+    PublishedAt = $publishedAt
     SummarySizeBytes = [int64]$summaryItem.Length
     ReviewZipSizeBytes = [int64]$zipItem.Length
+    PublishedBy = 'publish-paired-exchange-artifact.ps1'
+    ValidationPassed = $true
+    ValidationCompletedAt = $publishedAt
 }
 $payload | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $publishReadyPath -Encoding UTF8
 Write-Output 'published source-outbox marker before timeout'

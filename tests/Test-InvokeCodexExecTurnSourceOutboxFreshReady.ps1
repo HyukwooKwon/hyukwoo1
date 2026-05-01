@@ -72,6 +72,9 @@ function Write-ValidSourceOutboxArtifacts {
         PublishedAt = (Get-Date).ToString('o')
         SummarySizeBytes = [int64]$summaryItem.Length
         ReviewZipSizeBytes = [int64]$zipItem.Length
+        PublishedBy = 'publish-paired-exchange-artifact.ps1'
+        ValidationPassed = $true
+        ValidationCompletedAt = (Get-Date).ToString('o')
     }
     $payload | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $PublishReadyPath -Encoding UTF8
 }

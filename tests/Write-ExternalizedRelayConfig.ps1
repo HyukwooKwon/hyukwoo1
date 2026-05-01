@@ -4,6 +4,9 @@ param(
     [Parameter(Mandatory)][string]$WorkRepoRoot,
     [string]$OutputConfigPath,
     [string]$ReviewInputPath,
+    [string]$PairId,
+    [string]$BookkeepingRoot,
+    [string]$PairRunRootBase,
     [switch]$BootstrapBindingProfile,
     [switch]$BootstrapRuntimeMap,
     [switch]$AsJson
@@ -11,6 +14,41 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+
+function Get-ConfigValue {
+    param(
+        $Object,
+        [Parameter(Mandatory)][string]$Name,
+        $DefaultValue = $null
+    )
+
+    if ($null -eq $Object) {
+        return $DefaultValue
+    }
+
+    if ($Object -is [hashtable]) {
+        if ($Object.ContainsKey($Name)) {
+            return $Object[$Name]
+        }
+
+        return $DefaultValue
+    }
+
+    if ($Object -is [System.Collections.IDictionary]) {
+        if ($Object.Contains($Name)) {
+            return $Object[$Name]
+        }
+
+        return $DefaultValue
+    }
+
+    $property = $Object.PSObject.Properties[$Name]
+    if ($null -ne $property) {
+        return $property.Value
+    }
+
+    return $DefaultValue
+}
 
 function Ensure-Directory {
     param([Parameter(Mandatory)][string]$Path)
@@ -48,10 +86,31 @@ function Get-DeterministicShortHash {
     }
 }
 
+function ConvertTo-SafePathSegment {
+    param(
+        [Parameter(Mandatory)][string]$Value,
+        [string]$Fallback = 'default'
+    )
+
+    $normalized = ([string]$Value).Trim()
+    if ([string]::IsNullOrWhiteSpace($normalized)) {
+        return $Fallback
+    }
+
+    $safe = [regex]::Replace($normalized, '[^A-Za-z0-9._-]+', '-')
+    $safe = $safe.Trim('-')
+    if ([string]::IsNullOrWhiteSpace($safe)) {
+        return $Fallback
+    }
+
+    return $safe
+}
+
 function Get-ExternalizedRouterMutexName {
     param(
         [Parameter(Mandatory)][string]$BaseMutexName,
-        [Parameter(Mandatory)][string]$WorkRepoRoot
+        [Parameter(Mandatory)][string]$WorkRepoRoot,
+        [string]$ScopeKey = ''
     )
 
     $normalizedBase = if ([string]::IsNullOrWhiteSpace($BaseMutexName)) {
@@ -61,7 +120,11 @@ function Get-ExternalizedRouterMutexName {
         $BaseMutexName.Trim()
     }
 
-    $suffix = Get-DeterministicShortHash -Text ([System.IO.Path]::GetFullPath($WorkRepoRoot).ToLowerInvariant())
+    $hashInput = [System.IO.Path]::GetFullPath($WorkRepoRoot).ToLowerInvariant()
+    if (-not [string]::IsNullOrWhiteSpace($ScopeKey)) {
+        $hashInput = ($hashInput + '|' + $ScopeKey.Trim().ToLowerInvariant())
+    }
+    $suffix = Get-DeterministicShortHash -Text $hashInput
     return ($normalizedBase + '_ext_' + $suffix)
 }
 
@@ -91,11 +154,13 @@ $resolvedWorkRepoRoot = [System.IO.Path]::GetFullPath($WorkRepoRoot)
 if (-not (Test-Path -LiteralPath $resolvedWorkRepoRoot -PathType Container)) {
     throw "WorkRepoRoot not found: $resolvedWorkRepoRoot"
 }
+$pairScopeSegment = if ([string]::IsNullOrWhiteSpace($PairId)) { '' } else { ConvertTo-SafePathSegment -Value $PairId -Fallback 'pair' }
 
 $config = Import-PowerShellDataFile -Path $resolvedBaseConfigPath
-$externalizedRouterMutexName = Get-ExternalizedRouterMutexName -BaseMutexName ([string]$config.RouterMutexName) -WorkRepoRoot $resolvedWorkRepoRoot
+$externalizedRouterMutexName = Get-ExternalizedRouterMutexName -BaseMutexName ([string]$config.RouterMutexName) -WorkRepoRoot $resolvedWorkRepoRoot -ScopeKey $pairScopeSegment
+$pairTestConfig = Get-ConfigValue -Object $config -Name 'PairTest' -DefaultValue @{}
 $defaultReviewInputPath = if ([string]::IsNullOrWhiteSpace($ReviewInputPath)) {
-    [string]$config.PairTest.DefaultSeedReviewInputPath
+    [string](Get-ConfigValue -Object $pairTestConfig -Name 'DefaultSeedReviewInputPath' -DefaultValue '')
 }
 else {
     $ReviewInputPath
@@ -108,12 +173,25 @@ else {
 }
 
 if (-not $PSBoundParameters.ContainsKey('OutputConfigPath') -or [string]::IsNullOrWhiteSpace($OutputConfigPath)) {
-    $OutputConfigPath = Join-Path $resolvedWorkRepoRoot '.relay-config\bottest-live-visible\settings.externalized.psd1'
+    if ([string]::IsNullOrWhiteSpace($pairScopeSegment)) {
+        $OutputConfigPath = Join-Path $resolvedWorkRepoRoot '.relay-config\bottest-live-visible\settings.externalized.psd1'
+    }
+    else {
+        $OutputConfigPath = Join-Path $resolvedWorkRepoRoot ('.relay-config\bottest-live-visible\pairs\{0}\settings.externalized.psd1' -f $pairScopeSegment)
+    }
 }
 $resolvedOutputConfigPath = [System.IO.Path]::GetFullPath($OutputConfigPath)
 Ensure-Directory -Path (Split-Path -Parent $resolvedOutputConfigPath)
 
-$bookkeepingRoot = Join-Path $resolvedWorkRepoRoot '.relay-bookkeeping\bottest-live-visible'
+if (-not [string]::IsNullOrWhiteSpace($BookkeepingRoot)) {
+    $bookkeepingRoot = [System.IO.Path]::GetFullPath($BookkeepingRoot)
+}
+elseif ([string]::IsNullOrWhiteSpace($pairScopeSegment)) {
+    $bookkeepingRoot = Join-Path $resolvedWorkRepoRoot '.relay-bookkeeping\bottest-live-visible'
+}
+else {
+    $bookkeepingRoot = Join-Path $resolvedWorkRepoRoot ('.relay-bookkeeping\bottest-live-visible\pairs\{0}' -f $pairScopeSegment)
+}
 $inboxRoot = Join-Path $bookkeepingRoot 'inbox'
 $processedRoot = Join-Path $bookkeepingRoot 'processed'
 $failedRoot = Join-Path $bookkeepingRoot 'failed'
@@ -129,7 +207,15 @@ $routerLogPath = Join-Path $logsRoot 'router.log'
 $visibleWorkerQueueRoot = Join-Path $runtimeRoot 'visible-worker\queue'
 $visibleWorkerStatusRoot = Join-Path $runtimeRoot 'visible-worker\status'
 $visibleWorkerLogRoot = Join-Path $runtimeRoot 'visible-worker\logs'
-$pairRunRootBase = Join-Path $resolvedWorkRepoRoot '.relay-runs\bottest-live-visible'
+if (-not [string]::IsNullOrWhiteSpace($PairRunRootBase)) {
+    $pairRunRootBase = [System.IO.Path]::GetFullPath($PairRunRootBase)
+}
+elseif ([string]::IsNullOrWhiteSpace($pairScopeSegment)) {
+    $pairRunRootBase = Join-Path $resolvedWorkRepoRoot '.relay-runs\bottest-live-visible'
+}
+else {
+    $pairRunRootBase = Join-Path $resolvedWorkRepoRoot ('.relay-runs\bottest-live-visible\pairs\{0}' -f $pairScopeSegment)
+}
 
 foreach ($path in @(
     $inboxRoot,
@@ -143,7 +229,8 @@ foreach ($path in @(
     (Split-Path -Parent $bindingProfilePath),
     $visibleWorkerQueueRoot,
     $visibleWorkerStatusRoot,
-    $visibleWorkerLogRoot
+    $visibleWorkerLogRoot,
+    $pairRunRootBase
 )) {
     Ensure-Directory -Path $path
 }
@@ -152,6 +239,15 @@ $configText = Get-Content -LiteralPath $resolvedBaseConfigPath -Raw -Encoding UT
 $configText = Replace-QuotedAssignment -Text $configText -Name 'DefaultSeedWorkRepoRoot' -Value $resolvedWorkRepoRoot
 if (-not [string]::IsNullOrWhiteSpace($resolvedReviewInputPath)) {
     $configText = Replace-QuotedAssignment -Text $configText -Name 'DefaultSeedReviewInputPath' -Value $resolvedReviewInputPath
+}
+$pairScopedExternalRunRootRelativeRoot = if ([string]::IsNullOrWhiteSpace($pairScopeSegment)) {
+    ''
+}
+else {
+    ('.relay-runs\bottest-live-visible\pairs\{0}' -f $pairScopeSegment)
+}
+if (-not [string]::IsNullOrWhiteSpace($pairScopedExternalRunRootRelativeRoot)) {
+    $configText = Replace-QuotedAssignment -Text $configText -Name 'ExternalWorkRepoRunRootRelativeRoot' -Value $pairScopedExternalRunRootRelativeRoot
 }
 $configText = Replace-QuotedAssignment -Text $configText -Name 'RuntimeRoot' -Value $runtimeRoot
 $configText = Replace-QuotedAssignment -Text $configText -Name 'RuntimeMapPath' -Value $runtimeMapPath
@@ -184,8 +280,8 @@ foreach ($targetId in @('target01','target02','target03','target04','target05','
 
 Set-Content -LiteralPath $resolvedOutputConfigPath -Value $configText -Encoding UTF8
 
-$sourceBindingProfilePath = [string]$config.BindingProfilePath
-$sourceRuntimeMapPath = [string]$config.RuntimeMapPath
+$sourceBindingProfilePath = [string](Get-ConfigValue -Object $config -Name 'BindingProfilePath' -DefaultValue '')
+$sourceRuntimeMapPath = [string](Get-ConfigValue -Object $config -Name 'RuntimeMapPath' -DefaultValue '')
 if ($BootstrapBindingProfile -and (Test-Path -LiteralPath $sourceBindingProfilePath -PathType Leaf)) {
     Ensure-Directory -Path (Split-Path -Parent $bindingProfilePath)
     Copy-Item -LiteralPath $sourceBindingProfilePath -Destination $bindingProfilePath -Force
@@ -198,6 +294,8 @@ if ($BootstrapRuntimeMap -and (Test-Path -LiteralPath $sourceRuntimeMapPath -Pat
 $result = [pscustomobject]@{
     BaseConfigPath = $resolvedBaseConfigPath
     WorkRepoRoot = $resolvedWorkRepoRoot
+    PairId = [string]$PairId
+    PairScopeSegment = $pairScopeSegment
     OutputConfigPath = $resolvedOutputConfigPath
     ReviewInputPath = $resolvedReviewInputPath
     BookkeepingRoot = $bookkeepingRoot

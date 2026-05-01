@@ -195,6 +195,65 @@ function Test-UseExternalWorkRepoRunRoot {
     return [bool](Get-ConfigValue -Object $PairPolicy -Name 'UseExternalWorkRepoRunRoot' -DefaultValue ([bool](Get-ConfigValue -Object $PairTest -Name 'UseExternalWorkRepoRunRoot' -DefaultValue $false)))
 }
 
+function Resolve-ExternalWorkRepoRunRootBase {
+    param(
+        [Parameter(Mandatory)]$PairTest,
+        $PairPolicy = $null,
+        [Parameter(Mandatory)][string]$WorkRepoRoot
+    )
+
+    if (-not (Test-NonEmptyString $WorkRepoRoot)) {
+        throw 'external run root base requires a non-empty WorkRepoRoot.'
+    }
+
+    $relativeRootSpec = [string](Get-ConfigValue -Object $PairPolicy -Name 'ExternalWorkRepoRunRootRelativeRoot' -DefaultValue ([string](Get-ConfigValue -Object $PairTest -Name 'ExternalWorkRepoRunRootRelativeRoot' -DefaultValue '.relay-runs\bottest-live-visible')))
+    if ([System.IO.Path]::IsPathRooted($relativeRootSpec)) {
+        return [System.IO.Path]::GetFullPath($relativeRootSpec)
+    }
+
+    return [System.IO.Path]::GetFullPath((Join-Path $WorkRepoRoot $relativeRootSpec))
+}
+
+function Resolve-ExternalRunRootOwnerRoot {
+    param(
+        [Parameter(Mandatory)]$PairTest,
+        $PairPolicy = $null,
+        [Parameter(Mandatory)][string]$RunRoot,
+        [string]$WorkRepoRoot = ''
+    )
+
+    $resolvedRunRoot = [System.IO.Path]::GetFullPath($RunRoot)
+    if (Test-NonEmptyString $WorkRepoRoot) {
+        $resolvedWorkRepoRoot = [System.IO.Path]::GetFullPath($WorkRepoRoot)
+        if (Test-PathEqualsOrIsDescendant -Path $resolvedRunRoot -BasePath $resolvedWorkRepoRoot) {
+            return $resolvedWorkRepoRoot
+        }
+    }
+
+    $relativeRootSpec = [string](Get-ConfigValue -Object $PairPolicy -Name 'ExternalWorkRepoRunRootRelativeRoot' -DefaultValue ([string](Get-ConfigValue -Object $PairTest -Name 'ExternalWorkRepoRunRootRelativeRoot' -DefaultValue '.relay-runs\bottest-live-visible')))
+    if ([System.IO.Path]::IsPathRooted($relativeRootSpec)) {
+        return ''
+    }
+
+    $segments = @(
+        ($relativeRootSpec -split '[\\/]') |
+            Where-Object { -not [string]::IsNullOrWhiteSpace($_) -and $_ -ne '.' }
+    )
+    $ownerRoot = Split-Path -Parent $resolvedRunRoot
+    foreach ($segment in @($segments)) {
+        if (-not (Test-NonEmptyString $ownerRoot)) {
+            return ''
+        }
+        $ownerRoot = Split-Path -Parent $ownerRoot
+    }
+
+    if (-not (Test-NonEmptyString $ownerRoot)) {
+        return ''
+    }
+
+    return [System.IO.Path]::GetFullPath($ownerRoot)
+}
+
 function Get-StringArray {
     param($Value)
 
@@ -226,6 +285,218 @@ function Get-StringArray {
     }
 
     return @()
+}
+
+function Get-ForbiddenArtifactPolicy {
+    param($Source)
+
+    $defaultLiterals = @(
+        '여기에 고정문구 입력'
+    )
+    $defaultRegexes = @(
+        '이렇게 계획개선해봤어',
+        '더 개선해야될 부분이 있어\??',
+        '이런부분도 참고해봐'
+    )
+
+    $literals = @(
+        Get-StringArray (Get-ConfigValue -Object $Source -Name 'ForbiddenArtifactLiterals' -DefaultValue @($defaultLiterals))
+    )
+    $regexes = @(
+        Get-StringArray (Get-ConfigValue -Object $Source -Name 'ForbiddenArtifactRegexes' -DefaultValue @($defaultRegexes))
+    )
+
+    foreach ($pattern in @($regexes)) {
+        if (-not (Test-NonEmptyString $pattern)) {
+            continue
+        }
+
+        try {
+            $null = [regex]::new([string]$pattern, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+        }
+        catch {
+            throw ("PairTest.ForbiddenArtifactRegexes contains invalid regex pattern: {0}" -f [string]$pattern)
+        }
+    }
+
+    return [pscustomobject]@{
+        Literals = @($literals)
+        Regexes  = @($regexes)
+    }
+}
+
+function Get-ForbiddenArtifactTextMatch {
+    param(
+        [string]$Text,
+        [string[]]$LiteralList = @(),
+        [string[]]$RegexPatternList = @()
+    )
+
+    if (-not (Test-NonEmptyString $Text)) {
+        return [pscustomobject]@{
+            Found      = $false
+            MatchKind  = ''
+            MatchText  = ''
+            Pattern    = ''
+            EntryPath  = ''
+        }
+    }
+
+    foreach ($literal in @($LiteralList)) {
+        if (-not (Test-NonEmptyString $literal)) {
+            continue
+        }
+        if ($Text.Contains([string]$literal)) {
+            return [pscustomobject]@{
+                Found      = $true
+                MatchKind  = 'literal'
+                MatchText  = [string]$literal
+                Pattern    = [string]$literal
+                EntryPath  = ''
+            }
+        }
+    }
+
+    foreach ($pattern in @($RegexPatternList)) {
+        if (-not (Test-NonEmptyString $pattern)) {
+            continue
+        }
+
+        try {
+            $match = [regex]::Match(
+                $Text,
+                [string]$pattern,
+                [System.Text.RegularExpressions.RegexOptions]::IgnoreCase
+            )
+        }
+        catch {
+            continue
+        }
+
+        if ($match.Success) {
+            $matchText = [string]$match.Value
+            if ($matchText.Length -gt 120) {
+                $matchText = ($matchText.Substring(0, 120) + ' ...')
+            }
+
+            return [pscustomobject]@{
+                Found      = $true
+                MatchKind  = 'regex'
+                MatchText  = $matchText
+                Pattern    = [string]$pattern
+                EntryPath  = ''
+            }
+        }
+    }
+
+    return [pscustomobject]@{
+        Found      = $false
+        MatchKind  = ''
+        MatchText  = ''
+        Pattern    = ''
+        EntryPath  = ''
+    }
+}
+
+function Get-ForbiddenArtifactTextFileMatch {
+    param(
+        [string]$Path,
+        [string[]]$LiteralList = @(),
+        [string[]]$RegexPatternList = @()
+    )
+
+    if (-not (Test-NonEmptyString $Path) -or -not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        return [pscustomobject]@{
+            Found      = $false
+            MatchKind  = ''
+            MatchText  = ''
+            Pattern    = ''
+            EntryPath  = ''
+        }
+    }
+
+    try {
+        $raw = Get-Content -LiteralPath $Path -Raw -Encoding UTF8 -ErrorAction Stop
+    }
+    catch {
+        return [pscustomobject]@{
+            Found      = $false
+            MatchKind  = ''
+            MatchText  = ''
+            Pattern    = ''
+            EntryPath  = ''
+        }
+    }
+
+    return (Get-ForbiddenArtifactTextMatch -Text $raw -LiteralList @($LiteralList) -RegexPatternList @($RegexPatternList))
+}
+
+function Get-ForbiddenArtifactZipMatch {
+    param(
+        [string]$Path,
+        [string[]]$LiteralList = @(),
+        [string[]]$RegexPatternList = @()
+    )
+
+    try {
+        Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction SilentlyContinue
+    }
+    catch {
+    }
+
+    if (-not (Test-NonEmptyString $Path) -or -not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        return [pscustomobject]@{
+            Found      = $false
+            MatchKind  = ''
+            MatchText  = ''
+            Pattern    = ''
+            EntryPath  = ''
+        }
+    }
+
+    try {
+        $archive = [System.IO.Compression.ZipFile]::OpenRead($Path)
+        try {
+            foreach ($entry in $archive.Entries) {
+                if ($entry.Length -le 0 -or $entry.Length -gt 1MB) {
+                    continue
+                }
+
+                $reader = $null
+                try {
+                    $reader = [System.IO.StreamReader]::new($entry.Open(), [System.Text.Encoding]::UTF8, $true)
+                    $content = $reader.ReadToEnd()
+                    $match = Get-ForbiddenArtifactTextMatch -Text $content -LiteralList @($LiteralList) -RegexPatternList @($RegexPatternList)
+                    if ([bool]$match.Found) {
+                        $match | Add-Member -NotePropertyName 'EntryPath' -NotePropertyValue ([string]$entry.FullName) -Force
+                        return $match
+                    }
+                }
+                catch {
+                }
+                finally {
+                    if ($null -ne $reader) {
+                        $reader.Dispose()
+                    }
+                }
+            }
+        }
+        finally {
+            if ($null -ne $archive) {
+                $archive.Dispose()
+            }
+        }
+    }
+    catch {
+    }
+
+    return [pscustomobject]@{
+        Found      = $false
+        MatchKind  = ''
+        MatchText  = ''
+        Pattern    = ''
+        EntryPath  = ''
+    }
 }
 
 function Get-RelaySubmitRetryModes {
@@ -728,6 +999,25 @@ function Get-BookkeepingResidualRootsEvidence {
     return @($items)
 }
 
+function Test-PathInsideAnyAllowedRoot {
+    param(
+        [string]$Path,
+        [string[]]$AllowedRootPaths = @()
+    )
+
+    foreach ($allowedRootPath in @($AllowedRootPaths)) {
+        if (-not (Test-NonEmptyString ([string]$allowedRootPath))) {
+            continue
+        }
+
+        if (Test-PathEqualsOrIsDescendant -Path $Path -BasePath ([string]$allowedRootPath)) {
+            return $true
+        }
+    }
+
+    return $false
+}
+
 function Test-PathEqualsOrIsDescendant {
     param(
         [string]$Path,
@@ -754,7 +1044,8 @@ function Test-BookkeepingRootsPolicy {
         $PairPolicy = $null,
         [Parameter(Mandatory)][string]$AutomationRoot,
         [Parameter(Mandatory)][string]$BasePath,
-        [string]$WorkRepoRoot = ''
+        [string]$WorkRepoRoot = '',
+        [string[]]$AllowedRootPaths = @()
     )
 
     $requiresExternalBookkeeping = (
@@ -782,6 +1073,12 @@ function Test-BookkeepingRootsPolicy {
 
     $resolvedAutomationRoot = [System.IO.Path]::GetFullPath($AutomationRoot)
     $resolvedWorkRepoRoot = [System.IO.Path]::GetFullPath($WorkRepoRoot)
+    $normalizedAllowedRootPaths = @(
+        @($AllowedRootPaths) |
+            Where-Object { Test-NonEmptyString ([string]$_) } |
+            ForEach-Object { [System.IO.Path]::GetFullPath([string]$_) } |
+            Sort-Object -Unique
+    )
     $residualRoots = @(Get-BookkeepingResidualRootsEvidence -Config $Config -BasePath $BasePath)
 
     foreach ($item in @($residualRoots)) {
@@ -799,11 +1096,24 @@ function Test-BookkeepingRootsPolicy {
             }
         }
 
-        if (-not (Test-PathEqualsOrIsDescendant -Path $path -BasePath $resolvedWorkRepoRoot)) {
+        $pathAllowed = if ($normalizedAllowedRootPaths.Count -gt 0) {
+            Test-PathInsideAnyAllowedRoot -Path $path -AllowedRootPaths $normalizedAllowedRootPaths
+        }
+        else {
+            Test-PathEqualsOrIsDescendant -Path $path -BasePath $resolvedWorkRepoRoot
+        }
+
+        if (-not $pathAllowed) {
+            $detail = if ($normalizedAllowedRootPaths.Count -gt 0) {
+                ('{0} must be inside one of the allowed external bookkeeping roots. allowedRoots={1} path={2}' -f [string]$item.Name, ($normalizedAllowedRootPaths -join ', '), $path)
+            }
+            else {
+                ('{0} must be inside WorkRepoRoot. workRepoRoot={1} path={2}' -f [string]$item.Name, $resolvedWorkRepoRoot, $path)
+            }
             return [pscustomobject]@{
                 Passed = $false
                 Reason = 'bookkeeping-root-outside-workrepo'
-                Detail = ('{0} must be inside WorkRepoRoot. workRepoRoot={1} path={2}' -f [string]$item.Name, $resolvedWorkRepoRoot, $path)
+                Detail = $detail
                 ResidualRoots = @($residualRoots)
             }
         }
@@ -980,7 +1290,8 @@ function Assert-BookkeepingRootsPolicy {
         $PairPolicy = $null,
         [Parameter(Mandatory)][string]$AutomationRoot,
         [Parameter(Mandatory)][string]$BasePath,
-        [string]$WorkRepoRoot = ''
+        [string]$WorkRepoRoot = '',
+        [string[]]$AllowedRootPaths = @()
     )
 
     $policyResult = Test-BookkeepingRootsPolicy `
@@ -989,7 +1300,8 @@ function Assert-BookkeepingRootsPolicy {
         -PairPolicy $PairPolicy `
         -AutomationRoot $AutomationRoot `
         -BasePath $BasePath `
-        -WorkRepoRoot $WorkRepoRoot
+        -WorkRepoRoot $WorkRepoRoot `
+        -AllowedRootPaths $AllowedRootPaths
 
     if (-not [bool]$policyResult.Passed) {
         throw ('bookkeeping root policy failed: {0} detail={1}' -f [string]$policyResult.Reason, [string]$policyResult.Detail)
@@ -1264,6 +1576,7 @@ function Resolve-PairPolicyMap {
             $seedTargetId = $topTargetId
         }
 
+        $pairHasExplicitSeedWorkRepoRoot = Test-ConfigMemberExists -Object $pairSource -Name 'DefaultSeedWorkRepoRoot'
         $seedWorkRepoRootRaw = [string](Get-ConfigValue -Object $pairSource -Name 'DefaultSeedWorkRepoRoot' -DefaultValue $globalSeedWorkRepoRoot)
         $seedReviewInputPathRaw = [string](Get-ConfigValue -Object $pairSource -Name 'DefaultSeedReviewInputPath' -DefaultValue $globalSeedReviewInputPath)
         $policyMap[$pairId] = [pscustomobject]@{
@@ -1272,6 +1585,8 @@ function Resolve-PairPolicyMap {
             BottomTargetId = $bottomTargetId
             DefaultSeedTargetId = $seedTargetId
             DefaultSeedWorkRepoRoot = if (Test-NonEmptyString $seedWorkRepoRootRaw) { Resolve-FullPathFromBase -PathValue $seedWorkRepoRootRaw -BasePath $Root } else { '' }
+            DefaultSeedWorkRepoRootSource = if ($pairHasExplicitSeedWorkRepoRoot) { 'pair-policy' } elseif (Test-NonEmptyString $seedWorkRepoRootRaw) { 'global-default' } else { 'unset' }
+            DefaultSeedWorkRepoRootInherited = [bool]((-not $pairHasExplicitSeedWorkRepoRoot) -and (Test-NonEmptyString $seedWorkRepoRootRaw))
             DefaultSeedReviewInputPath = if (Test-NonEmptyString $seedReviewInputPathRaw) { Resolve-FullPathFromBase -PathValue $seedReviewInputPathRaw -BasePath $Root } else { '' }
             DefaultSeedReviewInputSearchRelativePath = [string](Get-ConfigValue -Object $pairSource -Name 'DefaultSeedReviewInputSearchRelativePath' -DefaultValue $globalSeedReviewSearchRelativePath)
             DefaultSeedReviewInputFilter = [string](Get-ConfigValue -Object $pairSource -Name 'DefaultSeedReviewInputFilter' -DefaultValue $globalSeedReviewFilter)
@@ -1444,6 +1759,8 @@ function Get-PairPolicyForPair {
         BottomTargetId = [string](Get-ConfigValue -Object $pair -Name 'BottomTargetId' -DefaultValue '')
         DefaultSeedTargetId = [string](Get-ConfigValue -Object $pair -Name 'SeedTargetId' -DefaultValue '')
         DefaultSeedWorkRepoRoot = [string](Get-ConfigValue -Object $PairTest -Name 'DefaultSeedWorkRepoRoot' -DefaultValue '')
+        DefaultSeedWorkRepoRootSource = if (Test-NonEmptyString ([string](Get-ConfigValue -Object $PairTest -Name 'DefaultSeedWorkRepoRoot' -DefaultValue ''))) { 'global-default' } else { 'unset' }
+        DefaultSeedWorkRepoRootInherited = [bool](Test-NonEmptyString ([string](Get-ConfigValue -Object $PairTest -Name 'DefaultSeedWorkRepoRoot' -DefaultValue '')))
         DefaultSeedReviewInputPath = [string](Get-ConfigValue -Object $PairTest -Name 'DefaultSeedReviewInputPath' -DefaultValue '')
         DefaultSeedReviewInputSearchRelativePath = [string](Get-ConfigValue -Object $PairTest -Name 'DefaultSeedReviewInputSearchRelativePath' -DefaultValue 'reviewfile')
         DefaultSeedReviewInputFilter = [string](Get-ConfigValue -Object $PairTest -Name 'DefaultSeedReviewInputFilter' -DefaultValue '*.zip')
@@ -1477,17 +1794,11 @@ function Resolve-PairRunRootPath {
 
     $useExternalRunRoot = Test-UseExternalWorkRepoRunRoot -PairTest $PairTest -PairPolicy $PairPolicy -WorkRepoRoot $WorkRepoRoot
     if ($useExternalRunRoot) {
-        $relativeRootSpec = [string](Get-ConfigValue -Object $PairPolicy -Name 'ExternalWorkRepoRunRootRelativeRoot' -DefaultValue ([string](Get-ConfigValue -Object $PairTest -Name 'ExternalWorkRepoRunRootRelativeRoot' -DefaultValue '.relay-runs\bottest-live-visible')))
         if (-not (Test-NonEmptyString $WorkRepoRoot)) {
             throw 'external run root requires a non-empty WorkRepoRoot.'
         }
 
-        $baseRoot = if ([System.IO.Path]::IsPathRooted($relativeRootSpec)) {
-            [System.IO.Path]::GetFullPath($relativeRootSpec)
-        }
-        else {
-            [System.IO.Path]::GetFullPath((Join-Path $WorkRepoRoot $relativeRootSpec))
-        }
+        $baseRoot = Resolve-ExternalWorkRepoRunRootBase -PairTest $PairTest -PairPolicy $PairPolicy -WorkRepoRoot $WorkRepoRoot
     }
     else {
         $baseRoot = Resolve-FullPathFromBase `
@@ -1538,6 +1849,7 @@ function Resolve-PairTestConfig {
     $pairDefinitionResolveSource = if ($null -ne $ManifestPairTest) { $ManifestPairTest } elseif ($null -ne $config) { $config } else { $source }
     $pairDefinitionSet = Resolve-ConfiguredPairDefinitions -Source $pairDefinitionResolveSource -SourceLabel $(if ($null -ne $ManifestPairTest) { 'manifest' } else { 'config' })
     $pairPolicies = Resolve-PairPolicyMap -Source $source -PairDefinitions @($pairDefinitionSet.Pairs) -Root $Root
+    $forbiddenArtifactPolicy = Get-ForbiddenArtifactPolicy -Source $source
     $configuredDefaultPairId = [string](Get-ConfigValue -Object $source -Name 'DefaultPairId' -DefaultValue '')
     if (Test-NonEmptyString $configuredDefaultPairId) {
         $defaultPairExists = @(
@@ -1578,8 +1890,10 @@ function Resolve-PairTestConfig {
         ReviewZipPattern  = [string](Get-ConfigValue -Object $source -Name 'ReviewZipPattern' -DefaultValue 'review_{TargetId}_{yyyyMMdd_HHmmss}_{Guid}.zip')
         CheckScriptFileName = [string](Get-ConfigValue -Object $source -Name 'CheckScriptFileName' -DefaultValue 'check-artifact.ps1')
         SubmitScriptFileName = [string](Get-ConfigValue -Object $source -Name 'SubmitScriptFileName' -DefaultValue 'submit-artifact.ps1')
+        PublishScriptFileName = [string](Get-ConfigValue -Object $source -Name 'PublishScriptFileName' -DefaultValue 'publish-artifact.ps1')
         CheckCmdFileName  = [string](Get-ConfigValue -Object $source -Name 'CheckCmdFileName' -DefaultValue 'check-artifact.cmd')
         SubmitCmdFileName = [string](Get-ConfigValue -Object $source -Name 'SubmitCmdFileName' -DefaultValue 'submit-artifact.cmd')
+        PublishCmdFileName = [string](Get-ConfigValue -Object $source -Name 'PublishCmdFileName' -DefaultValue 'publish-artifact.cmd')
         SourceOutboxFolderName = [string](Get-ConfigValue -Object $source -Name 'SourceOutboxFolderName' -DefaultValue 'source-outbox')
         SourceSummaryFileName = [string](Get-ConfigValue -Object $source -Name 'SourceSummaryFileName' -DefaultValue 'summary.txt')
         SourceReviewZipFileName = [string](Get-ConfigValue -Object $source -Name 'SourceReviewZipFileName' -DefaultValue 'review.zip')
@@ -1604,6 +1918,8 @@ function Resolve-PairTestConfig {
         DefaultPublishContractMode = [string](Get-ConfigValue -Object $source -Name 'DefaultPublishContractMode' -DefaultValue 'strict')
         DefaultRecoveryPolicy = [string](Get-ConfigValue -Object $source -Name 'DefaultRecoveryPolicy' -DefaultValue 'manual-review')
         DefaultPauseAllowed = [bool](Get-ConfigValue -Object $source -Name 'DefaultPauseAllowed' -DefaultValue $true)
+        ForbiddenArtifactLiterals = @($forbiddenArtifactPolicy.Literals)
+        ForbiddenArtifactRegexes = @($forbiddenArtifactPolicy.Regexes)
         SeedOutboxStartTimeoutSeconds = [int](Get-ConfigValue -Object $source -Name 'SeedOutboxStartTimeoutSeconds' -DefaultValue 120)
         SeedWaitForUserIdleTimeoutSeconds = [int](Get-ConfigValue -Object $source -Name 'SeedWaitForUserIdleTimeoutSeconds' -DefaultValue 180)
         SeedRetryMaxAttempts = [int](Get-ConfigValue -Object $source -Name 'SeedRetryMaxAttempts' -DefaultValue 3)

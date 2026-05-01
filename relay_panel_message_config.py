@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import difflib
+import hashlib
 import json
 import shutil
 import tempfile
@@ -33,6 +34,8 @@ SCOPED_SLOT_LABELS = {
     "one-time-suffix": "One-time Suffix",
     "global-suffix": "글로벌 Suffix",
 }
+
+CONFIG_BACKUP_RETENTION_COUNT = 20
 
 
 class MessageConfigService:
@@ -117,6 +120,152 @@ class MessageConfigService:
                 if target_id:
                     result[target_id] = item
         return result
+
+    def pair_definitions(self, document: dict[str, Any]) -> list[dict[str, str]]:
+        pair_test = self._pair_test(document)
+        definitions = pair_test.get("PairDefinitions", []) or []
+        rows: list[dict[str, str]] = []
+        for item in definitions:
+            if not isinstance(item, dict):
+                continue
+            pair_id = str(item.get("PairId", "") or "").strip()
+            if not pair_id:
+                continue
+            rows.append(
+                {
+                    "PairId": pair_id,
+                    "TopTargetId": str(item.get("TopTargetId", "") or "").strip(),
+                    "BottomTargetId": str(item.get("BottomTargetId", "") or "").strip(),
+                    "SeedTargetId": str(item.get("SeedTargetId", "") or "").strip(),
+                }
+            )
+        return rows
+
+    def pair_definition_map(self, document: dict[str, Any]) -> dict[str, dict[str, str]]:
+        return {
+            str(item.get("PairId", "") or "").strip(): item
+            for item in self.pair_definitions(document)
+            if str(item.get("PairId", "") or "").strip()
+        }
+
+    def _pair_policies(self, document: dict[str, Any]) -> dict[str, Any]:
+        pair_test = self._pair_test(document)
+        policies = pair_test.setdefault("PairPolicies", {})
+        if not isinstance(policies, dict):
+            raise ValueError("PairTest.PairPolicies section is not editable")
+        return policies
+
+    def pair_policy(self, document: dict[str, Any], pair_id: str) -> dict[str, Any]:
+        normalized_pair_id = str(pair_id or "").strip()
+        if not normalized_pair_id:
+            raise ValueError("pair_id is required")
+        policies = self._pair_policies(document)
+        node = policies.setdefault(normalized_pair_id, {})
+        if not isinstance(node, dict):
+            raise ValueError(f"PairPolicies.{normalized_pair_id} section is not editable")
+        return node
+
+    def effective_pair_policy(self, document: dict[str, Any], pair_id: str) -> dict[str, Any]:
+        normalized_pair_id = str(pair_id or "").strip()
+        if not normalized_pair_id:
+            raise ValueError("pair_id is required")
+        pair_test = self._pair_test(document)
+        pair_definition = self.pair_definition_map(document).get(normalized_pair_id, {})
+        pair_policy = self.pair_policy(document, normalized_pair_id)
+        has_pair_repo_override = "DefaultSeedWorkRepoRoot" in pair_policy
+        default_seed_work_repo_root_value = str(
+            pair_policy.get(
+                "DefaultSeedWorkRepoRoot",
+                pair_test.get("DefaultSeedWorkRepoRoot", "") or "",
+            )
+            or ""
+        ).strip()
+        top_target_id = str(pair_definition.get("TopTargetId", "") or "").strip()
+        bottom_target_id = str(pair_definition.get("BottomTargetId", "") or "").strip()
+        seed_target_id = str(
+            pair_policy.get(
+                "DefaultSeedTargetId",
+                pair_definition.get("SeedTargetId", "") or top_target_id,
+            )
+            or ""
+        ).strip()
+        return {
+            "PairId": normalized_pair_id,
+            "TopTargetId": top_target_id,
+            "BottomTargetId": bottom_target_id,
+            "DefaultSeedTargetId": seed_target_id,
+            "DefaultSeedWorkRepoRoot": default_seed_work_repo_root_value,
+            "DefaultSeedWorkRepoRootSource": (
+                "pair-policy"
+                if has_pair_repo_override
+                else ("global-default" if default_seed_work_repo_root_value else "unset")
+            ),
+            "DefaultSeedWorkRepoRootInherited": (not has_pair_repo_override and bool(default_seed_work_repo_root_value)),
+            "UseExternalWorkRepoRunRoot": bool(
+                pair_policy.get(
+                    "UseExternalWorkRepoRunRoot",
+                    pair_test.get("UseExternalWorkRepoRunRoot", False),
+                )
+            ),
+            "UseExternalWorkRepoContractPaths": bool(
+                pair_policy.get(
+                    "UseExternalWorkRepoContractPaths",
+                    pair_test.get("UseExternalWorkRepoContractPaths", False),
+                )
+            ),
+            "RequireExternalRunRoot": bool(
+                pair_policy.get(
+                    "RequireExternalRunRoot",
+                    pair_test.get("RequireExternalRunRoot", False),
+                )
+            ),
+            "DefaultPairMaxRoundtripCount": int(
+                pair_policy.get(
+                    "DefaultPairMaxRoundtripCount",
+                    pair_test.get("DefaultPairMaxRoundtripCount", 0),
+                )
+                or 0
+            ),
+            "PauseAllowed": bool(
+                pair_policy.get(
+                    "PauseAllowed",
+                    pair_test.get("DefaultPauseAllowed", True),
+                )
+            ),
+            "PublishContractMode": str(
+                pair_policy.get(
+                    "PublishContractMode",
+                    pair_test.get("DefaultPublishContractMode", "strict"),
+                )
+                or ""
+            ).strip(),
+            "RecoveryPolicy": str(
+                pair_policy.get(
+                    "RecoveryPolicy",
+                    pair_test.get("DefaultRecoveryPolicy", "manual-review"),
+                )
+                or ""
+            ).strip(),
+        }
+
+    def set_pair_policy_values(
+        self,
+        document: dict[str, Any],
+        pair_id: str,
+        *,
+        default_seed_work_repo_root: str,
+        default_seed_target_id: str,
+        use_external_work_repo_run_root: bool,
+        use_external_work_repo_contract_paths: bool,
+        default_pair_max_roundtrip_count: int,
+    ) -> dict[str, Any]:
+        node = self.pair_policy(document, pair_id)
+        node["DefaultSeedWorkRepoRoot"] = str(default_seed_work_repo_root or "").strip()
+        node["DefaultSeedTargetId"] = str(default_seed_target_id or "").strip()
+        node["UseExternalWorkRepoRunRoot"] = bool(use_external_work_repo_run_root)
+        node["UseExternalWorkRepoContractPaths"] = bool(use_external_work_repo_contract_paths)
+        node["DefaultPairMaxRoundtripCount"] = int(default_pair_max_roundtrip_count)
+        return node
 
     def get_slot_order(self, document: dict[str, Any], template_name: str) -> list[str]:
         node = self._template_node(document, template_name)
@@ -511,17 +660,92 @@ class MessageConfigService:
 
     def backup_dir(self, config_path: str) -> Path:
         config_file = Path(config_path)
-        return self.root / "runtime" / "config-editor-backups" / config_file.stem
+        return self.root / "runtime" / "config-editor-backups" / f"{config_file.stem}__{self._backup_key(config_path)}"
 
     def list_backups(self, config_path: str) -> list[Path]:
-        return sorted(self.backup_dir(config_path).glob("*.psd1"), key=lambda path: path.stat().st_mtime, reverse=True)
+        return [record["backup_path"] for record in self._iter_backup_records(config_path)]
+
+    def _normalize_config_path(self, config_path: str) -> str:
+        return str(Path(config_path).expanduser().resolve(strict=False))
+
+    def _backup_key(self, config_path: str) -> str:
+        normalized = self._normalize_config_path(config_path).encode("utf-8")
+        return hashlib.sha256(normalized).hexdigest()[:12]
+
+    def _backup_meta_path(self, backup_path: Path) -> Path:
+        return backup_path.with_suffix(backup_path.suffix + ".meta.json")
+
+    def _read_backup_meta(self, meta_path: Path) -> dict[str, Any] | None:
+        try:
+            payload = json.loads(meta_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        if not isinstance(payload, dict):
+            return None
+        return payload
+
+    def _iter_backup_records(self, config_path: str) -> list[dict[str, Any]]:
+        normalized = self._normalize_config_path(config_path)
+        backup_key = self._backup_key(config_path)
+        records: list[dict[str, Any]] = []
+        for meta_path in self.backup_dir(config_path).glob("*.meta.json"):
+            payload = self._read_backup_meta(meta_path)
+            if not payload:
+                continue
+            if str(payload.get("backup_key", "")) != backup_key:
+                continue
+            if str(payload.get("source_config_path_normalized", "")) != normalized:
+                continue
+            backup_file_name = str(payload.get("backup_file_name", "") or "")
+            backup_path = meta_path.parent / backup_file_name if backup_file_name else Path(str(meta_path)[:-10])
+            if not backup_path.is_file():
+                continue
+            records.append(
+                {
+                    "backup_path": backup_path,
+                    "meta_path": meta_path,
+                    "created_at": str(payload.get("backup_created_at", "") or ""),
+                }
+            )
+        records.sort(
+            key=lambda item: (item["created_at"], item["backup_path"].stat().st_mtime_ns),
+            reverse=True,
+        )
+        return records
+
+    def _prune_backup_records(self, config_path: str, *, keep: int = CONFIG_BACKUP_RETENTION_COUNT) -> None:
+        records = self._iter_backup_records(config_path)
+        for record in records[max(keep, 0) :]:
+            try:
+                record["backup_path"].unlink(missing_ok=True)
+            except OSError:
+                pass
+            try:
+                record["meta_path"].unlink(missing_ok=True)
+            except OSError:
+                pass
 
     def _write_backup(self, config_path: str, *, suffix: str) -> Path:
         backup_root = self.backup_dir(config_path)
         backup_root.mkdir(parents=True, exist_ok=True)
-        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         backup_path = backup_root / f"{Path(config_path).stem}.{stamp}.{suffix}.psd1"
         shutil.copy2(config_path, backup_path)
+        backup_path_bytes = backup_path.read_bytes()
+        backup_meta = {
+            "source_config_path": config_path,
+            "source_config_path_normalized": self._normalize_config_path(config_path),
+            "backup_key": self._backup_key(config_path),
+            "backup_created_at": datetime.now().isoformat(),
+            "backup_kind": suffix,
+            "source_sha256": hashlib.sha256(backup_path_bytes).hexdigest(),
+            "backup_file_name": backup_path.name,
+        }
+        self._backup_meta_path(backup_path).write_text(
+            json.dumps(backup_meta, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        self._prune_backup_records(config_path)
         return backup_path
 
     def save_document(self, config_path: str, document: dict[str, Any]) -> Path:

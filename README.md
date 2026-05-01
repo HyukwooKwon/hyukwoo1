@@ -64,6 +64,7 @@ show-relay-status.ps1
 - `run-pair02-headless-drill.ps1`
 - `run-pair03-headless-drill.ps1`
 - `run-pair04-headless-drill.ps1`
+- `tests\Resolve-ParallelPairScopedWrapperStatus.ps1`
 - `disable-pair.ps1`
 - `enable-pair.ps1`
 - `show-pair-activation-status.ps1`
@@ -149,10 +150,22 @@ visible lane은 사용자가 최근 입력 중이면 seed 주입을 보류하고
 - 기본 smoke external runroot base는 `C:\dev\python\relay-workrepo-visible-smoke\.relay-runs\bottest-live-visible` 입니다.
 - 외부 repo 감지는 repo 전체를 재귀 감시하지 않고, 그 repo 안의 `.relay-contract\...` 아래에 확정된 `summary.txt + review.zip + publish.ready.json` explicit contract path만 대상으로 합니다.
 - 작업 repo가 바뀌면 감지 경로도 같이 바뀌어야 하고, watcher는 항상 request/manifest에 기록된 `SourceOutboxPath` / `SourceSummaryPath` / `SourceReviewZipPath` / `PublishReadyPath` 만 strict 검증합니다.
+- target request에 `WorkRepoRoot`가 있으면 headless Codex 실행은 `targetFolder`가 아니라 그 `WorkRepoRoot`를 실제 process working directory와 `codex -C` 기준으로 사용합니다. 최신 `result.json` / important summary에는 `EffectiveWorkingDirectory`도 같이 남습니다.
 - `primary contract externalized`와 `full externalized`는 다릅니다.
   - `primary contract externalized`: `summary.txt + review.zip + publish.ready.json` 이 현재 작업 중인 외부 repo root 아래에서 생성/감지되는 상태
   - `full externalized`: 위 primary contract뿐 아니라 `RunRoot`, receipt/status, import된 summary/review/done/result bookkeeping copy까지 외부 repo 기준으로 남는 상태
 - shared `bottest-live-visible` 현재 구현 기준은 `primary contract externalized + external runroot`입니다. `WorkRepoRoot`와 `RunRoot`는 외부 repo 기준이어야 하지만, import bookkeeping까지 전부 외부화한 `full externalized`는 아직 2단계입니다.
+- 다만 현재 multi-pair external runroot/bookkeeping은 selected pair들이 하나의 shared external bookkeeping root를 쓴다는 가정이 아직 남아 있습니다. 따라서 pair마다 서로 다른 repo를 완전히 혼합한 multi-pair 실행은 2단계 확장 과제로 보고, 현재 안정 baseline은 `pair별 explicit contract path + pair별 work repo + single external bookkeeping root` 입니다.
+- 이제 mixed pair 준비 단계에서는 pair마다 서로 다른 `PairWorkRepoRoot`를 써도 target folder / work folder / request / result / source-outbox contract path가 각 repo 밑으로 분리됩니다. headless Codex 실행도 해당 pair의 `WorkRepoRoot`를 실제 cwd와 `codex -C` 기준으로 씁니다. 다만 top-level coordinator `RunRoot`와 bookkeeping roots는 하나의 shared external coordinator root를 계속 쓸 수 있습니다.
+- `2026-04-27` 기준 stage1 mixed-pair headless live proof도 완료됐습니다. `pair01 -> repo-a`, `pair02 -> repo-b`, coordinator repo shared bookkeeping 조합으로 `1 roundtrip`과 `3 roundtrip`을 모두 통과했습니다. pair별 bookkeeping roots까지 완전 분리하는 2단계는 아직 남아 있습니다.
+- `2026-04-28` 기준 `tests\\Write-PairExternalizedRelayConfigs.ps1` 로 pair별 externalized config도 생성할 수 있습니다. 이 스크립트는 각 `PairWorkRepoRoot` 아래에 pair별 `.relay-config\\...\\pairs\\<pairId>\\settings.externalized.psd1`, `.relay-bookkeeping\\...\\pairs\\<pairId>`, `.relay-runs\\...\\pairs\\<pairId>` 경로를 떨어뜨립니다.
+- 같은 날짜 기준 stage2 live proof도 pair별로 `1 roundtrip`씩 완료했습니다. `pair01 -> repo-a` 와 `pair02 -> repo-b`는 각자 자기 pair-scoped config와 pair-scoped bookkeeping roots에서 `pair-roundtrip-limit-reached` clean stop까지 통과했습니다. proof는 `reviewfile\\proof_pair_scoped_externalized_configs.json` 에 남깁니다.
+- 같은 날짜 기준 pair-scoped config 두 개를 병렬로 동시에 태우는 stage2 parallel live proof도 `1 roundtrip`까지 통과했습니다. 즉 `pair01 -> repo-a`, `pair02 -> repo-b`를 서로 다른 pair-scoped bookkeeping roots에서 동시에 실행해도 둘 다 clean stop까지 확인했습니다.
+- 같은 날짜 기준 shared coordinator root 아래 aggregate manifest/state를 남기는 stage2 shared-orchestrator live proof도 `1 roundtrip`까지 통과했습니다. 이 경로는 coordinator repo에 aggregate `manifest.json`, `.state\\watcher-status.json`, `.state\\pair-state.json` 을 남기고, 실제 pair 작업/contract/bookkeeping은 각 pair repo 아래에 유지합니다.
+- 같은 날짜 기준 pair-scoped stage2의 `3 roundtrip` proof도 완료됐습니다. 병렬 pair-scoped run은 `pair01`, `pair02` 둘 다 `ForwardedCount=6`, `RoundtripCount=3`, `DonePresentCount=2`, `ErrorPresentCount=0`으로 clean stop했고, shared coordinator aggregate run도 `ForwardedCount=12`, `DonePresentCount=4`, `ErrorPresentCount=0`, `pair-scoped-shared-coordinator-limit-reached` expected stop까지 확인했습니다.
+- `tests\\Run-ParallelPairScopedHeadlessDrill.ps1` 는 coordinator root를 쓰는 경우 `.state\\wrapper-status.json` 도 같이 남깁니다. 상위 셸이 timeout으로 먼저 끊겨도 이 파일에서 child pair run root, stdout/stderr log, wrapper 단계(`initializing`, `running`, `child-runs-completed`, `completed`, `failed`)를 바로 확인할 수 있습니다.
+- 상위 wrapper가 먼저 timeout으로 끊겼다면 `tests\\Resolve-ParallelPairScopedWrapperStatus.ps1 -CoordinatorRunRoot <...> -AsJson` 으로 child pair run 상태를 다시 읽어 `wrapper-status.json` 을 reconcile 합니다. 이 스크립트는 pair별 `WatcherState`, `RoundtripCount`, `CurrentPhase`, `LastHeartbeatAt`, `FinalResult`, `CompletionSource` 를 다시 채우고, 모든 child run이 clean stop이면 coordinator aggregate `manifest.json`, `.state\\watcher-status.json`, `.state\\pair-state.json` 도 복구합니다.
+- 다만 이 shared-orchestrator stage2는 aggregate coordinator state를 쓰는 방식이고, pair별 watcher를 단일 shared watcher 하나로 통합한 구조는 아직 아닙니다.
 - 현재 base config의 `InboxRoot / ProcessedRoot / RuntimeRoot / LogsRoot` 가 아직 `hyukwoo1`를 가리키면, shared external mode real run은 `automation-repo-bookkeeping-roots-disallowed` 로 즉시 실패합니다. 즉 external mode live proof를 돌리려면 이 residual bookkeeping roots도 현재 작업 중인 external `WorkRepoRoot` 아래로 옮긴 effective config가 필요합니다.
 
 이 external contract path들은 모두 explicit path로 manifest/request에 기록되고, 선택한 `WorkRepoRoot` 내부에 있어야 합니다. target 간 contract path가 충돌하거나 work repo 밖으로 벗어나면 run 준비 단계에서 즉시 실패합니다.
@@ -181,7 +194,9 @@ pwsh -NoProfile -ExecutionPolicy Bypass -File .\show-paired-run-summary.ps1 -Con
 ```
 
 panel을 사용 중이면 홈 탭과 운영 탭의 `runroot 요약` 버튼으로 같은 helper를 바로 실행할 수 있고, 같은 위치의 `important-summary 열기` 버튼으로 방금 생성된 텍스트 요약을 바로 열 수 있습니다.
+watcher 제어 의미는 패널에도 고정 안내로 표시합니다. `pause/resume` 은 queued/pending 상태를 유지한 채 다음 동작만 잠시 멈추고 다시 이어가는 뜻이고, `stop` 은 현재 watcher 종료입니다. 즉 `stop` 뒤에는 `resume` 이 아니라 `watch 재시작`이 필요합니다. watcher 제어 전용 hotkey는 현재 없습니다.
 이 helper는 같은 RunRoot 아래 `.state\important-summary.txt` 와 `.state\important-summary.json` 도 함께 갱신합니다. 이 파일에는 실제 payload 파일(`messages\target01.txt`, `messages\target05.txt`), processed archive 옆의 실제 전송 payload snapshot(`*.payload.txt`), request/contract 경로, `summary.txt / review.zip / publish.ready.json` 생성 여부, receipt/seed/pair/watcher 핵심 상태, 최신 prepare/AHK/router 로그 경로가 같이 들어갑니다. 또 상단 `freshness` 블록에 최신 관측 신호 시각뿐 아니라 `NewestProgressSignalAt`, `ProgressSignalAgeSeconds`, `ProgressStale`까지 같이 적어서 "최근 흔적"과 "실제 relay 진전"을 분리해 읽을 수 있게 했고, `operator-focus` 블록에 `AttentionLevel`, `CurrentBottleneck`, `NextExpectedStep`, `RecommendedAction`를, `recent-events` 블록에 최근 핵심 이벤트 5~8줄을 같이 적어서 운영자가 먼저 봐야 할 병목과 최신성을 한 장에서 판단할 수 있게 맞춥니다. JSON 쪽 recent event는 `EventClass`, `PairId`, `TargetId`, `IsProgressSignal`도 같이 남겨 후속 helper가 텍스트 재파싱 없이 같은 근거를 재사용할 수 있게 맞춥니다.
+또 target 블록에는 `PayloadContainsForbiddenLiteral`, `SourceSummaryContainsForbiddenLiteral`, `SourceReviewZipContainsForbiddenLiteral`, `ForwardBlockedByForbiddenLiteral` 도 같이 남겨서, “자동화가 실제로 보낸 payload 오염”과 “target이 만든 산출물 오염”을 한 장에서 바로 구분할 수 있게 유지합니다.
 여기서 `StaleSummary` 는 최근 어떤 관측 신호든 있었는지를 뜻하고, `ProgressStale` 는 실제 relay/orchestration 진전 신호가 최근에 있었는지를 뜻합니다. 따라서 `StaleSummary=false` 이면서 `ProgressStale=true` 인 경우는 "로그와 준비 흔적은 최근에 있었지만 실제 relay 진전은 멈춘 상태"로 읽으면 됩니다.
 또 `RunRoot 준비`와 `준비 전체 실행`이 성공하면 output 영역에 같은 `[runroot 요약]` 블록을 한 번 자동으로 붙여 현재 기준선을 바로 확인할 수 있습니다.
 또 `고정문구 / 순서 편집` 탭 우측의 `최종 전달문`, `경로 요약` 탭에서 현재 target 기준 완성 preview와 자동 주입 경로를 panel 안에서 바로 확인할 수 있습니다.
@@ -241,6 +256,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\import-paired-exchange-art
 visible/manual 흐름에서는 직접 paired contract 경로를 복사해서 맞추기보다, 작업 결과 source summary/source zip 경로만 넘겨서 이 wrapper로 검사 후 제출하는 쪽이 안전합니다.
 repo 쪽에서 packaging한 zip은 source artifact일 뿐이고, 그 zip을 만들었다고 paired submit이 끝난 것은 아닙니다. paired submit은 panel, target-local wrapper, 또는 `import-paired-exchange-artifact.ps1`가 target folder contract에 `summary.txt`, `reviewfile`, `done.json`, `result.json`을 기록할 때만 완료됩니다.
 새 RunRoot에서는 각 target 아래 `source-outbox`도 같이 만들어지고, 기본 흐름은 `source-outbox\summary.txt` + `source-outbox\review.zip` + `source-outbox\publish.ready.json`을 watcher가 감지해서 기존 `Import-PairedExchangeArtifact.ps1`를 자동 호출하는 방식입니다. 기존 `check/submit` wrapper와 panel submit은 legacy RunRoot 복구나 수동 recovery 용도로 유지합니다.
+`PairTest.ForbiddenArtifactLiterals` / `PairTest.ForbiddenArtifactRegexes` 는 watcher, target-local `check-artifact.*`, 중요 summary가 같이 쓰는 공통 오염 차단 규칙입니다. placeholder 문구나 계획 리뷰 문구가 `summary.txt` 또는 `review.zip` 에 들어가면 handoff를 열지 않고, `check-artifact.*` 도 같은 이유로 pre-publish를 실패시킵니다.
 패널의 결과 / 산출물 탭도 새 RunRoot에서는 이 target-local wrapper를 우선 사용하고, 예전 RunRoot처럼 wrapper가 없으면 기존 root `check/import` 스크립트로 fallback 합니다.
 `target submit 실행`이 fallback 경로를 타면 panel이 추가 확인을 한 번 더 요구하고, 같은 target에 아주 최근 submit 기록이 있으면 재실행 확인을 먼저 띄웁니다.
 panel은 현재 RunRoot가 stale이거나 target-local wrapper가 없을 때 결과 / 산출물 상태줄에 강한 경고 배지를 같이 붙입니다.
@@ -329,12 +345,39 @@ handoff 메시지에는 아래 정보가 항상 들어갑니다.
 - 선택 row 기준 `envelope.json` / `rendered.txt` preview 저장
 - 선택된 pair의 headless 단일 왕복 드릴 실행
 - 선택한 row의 target/review 폴더 열기와 summary 경로 복사
+- `설정 / 문구` 탭의 `4 Pair 설정 / 실효 경로` 카드
+  - pair별 `DefaultSeedWorkRepoRoot`, `DefaultSeedTargetId`, `DefaultPairMaxRoundtripCount`, `UseExternalWorkRepoRunRoot`, `UseExternalWorkRepoContractPaths` 를 바로 수정
+  - 상단 `RunRoot Override` 입력칸은 pair 정책 자체가 아니라 실행 컨텍스트 override입니다. 비워두면 pair 정책 기준 selected/new RunRoot를 사용하고, 값이 있으면 그 경로가 우선합니다.
+  - `Repo 선택`, `Repo 열기` 버튼으로 pair repo root를 직접 고르거나 바로 열기
+  - `전체 실효값`으로 4 pair의 repo/runroot/source-outbox/publish-ready preview를 한 번에 갱신
+  - `실효값` 버튼으로 해당 pair의 repo/runroot/source-outbox/publish-ready 경로를 즉시 preview
+  - `요약` 버튼으로 현재 pair runroot 아래 `important-summary.txt`를 바로 열기
+  - `route matrix 복사`, `route JSON 저장`으로 현재 4 pair 경로 상태를 즉시 공유/보관
+  - `설정 복제`로 한 pair 카드의 repo/roundtrip/external 플래그를 다른 pair 카드에 바로 복제
+  - 각 pair 카드의 `병렬 drill` 체크와 상단 `선택 pair 병렬 실테스트` 버튼으로 체크된 pair들만 기존 parallel drill wrapper로 바로 실행
+  - 병렬 drill은 `coordinator repo` 입력값 아래 shared coordinator runroot를 만들고, 완료 시 현재 RunRoot를 그 coordinator runroot로 맞춰 runtime 배지와 wrapper-status를 바로 읽음
+  - `PAIR POLICY` / `GLOBAL DEFAULT` 배지로 repo source를, `RUNROOT AUTO` / `RUNROOT SELECTED MIRROR` / `RUNROOT OVERRIDE ACTIVE` 배지로 현재 runroot 입력 의미를 먼저 확인
+  - 상단 `RunRoot Override` 상태 텍스트는 `AUTO` / `SELECTED MIRROR` / `OVERRIDE ACTIVE` / `STALE` 로 읽습니다.
+  - `ROUTE OK`, `SHARED REPO OK`, `ROUTE CHECK` 배지로 같은 pair 내부 정렬 상태와 다른 pair와의 repo 공유 상태를 즉시 확인
+  - `RUNNING`, `WAITING`, `DONE`, `ERROR`, `STOPPED` runtime 배지로 현재 RunRoot의 pair 진행 상태를 바로 확인
+  - runtime 배지는 현재 RunRoot의 `.state\wrapper-status.json` 을 우선 읽고, 없으면 기존 paired status로 fallback 해서 `WatcherState`, `RoundtripCount`, `CurrentPhase`, `LastForwardedAt` 를 보여줌
+  - `pair 설정 저장 + 새로고침`으로 pair 정책 draft를 config에 반영
+- 같은 탭의 `초기 실행 준비 / Seed Kickoff Composer`
+  - 사용자는 `Pair`, `SeedTarget`, `입력 파일`, `작업 설명`만 직접 입력
+  - 상단에 `붙여넣기 대상`과 `시작 가능 여부`를 고정으로 보여주고, `빠른 시작`에서 `미리보기`, `수동 시작문 복사`, `초기 입력 큐잉`을 바로 실행 가능
+  - 패널은 현재 pair의 실효 경로를 읽어 `summary.txt / review.zip / publish.ready.json` 절대경로와 helper 경로를 자동으로 합성해서 읽기 전용으로 보여줌
+  - `수동 시작문 복사`는 target 전달문만 복사하고, operator 확인용 설명 블록은 화면 미리보기에만 남긴다.
+  - `경로만 복사`, `시작 순서 복사`, `helper 명령 복사`로 kickoff 준비 문구를 보조 복사 가능
+  - `초기 입력 큐잉`은 영구 `Initial/Handoff` 설정을 바꾸지 않고 one-time queue에만 등록
+  - queue 등록 시에는 작업 설명 블록만 저장되고, 경로/파일 계약/helper 안내는 seed/handoff scaffold가 별도로 자동 추가됨
+  - 권장 흐름은 `pair 설정 저장 + 새로고침 -> 실효값 확인 -> 수동 시작문 복사 또는 초기 입력 큐잉`
 - `_tmp\effective-config*.json` 최근 20개 스냅샷의 stale/warnings 메타 조회, snapshot/run root 열기, 경로 복사, JSON 본문 확인
 - typed-window 실테스트 기준선과 submit sequence 요약 표시
 - 실행 중 `Operator Status`와 마지막 결과 요약 표시
 - 실행 중 버튼 잠금으로 중복 클릭 방지
 
 현재 panel은 운영 보조 UI로 유지합니다. 기존 `cleanup -> preflight-only -> active acceptance -> post-cleanup` 매크로 버튼은 공식 경로로 남기고, 앞으로 추가하는 분리 버튼은 pair01 기준 primitive 검증/디버깅용으로만 확장합니다. panel이 별도 상태를 만들지 않고 `show-effective-config.ps1 -AsJson`, receipt, status JSON을 그대로 읽는 구조를 유지합니다.
+pair 설정 카드는 config SSOT를 대체하지 않습니다. disk config를 기준으로 pair 정책 초안을 다시 읽고, `실효값` preview로 경로를 확인한 뒤 저장하는 helper로만 사용합니다. `Initial/Handoff` 문구 편집에 미저장 변경이 있으면 pair 설정 저장은 차단합니다.
 
 primitive helper도 같은 원칙으로 둡니다. `tests\Invoke-PairedExchangeOneShotSubmit.ps1`는 `Send-InitialPairSeedWithRetry.ps1 + show-paired-exchange-status.ps1`를 묶은 one-shot submit wrapper이고, `tests\Confirm-PairedExchangePublishPrimitive.ps1`와 `tests\Confirm-PairedExchangeHandoffPrimitive.ps1`는 target/pair 기준 publish, handoff 단계를 읽기 전용으로 판정하는 wrapper입니다. 셋 다 panel 전용 로직이 아니라 pair01 분리 단계와 이후 매크로 오케스트레이터가 같이 재사용할 공용 helper로만 유지합니다. 내부 row 판정과 acceptance reason 선택은 `tests\PairedExchangeConfig.ps1`의 shared helper를 같이 써서, panel과 macro의 publish/handoff/outcome 판단이 따로 벌어지지 않게 유지합니다.
 
