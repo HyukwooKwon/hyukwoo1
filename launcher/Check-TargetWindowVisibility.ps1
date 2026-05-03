@@ -21,6 +21,26 @@ function Test-NonEmptyString {
     return ($Value -is [string] -and -not [string]::IsNullOrWhiteSpace($Value))
 }
 
+function Convert-ToUtcDateTime {
+    param([object]$Value)
+
+    if (-not (Test-NonEmptyString $Value)) {
+        return $null
+    }
+
+    $text = [string]$Value
+    if ($text.EndsWith('Z')) {
+        $text = $text.Substring(0, $text.Length - 1) + '+00:00'
+    }
+
+    try {
+        return ([datetimeoffset]::Parse($text, [System.Globalization.CultureInfo]::InvariantCulture)).UtcDateTime
+    }
+    catch {
+        return $null
+    }
+}
+
 function Get-ObjectPropertyValue {
     param(
         $Object,
@@ -264,6 +284,15 @@ $runtimeDoc = Read-RuntimeItems -Path ([string]$config.RuntimeMapPath)
 $bindingProfileDoc = Read-BindingDocument -Path ([string]$config.BindingProfilePath)
 $bindingScope = Get-BindingSessionScope -Config $config -BindingDocument $bindingProfileDoc
 $visibleWindows = @(Get-VisibleWindows)
+$bindingLastWriteAt = [string]$bindingProfileDoc.LastWriteAt
+$runtimeLastWriteAt = [string]$runtimeDoc.LastWriteAt
+$bindingTimestamp = Convert-ToUtcDateTime -Value $bindingLastWriteAt
+$runtimeTimestamp = Convert-ToUtcDateTime -Value $runtimeLastWriteAt
+$runtimeStaleAgainstBinding = (
+    $null -ne $bindingTimestamp -and
+    $null -ne $runtimeTimestamp -and
+    $runtimeTimestamp -lt $bindingTimestamp
+)
 $runtimeById = @{}
 $duplicateIds = New-Object System.Collections.Generic.List[string]
 
@@ -349,7 +378,27 @@ foreach ($target in @($config.Targets | Where-Object { [string]$_.Id -in $bindin
     }
 
     $resolution = Select-FirstVisibleLocator -ByHwnd $byHwnd -ByWindowPid $byWindowPid -ByShellPid $byShellPid -ByTitle $byTitle
-    if ($resolution.Injectable) {
+    $injectable = [bool]$resolution.Injectable
+    $injectionMethod = [string]$resolution.Method
+    $injectionReason = [string]$resolution.Reason
+    if ($runtimeStaleAgainstBinding) {
+        $injectable = $false
+        $injectionReason = 'runtime-stale-against-binding'
+    }
+    elseif (-not $injectable -and $injectionReason -eq 'duplicate-visible-title' -and ('hwnd' -in $allowedInjectionMethods)) {
+        $injectionReason = 'hwnd-required-title-duplicate'
+    }
+    elseif ($injectable -and $injectionMethod -notin $allowedInjectionMethods) {
+        switch ($injectionMethod) {
+            'title' { $injectionReason = 'hwnd-required-title-only' }
+            'windowPid' { $injectionReason = 'hwnd-required-windowpid-only' }
+            'shellPid' { $injectionReason = 'hwnd-required-shellpid-only' }
+            default { $injectionReason = 'injection-method-not-allowed' }
+        }
+        $injectable = $false
+    }
+
+    if ($injectable) {
         $injectableCount++
     }
 
@@ -375,9 +424,9 @@ foreach ($target in @($config.Targets | Where-Object { [string]$_.Id -in $bindin
         ByWindowPidCount        = @($byWindowPid).Count
         ByShellPidCount         = @($byShellPid).Count
         ByTitleCount            = @($byTitle).Count
-        Injectable              = [bool]$resolution.Injectable
-        InjectionMethod         = [string]$resolution.Method
-        InjectionReason         = [string]$resolution.Reason
+        Injectable              = [bool]$injectable
+        InjectionMethod         = $injectionMethod
+        InjectionReason         = $injectionReason
         MatchTitle              = if ($null -ne $match) { [string]$match.Title } else { '' }
         MatchHwnd               = if ($null -ne $match) { [string]$match.Hwnd } else { '' }
         MatchWindowPid          = if ($null -ne $match) { [string]$match.ProcessId } else { '' }
@@ -392,6 +441,9 @@ $status = [pscustomobject]@{
     RuntimeExists       = [bool]$runtimeDoc.Exists
     RuntimeParseError   = [string]$runtimeDoc.ParseError
     RuntimeLastWriteAt  = [string]$runtimeDoc.LastWriteAt
+    BindingProfileExists = [bool]$bindingProfileDoc.Exists
+    BindingProfileLastWriteAt = $bindingLastWriteAt
+    RuntimeStaleAgainstBinding = [bool]$runtimeStaleAgainstBinding
     VisibleWindowCount  = @($visibleWindows).Count
     ReuseMode           = [string]$bindingScope.ReuseMode
     PartialReuse        = [bool]$bindingScope.PartialReuse
@@ -408,6 +460,7 @@ $status = [pscustomobject]@{
     DuplicateTargetIds  = @($duplicateIds | Sort-Object -Unique)
     AllowedInjectionMethods = @($allowedInjectionMethods)
     WindowPidOnlyFallbackDetected = (@($rows | Where-Object { [string]$_.InjectionMethod -eq 'windowPid' }).Count -gt 0)
+    TitleFallbackRejectedCount = @($rows | Where-Object { [string]$_.InjectionReason -eq 'hwnd-required-title-duplicate' }).Count
     InjectableCount     = $injectableCount
     NonInjectableCount  = @($rows | Where-Object { -not $_.Injectable }).Count
     MissingRuntimeCount = $missingRuntimeCount
@@ -423,6 +476,15 @@ else {
     $lines.Add(('Root: {0}' -f $status.Root))
     $lines.Add(('Config: {0}' -f $status.ConfigPath))
     $lines.Add(('Runtime: exists={0} entries={1}/{2} visibleWindows={3} configured={4}' -f $status.RuntimeExists, $status.RuntimeEntryCount, $status.ExpectedTargetCount, $status.VisibleWindowCount, $status.ConfiguredTargetCount))
+    if (Test-NonEmptyString $status.BindingProfileLastWriteAt) {
+        $lines.Add(('Binding Profile LastWriteAt: {0}' -f $status.BindingProfileLastWriteAt))
+    }
+    if (Test-NonEmptyString $status.RuntimeLastWriteAt) {
+        $lines.Add(('Runtime LastWriteAt: {0}' -f $status.RuntimeLastWriteAt))
+    }
+    if ($status.RuntimeStaleAgainstBinding) {
+        $lines.Add('RuntimeStaleAgainstBinding: true')
+    }
     if ($status.PartialReuse) {
         $lines.Add(('Scope: partial / activePairs={0} / inactiveTargets={1}' -f ($(if ($status.ActivePairIds.Count -gt 0) { $status.ActivePairIds -join ', ' } else { '(none)' })), ($(if ($status.InactiveTargetIds.Count -gt 0) { $status.InactiveTargetIds -join ', ' } else { '(none)' }))))
     }
@@ -435,6 +497,9 @@ else {
     $lines.Add(('Injectable: ok={0} fail={1} missingRuntime={2}' -f $status.InjectableCount, $status.NonInjectableCount, $status.MissingRuntimeCount))
     $lines.Add(('AllowedInjectionMethods: {0}' -f ($status.AllowedInjectionMethods -join ', ')))
     $lines.Add(('WindowPidOnlyFallbackDetected: {0}' -f [bool]$status.WindowPidOnlyFallbackDetected))
+    if ($status.TitleFallbackRejectedCount -gt 0) {
+        $lines.Add(('TitleFallbackRejectedCount: {0}' -f $status.TitleFallbackRejectedCount))
+    }
     $lines.Add('')
     $lines.Add('Targets')
     $table = ($status.Targets | Select-Object TargetId, Injectable, InjectionMethod, InjectionReason, RuntimeTitle, RuntimeWindowPid, RuntimeShellPid, ByWindowPidCount, ByShellPidCount, ByTitleCount, MatchTitle | Format-Table -AutoSize | Out-String).TrimEnd()

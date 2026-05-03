@@ -5,6 +5,7 @@ param(
     [int]$PollIntervalMs = 1500,
     [int]$RunDurationSec = 0,
     [switch]$UseHeadlessDispatch,
+    [switch]$AllowHeadlessDispatchInTypedWindowLane,
     [int]$MaxForwardCount = 0,
     [int]$PairMaxRoundtripCount = 0
 )
@@ -818,6 +819,195 @@ function New-SourceOutboxStateKey {
     )
 }
 
+function Test-SourceOutboxMarkerRepairEligible {
+    param([string]$Reason)
+
+    if (-not (Test-NonEmptyString $Reason)) {
+        return $false
+    }
+
+    if ($Reason -like 'marker-missing-field-*') {
+        return $true
+    }
+
+    return ($Reason -in @(
+            'marker-empty',
+            'marker-json-invalid',
+            'marker-validation-flag-invalid',
+            'marker-validation-not-passed',
+            'marker-publisher-unsupported',
+            'marker-before-request',
+            'marker-before-artifacts',
+            'summary-size-mismatch',
+            'reviewzip-size-mismatch',
+            'summary-hash-mismatch',
+            'reviewzip-hash-mismatch'
+        ))
+}
+
+function Get-SourceOutboxMarkerSuggestedAction {
+    param(
+        [string]$Reason,
+        [bool]$RepairEligible = $false
+    )
+
+    if ($RepairEligible) {
+        return 'rerun-publish-helper-overwrite'
+    }
+
+    if (-not (Test-NonEmptyString $Reason)) {
+        return ''
+    }
+
+    if ($Reason -in @(
+            'marker-pairid-mismatch',
+            'marker-targetid-mismatch',
+            'marker-summary-path-mismatch',
+            'marker-reviewzip-path-mismatch',
+            'marker-schema-version-unsupported'
+        )) {
+        return 'manual-review-source-outbox-marker'
+    }
+
+    if ($Reason -in @(
+            'source-summary-missing',
+            'source-reviewzip-invalid',
+            'source-summary-forbidden-literal',
+            'source-reviewzip-forbidden-literal'
+        )) {
+        return 'fix-source-artifacts-before-publish'
+    }
+
+    return ''
+}
+
+function Get-SourceOutboxMarkerRepairPlan {
+    param(
+        [Parameter(Mandatory)][string]$Root,
+        [Parameter(Mandatory)][string]$ConfigPath,
+        [Parameter(Mandatory)][string]$RunRoot,
+        [Parameter(Mandatory)]$Item,
+        [Parameter(Mandatory)][string]$Reason
+    )
+
+    $eligible = [bool](Test-SourceOutboxMarkerRepairEligible -Reason $Reason)
+    $targetId = [string](Get-ConfigValue -Object $Item -Name 'TargetId' -DefaultValue '')
+    $wrapperScriptPath = [string](Get-ConfigValue -Object $Item -Name 'PublishScriptPath' -DefaultValue '')
+    $wrapperCommandPath = [string](Get-ConfigValue -Object $Item -Name 'PublishCmdPath' -DefaultValue '')
+    $repairSourceContext = ('watcher-auto-repair:' + $Reason)
+    $displayCommand = ''
+    if (Test-NonEmptyString $wrapperScriptPath) {
+        $displayCommand = ("& '{0}' -Overwrite -SourceContext '{1}' -AsJson" -f $wrapperScriptPath, $repairSourceContext)
+    }
+    elseif (Test-NonEmptyString $wrapperCommandPath) {
+        $displayCommand = ("& '{0}'" -f $wrapperCommandPath)
+    }
+    else {
+        $displayCommand = ("& '{0}' -ConfigPath '{1}' -RunRoot '{2}' -TargetId '{3}' -Overwrite -SourceContext '{4}' -AsJson" -f
+            (Join-Path $Root 'tests\Publish-PairedExchangeArtifact.ps1'),
+            $ConfigPath,
+            $RunRoot,
+            $targetId,
+            $repairSourceContext)
+    }
+
+    return [pscustomobject]@{
+        Eligible          = $eligible
+        RepairScriptPath  = (Join-Path $Root 'tests\Publish-PairedExchangeArtifact.ps1')
+        RepairArgs        = @(
+            '-ConfigPath', $ConfigPath,
+            '-RunRoot', $RunRoot,
+            '-TargetId', $targetId,
+            '-Overwrite',
+            '-SourceContext', $repairSourceContext,
+            '-AsJson'
+        )
+        RepairCommand     = $displayCommand
+        RepairSourceContext = $repairSourceContext
+        ExpectedPublisher = 'publish-paired-exchange-artifact.ps1'
+        SuggestedAction   = (Get-SourceOutboxMarkerSuggestedAction -Reason $Reason -RepairEligible:$eligible)
+    }
+}
+
+function Invoke-SourceOutboxMarkerRepair {
+    param(
+        [Parameter(Mandatory)][string]$Root,
+        [Parameter(Mandatory)][string]$ConfigPath,
+        [Parameter(Mandatory)][string]$RunRoot,
+        [Parameter(Mandatory)]$Item,
+        [Parameter(Mandatory)][string]$Reason
+    )
+
+    $repairPlan = Get-SourceOutboxMarkerRepairPlan -Root $Root -ConfigPath $ConfigPath -RunRoot $RunRoot -Item $Item -Reason $Reason
+    if (-not [bool]$repairPlan.Eligible) {
+        return [pscustomobject]@{
+            Ok            = $false
+            RepairPlan    = $repairPlan
+            ErrorMessage  = 'source-outbox-marker-repair-not-eligible'
+            ExitCode      = 1
+            Json          = $null
+            Raw           = ''
+        }
+    }
+
+    $powershellPath = Resolve-PowerShellExecutable
+    $result = & $powershellPath '-NoProfile' '-ExecutionPolicy' 'Bypass' '-File' ([string]$repairPlan.RepairScriptPath) @($repairPlan.RepairArgs)
+    $exitCode = $LASTEXITCODE
+    $raw = ($result | Out-String).Trim()
+    if ([string]::IsNullOrWhiteSpace($raw)) {
+        return [pscustomobject]@{
+            Ok            = $false
+            RepairPlan    = $repairPlan
+            ErrorMessage  = 'source-outbox-marker-repair-no-output'
+            ExitCode      = $exitCode
+            Json          = $null
+            Raw           = ''
+        }
+    }
+
+    $json = $null
+    try {
+        $json = ConvertFrom-RelayJsonText -Json $raw
+    }
+    catch {
+        return [pscustomobject]@{
+            Ok            = $false
+            RepairPlan    = $repairPlan
+            ErrorMessage  = ('source-outbox-marker-repair-json-parse-failed: ' + $_.Exception.Message)
+            ExitCode      = $exitCode
+            Json          = $null
+            Raw           = $raw
+        }
+    }
+
+    if ($exitCode -ne 0 -or -not [bool](Get-ConfigValue -Object $json -Name 'PublishReadyCreated' -DefaultValue $false)) {
+        $issues = @([string[]](Get-ConfigValue -Object $json -Name 'Issues' -DefaultValue @()))
+        $errorMessage = if ($issues.Count -gt 0) {
+            ('source-outbox-marker-repair-failed:' + ($issues -join ','))
+        }
+        else {
+            ('source-outbox-marker-repair-exit-' + [string]$exitCode)
+        }
+        return [pscustomobject]@{
+            Ok            = $false
+            RepairPlan    = $repairPlan
+            ErrorMessage  = $errorMessage
+            ExitCode      = $exitCode
+            Json          = $json
+            Raw           = $raw
+        }
+    }
+
+    return [pscustomobject]@{
+        Ok            = $true
+        RepairPlan    = $repairPlan
+        ErrorMessage  = ''
+        ExitCode      = $exitCode
+        Json          = $json
+        Raw           = $raw
+    }
+}
+
 function Test-SourceOutboxReady {
     param(
         [Parameter(Mandatory)]$PairTest,
@@ -1453,6 +1643,55 @@ function Save-SourceOutboxStatus {
     }
 
     Write-JsonFileAtomically -Path $Path -Payload $payload -Depth 8
+}
+
+function Get-SourceOutboxRepairStatusMetadata {
+    param(
+        $ExistingEntry = $null,
+        [string]$OriginalReadyReason = '',
+        [string]$FinalReadyReason = '',
+        [string]$RepairSourceContext = '',
+        [string]$RepairCommand = '',
+        [bool]$RepairAttempted = $false,
+        [bool]$RepairSucceeded = $false,
+        [string]$RepairCompletedAt = '',
+        [string]$RepairMessage = ''
+    )
+
+    $currentOriginalReason = if (Test-NonEmptyString $OriginalReadyReason) { $OriginalReadyReason } else { '' }
+    $currentFinalReason = if (Test-NonEmptyString $FinalReadyReason) { $FinalReadyReason } else { '' }
+    $shouldCarryExisting = $false
+    if ($null -ne $ExistingEntry -and $currentOriginalReason -eq 'ready' -and -not $RepairAttempted -and -not $RepairSucceeded) {
+        $existingOriginalReason = [string](Get-ConfigValue -Object $ExistingEntry -Name 'OriginalReadyReason' -DefaultValue '')
+        $existingRepairAttempted = [bool](Get-ConfigValue -Object $ExistingEntry -Name 'RepairAttempted' -DefaultValue $false)
+        if ($existingRepairAttempted -or ((Test-NonEmptyString $existingOriginalReason) -and $existingOriginalReason -ne 'ready')) {
+            $shouldCarryExisting = $true
+        }
+    }
+
+    if ($shouldCarryExisting) {
+        return [pscustomobject]@{
+            OriginalReadyReason = [string](Get-ConfigValue -Object $ExistingEntry -Name 'OriginalReadyReason' -DefaultValue $currentOriginalReason)
+            FinalReadyReason    = $(if (Test-NonEmptyString $currentFinalReason) { $currentFinalReason } else { [string](Get-ConfigValue -Object $ExistingEntry -Name 'FinalReadyReason' -DefaultValue '') })
+            RepairSourceContext = [string](Get-ConfigValue -Object $ExistingEntry -Name 'RepairSourceContext' -DefaultValue $RepairSourceContext)
+            RepairCommand       = [string](Get-ConfigValue -Object $ExistingEntry -Name 'RepairCommand' -DefaultValue $RepairCommand)
+            RepairAttempted     = [bool](Get-ConfigValue -Object $ExistingEntry -Name 'RepairAttempted' -DefaultValue $RepairAttempted)
+            RepairSucceeded     = [bool](Get-ConfigValue -Object $ExistingEntry -Name 'RepairSucceeded' -DefaultValue $RepairSucceeded)
+            RepairCompletedAt   = [string](Get-ConfigValue -Object $ExistingEntry -Name 'RepairCompletedAt' -DefaultValue $RepairCompletedAt)
+            RepairMessage       = [string](Get-ConfigValue -Object $ExistingEntry -Name 'RepairMessage' -DefaultValue $RepairMessage)
+        }
+    }
+
+    return [pscustomobject]@{
+        OriginalReadyReason = $currentOriginalReason
+        FinalReadyReason    = $currentFinalReason
+        RepairSourceContext = $RepairSourceContext
+        RepairCommand       = $RepairCommand
+        RepairAttempted     = [bool]$RepairAttempted
+        RepairSucceeded     = [bool]$RepairSucceeded
+        RepairCompletedAt   = $RepairCompletedAt
+        RepairMessage       = $RepairMessage
+    }
 }
 
 function Load-PairStateEntries {
@@ -2228,6 +2467,12 @@ try {
 
     $manifest = ConvertFrom-RelayJsonText -Json (Get-Content -LiteralPath $manifestPath -Raw -Encoding UTF8)
     $pairTest = Resolve-PairTestConfig -Root $root -ConfigPath $resolvedConfigPath -ManifestPairTest (Get-ConfigValue -Object $manifest -Name 'PairTest' -DefaultValue $null)
+    Assert-HeadlessDispatchAllowedForLane `
+        -UseHeadlessDispatch:$UseHeadlessDispatch `
+        -AllowHeadlessDispatchInTypedWindowLane:$AllowHeadlessDispatchInTypedWindowLane `
+        -Config $config `
+        -PairTest $pairTest `
+        -ConfigPath $resolvedConfigPath
     $script:ForbiddenArtifactLiterals = @($pairTest.ForbiddenArtifactLiterals)
     $script:ForbiddenArtifactRegexes = @($pairTest.ForbiddenArtifactRegexes)
     $targetItems = @($manifest.Targets)
@@ -2260,6 +2505,8 @@ try {
     $handoffFailureState = @{}
     $sourceOutboxPendingState = @{}
     $sourceOutboxFailureState = @{}
+    $sourceOutboxRepairState = @{}
+    $sourceOutboxRepairMetadataByTarget = @{}
     $sourceOutboxStatusEntries = @{}
     $pairProfiles = Get-PairProfiles -TargetItems @($targetItems)
     $pairRoundtripLimitMap = Get-PairRoundtripLimitMap -TargetItems @($targetItems) -GlobalPairMaxRoundtripCount $PairMaxRoundtripCount
@@ -2439,12 +2686,108 @@ try {
             }
 
             $sourceOutboxReadiness = Test-SourceOutboxReady -PairTest $pairTest -Item $item
+            $sourceOutboxOriginalReason = if (Test-NonEmptyString ([string]$sourceOutboxReadiness.Reason)) { [string]$sourceOutboxReadiness.Reason } elseif ([bool]$sourceOutboxReadiness.IsReady) { 'ready' } else { '' }
+            $repairPlan = if (Test-NonEmptyString $sourceOutboxOriginalReason) {
+                Get-SourceOutboxMarkerRepairPlan `
+                    -Root $root `
+                    -ConfigPath $resolvedConfigPath `
+                    -RunRoot $resolvedRunRoot `
+                    -Item $item `
+                    -Reason $sourceOutboxOriginalReason
+            }
+            else {
+                [pscustomobject]@{
+                    Eligible            = $false
+                    RepairScriptPath    = ''
+                    RepairArgs          = @()
+                    RepairCommand       = ''
+                    RepairSourceContext = ''
+                    ExpectedPublisher   = 'publish-paired-exchange-artifact.ps1'
+                    SuggestedAction     = ''
+                }
+            }
+            $repairAttempted = $false
+            $repairSucceeded = $false
+            $repairMessage = ''
+            $repairCompletedAt = ''
+            $repairResult = $null
+            $finalReadyReason = if (Test-NonEmptyString ([string]$sourceOutboxReadiness.Reason)) { [string]$sourceOutboxReadiness.Reason } elseif ([bool]$sourceOutboxReadiness.IsReady) { 'ready' } else { '' }
+            $existingTargetStatusEntry = Get-ConfigValue -Object $sourceOutboxStatusEntries -Name ([string]$item.TargetId) -DefaultValue $null
+            $existingRepairMetadataEntry = Get-ConfigValue -Object $sourceOutboxRepairMetadataByTarget -Name ([string]$item.TargetId) -DefaultValue $existingTargetStatusEntry
+            $repairStatus = Get-SourceOutboxRepairStatusMetadata `
+                -ExistingEntry $existingRepairMetadataEntry `
+                -OriginalReadyReason $sourceOutboxOriginalReason `
+                -FinalReadyReason $finalReadyReason `
+                -RepairSourceContext ([string]$repairPlan.RepairSourceContext) `
+                -RepairCommand ([string]$repairPlan.RepairCommand) `
+                -RepairAttempted:$repairAttempted `
+                -RepairSucceeded:$repairSucceeded `
+                -RepairCompletedAt $repairCompletedAt `
+                -RepairMessage ([string]$repairMessage)
             if ($sourceOutboxReadiness.MarkerPresent) {
                 if (-not $sourceOutboxReadiness.IsReady) {
+                    if ([bool]$repairPlan.Eligible -and -not [bool]$sourceOutboxReadiness.Paths.PublishReadyArchived) {
+                        $repairStateKey = ($sourceOutboxReadiness.StateKey + '|repair')
+                        if (Test-NonEmptyString $repairStateKey -and -not $sourceOutboxRepairState.ContainsKey($repairStateKey)) {
+                            $sourceOutboxRepairState[$repairStateKey] = $true
+                            $repairAttempted = $true
+                            Write-Host ("source-outbox auto-repair start {0} marker={1} reason={2}" -f [string]$item.TargetId, [string]$sourceOutboxReadiness.Paths.EffectivePublishReadyPath, [string]$sourceOutboxReadiness.Reason)
+                            $repairResult = Invoke-SourceOutboxMarkerRepair `
+                                -Root $root `
+                                -ConfigPath $resolvedConfigPath `
+                                -RunRoot $resolvedRunRoot `
+                                -Item $item `
+                                -Reason ([string]$sourceOutboxReadiness.Reason)
+                            $repairCompletedAt = (Get-Date).ToString('o')
+                            if ([bool]$repairResult.Ok) {
+                                $repairSucceeded = $true
+                                $repairMessage = 'source-outbox-marker-repaired'
+                                Write-Host ("source-outbox auto-repair succeeded {0} marker={1} helper={2}" -f [string]$item.TargetId, [string]$sourceOutboxReadiness.Paths.EffectivePublishReadyPath, [string]$repairResult.RepairPlan.RepairCommand)
+                                $sourceOutboxReadiness = Test-SourceOutboxReady -PairTest $pairTest -Item $item
+                            }
+                            else {
+                                $repairMessage = [string]$repairResult.ErrorMessage
+                                Write-SourceOutboxFailureLog `
+                                    -Path $sourceOutboxFailureLogPath `
+                                    -PairId ([string]$item.PairId) `
+                                    -TargetId ([string]$item.TargetId) `
+                                    -MarkerPath ([string]$sourceOutboxReadiness.Paths.EffectivePublishReadyPath) `
+                                    -StateKey $repairStateKey `
+                                    -Message ('auto-repair-failed:' + $repairMessage)
+                                Write-Host ("source-outbox auto-repair failed {0} marker={1} error={2}" -f [string]$item.TargetId, [string]$sourceOutboxReadiness.Paths.EffectivePublishReadyPath, $repairMessage)
+                            }
+                        }
+                    }
+
+                    $finalReadyReason = if (Test-NonEmptyString ([string]$sourceOutboxReadiness.Reason)) { [string]$sourceOutboxReadiness.Reason } elseif ([bool]$sourceOutboxReadiness.IsReady) { 'ready' } else { '' }
+                    $existingTargetStatusEntry = Get-ConfigValue -Object $sourceOutboxStatusEntries -Name ([string]$item.TargetId) -DefaultValue $null
+                    $existingRepairMetadataEntry = Get-ConfigValue -Object $sourceOutboxRepairMetadataByTarget -Name ([string]$item.TargetId) -DefaultValue $existingTargetStatusEntry
+                    $repairStatus = Get-SourceOutboxRepairStatusMetadata `
+                        -ExistingEntry $existingRepairMetadataEntry `
+                        -OriginalReadyReason $sourceOutboxOriginalReason `
+                        -FinalReadyReason $finalReadyReason `
+                        -RepairSourceContext ([string]$repairPlan.RepairSourceContext) `
+                        -RepairCommand ([string]$repairPlan.RepairCommand) `
+                        -RepairAttempted:$repairAttempted `
+                        -RepairSucceeded:$repairSucceeded `
+                        -RepairCompletedAt $repairCompletedAt `
+                        -RepairMessage ([string]$repairMessage)
+                    if ([bool]$repairStatus.RepairAttempted -or [bool]$repairStatus.RepairSucceeded) {
+                        $sourceOutboxRepairMetadataByTarget[[string]$item.TargetId] = $repairStatus
+                    }
+
+                    if (-not $sourceOutboxReadiness.IsReady) {
                     $sourcePendingKey = [string]$sourceOutboxReadiness.StateKey
                     if (Test-NonEmptyString $sourcePendingKey -and -not $sourceOutboxPendingState.ContainsKey($sourcePendingKey)) {
                         $sourceOutboxPendingState[$sourcePendingKey] = $true
-                        Write-Host ("source-outbox waiting {0} marker={1} reason={2}" -f [string]$item.TargetId, [string]$sourceOutboxReadiness.Paths.EffectivePublishReadyPath, [string]$sourceOutboxReadiness.Reason)
+                        $waitingMessage = ("source-outbox waiting {0} marker={1} reason={2}" -f [string]$item.TargetId, [string]$sourceOutboxReadiness.Paths.EffectivePublishReadyPath, [string]$sourceOutboxReadiness.Reason)
+                        if (Test-NonEmptyString ([string]$repairPlan.SuggestedAction)) {
+                            $waitingMessage += (' suggestedAction=' + [string]$repairPlan.SuggestedAction)
+                        }
+                        if (Test-NonEmptyString ([string]$repairPlan.RepairCommand)) {
+                            $waitingMessage += (' repair=' + [string]$repairPlan.RepairCommand)
+                        }
+                        Write-Host $waitingMessage
                     }
 
                     $sourceOutboxStatusEntries[[string]$item.TargetId] = [pscustomobject]@{
@@ -2459,9 +2802,19 @@ try {
                         PublishReadyPath    = [string]$sourceOutboxReadiness.Paths.EffectivePublishReadyPath
                         PublishedAt         = [string]$sourceOutboxReadiness.PublishedAt
                         ContractLatestState = ''
-                        NextAction          = ''
+                        NextAction          = [string]$repairPlan.SuggestedAction
+                        SuggestedAction     = [string]$repairPlan.SuggestedAction
+                        OriginalReadyReason = [string]$repairStatus.OriginalReadyReason
+                        FinalReadyReason    = [string]$repairStatus.FinalReadyReason
+                        RepairSourceContext = [string]$repairStatus.RepairSourceContext
+                        RepairCommand       = [string]$repairStatus.RepairCommand
+                        RepairAttempted     = [bool]$repairStatus.RepairAttempted
+                        RepairSucceeded     = [bool]$repairStatus.RepairSucceeded
+                        RepairCompletedAt   = [string]$repairStatus.RepairCompletedAt
+                        RepairMessage       = [string]$repairStatus.RepairMessage
                     }
                     Save-SourceOutboxStatus -Path $sourceOutboxStatusPath -RunRoot $resolvedRunRoot -Entries $sourceOutboxStatusEntries
+                }
                 }
                 else {
                     $sourceFingerprint = Get-SourceOutboxFingerprint -TargetId ([string]$item.TargetId) -Readiness $sourceOutboxReadiness
@@ -2533,6 +2886,14 @@ try {
                                 PublishCycleId      = [string](Get-ConfigValue -Object $sourceOutboxReadiness.Marker -Name 'PublishCycleId' -DefaultValue '')
                                 ContractLatestState = ''
                                 NextAction          = ''
+                                OriginalReadyReason = [string]$repairStatus.OriginalReadyReason
+                                FinalReadyReason    = [string]$repairStatus.FinalReadyReason
+                                RepairSourceContext = [string]$repairStatus.RepairSourceContext
+                                RepairCommand       = [string]$repairStatus.RepairCommand
+                                RepairAttempted     = [bool]$repairStatus.RepairAttempted
+                                RepairSucceeded     = [bool]$repairStatus.RepairSucceeded
+                                RepairCompletedAt   = [string]$repairStatus.RepairCompletedAt
+                                RepairMessage       = [string]$repairStatus.RepairMessage
                             }
                             Save-SourceOutboxStatus -Path $sourceOutboxStatusPath -RunRoot $resolvedRunRoot -Entries $sourceOutboxStatusEntries
                         }
@@ -2591,6 +2952,15 @@ try {
                                 LatestState         = $contractLatestState
                                 ContractLatestState = $contractLatestState
                                 NextAction          = Get-ContractNextAction -LatestState $contractLatestState
+                                SuggestedAction     = ''
+                                OriginalReadyReason = [string]$repairStatus.OriginalReadyReason
+                                FinalReadyReason    = [string]$repairStatus.FinalReadyReason
+                                RepairSourceContext = [string]$repairStatus.RepairSourceContext
+                                RepairCommand       = [string]$repairStatus.RepairCommand
+                                RepairAttempted     = [bool]$repairStatus.RepairAttempted
+                                RepairSucceeded     = [bool]$repairStatus.RepairSucceeded
+                                RepairCompletedAt   = [string]$repairStatus.RepairCompletedAt
+                                RepairMessage       = [string]$repairStatus.RepairMessage
                             }
                             Save-SourceOutboxStatus -Path $sourceOutboxStatusPath -RunRoot $resolvedRunRoot -Entries $sourceOutboxStatusEntries
                             Write-Host ("source-outbox imported {0} marker={1} destZip={2}" -f [string]$item.TargetId, [string]$sourceOutboxReadiness.Paths.EffectivePublishReadyPath, [string]$sourceOutboxStatusEntries[[string]$item.TargetId].ImportedZipPath)
@@ -2639,6 +3009,15 @@ try {
                             LatestState         = 'duplicate-skipped'
                             ContractLatestState = ''
                             NextAction          = 'duplicate-skipped'
+                            SuggestedAction     = ''
+                            OriginalReadyReason = [string]$repairStatus.OriginalReadyReason
+                            FinalReadyReason    = [string]$repairStatus.FinalReadyReason
+                            RepairSourceContext = [string]$repairStatus.RepairSourceContext
+                            RepairCommand       = [string]$repairStatus.RepairCommand
+                            RepairAttempted     = [bool]$repairStatus.RepairAttempted
+                            RepairSucceeded     = [bool]$repairStatus.RepairSucceeded
+                            RepairCompletedAt   = [string]$repairStatus.RepairCompletedAt
+                            RepairMessage       = [string]$repairStatus.RepairMessage
                         }
                         Save-SourceOutboxStatus -Path $sourceOutboxStatusPath -RunRoot $resolvedRunRoot -Entries $sourceOutboxStatusEntries
                         Write-Host ("source-outbox duplicate skipped {0} marker={1}" -f [string]$item.TargetId, [string]$sourceOutboxReadiness.Paths.EffectivePublishReadyPath)

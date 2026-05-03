@@ -10,7 +10,8 @@ param(
     [string]$SeedTaskText,
     [string]$SeedTaskFilePath,
     [switch]$SendInitialMessages,
-    [switch]$UseHeadlessDispatch
+    [switch]$UseHeadlessDispatch,
+    [switch]$AllowHeadlessDispatchInTypedWindowLane
 )
 
 Set-StrictMode -Version Latest
@@ -752,6 +753,8 @@ function Get-AutomaticPathGuideBlock {
         [Parameter(Mandatory)][string]$OutputSummaryPath,
         [Parameter(Mandatory)][string]$OutputReviewZipPath,
         [Parameter(Mandatory)][string]$PublishReadyPath,
+        [string]$PublishScriptPath = '',
+        [string]$PublishCmdPath = '',
         [string]$WorkRepoRoot = '',
         [string]$ExternalReviewInputPath = ''
     )
@@ -790,13 +793,28 @@ function Get-AutomaticPathGuideBlock {
     else {
         $lines += '먼저 확인할 검토 입력 파일 없음. 현재 작업 파일 기준으로 검토 후 내 출력 파일을 생성하세요.'
     }
+    $publishHelperPath = if (Test-NonEmptyString $PublishCmdPath) { $PublishCmdPath } elseif (Test-NonEmptyString $PublishScriptPath) { $PublishScriptPath } else { '' }
     $lines += @(
         ''
-        '내가 생성할 파일:'
+        '내가 직접 생성할 파일:'
         ('- summary.txt: ' + $OutputSummaryPath)
         ('- review.zip: ' + $OutputReviewZipPath)
-        ('- publish.ready.json: ' + $PublishReadyPath)
     )
+    if (Test-NonEmptyString $publishHelperPath) {
+        $lines += @(
+            ''
+            '마지막 실행:'
+            ('- publish helper: ' + $publishHelperPath)
+            ('- helper output marker: ' + $PublishReadyPath)
+        )
+    }
+    else {
+        $lines += @(
+            ''
+            'helper output marker:'
+            ('- publish.ready.json: ' + $PublishReadyPath)
+        )
+    }
 
     return ($lines -join "`r`n")
 }
@@ -873,6 +891,8 @@ function Get-TargetInstructionText {
         -OutputSummaryPath $SourceSummaryPath `
         -OutputReviewZipPath $SourceReviewZipPath `
         -PublishReadyPath $PublishReadyPath `
+        -PublishScriptPath $PublishScriptPath `
+        -PublishCmdPath $PublishCmdPath `
         -WorkRepoRoot $WorkRepoRoot `
         -ExternalReviewInputPath $ReviewInputPath
 
@@ -886,7 +906,7 @@ ReviewInputPath: $ReviewInputPath
 SourceOutboxPath: $SourceOutboxPath
 
 지금은 이 target이 초기 seed 대상입니다. 작업을 바로 시작하세요.
-최종 결과는 SourceOutboxPath 아래의 summary.txt, review.zip, publish.ready.json 세 파일로만 publish 합니다.
+최종 publish는 SourceOutboxPath 아래의 summary.txt 와 review.zip 을 만든 뒤 마지막에 publish helper를 실행하는 방식만 허용합니다.
 직접 contract folder 복사나 별도 submit 명령은 금지입니다.
 $(if (Test-NonEmptyString $SeedTaskText) { "`r`nTask:`r`n$SeedTaskText" } else { '' })
 "@
@@ -899,7 +919,7 @@ SourceOutboxPath: $SourceOutboxPath
 
 지금은 초기 seed 대상이 아닙니다.
 partner handoff message가 오기 전까지 작업을 시작하지 마세요.
-handoff를 받으면 partner가 넘긴 summary/review zip을 입력으로 사용하고, 최종 결과만 SourceOutboxPath 아래의 summary.txt, review.zip, publish.ready.json 세 파일로 publish 합니다.
+handoff를 받으면 partner가 넘긴 summary/review zip을 입력으로 사용하고, 최종 publish는 SourceOutboxPath 아래의 summary.txt 와 review.zip 을 만든 뒤 마지막에 publish helper를 실행하는 방식만 허용합니다.
 "@
         }
         default {
@@ -948,7 +968,7 @@ $pathGuideBlock
 이번 테스트에서는 아래 규칙으로 움직이세요.
 1. 프로젝트 작업은 현재 work repo 또는 '$WorkFolderPath' 아래에서 자유롭게 진행합니다.
 2. 최종 source 산출물은 '$SourceOutboxPath' 아래의 '$sourceSummaryFileName' 와 '$sourceReviewZipFileName' 으로만 정리합니다.
-3. publish 완료 신호는 '$PublishReadyPath' 파일입니다. 이 파일은 반드시 summary/zip 작성이 끝난 뒤 마지막에 '$PublishCmdPath' 또는 '$PublishScriptPath' helper로만 생성합니다.
+3. publish 완료 신호는 '$PublishReadyPath' helper output marker입니다. 이 파일은 반드시 summary/zip 작성이 끝난 뒤 마지막에 '$PublishCmdPath' 또는 '$PublishScriptPath' helper가 생성/overwrite해야 합니다.
 4. publish helper는 '$publishReadyFileName' 에 SchemaVersion, PairId, TargetId, SummaryPath, ReviewZipPath, PublishedAt, SummarySizeBytes, ReviewZipSizeBytes, SummarySha256, ReviewZipSha256, PublishedBy, ValidationPassed, ValidationCompletedAt 를 자동 기록합니다.
 5. marker의 SummaryPath / ReviewZipPath 는 '$SourceSummaryPath' 와 '$SourceReviewZipPath' 를 가리켜야 합니다. 크기/해시/validation stamp가 실제 파일과 다르면 자동 publish가 거부됩니다.
 6. 직접 paired contract 경로(SummaryPath / ReviewFolderPath / Done/Result)에 복사하지 마세요. watcher가 source-outbox marker를 감지하면 기존 import를 자동 호출합니다.
@@ -1019,6 +1039,8 @@ function Get-TargetInitialSeedMessageText {
         -OutputSummaryPath $SourceSummaryPath `
         -OutputReviewZipPath $SourceReviewZipPath `
         -PublishReadyPath $PublishReadyPath `
+        -PublishScriptPath $PublishScriptPath `
+        -PublishCmdPath $PublishCmdPath `
         -WorkRepoRoot $WorkRepoRoot `
         -ExternalReviewInputPath $ReviewInputPath
     $bodyBlock = switch ($InitialRoleMode) {
@@ -1037,7 +1059,7 @@ $pathGuideBlock
 - publish helper: $PublishCmdPath
 
 규칙:
-1. summary.txt 와 review.zip 작성이 끝나면 마지막에 '$PublishCmdPath' 또는 '$PublishScriptPath' helper를 실행해서 publish.ready.json 을 생성합니다.
+1. summary.txt 와 review.zip 작성이 끝나면 마지막에 '$PublishCmdPath' 또는 '$PublishScriptPath' helper를 실행합니다. publish.ready.json 은 helper가 자동 생성/overwrite합니다.
 2. 직접 target contract 경로에 복사하거나 별도 submit 명령을 다시 실행하지 마세요.
 3. 상세 계약과 recovery 경로는 instructions.txt 를 확인하세요: $InstructionPath
 $(if (Test-NonEmptyString $SeedTaskText) { "`r`nTask:`r`n$SeedTaskText" } else { '' })
@@ -1074,7 +1096,8 @@ $pathGuideBlock
 SourceOutboxPath: $SourceOutboxPath
 summary.txt: $SourceSummaryPath
 review.zip: $SourceReviewZipPath
-publish.ready.json: $PublishReadyPath
+publish helper: $PublishCmdPath
+helper output marker: $PublishReadyPath
 
 상세 계약은 instructions.txt 를 확인하세요: $InstructionPath
 "@
@@ -1098,6 +1121,12 @@ if ([string]::IsNullOrWhiteSpace($ConfigPath)) {
 $resolvedConfigPath = (Resolve-Path -LiteralPath $ConfigPath).Path
 $config = Import-PowerShellDataFile -Path $resolvedConfigPath
 $pairTest = Resolve-PairTestConfig -Root $root -ConfigPath $resolvedConfigPath
+Assert-HeadlessDispatchAllowedForLane `
+    -UseHeadlessDispatch:$UseHeadlessDispatch `
+    -AllowHeadlessDispatchInTypedWindowLane:$AllowHeadlessDispatchInTypedWindowLane `
+    -Config $config `
+    -PairTest $pairTest `
+    -ConfigPath $resolvedConfigPath
 $selectedPairs = @(Get-PairDefinitions -PairTest $pairTest -IncludePairId $IncludePairId)
 
 $requestedSeedTargetIds = @(

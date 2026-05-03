@@ -90,7 +90,13 @@ function ConvertTo-PowerShellSingleQuotedLiteral {
 
 $root = Split-Path -Parent $PSScriptRoot
 if ([string]::IsNullOrWhiteSpace($ConfigPath)) {
-    $ConfigPath = Join-Path $root 'config\settings.bottest-live-visible.psd1'
+    $preferredExternalizedConfigPath = 'C:\dev\python\relay-workrepo-visible-smoke\.relay-config\bottest-live-visible\settings.externalized.psd1'
+    if (Test-Path -LiteralPath $preferredExternalizedConfigPath -PathType Leaf) {
+        $ConfigPath = $preferredExternalizedConfigPath
+    }
+    else {
+        $ConfigPath = Join-Path $root 'config\settings.bottest-live-visible.psd1'
+    }
 }
 
 $resolvedConfigPath = (Resolve-Path -LiteralPath $ConfigPath).Path
@@ -165,6 +171,7 @@ $watcherRun = Invoke-PowerShellProcess -ScriptPath (Join-Path $root 'tests\Watch
     '-ConfigPath', $headlessConfigPath,
     '-RunRoot', $contractRunRoot,
     '-UseHeadlessDispatch',
+    '-AllowHeadlessDispatchInTypedWindowLane',
     '-MaxForwardCount', '1',
     '-RunDurationSec', '90'
 )

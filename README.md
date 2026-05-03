@@ -364,13 +364,14 @@ handoff 메시지에는 아래 정보가 항상 들어갑니다.
   - `pair 설정 저장 + 새로고침`으로 pair 정책 draft를 config에 반영
 - 같은 탭의 `초기 실행 준비 / Seed Kickoff Composer`
   - 사용자는 `Pair`, `SeedTarget`, `입력 파일`, `작업 설명`만 직접 입력
-  - 상단에 `붙여넣기 대상`과 `시작 가능 여부`를 고정으로 보여주고, `빠른 시작`에서 `미리보기`, `수동 시작문 복사`, `초기 입력 큐잉`을 바로 실행 가능
+  - 상단에 `붙여넣기 대상`과 `시작 가능 여부`를 고정으로 보여주고, `빠른 시작`에서 `미리보기`, `초간단 시작문 복사`, `상세 시작문 복사`, `초기 입력 큐잉`을 바로 실행 가능
+  - `초간단 시작문 미리보기` 박스에 실제로 복사될 기본 시작문을 항상 먼저 보여줌
   - 패널은 현재 pair의 실효 경로를 읽어 `summary.txt / review.zip / publish.ready.json` 절대경로와 helper 경로를 자동으로 합성해서 읽기 전용으로 보여줌
-  - `수동 시작문 복사`는 target 전달문만 복사하고, operator 확인용 설명 블록은 화면 미리보기에만 남긴다.
-  - `경로만 복사`, `시작 순서 복사`, `helper 명령 복사`로 kickoff 준비 문구를 보조 복사 가능
+  - `초간단 시작문 복사`는 작업 내용 + 3개 파일 생성 지시 + 순서 규칙만 복사하고, operator 확인용 설명 블록은 화면 미리보기에만 남긴다.
+  - `상세 시작문 복사`, `summary 경로 복사`, `review.zip 경로 복사`, `publish.ready 경로 복사`, `계약 경로 복사`, `시작 순서 복사`, `helper 명령 복사`로 kickoff 준비 문구를 보조 복사 가능
   - `초기 입력 큐잉`은 영구 `Initial/Handoff` 설정을 바꾸지 않고 one-time queue에만 등록
   - queue 등록 시에는 작업 설명 블록만 저장되고, 경로/파일 계약/helper 안내는 seed/handoff scaffold가 별도로 자동 추가됨
-  - 권장 흐름은 `pair 설정 저장 + 새로고침 -> 실효값 확인 -> 수동 시작문 복사 또는 초기 입력 큐잉`
+  - 권장 흐름은 `pair 설정 저장 + 새로고침 -> 실효값 확인 -> 초간단 시작문 복사 또는 초기 입력 큐잉`
 - `_tmp\effective-config*.json` 최근 20개 스냅샷의 stale/warnings 메타 조회, snapshot/run root 열기, 경로 복사, JSON 본문 확인
 - typed-window 실테스트 기준선과 submit sequence 요약 표시
 - 실행 중 `Operator Status`와 마지막 결과 요약 표시
@@ -673,8 +674,8 @@ headless lane은 각 target 폴더에 `request.json`, `done.json`, `error.json`,
 4. pair01 한 쌍 자동 왕복
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\tests\Start-PairedExchangeTest.ps1 -ConfigPath .\config\settings.bottest-live-visible.psd1 -RunRoot .\pair-test\bottest-live-visible\run_headless_pair01_auto -IncludePairId pair01 -SendInitialMessages -InitialTargetId target01 -UseHeadlessDispatch
-pwsh -NoProfile -ExecutionPolicy Bypass -File .\tests\Watch-PairedExchange.ps1 -ConfigPath .\config\settings.bottest-live-visible.psd1 -RunRoot .\pair-test\bottest-live-visible\run_headless_pair01_auto -UseHeadlessDispatch -MaxForwardCount 2
+powershell -NoProfile -ExecutionPolicy Bypass -File .\tests\Start-PairedExchangeTest.ps1 -ConfigPath .\config\settings.bottest-live-visible.psd1 -RunRoot .\pair-test\bottest-live-visible\run_headless_pair01_auto -IncludePairId pair01 -SendInitialMessages -InitialTargetId target01 -UseHeadlessDispatch -AllowHeadlessDispatchInTypedWindowLane
+pwsh -NoProfile -ExecutionPolicy Bypass -File .\tests\Watch-PairedExchange.ps1 -ConfigPath .\config\settings.bottest-live-visible.psd1 -RunRoot .\pair-test\bottest-live-visible\run_headless_pair01_auto -UseHeadlessDispatch -AllowHeadlessDispatchInTypedWindowLane -MaxForwardCount 2
 ```
 
 이미 준비된 `RunRoot`에 initial seed만 다시 넣어야 하면 `Start-PairedExchangeTest.ps1`를 다시 돌리지 말고 `tests\Send-InitialPairSeed.ps1`를 사용합니다.

@@ -465,6 +465,8 @@ class DashboardAggregator:
         return {
             "ready": ready,
             "reason": reason,
+            "anchor_raw": anchor_raw,
+            "binding_last_write": binding_last_write,
             "workflow_label": workflow_label,
             "workflow_detail": workflow_detail,
             "issue_title": issue_title,
@@ -497,6 +499,16 @@ class DashboardAggregator:
         blank_target_ids = cls._string_list(runtime.get("BlankTargetIds", []))
         launcher_session_ids = cls._string_list(runtime.get("LauncherSessionIds", []))
         has_single_session = bool(runtime.get("HasSingleLauncherSession", len(launcher_session_ids) <= 1))
+        runtime_last_write = str(runtime.get("LastWriteAt", "") or "")
+        anchor_raw = str(launch_status.get("anchor_raw", "") or "")
+        binding_last_write = str(launch_status.get("binding_last_write", "") or "")
+
+        runtime_current = True
+        if runtime_last_write:
+            if anchor_raw:
+                runtime_current = runtime_current and cls._timestamp_is_current(runtime_last_write, anchor_raw)
+            if binding_last_write:
+                runtime_current = runtime_current and cls._timestamp_is_current(runtime_last_write, binding_last_write)
 
         enabled = bool(launch_status.get("ready", False))
         session_count = len(launcher_session_ids) if launcher_session_ids else (1 if has_single_session and runtime_unique > 0 else 0)
@@ -507,6 +519,8 @@ class DashboardAggregator:
             reason = "runtime_missing"
         elif runtime_parse_error:
             reason = "runtime_parse_error"
+        elif runtime_last_write and not runtime_current:
+            reason = "runtime_stale"
         elif missing_target_ids or extra_target_ids or duplicate_target_ids or blank_target_ids:
             reason = "runtime_incomplete"
         elif not has_single_session:
@@ -520,6 +534,13 @@ class DashboardAggregator:
         if reason == "waiting_for_launch":
             status_text = "대기"
             detail = str(launch_status.get("attach_wait_detail", "")) or "대기: 현재 세션 창 준비 후 attach를 다시 확인합니다."
+        elif reason == "runtime_stale":
+            status_text = "필요"
+            detail = "runtime stale: last={0}".format(runtime_last_write)
+            if binding_last_write:
+                detail += " binding={0}".format(binding_last_write)
+            if anchor_raw:
+                detail += " panel={0}".format(anchor_raw)
         elif reason == "runtime_mixed_session":
             status_text = "필요"
             detail = "runtime unique={0}/{1} session=mixed({2})".format(runtime_unique, expected_targets, session_count)
@@ -533,7 +554,9 @@ class DashboardAggregator:
                 session_count,
             )
 
-        if reason == "runtime_mixed_session":
+        if reason == "runtime_stale":
+            issue_detail = "runtime map이 현재 세션 창 기준으로 다시 attach되지 않았습니다."
+        elif reason == "runtime_mixed_session":
             issue_detail = "runtime launcher session이 섞여 있습니다."
         else:
             issue_detail = "runtime map이 완전하지 않거나 세션이 섞였습니다."
@@ -573,7 +596,7 @@ class DashboardAggregator:
         ready = not reason
         if reason == "waiting_for_attach":
             status_text = "대기"
-            detail = "대기: 현재 세션 attach 완료 후 입력 가능 상태를 다시 확인합니다."
+            detail = "입력 점검 대기: 8창 열기만으로는 부족합니다. 현재 binding profile을 target-runtime.json에 붙인 뒤 입력 점검하세요. 순서: 8창 열기 -> 붙이기 -> 입력 점검."
         else:
             status_text = "완료" if ready else "필요"
             detail = "Injectable {0}/{1} fail={2} missing={3}".format(

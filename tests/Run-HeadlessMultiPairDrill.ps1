@@ -313,11 +313,12 @@ if (-not (Test-NonEmptyString $RunRoot)) {
 }
 
 $startParams = @{
-    ConfigPath          = $resolvedConfigPath
-    IncludePairId       = @($selectedPairIds)
-    InitialTargetId     = @($resolvedInitialTargetIds)
-    SendInitialMessages = $true
-    UseHeadlessDispatch = $true
+    ConfigPath                             = $resolvedConfigPath
+    IncludePairId                          = @($selectedPairIds)
+    InitialTargetId                        = @($resolvedInitialTargetIds)
+    SendInitialMessages                    = $true
+    UseHeadlessDispatch                    = $true
+    AllowHeadlessDispatchInTypedWindowLane = $true
 }
 if (Test-NonEmptyString $RunRoot) {
     $startParams.RunRoot = $RunRoot
@@ -338,11 +339,12 @@ if (-not (Test-NonEmptyString $resolvedRunRoot)) {
 }
 
 $watchParams = @{
-    ConfigPath          = $resolvedConfigPath
-    RunRoot             = $resolvedRunRoot
-    UseHeadlessDispatch = $true
+    ConfigPath                             = $resolvedConfigPath
+    RunRoot                                = $resolvedRunRoot
+    UseHeadlessDispatch                    = $true
+    AllowHeadlessDispatchInTypedWindowLane = $true
     PairMaxRoundtripCount = $PairMaxRoundtripCount
-    RunDurationSec      = $RunDurationSec
+    RunDurationSec                         = $RunDurationSec
 }
 $watchOutput = @(Invoke-LocalScriptAndCaptureOutput -ScriptPath $watchScriptPath -Parameters $watchParams)
 
@@ -391,8 +393,8 @@ $result = [pscustomobject]@{
     PairMaxRoundtripCount = $PairMaxRoundtripCount
     RunDurationSec    = $RunDurationSec
     Commands          = [pscustomobject]@{
-        Start  = Format-CommandLine -Parts (@('powershell', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $startScriptPath, '-ConfigPath', $resolvedConfigPath, '-IncludePairId') + @($selectedPairIds) + @('-InitialTargetId') + @($resolvedInitialTargetIds) + @('-SendInitialMessages', '-UseHeadlessDispatch') + $(if (Test-NonEmptyString $RunRoot) { @('-RunRoot', (Resolve-FullPathFromCurrentLocation -PathValue $RunRoot)) } else { @() }))
-        Watch  = Format-CommandLine -Parts @('pwsh', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $watchScriptPath, '-ConfigPath', $resolvedConfigPath, '-RunRoot', $resolvedRunRoot, '-UseHeadlessDispatch', '-PairMaxRoundtripCount', [string]$PairMaxRoundtripCount, '-RunDurationSec', [string]$RunDurationSec)
+        Start  = Format-CommandLine -Parts (@('powershell', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $startScriptPath, '-ConfigPath', $resolvedConfigPath, '-IncludePairId') + @($selectedPairIds) + @('-InitialTargetId') + @($resolvedInitialTargetIds) + @('-SendInitialMessages', '-UseHeadlessDispatch', '-AllowHeadlessDispatchInTypedWindowLane') + $(if (Test-NonEmptyString $RunRoot) { @('-RunRoot', (Resolve-FullPathFromCurrentLocation -PathValue $RunRoot)) } else { @() }))
+        Watch  = Format-CommandLine -Parts @('pwsh', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $watchScriptPath, '-ConfigPath', $resolvedConfigPath, '-RunRoot', $resolvedRunRoot, '-UseHeadlessDispatch', '-AllowHeadlessDispatchInTypedWindowLane', '-PairMaxRoundtripCount', [string]$PairMaxRoundtripCount, '-RunDurationSec', [string]$RunDurationSec)
         Status = Format-CommandLine -Parts @('powershell', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $statusScriptPath, '-ConfigPath', $resolvedConfigPath, '-RunRoot', $resolvedRunRoot, '-AsJson')
     }
     StartOutput       = @($startOutput)

@@ -25,12 +25,12 @@ if (-not (Test-NonEmptyString $BaseConfigPath)) {
 $resolvedBaseConfigPath = (Resolve-Path -LiteralPath $BaseConfigPath).Path
 $pairTest = Resolve-PairTestConfig -Root $root -ConfigPath $resolvedBaseConfigPath
 
-$selectedPairs = if (@($PairId | Where-Object { Test-NonEmptyString $_ }).Count -gt 0) {
+$selectedPairs = @(if (@($PairId | Where-Object { Test-NonEmptyString $_ }).Count -gt 0) {
     @(Select-PairDefinitions -PairDefinitions @($pairTest.PairDefinitions) -IncludePairId @($PairId))
 }
 else {
     @($pairTest.PairDefinitions)
-}
+})
 if ($selectedPairs.Count -lt 1) {
     throw 'pair-scoped externalized config를 생성할 pair를 찾지 못했습니다.'
 }

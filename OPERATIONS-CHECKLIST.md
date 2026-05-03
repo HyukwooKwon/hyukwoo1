@@ -173,6 +173,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\show-paired-exchange-statu
 - shared `bottest-live-visible` lane에서는 ad-hoc 임시 창을 띄우지 않습니다. `BotTestLive-Fresh-*`, `BotTestLive-Surrogate-*`, `BotTestLive-Candidate-*` 창은 금지하고, 반드시 공식 `BotTestLive-Window-01`~`08` 기존 창을 재사용하거나 그 공식 창만 재기동합니다.
 - 기본 진입점은 `ensure-targets.ps1`입니다.
 - `attach 됨`과 `실제 입력 가능`은 별도 단계로 취급합니다. `check-target-window-visibility.ps1`를 통과하지 못하면 router/manual E2E를 진행하지 않습니다.
+- visible typed-window 입력 점검 순서: `8창 열기`만으로는 부족합니다. binding profile 생성/갱신 후 반드시 `붙이기`로 `target-runtime.json`을 현재 hwnd 기준으로 다시 쓰고, 그 다음 `입력 점검`을 실행합니다.
 - 기존 invisible BotTest 세션과 새 visible 승인 lane이 함께 있으면 `BotTestLive-Window-*` 제목과 `config\settings.bottest-live-visible.psd1` 기준 lane을 사용합니다.
 - `start-targets.ps1 -ReplaceExisting`는 예외 경로입니다.
 - `-UnsafeForceKillManagedTargets`는 운영 표준 절차에서 제외합니다.
@@ -534,13 +535,13 @@ cmd /c .\launch-run-pair01-headless-drill.cmd
 1. 초기 target01 실행
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\tests\Start-PairedExchangeTest.ps1 -ConfigPath .\config\settings.bottest-live-visible.psd1 -RunRoot .\pair-test\bottest-live-visible\run_headless_pair01_auto -IncludePairId pair01 -SendInitialMessages -InitialTargetId target01 -UseHeadlessDispatch
+powershell -NoProfile -ExecutionPolicy Bypass -File .\tests\Start-PairedExchangeTest.ps1 -ConfigPath .\config\settings.bottest-live-visible.psd1 -RunRoot .\pair-test\bottest-live-visible\run_headless_pair01_auto -IncludePairId pair01 -SendInitialMessages -InitialTargetId target01 -UseHeadlessDispatch -AllowHeadlessDispatchInTypedWindowLane
 ```
 
 2. watcher가 두 번만 자동 forward
 
 ```powershell
-pwsh -NoProfile -ExecutionPolicy Bypass -File .\tests\Watch-PairedExchange.ps1 -ConfigPath .\config\settings.bottest-live-visible.psd1 -RunRoot .\pair-test\bottest-live-visible\run_headless_pair01_auto -UseHeadlessDispatch -MaxForwardCount 2
+pwsh -NoProfile -ExecutionPolicy Bypass -File .\tests\Watch-PairedExchange.ps1 -ConfigPath .\config\settings.bottest-live-visible.psd1 -RunRoot .\pair-test\bottest-live-visible\run_headless_pair01_auto -UseHeadlessDispatch -AllowHeadlessDispatchInTypedWindowLane -MaxForwardCount 2
 ```
 
 통과 기준:

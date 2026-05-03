@@ -44,10 +44,11 @@
 - 같은 pair 카드에서는 `RUNNING` / `WAITING` / `DONE` / `ERROR` / `STOPPED` runtime 배지도 함께 표시합니다. 값은 현재 RunRoot의 `.state\\wrapper-status.json` 을 우선 읽고, 없으면 기존 paired status로 fallback 해서 pair별 진행률을 보여줍니다.
 - `설정 / 문구` 탭의 `초기 실행 준비 / Seed Kickoff Composer` 는 영구 pair 정책과 분리된 1회성 kickoff 입력 helper입니다. 사용자는 `Pair`, `SeedTarget`, `입력 파일`, `작업 설명`만 입력하고, panel이 현재 pair의 실효 경로를 읽어 `summary.txt / review.zip / publish.ready.json` 절대경로와 helper 경로를 자동 합성해 보여줘야 합니다.
 - Composer 상단에는 `붙여넣기 대상`, `시작 가능 여부`, `빠른 시작`을 고정으로 보여주고, 세부 블록은 기본 접힘 상태를 유지합니다.
-- Composer의 `수동 시작문 복사`는 target 전달문만 복사하고, operator 확인용 설명 블록은 화면 미리보기에만 남깁니다.
-- `경로만 복사`, `시작 순서 복사`, `helper 명령 복사`는 복사용 helper이고, `초기 입력 큐잉`은 `Initial/Handoff` 영구 설정을 건드리지 않고 one-time queue에만 등록해야 합니다.
+- `초간단 시작문 미리보기` 박스에는 실제로 복사될 기본 시작문을 항상 먼저 보여줍니다.
+- Composer의 `초간단 시작문 복사`는 작업 내용 + 3개 파일 생성 지시 + 순서 규칙만 복사하고, operator 확인용 설명 블록은 화면 미리보기에만 남깁니다.
+- `상세 시작문 복사`, `summary 경로 복사`, `review.zip 경로 복사`, `publish.ready 경로 복사`, `계약 경로 복사`, `시작 순서 복사`, `helper 명령 복사`는 복사용 helper이고, `초기 입력 큐잉`은 `Initial/Handoff` 영구 설정을 건드리지 않고 one-time queue에만 등록해야 합니다.
 - queue에는 작업 설명 블록만 저장하고, 경로/파일 계약/helper 안내는 seed/handoff scaffold가 별도로 자동 추가된다는 의미를 panel 상태 문구와 문서에서 같이 유지합니다.
-- 권장 운영 순서는 `pair 설정 저장 + 새로고침 -> 실효값 확인 -> 수동 시작문 복사 또는 초기 입력 큐잉` 으로 고정합니다.
+- 권장 운영 순서는 `pair 설정 저장 + 새로고침 -> 실효값 확인 -> 초간단 시작문 복사 또는 초기 입력 큐잉` 으로 고정합니다.
 - `visible worker queue -> Invoke-CodexExecTurn` 경로는 shared real test에서 금지하고 maintenance/diagnostic 전용으로만 둡니다.
 - typed-window 경로에서는 `send_complete`, `processed ready`, `submit_complete`만으로 성공 판정하지 않습니다.
 - typed-window 입력은 shared lane에서 `paste + submit guard + attempt당 1회 최종 submit`를 기본 계약으로 사용하고, 입력 완료 전 submit dispatch나 같은 attempt 안 다중 submit을 허용하지 않습니다.

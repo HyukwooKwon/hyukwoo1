@@ -16,6 +16,50 @@ function Test-NonEmptyString {
     return ($Value -is [string] -and -not [string]::IsNullOrWhiteSpace($Value))
 }
 
+function Test-SharedVisibleTypedWindowLane {
+    param(
+        $Config = $null,
+        $PairTest = $null
+    )
+
+    $laneName = [string](Get-ConfigValue -Object $Config -Name 'LaneName' -DefaultValue '')
+    if ($laneName -ne 'bottest-live-visible') {
+        return $false
+    }
+
+    $executionPathMode = [string](Get-ConfigValue -Object $PairTest -Name 'ExecutionPathMode' -DefaultValue '')
+    if ($executionPathMode -ne 'typed-window') {
+        return $false
+    }
+
+    return [bool](Get-ConfigValue -Object $PairTest -Name 'RequireUserVisibleCellExecution' -DefaultValue $false)
+}
+
+function Assert-HeadlessDispatchAllowedForLane {
+    param(
+        [switch]$UseHeadlessDispatch,
+        [switch]$AllowHeadlessDispatchInTypedWindowLane,
+        $Config = $null,
+        $PairTest = $null,
+        [string]$ConfigPath = ''
+    )
+
+    if (-not [bool]$UseHeadlessDispatch) {
+        return
+    }
+
+    if ([bool]$AllowHeadlessDispatchInTypedWindowLane) {
+        return
+    }
+
+    if (-not (Test-SharedVisibleTypedWindowLane -Config $Config -PairTest $PairTest)) {
+        return
+    }
+
+    $resolvedConfigPath = if (Test-NonEmptyString $ConfigPath) { $ConfigPath } else { '<unset>' }
+    throw ("headless-dispatch-disallowed-in-shared-visible-typed-window lane=bottest-live-visible config={0} override=-AllowHeadlessDispatchInTypedWindowLane" -f $resolvedConfigPath)
+}
+
 function Get-ConfigValue {
     param(
         $Object,

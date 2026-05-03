@@ -174,11 +174,12 @@ $watchScriptPath = Join-Path $root 'tests\Watch-PairedExchange.ps1'
 $statusScriptPath = Join-Path $root 'show-paired-exchange-status.ps1'
 
 $startParams = @{
-    ConfigPath          = $resolvedConfigPath
-    IncludePairId       = @($PairId)
-    InitialTargetId     = @($InitialTargetId)
-    SendInitialMessages = $true
-    UseHeadlessDispatch = $true
+    ConfigPath                             = $resolvedConfigPath
+    IncludePairId                          = @($PairId)
+    InitialTargetId                        = @($InitialTargetId)
+    SendInitialMessages                    = $true
+    UseHeadlessDispatch                    = $true
+    AllowHeadlessDispatchInTypedWindowLane = $true
 }
 if (Test-NonEmptyString $RunRoot) {
     $startParams.RunRoot = $RunRoot
@@ -196,11 +197,12 @@ if (-not (Test-NonEmptyString $resolvedRunRoot)) {
 }
 
 $watchParams = @{
-    ConfigPath          = $resolvedConfigPath
-    RunRoot             = $resolvedRunRoot
-    UseHeadlessDispatch = $true
-    MaxForwardCount     = $MaxForwardCount
-    RunDurationSec      = $RunDurationSec
+    ConfigPath                             = $resolvedConfigPath
+    RunRoot                                = $resolvedRunRoot
+    UseHeadlessDispatch                    = $true
+    AllowHeadlessDispatchInTypedWindowLane = $true
+    MaxForwardCount                        = $MaxForwardCount
+    RunDurationSec                         = $RunDurationSec
 }
 $watchOutput = Invoke-ScriptAndCaptureOutput -ScriptPath $watchScriptPath -Parameters $watchParams
 
@@ -221,7 +223,8 @@ $startCommandParts = @(
     '-IncludePairId', $PairId,
     '-InitialTargetId', $InitialTargetId,
     '-SendInitialMessages',
-    '-UseHeadlessDispatch'
+    '-UseHeadlessDispatch',
+    '-AllowHeadlessDispatchInTypedWindowLane'
 )
 if (Test-NonEmptyString $RunRoot) {
     $startCommandParts += @('-RunRoot', (Resolve-FullPathFromCurrentLocation -PathValue $RunRoot))
@@ -238,7 +241,7 @@ $result = [pscustomobject]@{
     RunDurationSec    = $RunDurationSec
     Commands          = [pscustomobject]@{
         Start  = Format-CommandLine -Parts $startCommandParts
-        Watch  = Format-CommandLine -Parts @('pwsh', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $watchScriptPath, '-ConfigPath', $resolvedConfigPath, '-RunRoot', $resolvedRunRoot, '-UseHeadlessDispatch', '-MaxForwardCount', [string]$MaxForwardCount, '-RunDurationSec', [string]$RunDurationSec)
+        Watch  = Format-CommandLine -Parts @('pwsh', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $watchScriptPath, '-ConfigPath', $resolvedConfigPath, '-RunRoot', $resolvedRunRoot, '-UseHeadlessDispatch', '-AllowHeadlessDispatchInTypedWindowLane', '-MaxForwardCount', [string]$MaxForwardCount, '-RunDurationSec', [string]$RunDurationSec)
         Status = Format-CommandLine -Parts @('powershell', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $statusScriptPath, '-ConfigPath', $resolvedConfigPath, '-RunRoot', $resolvedRunRoot, '-AsJson')
     }
     StartOutput       = @($startOutput)

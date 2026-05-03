@@ -84,4 +84,13 @@ Assert-True ([string]$pair01[0].BookkeepingRoot -ne [string]$pair02[0].Bookkeepi
 Assert-True (Test-Path -LiteralPath ([string]$pair01[0].OutputConfigPath) -PathType Leaf) 'pair01 config file should exist.'
 Assert-True (Test-Path -LiteralPath ([string]$pair02[0].OutputConfigPath) -PathType Leaf) 'pair02 config file should exist.'
 
+$singlePairResult = & (Join-Path $root 'tests\Write-PairExternalizedRelayConfigs.ps1') `
+    -BaseConfigPath $configPath `
+    -PairId 'pair02' `
+    -AsJson | ConvertFrom-Json
+
+Assert-True (@($singlePairResult.GeneratedConfigs).Count -eq 1) 'single pair request should generate one pair-scoped config.'
+Assert-True ([string]$singlePairResult.GeneratedConfigs[0].PairId -eq 'pair02') 'single pair request should keep the requested pair id.'
+Assert-True ([string]$singlePairResult.GeneratedConfigs[0].WorkRepoRoot -eq $repoB) 'single pair request should keep pair02 repo root.'
+
 Write-Host 'write-pair-externalized-relay-configs ok'

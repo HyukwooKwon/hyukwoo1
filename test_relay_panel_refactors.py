@@ -237,10 +237,16 @@ class VarStub:
 class ButtonStub:
     def __init__(self) -> None:
         self.state = ""
+        self.text = ""
+        self.values = ()
 
     def configure(self, **kwargs) -> None:
         if "state" in kwargs:
             self.state = kwargs["state"]
+        if "text" in kwargs:
+            self.text = kwargs["text"]
+        if "values" in kwargs:
+            self.values = kwargs["values"]
 
 
 class TextWidgetStub:
@@ -2190,6 +2196,137 @@ class RelayOperatorPanelRuntimeCommandTests(unittest.TestCase):
         self.assertIn("show-relay-status.ps1", panel.last_command_var.get())
         self.assertIn("check-target-window-visibility.ps1", panel.last_command_var.get())
 
+    def test_run_visibility_check_surfaces_runtime_stale_and_hwnd_required_guidance(self) -> None:
+        panel = self._make_panel()
+        relay_payload = {"Runtime": {"ExpectedTargetCount": 8}}
+        visibility_payload = {
+            "ExpectedTargetCount": 8,
+            "InjectableCount": 0,
+            "NonInjectableCount": 8,
+            "MissingRuntimeCount": 0,
+            "BindingProfileLastWriteAt": "2026-05-02T06:24:35+09:00",
+            "RuntimeLastWriteAt": "2026-05-01T14:58:39+09:00",
+            "RuntimeStaleAgainstBinding": True,
+            "TitleFallbackRejectedCount": 8,
+            "Targets": [{"TargetId": "target01", "Injectable": False, "InjectionReason": "hwnd-required-title-duplicate"}],
+        }
+        panel.refresh_controller = SimpleNamespace(
+            refresh_runtime=lambda _context: RuntimeRefreshResult(
+                relay_status=relay_payload,
+                visibility_status=visibility_payload,
+            )
+        )
+
+        panel.run_visibility_check()
+
+        self.assertIn("Timestamps: binding=2026-05-02T06:24:35+09:00 runtime=2026-05-01T14:58:39+09:00", panel._captured_output)
+        self.assertIn("binding보다 오래된 runtime map입니다. 먼저 [붙이기]를 실행하세요.", panel._captured_output)
+        self.assertIn("같은 제목 창이 여러 개라 title fallback은 허용되지 않습니다. hwnd attach가 필요합니다.", panel._captured_output)
+        self.assertIn("target01(hwnd-required-title-duplicate)", panel._captured_output)
+
+    def test_current_sticky_action_spec_prefers_visible_tab_recommendation(self) -> None:
+        panel = self._make_panel()
+        panel.notebook = SimpleNamespace(select=lambda: "visible-tab")
+        panel.visible_acceptance_tab = "visible-tab"
+        panel._build_visible_acceptance_state = lambda: SimpleNamespace(
+            next_action_key="visible_preflight",
+            next_step="preflight 먼저",
+        )
+        panel.panel_state = SimpleNamespace(
+            next_actions=[SimpleNamespace(action_key="run_selected_pair", label="선택 Pair 실행", command_text="pwsh pair")],
+            issues=[],
+        )
+
+        spec = panel._current_sticky_action_spec()
+
+        self.assertEqual("visible_preflight", spec["action_key"])
+        self.assertEqual("입력 전 점검", spec["label"])
+        self.assertEqual("visible_acceptance", spec["source"])
+
+    def test_current_sticky_action_spec_prefers_artifact_focus_on_artifact_tab(self) -> None:
+        panel = self._make_panel()
+        panel.notebook = SimpleNamespace(select=lambda: "artifacts-tab")
+        panel.artifacts_tab = "artifacts-tab"
+        panel.artifact_service = ArtifactService()
+        panel.artifact_states = [make_artifact_state(target_id="target05", latest_state="ready-to-forward")]
+        panel.panel_state = SimpleNamespace(
+            next_actions=[SimpleNamespace(action_key="run_selected_pair", label="선택 Pair 실행", command_text="pwsh pair")],
+            issues=[],
+        )
+
+        spec = panel._current_sticky_action_spec()
+
+        self.assertEqual("focus_ready_to_forward_artifact", spec["action_key"])
+        self.assertEqual("다음 전달 대상 보기", spec["label"])
+        self.assertEqual("artifacts", spec["source"])
+
+    def test_run_recommended_action_routes_watcher_primitive_and_dashboard_actions(self) -> None:
+        panel = self._make_panel()
+        called: list[object] = []
+        panel.apply_watcher_recommended_action = lambda: called.append("watcher")
+        panel.reuse_existing_windows = lambda: called.append("primitive")
+        panel.handle_dashboard_action = lambda action_key, *, command_text="": called.append((action_key, command_text))
+
+        panel._run_recommended_action("watcher_recommended_action")
+        panel._run_recommended_action("visible_primitive_reuse")
+        panel._run_recommended_action("run_selected_pair", command_text="pwsh pair")
+
+        self.assertEqual(
+            [
+                "watcher",
+                "primitive",
+                ("run_selected_pair", "pwsh pair"),
+            ],
+            called,
+        )
+
+    def test_toggle_artifact_home_pair_scope_restores_previous_manual_filters(self) -> None:
+        panel = self._make_panel()
+        panel.home_pair_tree = object()
+        panel.artifact_home_browse_pair_filter_var = VarStub(False)
+        panel.artifact_home_browse_target_filter_var = VarStub(False)
+        panel.artifact_home_browse_toggle_var = VarStub("")
+        panel.artifact_home_browse_target_toggle_var = VarStub("")
+        panel._selected_home_pair_selection = lambda: "pair02"
+        panel.set_query_result = lambda *_args, **_kwargs: None
+        panel.artifact_pair_filter_var.set("pair04")
+        panel.artifact_target_filter_var.set("target08")
+
+        panel.toggle_artifact_home_pair_scope()
+
+        self.assertTrue(panel.artifact_home_browse_pair_filter_var.get())
+        self.assertEqual("pair02", panel.artifact_pair_filter_var.get())
+        self.assertEqual("", panel.artifact_target_filter_var.get())
+        self.assertEqual("Home Pair 고정 해제 (pair02)", panel.artifact_home_browse_toggle_var.get())
+
+        panel.toggle_artifact_home_pair_scope()
+
+        self.assertFalse(panel.artifact_home_browse_pair_filter_var.get())
+        self.assertEqual("pair04", panel.artifact_pair_filter_var.get())
+        self.assertEqual("target08", panel.artifact_target_filter_var.get())
+        self.assertEqual("Home Pair만 보기", panel.artifact_home_browse_toggle_var.get())
+
+    def test_sync_artifact_filters_with_home_pair_selection_prefers_inspection_target_for_target_follow(self) -> None:
+        panel = self._make_panel()
+        panel.home_pair_tree = object()
+        panel.artifact_home_browse_pair_filter_var = VarStub(True)
+        panel.artifact_home_browse_target_filter_var = VarStub(True)
+        panel.artifact_home_browse_toggle_var = VarStub("")
+        panel.artifact_home_browse_target_toggle_var = VarStub("")
+        panel.preview_rows = [
+            {"PairId": "pair02", "RoleName": "top", "TargetId": "target06"},
+            {"PairId": "pair01", "RoleName": "top", "TargetId": "target01"},
+        ]
+        panel._selected_home_pair_selection = lambda: "pair02"
+        panel._selected_inspection_target_id = lambda: "target06"
+
+        panel._sync_artifact_filters_with_home_pair_selection(refresh=False)
+
+        self.assertEqual("pair02", panel.artifact_pair_filter_var.get())
+        self.assertEqual("target06", panel.artifact_target_filter_var.get())
+        self.assertEqual("Home Pair 고정 해제 (pair02)", panel.artifact_home_browse_toggle_var.get())
+        self.assertEqual("target 고정 해제 (target06)", panel.artifact_home_browse_target_toggle_var.get())
+
     def test_run_paired_summary_routes_to_summary_script(self) -> None:
         panel = self._make_panel()
         captured: dict[str, object] = {}
@@ -3433,6 +3570,90 @@ class RelayOperatorPanelRuntimeCommandTests(unittest.TestCase):
         )
         self.assertEqual("", panel.last_command_var.get())
 
+    def test_attach_windows_from_bindings_runs_attach_then_refreshes_runtime_and_visibility(self) -> None:
+        panel = self._make_panel()
+        panel.attach_windows_from_bindings = RelayOperatorPanel.attach_windows_from_bindings.__get__(panel, RelayOperatorPanel)
+        panel._effective_refresh_context = RelayOperatorPanel._effective_refresh_context.__get__(panel, RelayOperatorPanel)
+        panel._runtime_refresh_command_preview = RelayOperatorPanel._runtime_refresh_command_preview.__get__(panel, RelayOperatorPanel)
+        panel._apply_runtime_refresh_result = RelayOperatorPanel._apply_runtime_refresh_result.__get__(panel, RelayOperatorPanel)
+        panel.panel_state = SimpleNamespace(
+            stages=[
+                SimpleNamespace(
+                    key="attach_windows",
+                    action_key="attach_windows",
+                    enabled=True,
+                    detail="",
+                ),
+            ]
+        )
+        relay_payload = {"Runtime": {"ExpectedTargetCount": 8}}
+        visibility_payload = {
+            "ExpectedTargetCount": 8,
+            "InjectableCount": 8,
+            "NonInjectableCount": 0,
+            "MissingRuntimeCount": 0,
+            "Targets": [],
+        }
+        panel.refresh_controller = SimpleNamespace(
+            refresh_runtime=lambda _context: RuntimeRefreshResult(
+                relay_status=relay_payload,
+                visibility_status=visibility_payload,
+            )
+        )
+
+        class CommandServiceStub:
+            def __init__(self) -> None:
+                self.commands: list[list[str]] = []
+
+            def build_script_command(
+                self,
+                script_name: str,
+                *,
+                config_path: str = "",
+                run_root: str = "",
+                pair_id: str = "",
+                target_id: str = "",
+                extra: list[str] | None = None,
+            ) -> list[str]:
+                command = [script_name]
+                if config_path:
+                    command += ["-ConfigPath", config_path]
+                if run_root:
+                    command += ["-RunRoot", run_root]
+                if pair_id:
+                    command += ["-PairId", pair_id]
+                if target_id:
+                    command += ["-TargetId", target_id]
+                if extra:
+                    command += list(extra)
+                return command
+
+            def run(self, command: list[str]) -> subprocess.CompletedProcess[str]:
+                self.commands.append(list(command))
+                if command[0] == "attach-targets-from-bindings.ps1":
+                    return subprocess.CompletedProcess(command, 0, stdout="attach done", stderr="")
+                raise AssertionError(command)
+
+        panel.command_service = CommandServiceStub()
+
+        panel.attach_windows_from_bindings()
+
+        self.assertEqual(
+            [["attach-targets-from-bindings.ps1", "-ConfigPath", "cfg.psd1"]],
+            panel.command_service.commands,
+        )
+        self.assertEqual(relay_payload, panel.relay_status_data)
+        self.assertEqual(visibility_payload, panel.visibility_status_data)
+        self.assertIn("attach bundle:", panel.last_command_var.get())
+        self.assertIn("attach-targets-from-bindings.ps1", panel.last_command_var.get())
+        self.assertIn("check-target-window-visibility.ps1", panel.last_command_var.get())
+        self.assertIn("[붙이기]", panel._captured_output)
+        self.assertIn("attach done", panel._captured_output)
+        self.assertIn("[입력 점검]", panel._captured_output)
+        self.assertIn("Injectable: 8/8", panel._captured_output)
+        self.assertIn("바인딩 attach 완료 / 입력 가능 8/8 / fail=0 missing=0", panel.last_result_var.get())
+        self.assertTrue(getattr(panel, "_load_effective_config_called", False))
+
     def test_format_background_exception_includes_returncode_stdout_and_stderr(self) -> None:
         panel = self._make_panel()
 
@@ -3639,6 +3860,307 @@ class RelayOperatorPanelRuntimeCommandTests(unittest.TestCase):
         self.assertEqual([panel.ops_tab, panel.snapshots_tab], panel.notebook.hidden)
         self.assertTrue(hasattr(panel, "result_notebook"))
 
+    def test_result_panel_collapsed_bottom_mode_reclaims_layout_space(self) -> None:
+        panel = RelayOperatorPanel.__new__(RelayOperatorPanel)
+
+        class GridStub:
+            def __init__(self) -> None:
+                self.grid_called = False
+                self.grid_removed = False
+                self.grid_configurations: list[dict[str, object]] = []
+                self.configure_calls: list[dict[str, object]] = []
+
+            def grid(self) -> None:
+                self.grid_called = True
+
+            def grid_remove(self) -> None:
+                self.grid_removed = True
+
+            def grid_configure(self, **kwargs) -> None:
+                self.grid_configurations.append(dict(kwargs))
+
+            def configure(self, **kwargs) -> None:
+                self.configure_calls.append(dict(kwargs))
+
+        panel.result_body_frame = GridStub()
+        panel.result_frame = GridStub()
+        panel.notebook = GridStub()
+        panel.result_panel_collapsed_var = VarStub(True)
+        panel.result_panel_dock_var = VarStub("bottom")
+        panel.result_toggle_button_var = VarStub("")
+        panel.result_panel_context_var = VarStub("")
+        rowconfigure_calls: list[tuple[int, int]] = []
+        columnconfigure_calls: list[tuple[int, int]] = []
+        panel.rowconfigure = lambda index, weight=0: rowconfigure_calls.append((index, weight))
+        panel.columnconfigure = lambda index, weight=0: columnconfigure_calls.append((index, weight))
+        panel._result_panel_layout_state = RelayOperatorPanel._result_panel_layout_state.__get__(panel, RelayOperatorPanel)
+        panel._apply_result_panel_layout = RelayOperatorPanel._apply_result_panel_layout.__get__(panel, RelayOperatorPanel)
+        panel._refresh_result_panel_context = RelayOperatorPanel._refresh_result_panel_context.__get__(panel, RelayOperatorPanel)
+        panel._apply_result_panel_visibility = RelayOperatorPanel._apply_result_panel_visibility.__get__(panel, RelayOperatorPanel)
+
+        panel._apply_result_panel_visibility()
+
+        self.assertTrue(panel.result_body_frame.grid_removed)
+        self.assertEqual("결과 펼치기", panel.result_toggle_button_var.get())
+        self.assertIn((2, 0), rowconfigure_calls)
+        self.assertIn((1, 0), columnconfigure_calls)
+        self.assertTrue(panel.result_frame.grid_configurations)
+        self.assertEqual("ew", panel.result_frame.grid_configurations[-1]["sticky"])
+        self.assertIn("축약 상태", panel.result_panel_context_var.get())
+
+    def test_set_text_expands_result_panel_even_in_simple_mode(self) -> None:
+        panel = RelayOperatorPanel.__new__(RelayOperatorPanel)
+        output_widget = TextWidgetStub("")
+        panel.output_text = output_widget
+        panel.query_output_text = TextWidgetStub("")
+        panel.result_panel_collapsed_var = VarStub(True)
+        panel.simple_mode_var = VarStub(True)
+        calls: list[str] = []
+        panel._apply_result_panel_visibility = lambda: calls.append("visibility")
+        panel.set_text = RelayOperatorPanel.set_text.__get__(panel, RelayOperatorPanel)
+
+        panel.set_text(output_widget, "latest output")
+
+        self.assertFalse(panel.result_panel_collapsed_var.get())
+        self.assertEqual(["visibility"], calls)
+        self.assertEqual("latest output", output_widget.value)
+        self.assertEqual("disabled", output_widget.state)
+
+    def test_set_text_keeps_collapsed_panel_and_marks_unseen_update_outside_simple_mode(self) -> None:
+        panel = RelayOperatorPanel.__new__(RelayOperatorPanel)
+
+        class GridStub:
+            def __init__(self) -> None:
+                self.grid_called = False
+                self.grid_removed = False
+
+            def grid(self) -> None:
+                self.grid_called = True
+
+            def grid_remove(self) -> None:
+                self.grid_removed = True
+
+            def grid_configure(self, **kwargs) -> None:
+                pass
+
+            def configure(self, **kwargs) -> None:
+                pass
+
+        output_widget = TextWidgetStub("")
+        panel.output_text = output_widget
+        panel.query_output_text = TextWidgetStub("")
+        panel.result_body_frame = GridStub()
+        panel.result_frame = GridStub()
+        panel.notebook = GridStub()
+        panel.result_panel_collapsed_var = VarStub(True)
+        panel.result_panel_dock_var = VarStub("bottom")
+        panel.result_toggle_button_var = VarStub("")
+        panel.result_panel_context_var = VarStub("")
+        panel.result_panel_status_var = VarStub("")
+        panel.result_panel_has_unseen_update = False
+        panel.simple_mode_var = VarStub(False)
+        panel.rowconfigure = lambda _index, weight=0: None
+        panel.columnconfigure = lambda _index, weight=0: None
+        panel._result_panel_layout_state = RelayOperatorPanel._result_panel_layout_state.__get__(panel, RelayOperatorPanel)
+        panel._apply_result_panel_layout = RelayOperatorPanel._apply_result_panel_layout.__get__(panel, RelayOperatorPanel)
+        panel._refresh_result_panel_context = RelayOperatorPanel._refresh_result_panel_context.__get__(panel, RelayOperatorPanel)
+        panel._apply_result_panel_visibility = RelayOperatorPanel._apply_result_panel_visibility.__get__(panel, RelayOperatorPanel)
+        panel._mark_result_panel_content_updated = RelayOperatorPanel._mark_result_panel_content_updated.__get__(panel, RelayOperatorPanel)
+        panel.set_text = RelayOperatorPanel.set_text.__get__(panel, RelayOperatorPanel)
+
+        panel.set_text(output_widget, "latest output")
+
+        self.assertTrue(panel.result_panel_collapsed_var.get())
+        self.assertTrue(panel.result_panel_has_unseen_update)
+        self.assertEqual("새 결과 보기", panel.result_toggle_button_var.get())
+        self.assertIn("새 결과 확인 대기", panel.result_panel_status_var.get())
+        self.assertEqual("latest output", output_widget.value)
+        self.assertEqual("disabled", output_widget.state)
+
+    def test_toggle_result_panel_clears_unseen_update_when_expanded(self) -> None:
+        panel = RelayOperatorPanel.__new__(RelayOperatorPanel)
+
+        class GridStub:
+            def __init__(self) -> None:
+                self.grid_called = False
+                self.grid_removed = False
+
+            def grid(self) -> None:
+                self.grid_called = True
+
+            def grid_remove(self) -> None:
+                self.grid_removed = True
+
+            def grid_configure(self, **kwargs) -> None:
+                pass
+
+            def configure(self, **kwargs) -> None:
+                pass
+
+        panel.result_body_frame = GridStub()
+        panel.result_frame = GridStub()
+        panel.notebook = GridStub()
+        panel.result_panel_collapsed_var = VarStub(True)
+        panel.result_panel_dock_var = VarStub("bottom")
+        panel.result_toggle_button_var = VarStub("")
+        panel.result_panel_context_var = VarStub("")
+        panel.result_panel_status_var = VarStub("")
+        panel.result_panel_has_unseen_update = True
+        panel.rowconfigure = lambda _index, weight=0: None
+        panel.columnconfigure = lambda _index, weight=0: None
+        panel._result_panel_layout_state = RelayOperatorPanel._result_panel_layout_state.__get__(panel, RelayOperatorPanel)
+        panel._apply_result_panel_layout = RelayOperatorPanel._apply_result_panel_layout.__get__(panel, RelayOperatorPanel)
+        panel._refresh_result_panel_context = RelayOperatorPanel._refresh_result_panel_context.__get__(panel, RelayOperatorPanel)
+        panel._apply_result_panel_visibility = RelayOperatorPanel._apply_result_panel_visibility.__get__(panel, RelayOperatorPanel)
+        panel.toggle_result_panel = RelayOperatorPanel.toggle_result_panel.__get__(panel, RelayOperatorPanel)
+        panel.set_operator_status = lambda *_args, **_kwargs: None
+        panel._refresh_sticky_context_bar = lambda: None
+
+        panel.toggle_result_panel()
+
+        self.assertFalse(panel.result_panel_collapsed_var.get())
+        self.assertFalse(panel.result_panel_has_unseen_update)
+        self.assertEqual("결과 접기", panel.result_toggle_button_var.get())
+        self.assertTrue(panel.result_body_frame.grid_called)
+
+    def test_refresh_result_panel_context_reports_latest_update_summary(self) -> None:
+        panel = RelayOperatorPanel.__new__(RelayOperatorPanel)
+
+        class FrameStub:
+            def __init__(self) -> None:
+                self.configured: list[dict[str, object]] = []
+
+            def configure(self, **kwargs) -> None:
+                self.configured.append(dict(kwargs))
+
+        panel.result_frame = FrameStub()
+        panel.result_panel_collapsed_var = VarStub(False)
+        panel.result_panel_dock_var = VarStub("bottom")
+        panel.result_panel_context_var = VarStub("")
+        panel.result_panel_status_var = VarStub("")
+        panel.result_panel_last_channel = "조회 결과"
+        panel.result_panel_last_updated_at = "07:10:11"
+        panel.result_panel_last_preview = "결과 / 산출물 새로고침 완료"
+        panel._result_panel_layout_state = RelayOperatorPanel._result_panel_layout_state.__get__(panel, RelayOperatorPanel)
+        panel._result_panel_latest_summary = RelayOperatorPanel._result_panel_latest_summary.__get__(panel, RelayOperatorPanel)
+        panel._refresh_result_panel_context = RelayOperatorPanel._refresh_result_panel_context.__get__(panel, RelayOperatorPanel)
+
+        panel._refresh_result_panel_context()
+
+        self.assertIn("하단 공용 패널", panel.result_panel_context_var.get())
+        self.assertIn("조회 결과", panel.result_panel_status_var.get())
+        self.assertIn("07:10:11", panel.result_panel_status_var.get())
+        self.assertEqual("하단 공용 패널 / 작업 · 조회 결과", panel.result_frame.configured[-1]["text"])
+
+    def test_result_panel_badge_spec_uses_compact_channel_and_time_only(self) -> None:
+        panel = RelayOperatorPanel.__new__(RelayOperatorPanel)
+        panel.result_panel_collapsed_var = VarStub(False)
+        panel.result_panel_dock_var = VarStub("bottom")
+        panel.result_panel_last_channel = "조회 결과"
+        panel.result_panel_last_updated_at = "07:10:11"
+        panel.result_panel_last_preview = "결과 / 산출물 새로고침 완료"
+        panel._result_panel_layout_state = RelayOperatorPanel._result_panel_layout_state.__get__(panel, RelayOperatorPanel)
+        panel._result_panel_latest_summary = RelayOperatorPanel._result_panel_latest_summary.__get__(panel, RelayOperatorPanel)
+        panel._result_panel_badge_spec = RelayOperatorPanel._result_panel_badge_spec.__get__(panel, RelayOperatorPanel)
+
+        badge = panel._result_panel_badge_spec()
+
+        self.assertEqual("결과: 하단 / 펼침 / 조회 결과 07:10", badge["text"])
+        self.assertNotIn("새로고침 완료", badge["text"])
+
+    def test_apply_message_fixed_section_visibility_toggles_body_and_row_weight(self) -> None:
+        panel = RelayOperatorPanel.__new__(RelayOperatorPanel)
+
+        class GridStub:
+            def __init__(self) -> None:
+                self.grid_called = False
+                self.grid_removed = False
+
+            def grid(self) -> None:
+                self.grid_called = True
+
+            def grid_remove(self) -> None:
+                self.grid_removed = True
+
+        class EditorLeftStub:
+            def __init__(self) -> None:
+                self.rowconfigure_calls: list[tuple[int, int]] = []
+
+            def rowconfigure(self, index: int, weight: int = 0) -> None:
+                self.rowconfigure_calls.append((index, weight))
+
+        panel.message_fixed_body_frame = GridStub()
+        panel.message_editor_left_frame = EditorLeftStub()
+        panel.message_fixed_section_collapsed_var = VarStub(True)
+        panel.message_fixed_section_toggle_var = VarStub("")
+        panel._apply_message_fixed_section_visibility = RelayOperatorPanel._apply_message_fixed_section_visibility.__get__(panel, RelayOperatorPanel)
+
+        panel._apply_message_fixed_section_visibility()
+
+        self.assertTrue(panel.message_fixed_body_frame.grid_removed)
+        self.assertEqual("고정문구 펼치기", panel.message_fixed_section_toggle_var.get())
+        self.assertIn((4, 0), panel.message_editor_left_frame.rowconfigure_calls)
+
+        panel.message_fixed_section_collapsed_var.set(False)
+        panel._apply_message_fixed_section_visibility()
+
+        self.assertTrue(panel.message_fixed_body_frame.grid_called)
+        self.assertEqual("고정문구 접기", panel.message_fixed_section_toggle_var.get())
+        self.assertIn((4, 1), panel.message_editor_left_frame.rowconfigure_calls)
+
+    def test_apply_message_block_focus_mode_tunes_layout_and_preview_target(self) -> None:
+        panel = RelayOperatorPanel.__new__(RelayOperatorPanel)
+
+        class ColumnStub:
+            def __init__(self) -> None:
+                self.columnconfigure_calls: list[tuple[int, int, int]] = []
+
+            def columnconfigure(self, index: int, weight: int = 0, minsize: int = 0) -> None:
+                self.columnconfigure_calls.append((index, weight, minsize))
+
+        class RowStub:
+            def __init__(self) -> None:
+                self.rowconfigure_calls: list[tuple[int, int]] = []
+
+            def rowconfigure(self, index: int, weight: int = 0) -> None:
+                self.rowconfigure_calls.append((index, weight))
+
+        panel.editor_tab = ColumnStub()
+        panel.message_editor_left_frame = RowStub()
+        panel.message_block_frame = RowStub()
+        panel.message_fixed_toggle_button = ButtonStub()
+        panel.message_block_focus_mode_var = VarStub(True)
+        panel.message_block_focus_button_var = VarStub("")
+        panel.message_fixed_section_collapsed_var = VarStub(False)
+        panel.message_template_var = VarStub("Handoff")
+        panel.editor_initial_preview_tab = "initial-tab"
+        panel.editor_handoff_preview_tab = "handoff-tab"
+        selected_tabs: list[object] = []
+        panel.editor_right_notebook = SimpleNamespace(select=lambda tab: selected_tabs.append(tab))
+        fixed_visibility_calls: list[object] = []
+        panel._apply_message_fixed_section_visibility = lambda: fixed_visibility_calls.append(panel.message_fixed_section_collapsed_var.get())
+        panel._apply_message_block_focus_mode = RelayOperatorPanel._apply_message_block_focus_mode.__get__(panel, RelayOperatorPanel)
+
+        panel._apply_message_block_focus_mode()
+
+        self.assertEqual("기본 편집 보기", panel.message_block_focus_button_var.get())
+        self.assertTrue(panel.message_fixed_section_collapsed_var.get())
+        self.assertEqual("disabled", panel.message_fixed_toggle_button.state)
+        self.assertIn((0, 3, 620), panel.editor_tab.columnconfigure_calls)
+        self.assertIn((2, 5), panel.message_editor_left_frame.rowconfigure_calls)
+        self.assertIn((3, 4), panel.message_block_frame.rowconfigure_calls)
+        self.assertEqual(["handoff-tab"], selected_tabs)
+        self.assertEqual([True], fixed_visibility_calls)
+
+        panel.message_block_focus_mode_var.set(False)
+        panel._apply_message_block_focus_mode()
+
+        self.assertEqual("블록 편집 집중", panel.message_block_focus_button_var.get())
+        self.assertEqual("normal", panel.message_fixed_toggle_button.state)
+        self.assertIn((0, 2, 520), panel.editor_tab.columnconfigure_calls)
+        self.assertIn((2, 3), panel.message_editor_left_frame.rowconfigure_calls)
+        self.assertIn((3, 2), panel.message_block_frame.rowconfigure_calls)
+
     def test_rebuild_panel_state_passes_panel_runtime_hints_to_aggregator(self) -> None:
         panel = self._make_panel()
         panel.rebuild_panel_state = RelayOperatorPanel.rebuild_panel_state.__get__(panel, RelayOperatorPanel)
@@ -3774,6 +4296,94 @@ class RelayOperatorPanelRuntimeCommandTests(unittest.TestCase):
         self.assertEqual("disabled", panel.home_start_watch_button.state)
         self.assertEqual("disabled", panel.artifact_watch_button.state)
 
+    def test_update_pair_button_states_disables_headless_drill_buttons_for_shared_visible_typed_window_lane(self) -> None:
+        panel = self._make_panel()
+        panel.update_pair_button_states = RelayOperatorPanel.update_pair_button_states.__get__(panel, RelayOperatorPanel)
+        panel.effective_data = {
+            "Config": {"LaneName": "bottest-live-visible"},
+            "PairTest": {
+                "ExecutionPathMode": "typed-window",
+                "RequireUserVisibleCellExecution": True,
+            },
+            "PairActivationSummary": [{"PairId": "pair01", "EffectiveEnabled": True}],
+            "RunContext": {"SelectedRunRoot": "C:\\runs\\current"},
+        }
+        panel.panel_state = SimpleNamespace(
+            stages=[
+                SimpleNamespace(key="pair_action", action_key="run_selected_pair", enabled=True, detail=""),
+            ]
+        )
+        panel.selected_pair_button = ButtonStub()
+        panel.home_run_pair_button = ButtonStub()
+        panel.home_enable_pair_button = ButtonStub()
+        panel.home_disable_pair_button = ButtonStub()
+        panel.fixed_pair01_button = ButtonStub()
+        panel.parallel_pair_drill_button = ButtonStub()
+        panel.home_start_watch_button = ButtonStub()
+        panel.artifact_watch_button = ButtonStub()
+        panel.ops_stop_watch_button = ButtonStub()
+        panel.ops_restart_watch_button = ButtonStub()
+        panel.ops_recover_watch_button = ButtonStub()
+        panel.board_attach_button = ButtonStub()
+        panel._watcher_start_eligibility = lambda: SimpleNamespace(allowed=True, cleanup_allowed=False, message="")
+        panel._watcher_stop_eligibility = lambda: SimpleNamespace(allowed=False)
+        panel._selected_parallel_pair_execution_allowed = lambda pair_ids=None: (True, "")
+
+        panel.update_pair_button_states()
+
+        self.assertEqual("disabled", panel.selected_pair_button.state)
+        self.assertEqual("disabled", panel.home_run_pair_button.state)
+        self.assertEqual("disabled", panel.fixed_pair01_button.state)
+        self.assertEqual("disabled", panel.parallel_pair_drill_button.state)
+        self.assertEqual("선택 Pair 실행 (shared visible 차단)", panel.selected_pair_button.text)
+        self.assertEqual("pair01 preset 실행 (shared visible 차단)", panel.fixed_pair01_button.text)
+        self.assertEqual("선택 pair 병렬 실테스트 (shared visible 차단)", panel.parallel_pair_drill_button.text)
+
+    def test_refresh_sticky_context_bar_surfaces_shared_visible_headless_block_reason(self) -> None:
+        panel = self._make_panel()
+        panel._refresh_sticky_context_bar = RelayOperatorPanel._refresh_sticky_context_bar.__get__(panel, RelayOperatorPanel)
+        panel.effective_data = {
+            "Config": {"LaneName": "bottest-live-visible"},
+            "PairTest": {
+                "ExecutionPathMode": "typed-window",
+                "RequireUserVisibleCellExecution": True,
+            },
+            "RunContext": {"SelectedRunRoot": "C:\\runs\\current"},
+        }
+        panel.panel_state = SimpleNamespace(overall_label="RUNNING", next_actions=[], issues=[])
+        panel.sticky_action_context_var = VarStub("")
+        panel.sticky_inspection_context_var = VarStub("")
+        panel.sticky_run_root_context_var = VarStub("")
+        panel.sticky_runtime_context_var = VarStub("")
+        panel.sticky_next_step_var = VarStub("")
+        panel.sticky_next_action_button_var = VarStub("")
+        panel.sticky_context_badge_var = VarStub("")
+        panel.run_root_status_var = VarStub("")
+        panel.sticky_next_action_button = ButtonStub()
+        panel._action_context_summary = lambda: "실행=pair01/target01"
+        panel._inspection_context_summary = lambda: "보고=pair01/target01"
+        panel._watcher_status = lambda: "running"
+        panel._current_next_step_summary = lambda: "watch 시작"
+        panel._current_sticky_action_spec = lambda: {
+            "action_key": "",
+            "label": "",
+            "command_text": "",
+            "read_only": False,
+        }
+        panel._current_context_badge_spec = lambda: {
+            "text": "문맥 일치",
+            "background": "#6B7280",
+            "foreground": "#FFFFFF",
+            "apply_enabled": False,
+        }
+        panel._artifact_browse_badge_spec = lambda: {"text": "", "background": "#6B7280", "foreground": "#FFFFFF"}
+        panel._result_panel_badge_spec = lambda: {"text": "", "background": "#6B7280", "foreground": "#FFFFFF"}
+
+        panel._refresh_sticky_context_bar()
+
+        self.assertIn("headless=차단(shared visible typed-window)", panel.sticky_runtime_context_var.get())
+        self.assertIn("Visible Acceptance 경로 사용", panel.sticky_next_step_var.get())
+
     def test_update_pair_button_states_disables_board_attach_when_attach_stage_is_blocked(self) -> None:
         panel = self._make_panel()
         panel.update_pair_button_states = RelayOperatorPanel.update_pair_button_states.__get__(panel, RelayOperatorPanel)
@@ -3804,6 +4414,38 @@ class RelayOperatorPanelRuntimeCommandTests(unittest.TestCase):
         panel.update_pair_button_states()
 
         self.assertEqual("disabled", panel.board_attach_button.state)
+
+    def test_update_pair_button_states_disables_board_visibility_when_visibility_stage_is_blocked(self) -> None:
+        panel = self._make_panel()
+        panel.update_pair_button_states = RelayOperatorPanel.update_pair_button_states.__get__(panel, RelayOperatorPanel)
+        panel.panel_state = SimpleNamespace(
+            stages=[
+                SimpleNamespace(
+                    key="check_visibility",
+                    action_key="check_visibility",
+                    enabled=False,
+                    detail="입력 점검 대기: 8창 열기만으로는 부족합니다. 현재 binding profile을 target-runtime.json에 붙인 뒤 입력 점검하세요. 순서: 8창 열기 -> 붙이기 -> 입력 점검.",
+                ),
+            ]
+        )
+        panel.selected_pair_button = ButtonStub()
+        panel.home_run_pair_button = ButtonStub()
+        panel.home_enable_pair_button = ButtonStub()
+        panel.home_disable_pair_button = ButtonStub()
+        panel.fixed_pair01_button = ButtonStub()
+        panel.home_start_watch_button = ButtonStub()
+        panel.artifact_watch_button = ButtonStub()
+        panel.ops_stop_watch_button = ButtonStub()
+        panel.ops_restart_watch_button = ButtonStub()
+        panel.ops_recover_watch_button = ButtonStub()
+        panel.board_attach_button = ButtonStub()
+        panel.board_visibility_button = ButtonStub()
+        panel._watcher_start_eligibility = lambda: SimpleNamespace(allowed=True, cleanup_allowed=False, message="")
+        panel._watcher_stop_eligibility = lambda: SimpleNamespace(allowed=False)
+
+        panel.update_pair_button_states()
+
+        self.assertEqual("disabled", panel.board_visibility_button.state)
 
     def test_update_pair_button_states_enables_visible_acceptance_buttons_with_manifest_run_root(self) -> None:
         panel = self._make_panel()
@@ -4965,6 +5607,10 @@ class RelayOperatorPanelMessageSlotTests(unittest.TestCase):
         panel.message_document_version = 0
         panel.message_preview_doc_version = -1
         panel.message_preview_cached_context_key = ""
+        panel.result_panel_has_unseen_update = False
+        panel.result_panel_last_channel = ""
+        panel.result_panel_last_preview = ""
+        panel.result_panel_last_updated_at = ""
         panel.visible_workflow_progress_by_scope = {}
         panel.pair_policy_editor_status_var = VarStub("")
         panel.pair_policy_parallel_status_var = VarStub("")
@@ -4974,6 +5620,7 @@ class RelayOperatorPanelMessageSlotTests(unittest.TestCase):
         panel.seed_kickoff_contract_text = TextWidgetStub("")
         panel.seed_kickoff_helper_text = TextWidgetStub("")
         panel.seed_kickoff_steps_text = TextWidgetStub("")
+        panel.seed_kickoff_simple_text = TextWidgetStub("")
         panel.seed_kickoff_preview_text = TextWidgetStub("")
         panel.seed_kickoff_preview_stack_frame = None
         panel.seed_kickoff_preview_detail_frame = None
@@ -5046,6 +5693,22 @@ class RelayOperatorPanelMessageSlotTests(unittest.TestCase):
         panel.pair_policy_clone_source_var = VarStub("pair01")
         panel.pair_policy_clone_target_var = VarStub("pair02")
         panel.pair_policy_card_seed_combos = {}
+        panel.pair_policy_card_parallel_checkbuttons = {
+            pair_id: ButtonStub()
+            for pair_id in ["pair01", "pair02", "pair03", "pair04"]
+        }
+        panel.pair_policy_card_summary_buttons = {
+            pair_id: ButtonStub()
+            for pair_id in ["pair01", "pair02", "pair03", "pair04"]
+        }
+        panel.pair_policy_card_preview_buttons = {
+            pair_id: ButtonStub()
+            for pair_id in ["pair01", "pair02", "pair03", "pair04"]
+        }
+        panel.pair_policy_card_copy_buttons = {
+            pair_id: ButtonStub()
+            for pair_id in ["pair01", "pair02", "pair03", "pair04"]
+        }
         panel.pair_policy_card_runtime_badge_labels = {}
         panel.pair_policy_card_effective_preview_widgets = {
             pair_id: TextWidgetStub("")
@@ -5061,6 +5724,7 @@ class RelayOperatorPanelMessageSlotTests(unittest.TestCase):
         panel._editor_one_time_text = lambda: "(one-time)"
         panel._message_editor_has_unsaved_changes = lambda: False
         panel._message_preview_is_fresh = lambda: True
+        panel._resolve_run_prepare_config_path = lambda *, pair_id, config_path: config_path
         return panel
 
     def test_message_slot_editor_context_resolves_target_slot_to_current_target(self) -> None:
@@ -5521,6 +6185,54 @@ class RelayOperatorPanelMessageSlotTests(unittest.TestCase):
         self.assertEqual(0, panel.inspection_context_row_index)
         self.assertIn("inspection 선택만 바뀌었습니다.", panel._captured_detail)
 
+    def test_on_row_selected_includes_paired_source_outbox_repair_status(self) -> None:
+        panel = self._make_panel()
+        panel.preview_rows = [
+            {
+                "PairId": "pair02",
+                "RoleName": "bottom",
+                "TargetId": "target05",
+                "PartnerTargetId": "target01",
+            },
+        ]
+        panel.paired_status_data = {
+            "Targets": [
+                {
+                    "TargetId": "target05",
+                    "SourceOutboxState": "waiting",
+                    "SourceOutboxNextAction": "manual-repair",
+                    "SourceOutboxOriginalReadyReason": "marker-publisher-unsupported",
+                    "SourceOutboxFinalReadyReason": "published",
+                    "SourceOutboxRepairAttempted": True,
+                    "SourceOutboxRepairSucceeded": True,
+                    "SourceOutboxRepairSourceContext": "watcher-auto-repair",
+                    "SourceOutboxRepairCompletedAt": "2026-05-02T10:31:23+09:00",
+                    "SourceOutboxRepairMessage": "publish helper rerun",
+                }
+            ]
+        }
+
+        class RowTreeStub:
+            def selection(self) -> tuple[str, ...]:
+                return ("0",)
+
+        panel.row_tree = RowTreeStub()
+        panel.details_text = object()
+        panel.initial_text = object()
+        panel.handoff_text = object()
+        panel.plan_text = object()
+        panel.one_time_text = object()
+        panel.render_target_board = lambda: None
+        panel.render_message_editor = lambda: None
+        panel.set_text = lambda widget, value: setattr(panel, "_captured_detail", value) if widget is panel.details_text else None
+
+        panel.on_row_selected()
+
+        self.assertIn("[paired source outbox status]", panel._captured_detail)
+        self.assertIn("original ready reason: marker-publisher-unsupported", panel._captured_detail)
+        self.assertIn("repair attempted/succeeded: True / True", panel._captured_detail)
+        self.assertIn("repair source context: watcher-auto-repair", panel._captured_detail)
+
     def test_on_row_selected_surfaces_pair_route_snapshot(self) -> None:
         panel = self._make_panel()
         panel.preview_rows = [
@@ -5584,6 +6296,54 @@ class RelayOperatorPanelMessageSlotTests(unittest.TestCase):
         self.assertIn("other pairs share this repo root: True", panel._captured_detail)
         self.assertIn(r"top source outbox: C:\repo-shared\.relay-contract\bottest-live-visible\run_1\pair01\target01\source-outbox", panel._captured_detail)
         self.assertIn(r"bottom source outbox: C:\repo-shared\.relay-contract\bottest-live-visible\run_1\pair01\target05\source-outbox", panel._captured_detail)
+
+    def test_render_rows_includes_source_outbox_repair_summary_column(self) -> None:
+        panel = self._make_panel()
+        panel.render_rows = RelayOperatorPanel.render_rows.__get__(panel, RelayOperatorPanel)
+        panel.paired_status_data = {
+            "Targets": [
+                {
+                    "TargetId": "target01",
+                    "SourceOutboxState": "waiting",
+                    "SourceOutboxNextAction": "manual-repair",
+                    "SourceOutboxOriginalReadyReason": "marker-publisher-unsupported",
+                    "SourceOutboxRepairAttempted": True,
+                    "SourceOutboxRepairSucceeded": True,
+                }
+            ]
+        }
+
+        class RowTreeStub:
+            def __init__(self) -> None:
+                self.inserted: list[tuple[str, tuple[object, ...]]] = []
+
+            def get_children(self) -> tuple[str, ...]:
+                return ()
+
+            def delete(self, _item: str) -> None:
+                return None
+
+            def insert(self, _parent: str, _index: str, *, iid: str, values: tuple[object, ...]) -> None:
+                self.inserted.append((iid, values))
+
+        panel.row_tree = RowTreeStub()
+
+        panel.render_rows(
+            [
+                {
+                    "PairId": "pair01",
+                    "RoleName": "top",
+                    "TargetId": "target01",
+                    "PartnerTargetId": "target05",
+                }
+            ]
+        )
+
+        self.assertEqual(1, len(panel.row_tree.inserted))
+        self.assertEqual("pair01", panel.row_tree.inserted[0][1][0])
+        self.assertIn("waiting", panel.row_tree.inserted[0][1][4])
+        self.assertIn("manual-repair", panel.row_tree.inserted[0][1][4])
+        self.assertIn("repair=ok(marker-publisher-unsupported)", panel.row_tree.inserted[0][1][4])
 
     def test_refresh_pair_policy_editor_populates_card_from_pair_policy_and_current_route(self) -> None:
         panel = self._make_panel()
@@ -5662,6 +6422,149 @@ class RelayOperatorPanelMessageSlotTests(unittest.TestCase):
         panel.refresh_pair_policy_editor()
 
         self.assertEqual("SHARED REPO OK", panel.pair_policy_card_vars["pair01"]["route_badge_var"].get())
+
+    def test_refresh_pair_policy_editor_auto_hydrates_all_pair_effective_previews_after_full_refresh(self) -> None:
+        panel = self._make_panel()
+        panel.message_config_doc["PairTest"]["PairDefinitions"].append(
+            {"PairId": "pair02", "TopTargetId": "target02", "BottomTargetId": "target06", "SeedTargetId": "target02"}
+        )
+        panel.message_config_doc["PairTest"]["PairPolicies"]["pair01"]["DefaultSeedWorkRepoRoot"] = r"C:\repo-shared"
+        panel.message_config_doc["PairTest"]["PairPolicies"]["pair02"] = {
+            "DefaultSeedWorkRepoRoot": r"C:\repo-shared",
+            "UseExternalWorkRepoRunRoot": True,
+            "UseExternalWorkRepoContractPaths": True,
+            "DefaultPairMaxRoundtripCount": 1,
+            "DefaultSeedTargetId": "target02",
+        }
+        panel.message_config_doc["Targets"] = [
+            {"Id": "target01"},
+            {"Id": "target05"},
+            {"Id": "target02"},
+            {"Id": "target06"},
+        ]
+        panel.preview_rows = [
+            {
+                "PairId": "pair01",
+                "RoleName": "top",
+                "TargetId": "target01",
+                "PairRunRoot": r"C:\dev\python\relay-workrepo-visible-smoke\.relay-runs\bottest-live-visible\run_old\pair01",
+                "SourceOutboxPath": r"C:\dev\python\relay-workrepo-visible-smoke\.relay-contract\bottest-live-visible\run_old\pair01\target01\source-outbox",
+                "PublishReadyPath": r"C:\dev\python\relay-workrepo-visible-smoke\.relay-contract\bottest-live-visible\run_old\pair01\target01\source-outbox\publish.ready.json",
+            },
+            {
+                "PairId": "pair01",
+                "RoleName": "bottom",
+                "TargetId": "target05",
+                "PairRunRoot": r"C:\dev\python\relay-workrepo-visible-smoke\.relay-runs\bottest-live-visible\run_old\pair01",
+                "SourceOutboxPath": r"C:\dev\python\relay-workrepo-visible-smoke\.relay-contract\bottest-live-visible\run_old\pair01\target05\source-outbox",
+                "PublishReadyPath": r"C:\dev\python\relay-workrepo-visible-smoke\.relay-contract\bottest-live-visible\run_old\pair01\target05\source-outbox\publish.ready.json",
+            },
+        ]
+        panel.message_config_service.load_config_document = lambda _path: panel.message_config_service.clone_document(panel.message_config_doc)
+        panel.__dict__["_pair_policy_refresh_auto_preview"] = True
+
+        def render_all_preview(*, document, config_path: str, pair_ids: list[str], mode: str = "both"):
+            self.assertEqual(["pair01", "pair02"], pair_ids)
+            self.assertEqual("both", mode)
+            return {
+                "Warnings": [],
+                "PreviewRows": [
+                    {
+                        "PairId": "pair01",
+                        "RoleName": "top",
+                        "TargetId": "target01",
+                        "PairRunRoot": r"C:\repo-shared\.relay-runs\bottest-live-visible\pairs\pair01\run_preview",
+                        "SourceOutboxPath": r"C:\repo-shared\.relay-contract\bottest-live-visible\run_preview\pair01\target01\source-outbox",
+                        "PublishReadyPath": r"C:\repo-shared\.relay-contract\bottest-live-visible\run_preview\pair01\target01\source-outbox\publish.ready.json",
+                    },
+                    {
+                        "PairId": "pair01",
+                        "RoleName": "bottom",
+                        "TargetId": "target05",
+                        "PairRunRoot": r"C:\repo-shared\.relay-runs\bottest-live-visible\pairs\pair01\run_preview",
+                        "SourceOutboxPath": r"C:\repo-shared\.relay-contract\bottest-live-visible\run_preview\pair01\target05\source-outbox",
+                        "PublishReadyPath": r"C:\repo-shared\.relay-contract\bottest-live-visible\run_preview\pair01\target05\source-outbox\publish.ready.json",
+                    },
+                    {
+                        "PairId": "pair02",
+                        "RoleName": "top",
+                        "TargetId": "target02",
+                        "PairRunRoot": r"C:\repo-shared\.relay-runs\bottest-live-visible\pairs\pair02\run_preview",
+                        "SourceOutboxPath": r"C:\repo-shared\.relay-contract\bottest-live-visible\run_preview\pair02\target02\source-outbox",
+                        "PublishReadyPath": r"C:\repo-shared\.relay-contract\bottest-live-visible\run_preview\pair02\target02\source-outbox\publish.ready.json",
+                    },
+                    {
+                        "PairId": "pair02",
+                        "RoleName": "bottom",
+                        "TargetId": "target06",
+                        "PairRunRoot": r"C:\repo-shared\.relay-runs\bottest-live-visible\pairs\pair02\run_preview",
+                        "SourceOutboxPath": r"C:\repo-shared\.relay-contract\bottest-live-visible\run_preview\pair02\target06\source-outbox",
+                        "PublishReadyPath": r"C:\repo-shared\.relay-contract\bottest-live-visible\run_preview\pair02\target06\source-outbox\publish.ready.json",
+                    },
+                ],
+            }
+
+        panel._render_all_pair_policy_effective_previews = render_all_preview
+
+        panel.refresh_pair_policy_editor()
+
+        self.assertEqual("SHARED REPO OK", panel.pair_policy_card_vars["pair01"]["route_badge_var"].get())
+        self.assertEqual("SHARED REPO OK", panel.pair_policy_card_vars["pair02"]["route_badge_var"].get())
+        self.assertIn(
+            r"top outbox=C:\repo-shared\.relay-contract\bottest-live-visible\run_preview\pair02\target02\source-outbox",
+            panel.pair_policy_card_vars["pair02"]["effective_preview_var"].get(),
+        )
+        self.assertNotIn(
+            r"C:\dev\python\relay-workrepo-visible-smoke",
+            panel.pair_policy_card_vars["pair01"]["effective_preview_var"].get(),
+        )
+        self.assertIn("pair별 실효값 자동 갱신 완료", panel.pair_policy_editor_status_var.get())
+
+    def test_refresh_pair_policy_editor_disables_non_configured_pair_card_actions(self) -> None:
+        panel = self._make_panel()
+        panel.message_config_service.load_config_document = lambda _path: panel.message_config_service.clone_document(panel.message_config_doc)
+        panel.pair_policy_card_vars["pair03"]["parallel_selected_var"].set(True)
+
+        panel.refresh_pair_policy_editor()
+
+        self.assertEqual("normal", panel.pair_policy_card_preview_buttons["pair01"].state)
+        self.assertEqual("disabled", panel.pair_policy_card_parallel_checkbuttons["pair03"].state)
+        self.assertEqual("disabled", panel.pair_policy_card_summary_buttons["pair03"].state)
+        self.assertEqual("disabled", panel.pair_policy_card_preview_buttons["pair03"].state)
+        self.assertEqual("disabled", panel.pair_policy_card_copy_buttons["pair03"].state)
+        self.assertFalse(panel.pair_policy_card_vars["pair03"]["parallel_selected_var"].get())
+
+    def test_preview_pair_policy_effective_shows_missing_runroot_reason_for_external_pair_preview(self) -> None:
+        panel = self._make_panel()
+        panel.effective_data = {
+            "RunContext": {
+                "SelectedRunRoot": r"C:\dev\python\relay-workrepo-visible-smoke\.relay-runs\bottest-live-visible\run_old",
+            }
+        }
+        panel._resolve_run_prepare_config_path = lambda *, pair_id, config_path: config_path
+        panel.message_config_service.load_config_document = lambda _path: panel.message_config_service.clone_document(panel.message_config_doc)
+        panel.message_config_service.render_effective_preview = lambda *args, **kwargs: {
+            "Warnings": [],
+            "PreviewRows": [],
+        }
+
+        panel.preview_pair_policy_effective("pair01")
+
+        preview_text = panel.pair_policy_card_vars["pair01"]["effective_preview_var"].get()
+        self.assertIn("runroot=(미리보기 없음)", preview_text)
+        self.assertIn("runroot-preview-reason=selected-runroot-outside-pair-base", preview_text)
+        self.assertIn(r"expected-runroot-base=C:\repo-a\.relay-runs\bottest-live-visible\pairs\pair01", preview_text)
+
+    def test_preview_pair_policy_effective_rejects_non_configured_pair_without_rendering(self) -> None:
+        panel = self._make_panel()
+        panel.message_config_service.load_config_document = lambda _path: panel.message_config_service.clone_document(panel.message_config_doc)
+        panel.message_config_service.render_effective_preview = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("render should not run"))
+
+        panel.preview_pair_policy_effective("pair03")
+
+        self.assertEqual("ROUTE 미구성", panel.pair_policy_card_vars["pair03"]["route_badge_var"].get())
+        self.assertEqual("PairDefinitions에 없는 pair입니다.", panel.pair_policy_card_vars["pair03"]["effective_preview_var"].get())
+        self.assertIn("PairDefinitions에 없는 pair", panel.pair_policy_editor_status_var.get())
 
     def test_copy_pair_policy_effective_preview_copies_full_text(self) -> None:
         panel = self._make_panel()
@@ -5772,7 +6675,12 @@ class RelayOperatorPanelMessageSlotTests(unittest.TestCase):
 
     def test_preview_pair_policy_effective_uses_card_draft_values(self) -> None:
         panel = self._make_panel()
-        panel.message_config_service.load_config_document = lambda _path: panel.message_config_service.clone_document(panel.message_config_doc)
+        original_load_config_document = panel.message_config_service.load_config_document
+        panel.message_config_service.load_config_document = lambda path: (
+            panel.message_config_service.clone_document(panel.message_config_doc)
+            if path == "cfg.psd1"
+            else original_load_config_document(path)
+        )
         captured: dict[str, dict] = {}
 
         def render_preview(document, *, config_path: str, run_root: str = "", pair_id: str = "", target_id: str = "", mode: str = "both"):
@@ -5827,6 +6735,39 @@ class RelayOperatorPanelMessageSlotTests(unittest.TestCase):
         self.assertIn("붙여넣기 대상: pair01 / target01", panel.seed_kickoff_target_banner_var.get())
         self.assertEqual("차단: 작업 설명 또는 입력 파일 필요", panel.seed_kickoff_readiness_var.get())
 
+    def test_seed_kickoff_known_pair_ids_ignores_non_configured_pair_cards(self) -> None:
+        panel = self._make_panel()
+
+        pair_ids = panel._seed_kickoff_known_pair_ids(panel.message_config_doc)
+
+        self.assertEqual(["pair01"], pair_ids)
+
+    def test_refresh_seed_kickoff_composer_limits_pair_combo_to_configured_pairs(self) -> None:
+        panel = self._make_panel()
+        panel.seed_kickoff_pair_combo = ButtonStub()
+        panel.seed_kickoff_target_combo = ButtonStub()
+
+        panel.refresh_seed_kickoff_composer()
+
+        self.assertEqual(["pair01"], list(panel.seed_kickoff_pair_combo.values))
+        self.assertEqual("readonly", panel.seed_kickoff_pair_combo.state)
+        self.assertEqual(["target01", "target05"], list(panel.seed_kickoff_target_combo.values))
+        self.assertEqual("readonly", panel.seed_kickoff_target_combo.state)
+
+    def test_refresh_seed_kickoff_composer_disables_combos_when_no_configured_pairs_exist(self) -> None:
+        panel = self._make_panel()
+        panel.message_config_doc["PairTest"]["PairDefinitions"] = []
+        panel.seed_kickoff_pair_combo = ButtonStub()
+        panel.seed_kickoff_target_combo = ButtonStub()
+
+        panel.refresh_seed_kickoff_composer()
+
+        self.assertEqual([], list(panel.seed_kickoff_pair_combo.values))
+        self.assertEqual("disabled", panel.seed_kickoff_pair_combo.state)
+        self.assertEqual([], list(panel.seed_kickoff_target_combo.values))
+        self.assertEqual("disabled", panel.seed_kickoff_target_combo.state)
+        self.assertIn("구성된 pair가 없어", panel.seed_kickoff_status_var.get())
+
     def test_preview_seed_kickoff_message_builds_contract_helper_and_full_preview(self) -> None:
         panel = self._make_panel()
         panel.message_config_service.load_config_document = lambda _path: panel.message_config_service.clone_document(panel.message_config_doc)
@@ -5877,18 +6818,237 @@ class RelayOperatorPanelMessageSlotTests(unittest.TestCase):
         panel.preview_seed_kickoff_message()
 
         self.assertIn("summary.txt: C:\\repo-a\\.relay-contract\\bottest-live-visible\\run_preview\\pair01\\target01\\source-outbox\\summary.txt", panel.seed_kickoff_contract_text.value)
-        self.assertIn("publish.ready.json: C:\\repo-a\\.relay-contract\\bottest-live-visible\\run_preview\\pair01\\target01\\source-outbox\\publish.ready.json", panel.seed_kickoff_contract_text.value)
-        self.assertIn("- publish: C:\\repo-a\\.relay-runs\\bottest-live-visible\\pairs\\pair01\\run_preview\\target01\\publish-artifact.cmd", panel.seed_kickoff_helper_text.value)
+        self.assertIn("helper output marker: C:\\repo-a\\.relay-contract\\bottest-live-visible\\run_preview\\pair01\\target01\\source-outbox\\publish.ready.json", panel.seed_kickoff_contract_text.value)
+        self.assertIn("- 권장 실행: C:\\repo-a\\.relay-runs\\bottest-live-visible\\pairs\\pair01\\run_preview\\target01\\publish-artifact.cmd", panel.seed_kickoff_helper_text.value)
         self.assertIn("[권장 시작 순서]", panel.seed_kickoff_steps_text.value)
-        self.assertIn("summary.txt -> review.zip -> publish.ready.json", panel.seed_kickoff_steps_text.value)
+        self.assertIn("summary.txt -> review.zip -> publish helper", panel.seed_kickoff_steps_text.value)
+        self.assertIn("[생성해야 할 파일]", panel.seed_kickoff_simple_text.value)
+        self.assertIn("1. summary.txt -> C:\\repo-a\\.relay-contract\\bottest-live-visible\\run_preview\\pair01\\target01\\source-outbox\\summary.txt", panel.seed_kickoff_simple_text.value)
+        self.assertIn("3. publish helper 실행 -> C:\\repo-a\\.relay-runs\\bottest-live-visible\\pairs\\pair01\\run_preview\\target01\\publish-artifact.cmd", panel.seed_kickoff_simple_text.value)
         self.assertIn("[초기 실행 작업 설명]", panel.seed_kickoff_preview_text.value)
         self.assertIn("이 저장소의 현재 상태를 검토하고 수정 계획을 정리하세요.", panel.seed_kickoff_preview_text.value)
         self.assertIn("[추가 입력 파일]", panel.seed_kickoff_preview_text.value)
         self.assertIn("repo-source=pair-policy / route=ROUTE OK", panel.seed_kickoff_preview_text.value)
         self.assertIn("[시작 방법]", panel.seed_kickoff_preview_text.value)
-        self.assertIn("수동 시작", panel.seed_kickoff_preview_text.value)
+        self.assertIn("publish helper를 실행하면 watcher가 다음 단계부터 자동 진행합니다.", panel.seed_kickoff_preview_text.value)
         self.assertIn("붙여넣기 대상: pair01 / target01", panel.seed_kickoff_target_banner_var.get())
         self.assertIn("준비됨: 시작문 복사 또는 초기 입력 큐잉 가능", panel.seed_kickoff_readiness_var.get())
+
+    def test_preview_seed_kickoff_message_uses_pair_scoped_externalized_preview_for_external_repo(self) -> None:
+        panel = self._make_panel()
+        panel.effective_data = {
+            "RunContext": {
+                "SelectedRunRoot": r"C:\dev\python\relay-workrepo-visible-smoke\.relay-runs\bottest-live-visible\run_old",
+            }
+        }
+        panel._resolve_run_prepare_config_path = lambda *, pair_id, config_path: (
+            r"C:\repo-a\.relay-config\bottest-live-visible\pairs\pair01\settings.externalized.psd1"
+        )
+        panel.message_config_service.load_config_document = lambda _path: panel.message_config_service.clone_document(panel.message_config_doc)
+
+        def render_preview(document, *, config_path: str, run_root: str = "", pair_id: str = "", target_id: str = "", mode: str = "both"):
+            self.assertEqual(r"C:\repo-a\.relay-config\bottest-live-visible\pairs\pair01\settings.externalized.psd1", config_path)
+            self.assertEqual("", run_root)
+            self.assertEqual("pair01", pair_id)
+            self.assertEqual("target01", target_id)
+            self.assertEqual("initial", mode)
+            return {
+                "Warnings": [],
+                "RunContext": {"NextRunRootPreview": r"C:\repo-a\.relay-runs\bottest-live-visible\pairs\pair01\run_preview"},
+                "PreviewRows": [
+                    {
+                        "PairId": "pair01",
+                        "RoleName": "top",
+                        "TargetId": "target01",
+                        "PairRunRoot": r"C:\repo-a\.relay-runs\bottest-live-visible\pairs\pair01\run_preview",
+                        "PairTargetFolder": r"C:\repo-a\.relay-runs\bottest-live-visible\pairs\pair01\run_preview\target01",
+                        "SourceOutboxPath": r"C:\repo-a\.relay-contract\bottest-live-visible\run_preview\pair01\target01\source-outbox",
+                        "SourceSummaryPath": r"C:\repo-a\.relay-contract\bottest-live-visible\run_preview\pair01\target01\source-outbox\summary.txt",
+                        "SourceReviewZipPath": r"C:\repo-a\.relay-contract\bottest-live-visible\run_preview\pair01\target01\source-outbox\review.zip",
+                        "PublishReadyPath": r"C:\repo-a\.relay-contract\bottest-live-visible\run_preview\pair01\target01\source-outbox\publish.ready.json",
+                    }
+                ],
+            }
+
+        panel.message_config_service.render_effective_preview = render_preview
+
+        panel.preview_seed_kickoff_message()
+
+        self.assertIn(
+            r"1. summary.txt -> C:\repo-a\.relay-contract\bottest-live-visible\run_preview\pair01\target01\source-outbox\summary.txt",
+            panel.seed_kickoff_simple_text.value,
+        )
+        self.assertNotIn(
+            r"C:\dev\python\relay-workrepo-visible-smoke",
+            panel.seed_kickoff_simple_text.value,
+        )
+
+    def test_preview_pair_policy_effective_uses_pair_scoped_externalized_preview_for_external_repo(self) -> None:
+        panel = self._make_panel()
+        panel.effective_data = {
+            "RunContext": {
+                "SelectedRunRoot": r"C:\dev\python\relay-workrepo-visible-smoke\.relay-runs\bottest-live-visible\run_old",
+            }
+        }
+        panel._resolve_run_prepare_config_path = lambda *, pair_id, config_path: (
+            r"C:\repo-a\.relay-config\bottest-live-visible\pairs\pair01\settings.externalized.psd1"
+        )
+        panel.message_config_service.load_config_document = lambda _path: panel.message_config_service.clone_document(panel.message_config_doc)
+
+        def render_preview(document, *, config_path: str, run_root: str = "", pair_id: str = "", target_id: str = "", mode: str = "both"):
+            self.assertEqual(r"C:\repo-a\.relay-config\bottest-live-visible\pairs\pair01\settings.externalized.psd1", config_path)
+            self.assertEqual("", run_root)
+            self.assertEqual("pair01", pair_id)
+            self.assertEqual("", target_id)
+            self.assertEqual("both", mode)
+            return {
+                "Warnings": [],
+                "PreviewRows": [
+                    {
+                        "PairId": "pair01",
+                        "RoleName": "top",
+                        "TargetId": "target01",
+                        "PairRunRoot": r"C:\repo-a\.relay-runs\bottest-live-visible\pairs\pair01\run_preview",
+                        "SourceOutboxPath": r"C:\repo-a\.relay-contract\bottest-live-visible\run_preview\pair01\target01\source-outbox",
+                        "PublishReadyPath": r"C:\repo-a\.relay-contract\bottest-live-visible\run_preview\pair01\target01\source-outbox\publish.ready.json",
+                    },
+                    {
+                        "PairId": "pair01",
+                        "RoleName": "bottom",
+                        "TargetId": "target05",
+                        "PairRunRoot": r"C:\repo-a\.relay-runs\bottest-live-visible\pairs\pair01\run_preview",
+                        "SourceOutboxPath": r"C:\repo-a\.relay-contract\bottest-live-visible\run_preview\pair01\target05\source-outbox",
+                        "PublishReadyPath": r"C:\repo-a\.relay-contract\bottest-live-visible\run_preview\pair01\target05\source-outbox\publish.ready.json",
+                    },
+                ],
+            }
+
+        panel.message_config_service.render_effective_preview = render_preview
+
+        panel.preview_pair_policy_effective("pair01")
+
+        self.assertIn(
+            r"runroot=C:\repo-a\.relay-runs\bottest-live-visible\pairs\pair01\run_preview",
+            panel.pair_policy_card_vars["pair01"]["effective_preview_var"].get(),
+        )
+        self.assertIn(
+            r"top outbox=C:\repo-a\.relay-contract\bottest-live-visible\run_preview\pair01\target01\source-outbox",
+            panel.pair_policy_card_vars["pair01"]["effective_preview_var"].get(),
+        )
+        self.assertNotIn(
+            r"C:\dev\python\relay-workrepo-visible-smoke",
+            panel.pair_policy_card_vars["pair01"]["effective_preview_var"].get(),
+        )
+
+    def test_preview_pair_policy_effective_uses_output_files_paths_for_route_snapshot(self) -> None:
+        panel = self._make_panel()
+        panel._resolve_run_prepare_config_path = lambda *, pair_id, config_path: config_path
+        panel.message_config_service.load_config_document = lambda _path: panel.message_config_service.clone_document(panel.message_config_doc)
+
+        def render_preview(document, *, config_path: str, run_root: str = "", pair_id: str = "", target_id: str = "", mode: str = "both"):
+            self.assertEqual("pair01", pair_id)
+            self.assertEqual("", target_id)
+            self.assertEqual("both", mode)
+            return {
+                "Warnings": [],
+                "PreviewRows": [
+                    {
+                        "PairId": "pair01",
+                        "RoleName": "top",
+                        "TargetId": "target01",
+                        "PairRunRoot": r"C:\repo-a\.relay-runs\bottest-live-visible\pairs\pair01\run_preview",
+                        "OutputFiles": {
+                            "SummaryPath": r"C:\repo-a\.relay-contract\bottest-live-visible\run_preview\pair01\target01\source-outbox\summary.txt",
+                            "ReviewZipPath": r"C:\repo-a\.relay-contract\bottest-live-visible\run_preview\pair01\target01\source-outbox\review.zip",
+                            "PublishReadyPath": r"C:\repo-a\.relay-contract\bottest-live-visible\run_preview\pair01\target01\source-outbox\publish.ready.json",
+                        },
+                    },
+                    {
+                        "PairId": "pair01",
+                        "RoleName": "bottom",
+                        "TargetId": "target05",
+                        "PairRunRoot": r"C:\repo-a\.relay-runs\bottest-live-visible\pairs\pair01\run_preview",
+                        "OutputFiles": {
+                            "SummaryPath": r"C:\repo-a\.relay-contract\bottest-live-visible\run_preview\pair01\target05\source-outbox\summary.txt",
+                            "ReviewZipPath": r"C:\repo-a\.relay-contract\bottest-live-visible\run_preview\pair01\target05\source-outbox\review.zip",
+                            "PublishReadyPath": r"C:\repo-a\.relay-contract\bottest-live-visible\run_preview\pair01\target05\source-outbox\publish.ready.json",
+                        },
+                    },
+                ],
+            }
+
+        panel.message_config_service.render_effective_preview = render_preview
+
+        panel.preview_pair_policy_effective("pair01")
+
+        preview_text = panel.pair_policy_card_vars["pair01"]["effective_preview_var"].get()
+        self.assertIn(
+            r"top outbox=C:\repo-a\.relay-contract\bottest-live-visible\run_preview\pair01\target01\source-outbox",
+            preview_text,
+        )
+        self.assertIn(
+            r"top publish=C:\repo-a\.relay-contract\bottest-live-visible\run_preview\pair01\target01\source-outbox\publish.ready.json",
+            preview_text,
+        )
+
+    def test_preview_pair_policy_effective_shows_output_files_parent_mismatch_warning(self) -> None:
+        panel = self._make_panel()
+        panel._resolve_run_prepare_config_path = lambda *, pair_id, config_path: config_path
+        panel.message_config_service.load_config_document = lambda _path: panel.message_config_service.clone_document(panel.message_config_doc)
+
+        panel.message_config_service.render_effective_preview = lambda *args, **kwargs: {
+            "Warnings": [],
+            "PreviewRows": [
+                {
+                    "PairId": "pair01",
+                    "RoleName": "top",
+                    "TargetId": "target01",
+                    "PairRunRoot": r"C:\repo-a\.relay-runs\bottest-live-visible\pairs\pair01\run_preview",
+                    "OutputFiles": {
+                        "SummaryPath": r"C:\repo-a\.relay-contract\bottest-live-visible\run_preview\pair01\target01\source-outbox-a\summary.txt",
+                        "ReviewZipPath": r"C:\repo-a\.relay-contract\bottest-live-visible\run_preview\pair01\target01\source-outbox-b\review.zip",
+                        "PublishReadyPath": r"C:\repo-a\.relay-contract\bottest-live-visible\run_preview\pair01\target01\source-outbox-a\publish.ready.json",
+                    },
+                },
+                {
+                    "PairId": "pair01",
+                    "RoleName": "bottom",
+                    "TargetId": "target05",
+                    "PairRunRoot": r"C:\repo-a\.relay-runs\bottest-live-visible\pairs\pair01\run_preview",
+                    "OutputFiles": {
+                        "SummaryPath": r"C:\repo-a\.relay-contract\bottest-live-visible\run_preview\pair01\target05\source-outbox\summary.txt",
+                        "ReviewZipPath": r"C:\repo-a\.relay-contract\bottest-live-visible\run_preview\pair01\target05\source-outbox\review.zip",
+                        "PublishReadyPath": r"C:\repo-a\.relay-contract\bottest-live-visible\run_preview\pair01\target05\source-outbox\publish.ready.json",
+                    },
+                },
+            ],
+        }
+
+        panel.preview_pair_policy_effective("pair01")
+
+        preview_text = panel.pair_policy_card_vars["pair01"]["effective_preview_var"].get()
+        self.assertIn("warnings=top:output-files-parent-mismatch", preview_text)
+        self.assertIn("top outbox=(없음)", preview_text)
+
+    def test_pair_policy_preview_run_root_rejects_non_pair_runroot_shape(self) -> None:
+        panel = self._make_panel()
+        policy = {
+            "DefaultSeedWorkRepoRoot": r"C:\repo-a",
+            "UseExternalWorkRepoRunRoot": True,
+            "UseExternalWorkRepoContractPaths": True,
+        }
+        panel.run_root_var.set(r"C:\repo-a\scratch\pair01\run_old")
+
+        rejected = panel._pair_policy_preview_run_root(pair_id="pair01", policy=policy)
+
+        self.assertEqual("", rejected)
+        panel.run_root_var.set(r"C:\repo-a\.relay-runs\bottest-live-visible\pairs\pair01")
+        self.assertEqual("", panel._pair_policy_preview_run_root(pair_id="pair01", policy=policy))
+        panel.run_root_var.set(r"C:\repo-a\.relay-runs\bottest-live-visible\pairs\pair01\run_current\target01")
+        self.assertEqual("", panel._pair_policy_preview_run_root(pair_id="pair01", policy=policy))
+        panel.run_root_var.set(r"C:\repo-a\.relay-runs\bottest-live-visible\pairs\pair01\run_current")
+        accepted = panel._pair_policy_preview_run_root(pair_id="pair01", policy=policy)
+        self.assertEqual(r"C:\repo-a\.relay-runs\bottest-live-visible\pairs\pair01\run_current", accepted)
 
     def test_copy_seed_kickoff_path_block_copies_contract_text(self) -> None:
         panel = self._make_panel()
@@ -5945,7 +7105,7 @@ class RelayOperatorPanelMessageSlotTests(unittest.TestCase):
 
         self.assertEqual(1, len(copied))
         self.assertIn("[권장 시작 순서]", copied[0])
-        self.assertIn("summary.txt -> review.zip -> publish.ready.json", copied[0])
+        self.assertIn("summary.txt -> review.zip -> publish helper", copied[0])
         self.assertIn("초기 실행 시작 순서 복사 완료", panel.output_text.value)
 
     def test_copy_seed_kickoff_full_text_sets_manual_paste_status(self) -> None:
@@ -5979,15 +7139,126 @@ class RelayOperatorPanelMessageSlotTests(unittest.TestCase):
         self.assertIn("초기 작업 설명", copied[0])
         self.assertIn("[생성해야 할 파일]", copied[0])
         self.assertIn("1. summary.txt -> C:\\repo-a\\.relay-contract\\bottest-live-visible\\run_preview\\pair01\\target01\\source-outbox\\summary.txt", copied[0])
-        self.assertIn("3. publish.ready.json -> C:\\repo-a\\.relay-contract\\bottest-live-visible\\run_preview\\pair01\\target01\\source-outbox\\publish.ready.json", copied[0])
+        self.assertIn("3. publish helper 실행 -> C:\\repo-a\\.relay-runs\\bottest-live-visible\\pairs\\pair01\\run_preview\\target01\\publish-artifact.cmd", copied[0])
+        self.assertNotIn("3. publish.ready.json ->", copied[0])
         self.assertNotIn("[자동 계약 / 경로]", copied[0])
         self.assertNotIn("[helper / wrapper]", copied[0])
         self.assertNotIn("[시작 방법]", copied[0])
         self.assertNotIn("[queue 등록 동작]", copied[0])
         self.assertNotIn("[초기 실행 입력 합성 미리보기]", copied[0])
         self.assertIn("PowerShell/셀 창에 직접 붙여넣으세요", panel.seed_kickoff_status_var.get())
-        self.assertIn("수동 시작문 복사 완료", panel.output_text.value)
+        self.assertIn("초간단 시작문 복사 완료", panel.output_text.value)
         self.assertIn("대상: pair01 / target01 실제 셀 창", panel.output_text.value)
+
+    def test_copy_seed_kickoff_detailed_text_includes_publish_helper(self) -> None:
+        panel = self._make_panel()
+        panel.message_config_service.load_config_document = lambda _path: panel.message_config_service.clone_document(panel.message_config_doc)
+        panel.message_config_service.render_effective_preview = lambda *args, **kwargs: {
+            "Warnings": [],
+            "RunContext": {"NextRunRootPreview": r"C:\repo-a\.relay-runs\bottest-live-visible\pairs\pair01\run_preview"},
+            "PreviewRows": [
+                {
+                    "PairId": "pair01",
+                    "RoleName": "top",
+                    "TargetId": "target01",
+                    "PairRunRoot": r"C:\repo-a\.relay-runs\bottest-live-visible\pairs\pair01\run_preview",
+                    "PairTargetFolder": r"C:\repo-a\.relay-runs\bottest-live-visible\pairs\pair01\run_preview\target01",
+                    "SourceOutboxPath": r"C:\repo-a\.relay-contract\bottest-live-visible\run_preview\pair01\target01\source-outbox",
+                    "SourceSummaryPath": r"C:\repo-a\.relay-contract\bottest-live-visible\run_preview\pair01\target01\source-outbox\summary.txt",
+                    "SourceReviewZipPath": r"C:\repo-a\.relay-contract\bottest-live-visible\run_preview\pair01\target01\source-outbox\review.zip",
+                    "PublishReadyPath": r"C:\repo-a\.relay-contract\bottest-live-visible\run_preview\pair01\target01\source-outbox\publish.ready.json",
+                    "PublishScriptPath": r"C:\repo-a\.relay-runs\bottest-live-visible\pairs\pair01\run_preview\target01\publish-artifact.ps1",
+                    "PublishCmdPath": r"C:\repo-a\.relay-runs\bottest-live-visible\pairs\pair01\run_preview\target01\publish-artifact.cmd",
+                }
+            ],
+        }
+        copied: list[str] = []
+        panel._copy_to_clipboard = copied.append
+        panel.seed_kickoff_task_text.value = "초기 작업 설명"
+
+        panel.copy_seed_kickoff_detailed_text()
+
+        self.assertEqual(1, len(copied))
+        self.assertIn("[생성 지시]", copied[0])
+        self.assertNotIn("- publish.ready.json 생성:", copied[0])
+        self.assertIn("- publish helper 실행: C:\\repo-a\\.relay-runs\\bottest-live-visible\\pairs\\pair01\\run_preview\\target01\\publish-artifact.cmd", copied[0])
+        self.assertIn("[helper 경로]", copied[0])
+        self.assertIn("publish-artifact.cmd", copied[0])
+        self.assertIn("상세 시작문 복사 완료", panel.output_text.value)
+
+    def test_copy_seed_kickoff_paths_and_publish_helper(self) -> None:
+        panel = self._make_panel()
+        panel.message_config_service.load_config_document = lambda _path: panel.message_config_service.clone_document(panel.message_config_doc)
+        panel.message_config_service.render_effective_preview = lambda *args, **kwargs: {
+            "Warnings": [],
+            "RunContext": {"NextRunRootPreview": r"C:\repo-a\.relay-runs\bottest-live-visible\pairs\pair01\run_preview"},
+            "PreviewRows": [
+                {
+                    "PairId": "pair01",
+                    "RoleName": "top",
+                    "TargetId": "target01",
+                    "PairRunRoot": r"C:\repo-a\.relay-runs\bottest-live-visible\pairs\pair01\run_preview",
+                    "PairTargetFolder": r"C:\repo-a\.relay-runs\bottest-live-visible\pairs\pair01\run_preview\target01",
+                    "SourceOutboxPath": r"C:\repo-a\.relay-contract\bottest-live-visible\run_preview\pair01\target01\source-outbox",
+                    "SourceSummaryPath": r"C:\repo-a\.relay-contract\bottest-live-visible\run_preview\pair01\target01\source-outbox\summary.txt",
+                    "SourceReviewZipPath": r"C:\repo-a\.relay-contract\bottest-live-visible\run_preview\pair01\target01\source-outbox\review.zip",
+                    "PublishReadyPath": r"C:\repo-a\.relay-contract\bottest-live-visible\run_preview\pair01\target01\source-outbox\publish.ready.json",
+                }
+            ],
+        }
+        copied: list[str] = []
+        panel._copy_to_clipboard = copied.append
+
+        panel.copy_seed_kickoff_summary_path()
+        panel.copy_seed_kickoff_review_zip_path()
+        panel.copy_seed_kickoff_publish_helper_command()
+
+        self.assertEqual(
+            [
+                r"C:\repo-a\.relay-contract\bottest-live-visible\run_preview\pair01\target01\source-outbox\summary.txt",
+                r"C:\repo-a\.relay-contract\bottest-live-visible\run_preview\pair01\target01\source-outbox\review.zip",
+                r"C:\repo-a\.relay-runs\bottest-live-visible\pairs\pair01\run_preview\target01\publish-artifact.cmd",
+            ],
+            copied,
+        )
+        self.assertIn("publish helper 명령 복사 완료", panel.output_text.value)
+
+    def test_copy_seed_kickoff_individual_paths_uses_output_files_fallback(self) -> None:
+        panel = self._make_panel()
+        panel.message_config_service.load_config_document = lambda _path: panel.message_config_service.clone_document(panel.message_config_doc)
+        panel.message_config_service.render_effective_preview = lambda *args, **kwargs: {
+            "Warnings": [],
+            "RunContext": {"NextRunRootPreview": r"C:\repo-a\.relay-runs\bottest-live-visible\pairs\pair01\run_preview"},
+            "PreviewRows": [
+                {
+                    "PairId": "pair01",
+                    "RoleName": "top",
+                    "TargetId": "target01",
+                    "PairRunRoot": r"C:\repo-a\.relay-runs\bottest-live-visible\pairs\pair01\run_preview",
+                    "PairTargetFolder": r"C:\repo-a\.relay-runs\bottest-live-visible\pairs\pair01\run_preview\target01",
+                    "OutputFiles": {
+                        "SummaryPath": r"C:\repo-a\.relay-contract\bottest-live-visible\run_preview\pair01\target01\source-outbox\summary.txt",
+                        "ReviewZipPath": r"C:\repo-a\.relay-contract\bottest-live-visible\run_preview\pair01\target01\source-outbox\review.zip",
+                        "PublishReadyPath": r"C:\repo-a\.relay-contract\bottest-live-visible\run_preview\pair01\target01\source-outbox\publish.ready.json",
+                    },
+                }
+            ],
+        }
+        copied: list[str] = []
+        panel._copy_to_clipboard = copied.append
+
+        panel.copy_seed_kickoff_summary_path()
+        panel.copy_seed_kickoff_review_zip_path()
+        panel.copy_seed_kickoff_publish_helper_command()
+
+        self.assertEqual(
+            [
+                r"C:\repo-a\.relay-contract\bottest-live-visible\run_preview\pair01\target01\source-outbox\summary.txt",
+                r"C:\repo-a\.relay-contract\bottest-live-visible\run_preview\pair01\target01\source-outbox\review.zip",
+                r"C:\repo-a\.relay-runs\bottest-live-visible\pairs\pair01\run_preview\target01\publish-artifact.cmd",
+            ],
+            copied,
+        )
 
     def test_enqueue_seed_kickoff_message_calls_one_time_queue_with_pair_target_and_text(self) -> None:
         panel = self._make_panel()
@@ -6080,6 +7351,62 @@ class RelayOperatorPanelMessageSlotTests(unittest.TestCase):
         self.assertIn("old RunRoot override 자동 비움", panel.pair_policy_editor_status_var.get())
         self.assertIn("적용 확인:", panel.pair_policy_editor_status_var.get())
         self.assertIn("repo-source=pair-policy", panel.pair_policy_editor_status_var.get())
+
+    def test_save_pair_policy_editor_clears_stale_run_root_when_external_route_flags_change(self) -> None:
+        panel = self._make_panel()
+        panel.save_pair_policy_editor = RelayOperatorPanel.save_pair_policy_editor.__get__(panel, RelayOperatorPanel)
+        panel.load_message_editor_document = lambda: None
+        panel.load_effective_config = lambda: None
+        panel.run_root_var.set(r"C:\runs\old-requested")
+        panel.pair_policy_card_vars["pair01"]["external_run_root_var"].set(False)
+        panel.message_config_service.load_config_document = lambda _path: panel.message_config_service.clone_document(panel.message_config_doc)
+        panel.message_config_service.save_document = lambda _path, _document: Path(r"C:\tmp\pair-policy-backup.psd1")
+
+        panel.save_pair_policy_editor()
+
+        self.assertEqual("", panel.run_root_var.get())
+        self.assertIn("route 변경: pair01", panel.pair_policy_editor_status_var.get())
+        self.assertIn("old RunRoot override 자동 비움", panel.pair_policy_editor_status_var.get())
+
+    def test_save_pair_policy_editor_preserves_auto_preview_status_after_refresh(self) -> None:
+        panel = self._make_panel()
+        panel.save_pair_policy_editor = RelayOperatorPanel.save_pair_policy_editor.__get__(panel, RelayOperatorPanel)
+        panel.load_message_editor_document = lambda: None
+        panel.message_config_service.load_config_document = lambda _path: panel.message_config_service.clone_document(panel.message_config_doc)
+        panel.message_config_service.save_document = lambda _path, _document: Path(r"C:\tmp\pair-policy-backup.psd1")
+        panel.run_root_var.set(r"C:\runs\old-requested")
+        panel.pair_policy_card_vars["pair01"]["repo_root_var"].set(r"C:\repo-new")
+
+        def fake_load_effective_config() -> None:
+            panel.pair_policy_effective_preview_rows = [
+                {
+                    "PairId": "pair01",
+                    "RoleName": "top",
+                    "TargetId": "target01",
+                    "PairRunRoot": r"C:\repo-new\.relay-runs\bottest-live-visible\pairs\pair01\run_preview",
+                    "SourceOutboxPath": r"C:\repo-new\.relay-contract\bottest-live-visible\run_preview\pair01\target01\source-outbox",
+                    "PublishReadyPath": r"C:\repo-new\.relay-contract\bottest-live-visible\run_preview\pair01\target01\source-outbox\publish.ready.json",
+                },
+                {
+                    "PairId": "pair01",
+                    "RoleName": "bottom",
+                    "TargetId": "target05",
+                    "PairRunRoot": r"C:\repo-new\.relay-runs\bottest-live-visible\pairs\pair01\run_preview",
+                    "SourceOutboxPath": r"C:\repo-new\.relay-contract\bottest-live-visible\run_preview\pair01\target05\source-outbox",
+                    "PublishReadyPath": r"C:\repo-new\.relay-contract\bottest-live-visible\run_preview\pair01\target05\source-outbox\publish.ready.json",
+                },
+            ]
+            panel.pair_policy_editor_status_var.set(
+                "4 pair 설정 카드를 현재 config 기준으로 동기화했습니다. pair별 실효값 자동 갱신 완료 / active=1 / ok=1 / shared=0 / check=0 / warnings=0"
+            )
+
+        panel.load_effective_config = fake_load_effective_config
+
+        panel.save_pair_policy_editor()
+
+        self.assertIn("old RunRoot override 자동 비움", panel.pair_policy_editor_status_var.get())
+        self.assertIn("pair별 실효값 자동 갱신 완료", panel.pair_policy_editor_status_var.get())
+        self.assertIn(r"top-outbox=C:\repo-new\.relay-contract\bottest-live-visible\run_preview\pair01\target01\source-outbox", panel.pair_policy_editor_status_var.get())
 
     def test_refresh_pair_policy_editor_marks_selected_run_root_mirror_badge(self) -> None:
         panel = self._make_panel()
@@ -6176,6 +7503,24 @@ class RelayOperatorPanelMessageSlotTests(unittest.TestCase):
         self.assertIn(r"repo=C:\repo-a", copied[0])
         self.assertIn("pair route matrix 복사 완료", panel._captured_output)
 
+    def test_copy_pair_route_matrix_includes_runroot_preview_reason_and_expected_base(self) -> None:
+        panel = self._make_panel()
+        panel.output_text = object()
+        panel.set_text = lambda _widget, value: setattr(panel, "_captured_output", value)
+        panel.run_root_var.set(r"C:\runs\selected-outside")
+        copied: list[str] = []
+        panel._copy_to_clipboard = copied.append
+
+        panel.copy_pair_route_matrix()
+
+        self.assertEqual(1, len(copied))
+        self.assertIn("runroot-preview-reason=runroot-override-outside-pair-base", copied[0])
+        self.assertIn(r"expected-runroot-base=C:\repo-a\.relay-runs\bottest-live-visible\pairs\pair01", copied[0])
+        payload = panel._pair_route_matrix_payload()
+        pair01 = next(item for item in payload["PairRouteMatrix"] if item["PairId"] == "pair01")
+        self.assertEqual("runroot-override-outside-pair-base", pair01["RouteSnapshot"]["RunRootPreviewReason"])
+        self.assertEqual(r"C:\repo-a\.relay-runs\bottest-live-visible\pairs\pair01", pair01["RouteSnapshot"]["ExpectedRunRootBase"])
+
     def test_browse_pair_policy_repo_root_updates_card_value(self) -> None:
         panel = self._make_panel()
         with mock.patch("relay_operator_panel.filedialog.askdirectory", return_value=r"C:\repo-picked"):
@@ -6206,6 +7551,25 @@ class RelayOperatorPanelMessageSlotTests(unittest.TestCase):
         selected = panel._selected_parallel_pair_ids()
 
         self.assertEqual(["pair01", "pair02"], selected)
+
+    def test_selected_parallel_pair_ids_ignores_non_configured_pairs(self) -> None:
+        panel = self._make_panel()
+        panel.pair_policy_card_vars["pair01"]["parallel_selected_var"].set(True)
+        panel.pair_policy_card_vars["pair03"]["parallel_selected_var"].set(True)
+
+        selected = panel._selected_parallel_pair_ids()
+
+        self.assertEqual(["pair01"], selected)
+
+    def test_preview_all_pair_policy_effective_stops_when_no_configured_pairs_exist(self) -> None:
+        panel = self._make_panel()
+        panel.message_config_doc["PairTest"]["PairDefinitions"] = []
+        panel.message_config_service.load_config_document = lambda _path: panel.message_config_service.clone_document(panel.message_config_doc)
+        panel._render_all_pair_policy_effective_previews = lambda **_kwargs: (_ for _ in ()).throw(AssertionError("render should not run"))
+
+        panel.preview_all_pair_policy_effective()
+
+        self.assertIn("구성된 pair가 없습니다", panel.pair_policy_editor_status_var.get())
 
     def test_browse_parallel_coordinator_repo_root_updates_value(self) -> None:
         panel = self._make_panel()
@@ -6380,13 +7744,19 @@ class RelayOperatorPanelMessageSlotTests(unittest.TestCase):
             {"Id": "target02"},
             {"Id": "target06"},
         ]
-        panel.message_config_service.load_config_document = lambda _path: panel.message_config_service.clone_document(panel.message_config_doc)
+        original_load_config_document = panel.message_config_service.load_config_document
+        panel.message_config_service.load_config_document = lambda path: (
+            panel.message_config_service.clone_document(panel.message_config_doc)
+            if path == "cfg.psd1"
+            else original_load_config_document(path)
+        )
+        panel._resolve_run_prepare_config_path = lambda *, pair_id, config_path: config_path
 
         def render_preview(_document, *, config_path: str, run_root: str = "", pair_id: str = "", target_id: str = "", mode: str = "both"):
-            self.assertEqual("", pair_id)
-            return {
-                "Warnings": ["shared repo warning"],
-                "PreviewRows": [
+            self.assertIn(pair_id, {"pair01", "pair02"})
+            self.assertEqual("both", mode)
+            rows_by_pair = {
+                "pair01": [
                     {
                         "PairId": "pair01",
                         "RoleName": "top",
@@ -6405,6 +7775,8 @@ class RelayOperatorPanelMessageSlotTests(unittest.TestCase):
                         "SourceOutboxPath": r"C:\repo-shared\.relay-contract\bottest-live-visible\run_preview\pair01\target05\source-outbox",
                         "PublishReadyPath": r"C:\repo-shared\.relay-contract\bottest-live-visible\run_preview\pair01\target05\source-outbox\publish.ready.json",
                     },
+                ],
+                "pair02": [
                     {
                         "PairId": "pair02",
                         "RoleName": "top",
@@ -6424,6 +7796,10 @@ class RelayOperatorPanelMessageSlotTests(unittest.TestCase):
                         "PublishReadyPath": r"C:\repo-shared\.relay-contract\bottest-live-visible\run_preview\pair02\target06\source-outbox\publish.ready.json",
                     },
                 ],
+            }
+            return {
+                "Warnings": ["shared repo warning"],
+                "PreviewRows": rows_by_pair[pair_id],
             }
 
         panel.message_config_service.render_effective_preview = render_preview
@@ -7543,6 +8919,81 @@ class DashboardAggregatorTests(unittest.TestCase):
         self.assertEqual("필요", state.stages[1].status_text)
         self.assertIn("session=mixed", state.stages[1].detail)
         self.assertFalse(state.stages[2].enabled)
+        self.assertEqual("대상 창 연결 안 됨", state.issues[0].title)
+
+    def test_build_panel_state_requires_fresh_runtime_after_current_session_binding_refresh(self) -> None:
+        aggregator = DashboardAggregator()
+        with tempfile.TemporaryDirectory() as tmp:
+            binding_profile = Path(tmp) / "bindings.json"
+            binding_profile.write_text(
+                json.dumps({"windows": [{"targetId": f"target{index:02d}"} for index in range(1, 9)]}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            panel_opened_at = datetime(2026, 4, 17, 12, 0, tzinfo=timezone.utc)
+            binding_last_write = (panel_opened_at + timedelta(minutes=1)).isoformat()
+            runtime_last_write = (panel_opened_at - timedelta(minutes=5)).isoformat()
+
+            state = aggregator.build_panel_state(
+                bundle=DashboardRawBundle(
+                    effective_data={
+                        "RunContext": {
+                            "SelectedRunRoot": "C:\\runs\\current",
+                            "SelectedRunRootSource": "explicit",
+                            "SelectedRunRootIsStale": False,
+                        },
+                        "PanelRuntimeHints": {
+                            "PanelOpenedAtUtc": panel_opened_at.isoformat(),
+                            "WindowLaunchAnchorUtc": panel_opened_at.isoformat(),
+                            "ActionRunRoot": "C:\\runs\\current",
+                            "ActionRunRootUsesOverride": False,
+                            "ActionRunRootIsStale": False,
+                        },
+                        "PairActivationSummary": [{"PairId": "pair01", "EffectiveEnabled": True}],
+                        "OverviewPairs": [{"PairId": "pair01", "TopTargetId": "target01", "BottomTargetId": "target05"}],
+                        "WarningSummary": {},
+                    },
+                    relay_status={
+                        "Lane": {
+                            "BindingProfilePath": str(binding_profile),
+                            "BindingProfileExists": True,
+                            "BindingProfileLastWriteAt": binding_last_write,
+                        },
+                        "Runtime": {
+                            "Exists": True,
+                            "LastWriteAt": runtime_last_write,
+                            "UniqueTargetCount": 8,
+                            "AttachedCount": 8,
+                            "LaunchedCount": 0,
+                            "LauncherSessionIds": ["session-a"],
+                            "HasSingleLauncherSession": True,
+                        },
+                        "Router": {"Status": "running", "PendingQueueCount": 0, "QueueCount": 0},
+                        "NextActions": [],
+                    },
+                    visibility_status={
+                        "InjectableCount": 0,
+                        "NonInjectableCount": 8,
+                        "MissingRuntimeCount": 0,
+                        "Targets": [],
+                    },
+                    paired_status={
+                        "Watcher": {"Status": "stopped"},
+                        "Counts": {},
+                        "Targets": [],
+                    },
+                    paired_status_error="",
+                ),
+                selected_pair="pair01",
+            )
+
+        self.assertFalse(state.workflow.attach_ready)
+        self.assertEqual("필요", state.stages[1].status_text)
+        self.assertIn("runtime stale:", state.stages[1].detail)
+        self.assertIn(runtime_last_write, state.stages[1].detail)
+        self.assertFalse(state.stages[2].enabled)
+        self.assertEqual("대기", state.stages[2].status_text)
+        self.assertIn("순서: 8창 열기 -> 붙이기 -> 입력 점검.", state.stages[2].detail)
+        self.assertEqual("대기", state.stages[4].status_text)
         self.assertEqual("대상 창 연결 안 됨", state.issues[0].title)
 
     def test_build_panel_state_uses_action_run_root_override_for_display_and_readiness(self) -> None:
@@ -8824,6 +10275,119 @@ class RelayOperatorPanelArtifactHardeningTests(unittest.TestCase):
             self.assertIn("parse failed", panel.artifact_source_memory_warning)
             self.assertIn("artifact-source-memory.json", panel.artifact_source_memory_warning)
 
+    def test_resolve_artifact_contract_paths_uses_output_files_fallback_from_preview_row(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            panel = self._make_panel(Path(tmp) / "artifact-source-memory.json")
+            panel.artifact_service = SimpleNamespace(resolve_artifact_path=lambda *_args, **_kwargs: "")
+            panel.preview_rows = [
+                {
+                    "TargetId": "target01",
+                    "PairTargetFolder": r"C:\repo-a\.relay-runs\bottest-live-visible\pairs\pair01\run_preview\target01",
+                    "OutputFiles": {
+                        "SummaryPath": r"C:\repo-a\.relay-contract\bottest-live-visible\run_preview\pair01\target01\source-outbox\summary.txt",
+                        "ReviewZipPath": r"C:\repo-a\.relay-contract\bottest-live-visible\run_preview\pair01\target01\source-outbox\review.zip",
+                        "PublishReadyPath": r"C:\repo-a\.relay-contract\bottest-live-visible\run_preview\pair01\target01\source-outbox\publish.ready.json",
+                    },
+                }
+            ]
+
+            resolved = panel._resolve_artifact_contract_paths(
+                make_artifact_state(
+                    target_id="target01",
+                    target_folder=r"C:\repo-a\.relay-runs\bottest-live-visible\pairs\pair01\run_preview\target01",
+                )
+            )
+
+            self.assertEqual(
+                r"C:\repo-a\.relay-contract\bottest-live-visible\run_preview\pair01\target01\source-outbox",
+                resolved["SourceOutboxPath"],
+            )
+            self.assertEqual(
+                r"C:\repo-a\.relay-contract\bottest-live-visible\run_preview\pair01\target01\source-outbox\summary.txt",
+                resolved["SourceSummaryPath"],
+            )
+            self.assertEqual(
+                r"C:\repo-a\.relay-contract\bottest-live-visible\run_preview\pair01\target01\source-outbox\review.zip",
+                resolved["SourceReviewZipPath"],
+            )
+            self.assertEqual(
+                r"C:\repo-a\.relay-contract\bottest-live-visible\run_preview\pair01\target01\source-outbox\publish.ready.json",
+                resolved["PublishReadyPath"],
+            )
+
+    def test_resolve_artifact_contract_paths_prefers_request_contract_over_preview_parent_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            panel = self._make_panel(Path(tmp) / "artifact-source-memory.json")
+            request_path = Path(tmp) / "request.json"
+            request_path.write_text(
+                json.dumps(
+                    {
+                        "TargetFolder": r"C:\repo-a\.relay-runs\bottest-live-visible\pairs\pair01\run_preview\target01",
+                        "SourceOutboxPath": r"C:\repo-a\.relay-contract\bottest-live-visible\run_preview\pair01\target01\source-outbox",
+                        "SourceSummaryPath": r"C:\repo-a\.relay-contract\bottest-live-visible\run_preview\pair01\target01\source-outbox\summary.txt",
+                        "SourceReviewZipPath": r"C:\repo-a\.relay-contract\bottest-live-visible\run_preview\pair01\target01\source-outbox\review.zip",
+                        "PublishReadyPath": r"C:\repo-a\.relay-contract\bottest-live-visible\run_preview\pair01\target01\source-outbox\publish.ready.json",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            panel.artifact_service = SimpleNamespace(resolve_artifact_path=lambda *_args, **_kwargs: str(request_path))
+            panel.preview_rows = [
+                {
+                    "TargetId": "target01",
+                    "PairTargetFolder": r"C:\repo-a\.relay-runs\bottest-live-visible\pairs\pair01\run_preview\target01",
+                    "OutputFiles": {
+                        "SummaryPath": r"C:\repo-a\.relay-contract\bottest-live-visible\run_preview\pair01\target01\outbox-a\summary.txt",
+                        "ReviewZipPath": r"C:\repo-a\.relay-contract\bottest-live-visible\run_preview\pair01\target01\outbox-b\review.zip",
+                        "PublishReadyPath": r"C:\repo-a\.relay-contract\bottest-live-visible\run_preview\pair01\target01\outbox-a\publish.ready.json",
+                    },
+                }
+            ]
+
+            resolved = panel._resolve_artifact_contract_paths(
+                make_artifact_state(
+                    target_id="target01",
+                    target_folder=r"C:\repo-a\.relay-runs\bottest-live-visible\pairs\pair01\run_preview\target01",
+                )
+            )
+
+            self.assertEqual(
+                r"C:\repo-a\.relay-contract\bottest-live-visible\run_preview\pair01\target01\source-outbox",
+                resolved["SourceOutboxPath"],
+            )
+            self.assertEqual("", resolved["SourceOutboxPathWarning"])
+            self.assertEqual("request", resolved["Source"])
+
+    def test_resolve_artifact_contract_paths_keeps_parent_mismatch_warning_from_preview_row(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            panel = self._make_panel(Path(tmp) / "artifact-source-memory.json")
+            panel.artifact_service = SimpleNamespace(resolve_artifact_path=lambda *_args, **_kwargs: "")
+            panel.preview_rows = [
+                {
+                    "TargetId": "target01",
+                    "PairTargetFolder": r"C:\repo-a\.relay-runs\bottest-live-visible\pairs\pair01\run_preview\target01",
+                    "OutputFiles": {
+                        "SummaryPath": r"C:\repo-a\.relay-contract\bottest-live-visible\run_preview\pair01\target01\outbox-a\summary.txt",
+                        "ReviewZipPath": r"C:\repo-a\.relay-contract\bottest-live-visible\run_preview\pair01\target01\outbox-b\review.zip",
+                        "PublishReadyPath": r"C:\repo-a\.relay-contract\bottest-live-visible\run_preview\pair01\target01\outbox-a\publish.ready.json",
+                    },
+                }
+            ]
+
+            resolved = panel._resolve_artifact_contract_paths(
+                make_artifact_state(
+                    target_id="target01",
+                    target_folder=r"C:\repo-a\.relay-runs\bottest-live-visible\pairs\pair01\run_preview\target01",
+                )
+            )
+
+            self.assertEqual("", resolved["SourceOutboxPath"])
+            self.assertEqual("output-files-parent-mismatch", resolved["SourceOutboxPathWarning"])
+            self.assertEqual(
+                r"C:\repo-a\.relay-contract\bottest-live-visible\run_preview\pair01\target01\outbox-a\summary.txt",
+                resolved["SourceSummaryPath"],
+            )
+
 
 class RelayOperatorPanelWatcherOptionTests(unittest.TestCase):
     def _make_panel(self, memory_path: Path | None = None) -> RelayOperatorPanel:
@@ -8843,6 +10407,7 @@ class RelayOperatorPanelWatcherOptionTests(unittest.TestCase):
         panel.artifact_submit_active_targets = set()
         panel.artifact_run_root_filter_var = VarStub("")
         panel.config_path_var = VarStub("cfg.psd1")
+        panel.pair_id_var = VarStub("pair01")
         panel.run_root_var = VarStub("")
         panel.effective_data = {
             "RunContext": {
@@ -8869,6 +10434,50 @@ class RelayOperatorPanelWatcherOptionTests(unittest.TestCase):
         self.assertEqual(0, request.max_forward_count)
         self.assertEqual(3600, request.run_duration_sec)
         self.assertEqual(10, request.pair_max_roundtrip_count)
+        self.assertTrue(request.use_headless_dispatch)
+
+    def test_build_watcher_start_request_from_controls_uses_direct_dispatch_for_shared_visible_typed_window_lane(self) -> None:
+        panel = self._make_panel()
+        panel.effective_data["Config"] = {"LaneName": "bottest-live-visible"}
+        panel.effective_data["PairTest"] = {
+            "ExecutionPathMode": "typed-window",
+            "RequireUserVisibleCellExecution": True,
+        }
+
+        request = panel._build_watcher_start_request_from_controls(
+            config_path="cfg.psd1",
+            run_root="C:\\runs\\current",
+            show_error=False,
+        )
+
+        self.assertIsNotNone(request)
+        assert request is not None
+        self.assertFalse(request.use_headless_dispatch)
+
+    def test_watcher_quick_start_request_prefers_manifest_config_path_and_direct_dispatch_for_shared_visible_typed_window_lane(self) -> None:
+        panel = self._make_panel()
+        panel.effective_data["Config"] = {"LaneName": "bottest-live-visible"}
+        panel.effective_data["PairTest"] = {
+            "ExecutionPathMode": "typed-window",
+            "RequireUserVisibleCellExecution": True,
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            run_root = Path(tmp)
+            manifest_config_path = run_root / "settings.externalized.psd1"
+            manifest_config_path.write_text("@{}", encoding="utf-8")
+            (run_root / "manifest.json").write_text(
+                json.dumps({"ConfigPath": str(manifest_config_path)}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+
+            request = panel._watcher_quick_start_request(
+                config_path="cfg.psd1",
+                run_root=str(run_root),
+            )
+
+        self.assertEqual(str(manifest_config_path), request.config_path)
+        self.assertFalse(request.use_headless_dispatch)
 
     def test_refresh_watcher_start_note_uses_current_controls(self) -> None:
         panel = self._make_panel()
@@ -8883,6 +10492,18 @@ class RelayOperatorPanelWatcherOptionTests(unittest.TestCase):
         self.assertIn("pair별 왕복 10회", note)
         self.assertIn("0은 해당 제한 없음", note)
         self.assertIn("다음 시작값:", note)
+
+    def test_refresh_watcher_start_note_uses_direct_dispatch_for_shared_visible_typed_window_lane(self) -> None:
+        panel = self._make_panel()
+        panel.effective_data["Config"] = {"LaneName": "bottest-live-visible"}
+        panel.effective_data["PairTest"] = {
+            "ExecutionPathMode": "typed-window",
+            "RequireUserVisibleCellExecution": True,
+        }
+
+        panel._refresh_watcher_start_note()
+
+        self.assertIn("direct dispatch", panel.watcher_start_note_var.get())
 
     def test_refresh_watcher_notes_split_quick_current_and_next(self) -> None:
         panel = self._make_panel()
@@ -8937,6 +10558,7 @@ class RelayOperatorPanelWatcherOptionTests(unittest.TestCase):
                 contract_paths={
                     "CheckScriptPathExists": False,
                     "SubmitScriptPathExists": False,
+                    "SourceOutboxPathWarning": "output-files-parent-mismatch",
                 },
             )
 
@@ -8944,6 +10566,7 @@ class RelayOperatorPanelWatcherOptionTests(unittest.TestCase):
             self.assertIn("[ARTIFACT RUNROOT STALE]", badges)
             self.assertIn("[LEGACY CHECK FALLBACK RISK]", badges)
             self.assertIn("[LEGACY SUBMIT FALLBACK RISK]", badges)
+            self.assertIn("[OUTPUTFILES PARENT MISMATCH]", badges)
 
     def test_confirm_recent_submit_repeat_prompts_for_recent_submit(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

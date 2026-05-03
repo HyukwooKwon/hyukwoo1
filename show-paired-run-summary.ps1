@@ -1186,6 +1186,14 @@ function Get-ImportantTargetSummary {
         ResultPresent      = [bool](Get-ObjectPropertyValue -Object $StatusTarget -Name 'ResultPresent' -DefaultValue $false)
         ForwardedAt        = [string](Get-ObjectPropertyValue -Object $StatusTarget -Name 'ForwardedAt' -DefaultValue '')
         SourceOutboxUpdatedAt = [string](Get-ObjectPropertyValue -Object $StatusTarget -Name 'SourceOutboxUpdatedAt' -DefaultValue '')
+        SourceOutboxOriginalReadyReason = [string](Get-ObjectPropertyValue -Object $SourceOutboxStatusTarget -Name 'OriginalReadyReason' -DefaultValue '')
+        SourceOutboxFinalReadyReason = [string](Get-ObjectPropertyValue -Object $SourceOutboxStatusTarget -Name 'FinalReadyReason' -DefaultValue '')
+        SourceOutboxRepairAttempted = [bool](Get-ObjectPropertyValue -Object $SourceOutboxStatusTarget -Name 'RepairAttempted' -DefaultValue $false)
+        SourceOutboxRepairSucceeded = [bool](Get-ObjectPropertyValue -Object $SourceOutboxStatusTarget -Name 'RepairSucceeded' -DefaultValue $false)
+        SourceOutboxRepairCompletedAt = [string](Get-ObjectPropertyValue -Object $SourceOutboxStatusTarget -Name 'RepairCompletedAt' -DefaultValue '')
+        SourceOutboxRepairMessage = [string](Get-ObjectPropertyValue -Object $SourceOutboxStatusTarget -Name 'RepairMessage' -DefaultValue '')
+        SourceOutboxRepairCommand = [string](Get-ObjectPropertyValue -Object $SourceOutboxStatusTarget -Name 'RepairCommand' -DefaultValue '')
+        SourceOutboxRepairSourceContext = [string](Get-ObjectPropertyValue -Object $SourceOutboxStatusTarget -Name 'RepairSourceContext' -DefaultValue '')
         InitialRoleMode    = $initialRoleMode
         ContractPathMode   = $contractPathMode
         ContractRootPath   = $contractRootPath
@@ -2123,6 +2131,25 @@ function Format-ImportantSummaryText {
         $lines.Add(('ContractRootPath: {0}' -f [string]$target.ContractRootPath))
         $lines.Add(('ContractReferenceTimeUtc: {0}' -f [string]$target.ContractReferenceTimeUtc))
         $lines.Add(('ContractArtifactsReady: {0}' -f [bool]$target.ContractArtifactsReady))
+        if (Test-NonEmptyString ([string]$target.SourceOutboxOriginalReadyReason)) {
+            $lines.Add(('SourceOutboxOriginalReadyReason: {0}' -f [string]$target.SourceOutboxOriginalReadyReason))
+        }
+        if (Test-NonEmptyString ([string]$target.SourceOutboxFinalReadyReason)) {
+            $lines.Add(('SourceOutboxFinalReadyReason: {0}' -f [string]$target.SourceOutboxFinalReadyReason))
+        }
+        if ([bool]$target.SourceOutboxRepairAttempted -or (Test-NonEmptyString ([string]$target.SourceOutboxRepairMessage))) {
+            $lines.Add(('SourceOutboxRepairAttempted: {0}' -f [bool]$target.SourceOutboxRepairAttempted))
+            $lines.Add(('SourceOutboxRepairSucceeded: {0}' -f [bool]$target.SourceOutboxRepairSucceeded))
+            if (Test-NonEmptyString ([string]$target.SourceOutboxRepairCompletedAt)) {
+                $lines.Add(('SourceOutboxRepairCompletedAt: {0}' -f [string]$target.SourceOutboxRepairCompletedAt))
+            }
+            if (Test-NonEmptyString ([string]$target.SourceOutboxRepairSourceContext)) {
+                $lines.Add(('SourceOutboxRepairSourceContext: {0}' -f [string]$target.SourceOutboxRepairSourceContext))
+            }
+            if (Test-NonEmptyString ([string]$target.SourceOutboxRepairMessage)) {
+                $lines.Add(('SourceOutboxRepairMessage: {0}' -f [string]$target.SourceOutboxRepairMessage))
+            }
+        }
         $lines.Add(('CurrentTriggerSourceOutboxPath: {0}' -f [string]$target.CurrentTriggerSourceOutboxPath))
         $lines.Add(('CurrentTriggerSummaryPath: {0}' -f [string]$target.CurrentTriggerSummaryPath))
         $lines.Add(('CurrentTriggerReviewZipPath: {0}' -f [string]$target.CurrentTriggerReviewZipPath))

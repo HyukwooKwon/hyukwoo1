@@ -147,10 +147,11 @@ visible worker closeout 기준선 (historical only):
 - 같은 pair 카드에서는 `RUNNING` / `WAITING` / `DONE` / `ERROR` / `STOPPED` runtime 배지도 같이 본다. 값은 현재 RunRoot의 `.state\\wrapper-status.json` 을 우선 읽고, 없으면 기존 paired status로 fallback 해서 pair별 `WatcherState`, `RoundtripCount`, `CurrentPhase`, `LastForwardedAt` 를 보여준다.
 - `설정 / 문구` 탭의 `초기 실행 준비 / Seed Kickoff Composer` 는 영구 pair 정책 편집과 분리된 1회성 kickoff helper로 사용한다. 사용자는 `Pair`, `SeedTarget`, `입력 파일`, `작업 설명`만 입력하고, panel은 현재 pair의 실효 경로를 읽어 `summary.txt / review.zip / publish.ready.json` 절대경로와 helper 경로를 자동 합성해 읽기 전용으로 보여준다.
 - Composer 상단에는 `붙여넣기 대상`, `시작 가능 여부`, `빠른 시작`을 고정으로 보여주고, 세부 블록은 기본 접힘 상태로 두어야 한다.
-- Composer의 `수동 시작문 복사`는 target 전달문만 복사하고, operator 확인용 설명 블록은 화면 미리보기에만 남긴다.
-- `경로만 복사`, `시작 순서 복사`, `helper 명령 복사`는 운영 복사용 helper다. `초기 입력 큐잉`은 `Initial/Handoff` 영구 설정을 바꾸지 않고 one-time queue에만 등록해야 한다.
+- `초간단 시작문 미리보기` 박스에는 실제로 복사될 기본 시작문을 항상 먼저 보여줘야 한다.
+- Composer의 `초간단 시작문 복사`는 작업 내용 + 3개 파일 생성 지시 + 순서 규칙만 복사하고, operator 확인용 설명 블록은 화면 미리보기에만 남긴다.
+- `상세 시작문 복사`, `summary 경로 복사`, `review.zip 경로 복사`, `publish.ready 경로 복사`, `계약 경로 복사`, `시작 순서 복사`, `helper 명령 복사`는 운영 복사용 helper다. `초기 입력 큐잉`은 `Initial/Handoff` 영구 설정을 바꾸지 않고 one-time queue에만 등록해야 한다.
 - queue에는 작업 설명 블록만 저장하고, 경로/파일 계약/helper 안내는 seed/handoff scaffold가 별도로 자동 추가된다는 해석을 유지한다.
-- 권장 운영 순서는 `pair 설정 저장 + 새로고침 -> 실효값 확인 -> 수동 시작문 복사 또는 초기 입력 큐잉` 으로 본다.
+- 권장 운영 순서는 `pair 설정 저장 + 새로고침 -> 실효값 확인 -> 초간단 시작문 복사 또는 초기 입력 큐잉` 으로 본다.
 - 현재 base config의 `InboxRoot / ProcessedRoot / RuntimeRoot / LogsRoot` 가 아직 `hyukwoo1`를 가리키면 shared external mode active run은 `automation-repo-bookkeeping-roots-disallowed` 로 즉시 실패해야 한다. external mode live proof는 이 residual bookkeeping roots도 현재 작업 중인 external `WorkRepoRoot` 아래로 옮긴 effective config에서만 수행한다.
 - `RunRoot`는 반드시 현재 작업 중인 `WorkRepoRoot` 아래 `.relay-runs\bottest-live-visible\...` 경로로 생성되어야 한다. `hyukwoo1` 아래 RunRoot나, 선택한 `WorkRepoRoot` 밖 RunRoot는 hard fail로 막는다.
 - 작업 repo가 바뀌면 감지 경로도 같이 바뀌어야 한다. watcher는 repo 전체를 감시하지 않고, 이번 run/pair/target에 대해 request/manifest에 기록된 `SourceOutboxPath`, `SourceSummaryPath`, `SourceReviewZipPath`, `PublishReadyPath` explicit path만 strict 검증한다.
