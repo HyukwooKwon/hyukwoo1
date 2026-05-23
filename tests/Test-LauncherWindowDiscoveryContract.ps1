@@ -64,6 +64,7 @@ $provider = {
         [pscustomobject]@{
             Hwnd      = 104
             ProcessId = 204
+            ProcessName = 'WindowsTerminal'
             Title     = 'bravo'
             ClassName = 'CASCADIA_HOST'
         }
@@ -84,6 +85,17 @@ Assert-True ($rectRows.Count -eq 2) 'Expected IncludeRect mode to preserve visib
 Assert-SequenceEqual -Actual @($rectRows[0].PSObject.Properties.Name) -Expected @('Hwnd', 'ProcessId', 'Title', 'ClassName', 'Rect') -Message 'Rect-inclusive window contract fields must stay fixed.'
 Assert-SequenceEqual -Actual @($rectRows[0].Rect) -Expected @(10, 20, 210, 260) -Message 'Expected Rect coordinates to remain ordered left/top/right/bottom.'
 Assert-True (@($rectRows[1].Rect).Count -eq 0) 'Expected missing geometry to serialize as an empty Rect array.'
+
+$foreground = Get-ForegroundWindowInfo -WindowProvider $provider -ForegroundHwnd 104
+Assert-SequenceEqual -Actual @($foreground.PSObject.Properties.Name) -Expected @('Hwnd', 'ProcessId', 'ProcessName', 'Title', 'ClassName') -Message 'Foreground window contract fields must stay fixed.'
+Assert-True ($foreground.Hwnd -eq 104) 'Expected foreground hwnd to be returned from the provider contract.'
+Assert-True ($foreground.ProcessId -eq 204) 'Expected foreground process id to be returned from the provider contract.'
+Assert-True ($foreground.ProcessName -eq 'WindowsTerminal') 'Expected foreground process name to be returned when available.'
+Assert-True ($foreground.Title -eq 'bravo') 'Expected foreground title to be returned from the provider contract.'
+Assert-True ($foreground.ClassName -eq 'CASCADIA_HOST') 'Expected foreground class name to be returned from the provider contract.'
+
+$missingForeground = Get-ForegroundWindowInfo -WindowProvider $provider -ForegroundHwnd 999
+Assert-True ($missingForeground.Hwnd -eq 0) 'Missing foreground hwnd should return an empty window record.'
 
 $launcherScripts = @(
     'launcher\Attach-Targets.ps1',

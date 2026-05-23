@@ -7,7 +7,8 @@ param(
     [switch]$UseHeadlessDispatch,
     [switch]$AllowHeadlessDispatchInTypedWindowLane,
     [int]$MaxForwardCount = 0,
-    [int]$PairMaxRoundtripCount = 0
+    [int]$PairMaxRoundtripCount = 0,
+    [switch]$ImportSourceOutboxOnly
 )
 
 Set-StrictMode -Version Latest
@@ -721,42 +722,11 @@ function Get-FileHashHex {
 function Get-SourceOutboxPaths {
     param(
         [Parameter(Mandatory)]$PairTest,
-        [Parameter(Mandatory)]$Item
+        [Parameter(Mandatory)]$Item,
+        $Request = $null
     )
 
-    $targetFolder = [string]$Item.TargetFolder
-    $sourceOutboxPath = [string](Get-ConfigValue -Object $Item -Name 'SourceOutboxPath' -DefaultValue '')
-    if (-not (Test-NonEmptyString $sourceOutboxPath)) {
-        $sourceOutboxPath = Join-Path $targetFolder ([string]$PairTest.SourceOutboxFolderName)
-    }
-
-    $sourceSummaryPath = [string](Get-ConfigValue -Object $Item -Name 'SourceSummaryPath' -DefaultValue '')
-    if (-not (Test-NonEmptyString $sourceSummaryPath)) {
-        $sourceSummaryPath = Join-Path $sourceOutboxPath ([string]$PairTest.SourceSummaryFileName)
-    }
-
-    $sourceReviewZipPath = [string](Get-ConfigValue -Object $Item -Name 'SourceReviewZipPath' -DefaultValue '')
-    if (-not (Test-NonEmptyString $sourceReviewZipPath)) {
-        $sourceReviewZipPath = Join-Path $sourceOutboxPath ([string]$PairTest.SourceReviewZipFileName)
-    }
-
-    $publishReadyPath = [string](Get-ConfigValue -Object $Item -Name 'PublishReadyPath' -DefaultValue '')
-    if (-not (Test-NonEmptyString $publishReadyPath)) {
-        $publishReadyPath = Join-Path $sourceOutboxPath ([string]$PairTest.PublishReadyFileName)
-    }
-
-    $publishedArchivePath = [string](Get-ConfigValue -Object $Item -Name 'PublishedArchivePath' -DefaultValue '')
-    if (-not (Test-NonEmptyString $publishedArchivePath)) {
-        $publishedArchivePath = Join-Path $sourceOutboxPath ([string]$PairTest.PublishedArchiveFolderName)
-    }
-
-    return [pscustomobject]@{
-        SourceOutboxPath     = $sourceOutboxPath
-        SourceSummaryPath    = $sourceSummaryPath
-        SourceReviewZipPath  = $sourceReviewZipPath
-        PublishReadyPath     = $publishReadyPath
-        PublishedArchivePath = $publishedArchivePath
-    }
+    return (Resolve-PairedSourceOutboxPaths -PairTest $PairTest -TargetEntry $Item -Request $Request)
 }
 
 function Read-JsonDocumentWithStatus {
@@ -1512,6 +1482,51 @@ function Wait-TypedWindowHandoffLateSuccess {
         Readiness = $lastReadiness
         LastActivity = $lastActivity
     }
+}
+
+function Invoke-TypedWindowHandoffPrepare {
+    param(
+        [Parameter(Mandatory)][string]$Root,
+        [Parameter(Mandatory)][string]$ConfigPath,
+        [Parameter(Mandatory)][string]$RunRoot,
+        [Parameter(Mandatory)][string]$PairId,
+        [Parameter(Mandatory)][string]$TargetId
+    )
+
+    $prepareRaw = & (Join-Path $Root 'tests\Prepare-TypedWindowSession.ps1') `
+        -ConfigPath $ConfigPath `
+        -RunRoot $RunRoot `
+        -PairId $PairId `
+        -TargetId $TargetId `
+        -AsJson
+    $prepareResult = $prepareRaw | ConvertFrom-Json
+    $prepareFinalState = [string](Get-ConfigValue -Object $prepareResult -Name 'FinalState' -DefaultValue '')
+    $prepareReason = [string](Get-ConfigValue -Object $prepareResult -Name 'PrepareReason' -DefaultValue '')
+    $prepareSessionState = [string](Get-ConfigValue -Object $prepareResult -Name 'TypedWindowSessionState' -DefaultValue '')
+    $prepareResetReason = [string](Get-ConfigValue -Object $prepareResult -Name 'TypedWindowLastResetReason' -DefaultValue '')
+    $prepareScopeKind = [string](Get-ConfigValue -Object $prepareResult -Name 'TypedWindowSessionScopeKind' -DefaultValue '')
+    $prepareScopeId = [string](Get-ConfigValue -Object $prepareResult -Name 'TypedWindowSessionScopeId' -DefaultValue '')
+    $prepareRouteKey = [string](Get-ConfigValue -Object $prepareResult -Name 'TypedWindowSessionRouteKey' -DefaultValue '')
+    if ($prepareFinalState -notin @('prepared', 'reused')) {
+        throw ("typed-window handoff prepare failed target={0} finalState={1} reason={2} session={3} reset={4} scope={5}/{6} route={7}" -f `
+                $TargetId,
+                $prepareFinalState,
+                $prepareReason,
+                $prepareSessionState,
+                $prepareResetReason,
+                $(if (Test-NonEmptyString $prepareScopeKind) { $prepareScopeKind } else { '(none)' }),
+                $(if (Test-NonEmptyString $prepareScopeId) { $prepareScopeId } else { '(none)' }),
+                $(if (Test-NonEmptyString $prepareRouteKey) { $prepareRouteKey } else { '(none)' }))
+    }
+
+    Write-Host ("typed-window handoff prepare {0} target={1} reason={2} scope={3}/{4} route={5}" -f `
+            $prepareFinalState,
+            $TargetId,
+            $prepareReason,
+            $(if (Test-NonEmptyString $prepareScopeKind) { $prepareScopeKind } else { '(none)' }),
+            $(if (Test-NonEmptyString $prepareScopeId) { $prepareScopeId } else { '(none)' }),
+            $(if (Test-NonEmptyString $prepareRouteKey) { $prepareRouteKey } else { '(none)' }))
+    return $prepareResult
 }
 
 function Get-SourceOutboxFingerprint {
@@ -2329,22 +2344,11 @@ function Get-HandoffMessageText {
     $summaryFileName = [string]$PairTest.SummaryFileName
     $zipFileName = [System.IO.Path]::GetFileName($ZipPath)
     $resolvedSummaryPath = if (Test-NonEmptyString $SummaryPath) { $SummaryPath } else { '(missing)' }
-    $recipientSourceOutboxPath = [string](Get-ConfigValue -Object $RecipientItem -Name 'SourceOutboxPath' -DefaultValue '')
-    if (-not (Test-NonEmptyString $recipientSourceOutboxPath)) {
-        $recipientSourceOutboxPath = Join-Path ([string]$SourceItem.PartnerFolder) ([string]$PairTest.SourceOutboxFolderName)
-    }
-    $recipientSourceSummaryPath = [string](Get-ConfigValue -Object $RecipientItem -Name 'SourceSummaryPath' -DefaultValue '')
-    if (-not (Test-NonEmptyString $recipientSourceSummaryPath)) {
-        $recipientSourceSummaryPath = Join-Path $recipientSourceOutboxPath ([string]$PairTest.SourceSummaryFileName)
-    }
-    $recipientSourceReviewZipPath = [string](Get-ConfigValue -Object $RecipientItem -Name 'SourceReviewZipPath' -DefaultValue '')
-    if (-not (Test-NonEmptyString $recipientSourceReviewZipPath)) {
-        $recipientSourceReviewZipPath = Join-Path $recipientSourceOutboxPath ([string]$PairTest.SourceReviewZipFileName)
-    }
-    $recipientPublishReadyPath = [string](Get-ConfigValue -Object $RecipientItem -Name 'PublishReadyPath' -DefaultValue '')
-    if (-not (Test-NonEmptyString $recipientPublishReadyPath)) {
-        $recipientPublishReadyPath = Join-Path $recipientSourceOutboxPath ([string]$PairTest.PublishReadyFileName)
-    }
+    $recipientSourcePaths = Resolve-PairedSourceOutboxPaths -PairTest $PairTest -TargetEntry $RecipientItem
+    $recipientSourceOutboxPath = [string]$recipientSourcePaths.SourceOutboxPath
+    $recipientSourceSummaryPath = [string]$recipientSourcePaths.SourceSummaryPath
+    $recipientSourceReviewZipPath = [string]$recipientSourcePaths.SourceReviewZipPath
+    $recipientPublishReadyPath = [string]$recipientSourcePaths.PublishReadyPath
     $recipientPublishScriptPath = [string](Get-ConfigValue -Object $RecipientItem -Name 'PublishScriptPath' -DefaultValue '')
     $recipientPublishCmdPath = [string](Get-ConfigValue -Object $RecipientItem -Name 'PublishCmdPath' -DefaultValue '')
     $availableReviewInputPaths = @()
@@ -2432,6 +2436,7 @@ function Write-HandoffFailureLog {
 $root = Split-Path -Parent $PSScriptRoot
 . (Join-Path $PSScriptRoot 'PairedExchangeConfig.ps1')
 . (Join-Path $PSScriptRoot 'OneTimeMessageQueue.ps1')
+. (Join-Path $PSScriptRoot 'lib\PairedSourceOutboxPaths.ps1')
 . (Join-Path $root 'router\RelayMessageMetadata.ps1')
 
 if ([string]::IsNullOrWhiteSpace($ConfigPath)) {
@@ -3074,6 +3079,10 @@ try {
                 continue
             }
 
+            if ($ImportSourceOutboxOnly) {
+                continue
+            }
+
             $recipientItem = Get-ConfigValue -Object $targetItemsById -Name ([string]$item.PartnerTargetId) -DefaultValue $null
             if ($null -eq $recipientItem) {
                 throw ("recipient target item not found: {0}" -f [string]$item.PartnerTargetId)
@@ -3131,45 +3140,70 @@ try {
                             -Mode 'handoff' | Out-Null
                     }
                     else {
-                        $handoffSubmitRaw = & (Join-Path $root 'tests\Send-InitialPairSeedWithRetry.ps1') `
-                            -ConfigPath $resolvedConfigPath `
-                            -RunRoot $resolvedRunRoot `
-                            -TargetId ([string]$item.PartnerTargetId) `
-                            -MessageTextFilePath $messagePath `
-                            -WaitForPublishSeconds ([int]$pairTest.SeedOutboxStartTimeoutSeconds) `
-                            -DisallowInlineTypedWindowPrepare `
-                            -AsJson
-                        $handoffSubmitResult = $handoffSubmitRaw | ConvertFrom-Json
-                        $handoffFinalState = [string](Get-ConfigValue -Object $handoffSubmitResult -Name 'FinalState' -DefaultValue '')
-                        $handoffSubmitState = [string](Get-ConfigValue -Object $handoffSubmitResult -Name 'SubmitState' -DefaultValue '')
-                        $handoffSubmitReason = [string](Get-ConfigValue -Object $handoffSubmitResult -Name 'SubmitReason' -DefaultValue '')
-                        $handoffOutboxPublished = [bool](Get-ConfigValue -Object $handoffSubmitResult -Name 'OutboxPublished' -DefaultValue $false)
-                        if (-not $handoffOutboxPublished -and $handoffFinalState -notin @('publish-detected', 'publish-detected-late')) {
-                            $lateHandoffResult = Wait-TypedWindowHandoffLateSuccess `
-                                -PairTest $pairTest `
-                                -Item $recipientItem `
-                                -TimeoutSeconds ([math]::Min([math]::Max(10, [int]$pairTest.SeedOutboxStartTimeoutSeconds), 30)) `
-                                -PollIntervalMs $PollIntervalMs
-                            if ([bool]$lateHandoffResult.Published) {
-                                $handoffOutboxPublished = $true
-                                $handoffFinalState = 'publish-detected-late'
-                                $handoffSubmitState = 'confirmed'
-                                $handoffSubmitReason = [string]$lateHandoffResult.Reason
-                                Write-Host ("typed-window handoff late success {0} -> {1} reason={2}" -f [string]$item.TargetId, [string]$item.PartnerTargetId, $handoffSubmitReason)
-                            }
-                            else {
-                                $lateHandoffReason = [string](Get-ConfigValue -Object $lateHandoffResult -Name 'Reason' -DefaultValue '')
-                                if (Test-NonEmptyString $lateHandoffReason) {
-                                    $handoffSubmitReason = if (Test-NonEmptyString $handoffSubmitReason) {
-                                        ($handoffSubmitReason + '; lateGrace=' + $lateHandoffReason)
-                                    }
-                                    else {
-                                        ('lateGrace=' + $lateHandoffReason)
-                                    }
+                        [void](Invoke-TypedWindowHandoffPrepare `
+                                -Root $root `
+                                -ConfigPath $resolvedConfigPath `
+                                -RunRoot $resolvedRunRoot `
+                                -PairId ([string]$recipientItem.PairId) `
+                                -TargetId ([string]$item.PartnerTargetId))
+                        $handoffSubmitAttempt = 0
+                        while ($true) {
+                            $handoffSubmitAttempt += 1
+                            $handoffSubmitRaw = & (Join-Path $root 'tests\Send-InitialPairSeedWithRetry.ps1') `
+                                -ConfigPath $resolvedConfigPath `
+                                -RunRoot $resolvedRunRoot `
+                                -TargetId ([string]$item.PartnerTargetId) `
+                                -MessageTextFilePath $messagePath `
+                                -WaitForPublishSeconds ([int]$pairTest.SeedOutboxStartTimeoutSeconds) `
+                                -DisallowInlineTypedWindowPrepare `
+                                -AsJson
+                            $handoffSubmitResult = $handoffSubmitRaw | ConvertFrom-Json
+                            $handoffFinalState = [string](Get-ConfigValue -Object $handoffSubmitResult -Name 'FinalState' -DefaultValue '')
+                            $handoffSubmitState = [string](Get-ConfigValue -Object $handoffSubmitResult -Name 'SubmitState' -DefaultValue '')
+                            $handoffSubmitReason = [string](Get-ConfigValue -Object $handoffSubmitResult -Name 'SubmitReason' -DefaultValue '')
+                            $handoffOutboxPublished = [bool](Get-ConfigValue -Object $handoffSubmitResult -Name 'OutboxPublished' -DefaultValue $false)
+                            if ($handoffSubmitReason -eq 'typed-window-inline-prepare-blocked') {
+                                if ($handoffSubmitAttempt -lt 2) {
+                                    Write-Host ("typed-window handoff prepare retry {0} -> {1} reason={2}" -f [string]$item.TargetId, [string]$item.PartnerTargetId, $handoffSubmitReason)
+                                    [void](Invoke-TypedWindowHandoffPrepare `
+                                            -Root $root `
+                                            -ConfigPath $resolvedConfigPath `
+                                            -RunRoot $resolvedRunRoot `
+                                            -PairId ([string]$recipientItem.PairId) `
+                                            -TargetId ([string]$item.PartnerTargetId))
+                                    continue
                                 }
 
-                                throw ("typed-window handoff not confirmed target={0} finalState={1} submitState={2} reason={3}" -f [string]$item.PartnerTargetId, $handoffFinalState, $handoffSubmitState, $handoffSubmitReason)
+                                throw ("typed-window handoff blocked after prepare retry target={0} finalState={1} submitState={2} reason={3}" -f [string]$item.PartnerTargetId, $handoffFinalState, $handoffSubmitState, $handoffSubmitReason)
                             }
+                            if (-not $handoffOutboxPublished -and $handoffFinalState -notin @('publish-detected', 'publish-detected-late')) {
+                                $lateHandoffResult = Wait-TypedWindowHandoffLateSuccess `
+                                    -PairTest $pairTest `
+                                    -Item $recipientItem `
+                                    -TimeoutSeconds ([math]::Min([math]::Max(10, [int]$pairTest.SeedOutboxStartTimeoutSeconds), 30)) `
+                                    -PollIntervalMs $PollIntervalMs
+                                if ([bool]$lateHandoffResult.Published) {
+                                    $handoffOutboxPublished = $true
+                                    $handoffFinalState = 'publish-detected-late'
+                                    $handoffSubmitState = 'confirmed'
+                                    $handoffSubmitReason = [string]$lateHandoffResult.Reason
+                                    Write-Host ("typed-window handoff late success {0} -> {1} reason={2}" -f [string]$item.TargetId, [string]$item.PartnerTargetId, $handoffSubmitReason)
+                                }
+                                else {
+                                    $lateHandoffReason = [string](Get-ConfigValue -Object $lateHandoffResult -Name 'Reason' -DefaultValue '')
+                                    if (Test-NonEmptyString $lateHandoffReason) {
+                                        $handoffSubmitReason = if (Test-NonEmptyString $handoffSubmitReason) {
+                                            ($handoffSubmitReason + '; lateGrace=' + $lateHandoffReason)
+                                        }
+                                        else {
+                                            ('lateGrace=' + $lateHandoffReason)
+                                        }
+                                    }
+
+                                    throw ("typed-window handoff not confirmed target={0} finalState={1} submitState={2} reason={3}" -f [string]$item.PartnerTargetId, $handoffFinalState, $handoffSubmitState, $handoffSubmitReason)
+                                }
+                            }
+                            break
                         }
                     }
                 }

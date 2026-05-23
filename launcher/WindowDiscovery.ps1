@@ -48,6 +48,42 @@ namespace Relay {
 '@
 }
 
+function Ensure-ForegroundWindowApiType {
+    if ('Relay.ForegroundWindowApi' -as [type]) {
+        return
+    }
+
+    Add-Type @'
+using System;
+using System.Runtime.InteropServices;
+
+namespace Relay {
+    public static class ForegroundWindowApi {
+        [DllImport("user32.dll")]
+        public static extern IntPtr GetForegroundWindow();
+    }
+}
+'@
+}
+
+function New-WindowInfoRecord {
+    param(
+        [int64]$Hwnd = 0,
+        [int]$ProcessId = 0,
+        [AllowEmptyString()][string]$ProcessName = '',
+        [AllowEmptyString()][string]$Title = '',
+        [AllowEmptyString()][string]$ClassName = ''
+    )
+
+    return [pscustomobject][ordered]@{
+        Hwnd        = [int64]$Hwnd
+        ProcessId   = [int]$ProcessId
+        ProcessName = [string]$ProcessName
+        Title       = [string]$Title
+        ClassName   = [string]$ClassName
+    }
+}
+
 function Get-VisibleWindows {
     param(
         [switch]$IncludeRect,
@@ -147,4 +183,78 @@ function Get-VisibleWindows {
     }, [IntPtr]::Zero) | Out-Null
 
     return $windows
+}
+
+function Get-ForegroundWindowInfo {
+    param(
+        [scriptblock]$WindowProvider,
+        $ForegroundHwnd = $null
+    )
+
+    if ($null -ne $WindowProvider) {
+        if ($null -eq $ForegroundHwnd -or [string]::IsNullOrWhiteSpace([string]$ForegroundHwnd)) {
+            return (New-WindowInfoRecord)
+        }
+
+        $foregroundHwndText = [string]$ForegroundHwnd
+        foreach ($window in @(& $WindowProvider)) {
+            if ($null -eq $window) {
+                continue
+            }
+
+            $hwndProperty = $window.PSObject.Properties['Hwnd']
+            if ($null -eq $hwndProperty -or [string]$hwndProperty.Value -ne $foregroundHwndText) {
+                continue
+            }
+
+            $processName = ''
+            $processNameProperty = $window.PSObject.Properties['ProcessName']
+            if ($null -ne $processNameProperty) {
+                $processName = [string]$processNameProperty.Value
+            }
+
+            return (New-WindowInfoRecord `
+                -Hwnd ([int64]$window.PSObject.Properties['Hwnd'].Value) `
+                -ProcessId ([int]$window.PSObject.Properties['ProcessId'].Value) `
+                -ProcessName $processName `
+                -Title ([string]$window.PSObject.Properties['Title'].Value) `
+                -ClassName ([string]$window.PSObject.Properties['ClassName'].Value))
+        }
+
+        return (New-WindowInfoRecord)
+    }
+
+    Ensure-WindowApiType
+    Ensure-ForegroundWindowApiType
+
+    $hWnd = [Relay.ForegroundWindowApi]::GetForegroundWindow()
+    if ($hWnd -eq [IntPtr]::Zero) {
+        return (New-WindowInfoRecord)
+    }
+
+    $windowProcessId = 0
+    [Relay.WindowApi]::GetWindowThreadProcessId($hWnd, [ref]$windowProcessId) | Out-Null
+
+    $titleBuffer = [System.Text.StringBuilder]::new(1024)
+    [Relay.WindowApi]::GetWindowText($hWnd, $titleBuffer, $titleBuffer.Capacity) | Out-Null
+
+    $classBuffer = [System.Text.StringBuilder]::new(256)
+    [Relay.WindowApi]::GetClassName($hWnd, $classBuffer, $classBuffer.Capacity) | Out-Null
+
+    $processName = ''
+    if ([int]$windowProcessId -gt 0) {
+        try {
+            $processName = [string](Get-Process -Id ([int]$windowProcessId) -ErrorAction Stop).ProcessName
+        }
+        catch {
+            $processName = ''
+        }
+    }
+
+    return (New-WindowInfoRecord `
+        -Hwnd $hWnd.ToInt64() `
+        -ProcessId ([int]$windowProcessId) `
+        -ProcessName $processName `
+        -Title $titleBuffer.ToString() `
+        -ClassName $classBuffer.ToString())
 }

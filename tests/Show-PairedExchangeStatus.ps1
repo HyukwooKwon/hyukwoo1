@@ -587,6 +587,33 @@ function Get-ContractNextActionDisplay {
     }
 }
 
+function Get-RelayTargetFolderIssueState {
+    param(
+        [AllowEmptyString()][string]$SubmitReason = '',
+        [AllowEmptyString()][string]$RetryReason = '',
+        [AllowEmptyString()][string]$DispatchReason = '',
+        [AllowEmptyString()][string]$SeedSendState = ''
+    )
+
+    foreach ($text in @($SubmitReason, $RetryReason, $DispatchReason, $SeedSendState)) {
+        $normalized = [string]$text
+        if (-not (Test-NonEmptyString $normalized)) {
+            continue
+        }
+        if ($normalized -match '^target relay folder mismatch:' -or $normalized -eq 'relay-folder-mismatch') {
+            return 'relay-folder-mismatch'
+        }
+        if ($normalized -match '^target relay folder missing in config:' -or $normalized -eq 'relay-folder-config-missing') {
+            return 'relay-folder-config-missing'
+        }
+        if ($normalized -match '^target relay folder missing:' -or $normalized -eq 'relay-folder-missing') {
+            return 'relay-folder-missing'
+        }
+    }
+
+    return ''
+}
+
 function Get-PairNextActionDisplay {
     param([object[]]$Rows)
 
@@ -620,6 +647,7 @@ function Get-PairNextActionDisplay {
 
 $root = Split-Path -Parent $PSScriptRoot
 . (Join-Path $PSScriptRoot 'PairedExchangeConfig.ps1')
+. (Join-Path $PSScriptRoot 'lib\PairedSourceOutboxPaths.ps1')
 . (Join-Path $root 'router\RelayMessageMetadata.ps1')
 
 if ([string]::IsNullOrWhiteSpace($ConfigPath)) {
@@ -761,6 +789,12 @@ foreach ($item in $targetItems | Sort-Object TargetId) {
     $contract = Get-TargetContractPaths -PairTest $pairTest -TargetEntry $item
     $requestDoc = Read-JsonDocument -Path ([string]$contract.RequestPath) -ExpectedShape 'object'
     $contract = Get-TargetContractPaths -PairTest $pairTest -TargetEntry $item -Request $requestDoc.Data
+    $sourceOutboxPaths = Resolve-PairedSourceOutboxPaths -PairTest $pairTest -TargetEntry $item -Request $requestDoc.Data
+    $sourceOutboxPath = [string]$sourceOutboxPaths.SourceOutboxPath
+    $sourceSummaryPath = [string]$sourceOutboxPaths.SourceSummaryPath
+    $sourceReviewZipPath = [string]$sourceOutboxPaths.SourceReviewZipPath
+    $publishReadyPath = [string]$sourceOutboxPaths.PublishReadyPath
+    $publishedArchivePath = [string]$sourceOutboxPaths.PublishedArchivePath
     $reviewRoot = [string]$contract.ReviewFolderPath
     $summaryPath = [string]$contract.SummaryPath
     $donePath = [string]$contract.DonePath
@@ -840,6 +874,17 @@ foreach ($item in $targetItems | Sort-Object TargetId) {
     $submitConfirmationSignal = [string](Get-ConfigValue -Object $seedSendRow -Name 'SubmitConfirmationSignal' -DefaultValue '')
     $typedWindowSessionState = [string](Get-ConfigValue -Object $seedSendRow -Name 'TypedWindowSessionState' -DefaultValue '')
     $typedWindowLastResetReason = [string](Get-ConfigValue -Object $seedSendRow -Name 'TypedWindowLastResetReason' -DefaultValue '')
+    $typedWindowSessionScopeKind = [string](Get-ConfigValue -Object $seedSendRow -Name 'TypedWindowSessionScopeKind' -DefaultValue '')
+    $typedWindowSessionScopeId = [string](Get-ConfigValue -Object $seedSendRow -Name 'TypedWindowSessionScopeId' -DefaultValue '')
+    $typedWindowSessionRouteKey = [string](Get-ConfigValue -Object $seedSendRow -Name 'TypedWindowSessionRouteKey' -DefaultValue '')
+    $focusLostObserved = [bool](Get-ConfigValue -Object $seedSendRow -Name 'FocusLostObserved' -DefaultValue $false)
+    $focusLostCount = [int](Get-ConfigValue -Object $seedSendRow -Name 'FocusLostCount' -DefaultValue 0)
+    $focusLostPolicy = [string](Get-ConfigValue -Object $seedSendRow -Name 'FocusLostPolicy' -DefaultValue '')
+    $focusLostRecoveryMode = [string](Get-ConfigValue -Object $seedSendRow -Name 'FocusLostRecoveryMode' -DefaultValue '')
+    $firstFocusLostAt = [string](Get-ConfigValue -Object $seedSendRow -Name 'FirstFocusLostAt' -DefaultValue '')
+    $lastFocusLostAt = [string](Get-ConfigValue -Object $seedSendRow -Name 'LastFocusLostAt' -DefaultValue '')
+    $focusLostDebugLogPath = [string](Get-ConfigValue -Object $seedSendRow -Name 'FocusLostDebugLogPath' -DefaultValue '')
+    $acceptanceProofGrade = [string](Get-ConfigValue -Object $seedSendRow -Name 'AcceptanceProofGrade' -DefaultValue '')
     $lateSuccessEvidence = (
         ($null -ne $readinessStatus -and [bool]$readinessStatus.IsReady) -or
         ($latestState -in @('ready-to-forward', 'forwarded')) -or
@@ -869,6 +914,12 @@ foreach ($item in $targetItems | Sort-Object TargetId) {
     $seedPrimarySubmitMode = [string](Get-ConfigValue -Object $seedSendRow -Name 'PrimarySubmitMode' -DefaultValue (Get-RelayPrimarySubmitMode -Modes $seedSubmitRetryModes))
     $seedFinalSubmitMode = [string](Get-ConfigValue -Object $seedSendRow -Name 'FinalSubmitMode' -DefaultValue (Get-RelayFinalSubmitMode -Modes $seedSubmitRetryModes))
     $seedSubmitRetryIntervalMs = [int](Get-ConfigValue -Object $seedSendRow -Name 'SubmitRetryIntervalMs' -DefaultValue $pairSubmitRetryIntervalMs)
+    $relayTargetFolderState = Get-RelayTargetFolderIssueState `
+        -SubmitReason $submitReason `
+        -RetryReason ([string](Get-ConfigValue -Object $seedSendRow -Name 'RetryReason' -DefaultValue '')) `
+        -DispatchReason $dispatchReason `
+        -SeedSendState $seedSendState
+    $submitStateDisplay = if (Test-NonEmptyString $relayTargetFolderState) { $relayTargetFolderState } else { $submitState }
 
     $targetRows += [pscustomobject]@{
         PairId            = [string]$item.PairId
@@ -876,6 +927,11 @@ foreach ($item in $targetItems | Sort-Object TargetId) {
         TargetId          = $targetId
         PartnerTargetId   = [string]$item.PartnerTargetId
         RequestPath       = [string]$contract.RequestPath
+        SourceOutboxPath  = $sourceOutboxPath
+        SourceSummaryPath = $sourceSummaryPath
+        SourceReviewZipPath = $sourceReviewZipPath
+        PublishReadyPath  = $publishReadyPath
+        PublishedArchivePath = $publishedArchivePath
         SummaryPath       = $summaryPath
         ReviewFolderPath  = $reviewRoot
         DonePath          = $donePath
@@ -915,6 +971,7 @@ foreach ($item in $targetItems | Sort-Object TargetId) {
         SeedSendState     = $seedSendState
         SeedSendRawState  = $seedSendRawState
         SeedSendSuperseded = $seedSendSuperseded
+        RelayTargetFolderState = $relayTargetFolderState
         SeedProcessedAt   = [string](Get-ConfigValue -Object $seedSendRow -Name 'ProcessedAt' -DefaultValue '')
         SeedFirstAttemptedAt = [string](Get-ConfigValue -Object $seedSendRow -Name 'FirstAttemptedAt' -DefaultValue '')
         SeedLastAttemptedAt = [string](Get-ConfigValue -Object $seedSendRow -Name 'LastAttemptedAt' -DefaultValue '')
@@ -928,6 +985,7 @@ foreach ($item in $targetItems | Sort-Object TargetId) {
         UserVisibleCellExecutionRequired = $seedUserVisibleCellExecutionRequired
         AllowedWindowVisibilityMethods = @($seedAllowedWindowVisibilityMethods)
         SubmitState       = $submitState
+        SubmitStateDisplay = $submitStateDisplay
         SubmitRawState    = $submitRawState
         SubmitConfirmed   = [bool](Get-ConfigValue -Object $seedSendRow -Name 'SubmitConfirmed' -DefaultValue $false)
         SubmitReason      = $submitReason
@@ -939,6 +997,17 @@ foreach ($item in $targetItems | Sort-Object TargetId) {
         SubmitConfirmationSignal = $submitConfirmationSignal
         TypedWindowSessionState = $typedWindowSessionState
         TypedWindowLastResetReason = $typedWindowLastResetReason
+        TypedWindowSessionScopeKind = $typedWindowSessionScopeKind
+        TypedWindowSessionScopeId = $typedWindowSessionScopeId
+        TypedWindowSessionRouteKey = $typedWindowSessionRouteKey
+        FocusLostObserved = [bool]$focusLostObserved
+        FocusLostCount = [int]$focusLostCount
+        FocusLostPolicy = $focusLostPolicy
+        FocusLostRecoveryMode = $focusLostRecoveryMode
+        FirstFocusLostAt = $firstFocusLostAt
+        LastFocusLostAt = $lastFocusLostAt
+        FocusLostDebugLogPath = $focusLostDebugLogPath
+        AcceptanceProofGrade = $acceptanceProofGrade
         SeedSubmitRetryModes = @($seedSubmitRetryModes)
         SeedSubmitRetrySequenceSummary = $seedSubmitRetrySequenceSummary
         SeedPrimarySubmitMode = $seedPrimarySubmitMode
@@ -1196,6 +1265,8 @@ $status = [pscustomobject]@{
         TypedWindowSubmitUnconfirmedCount = (@($targetRows | Where-Object { $_.SubmitProbeState -eq 'typed-window-submit-unconfirmed' })).Count
         TypedWindowRetryCount = (@($targetRows | Where-Object { [string]$_.TypedWindowExecutionState -like 'typed-window-retry-*' })).Count
         TypedWindowStalledCount = (@($targetRows | Where-Object { $_.TypedWindowExecutionState -in @('typed-window-running-no-artifact', 'typed-window-stalled-after-submit') })).Count
+        FocusLostObservedCount = (@($targetRows | Where-Object { [bool]$_.FocusLostObserved })).Count
+        FocusLostRecoveredCount = (@($targetRows | Where-Object { [string]$_.AcceptanceProofGrade -in @('recovered-auto-retry', 'recovered-manual-retry') })).Count
         PublishStartedCount = (@($targetRows | Where-Object { $_.SourceOutboxState -eq 'publish-started' })).Count
         TargetUnresponsiveCount = (@($targetRows | Where-Object { $_.SourceOutboxState -eq 'target-unresponsive-after-send' })).Count
         ManualAttentionCount = (@($targetRows | Where-Object { $_.SourceOutboxState -eq 'manual-attention-required' })).Count
@@ -1203,6 +1274,9 @@ $status = [pscustomobject]@{
         HandoffReadyCount  = (@($targetRows | Where-Object { $_.SourceOutboxNextAction -eq 'handoff-ready' })).Count
         DispatchRunningCount = (@($targetRows | Where-Object { $_.DispatchState -eq 'running' })).Count
         DispatchFailedCount  = (@($targetRows | Where-Object { $_.DispatchState -eq 'failed' })).Count
+        RelayFolderMismatchCount = (@($targetRows | Where-Object { $_.RelayTargetFolderState -eq 'relay-folder-mismatch' })).Count
+        RelayFolderMissingCount = (@($targetRows | Where-Object { $_.RelayTargetFolderState -eq 'relay-folder-missing' })).Count
+        RelayFolderConfigMissingCount = (@($targetRows | Where-Object { $_.RelayTargetFolderState -eq 'relay-folder-config-missing' })).Count
         ReadyToForwardCount = (@($targetRows | Where-Object { $_.LatestState -eq 'ready-to-forward' })).Count
         ForwardedCount      = (@($targetRows | Where-Object { $_.LatestState -eq 'forwarded' })).Count
         SummaryMissingCount = (@($targetRows | Where-Object { $_.LatestState -eq 'summary-missing' })).Count
@@ -1239,6 +1313,11 @@ $status = [pscustomobject]@{
         GeneratedAt = if ($null -ne $acceptanceReceipt) { [string](Get-ConfigValue -Object $acceptanceReceipt -Name 'GeneratedAt' -DefaultValue '') } else { '' }
         AcceptanceState = if ($null -ne $acceptanceReceipt) { [string](Get-ConfigValue -Object (Get-ConfigValue -Object $acceptanceReceipt -Name 'Outcome' -DefaultValue $null) -Name 'AcceptanceState' -DefaultValue '') } else { '' }
         AcceptanceReason = if ($null -ne $acceptanceReceipt) { [string](Get-ConfigValue -Object (Get-ConfigValue -Object $acceptanceReceipt -Name 'Outcome' -DefaultValue $null) -Name 'AcceptanceReason' -DefaultValue '') } else { '' }
+        RelayFolderMismatchCount = if ($null -ne $acceptanceReceipt) { [int](Get-ConfigValue -Object (Get-ConfigValue -Object $acceptanceReceipt -Name 'RelayIssues' -DefaultValue $null) -Name 'RelayFolderMismatchCount' -DefaultValue 0) } else { 0 }
+        RelayFolderMissingCount = if ($null -ne $acceptanceReceipt) { [int](Get-ConfigValue -Object (Get-ConfigValue -Object $acceptanceReceipt -Name 'RelayIssues' -DefaultValue $null) -Name 'RelayFolderMissingCount' -DefaultValue 0) } else { 0 }
+        RelayFolderConfigMissingCount = if ($null -ne $acceptanceReceipt) { [int](Get-ConfigValue -Object (Get-ConfigValue -Object $acceptanceReceipt -Name 'RelayIssues' -DefaultValue $null) -Name 'RelayFolderConfigMissingCount' -DefaultValue 0) } else { 0 }
+        RelayIssueSummary = if ($null -ne $acceptanceReceipt) { [string](Get-ConfigValue -Object (Get-ConfigValue -Object $acceptanceReceipt -Name 'RelayIssues' -DefaultValue $null) -Name 'RelayIssueSummary' -DefaultValue '') } else { '' }
+        RelayIssuesSource = if ($null -ne $acceptanceReceipt) { [string](Get-ConfigValue -Object (Get-ConfigValue -Object $acceptanceReceipt -Name 'RelayIssues' -DefaultValue $null) -Name 'Source' -DefaultValue '') } else { '' }
     }
     PairState = [pscustomobject]@{
         Exists      = [bool]$pairStateDoc.Exists
@@ -1291,12 +1370,16 @@ $lines.Add(('HeadlessDispatch: statusFiles={0} running={1} failed={2} completed=
     $status.HeadlessDispatch.FailedCount,
     $status.HeadlessDispatch.CompletedCount,
     $status.HeadlessDispatch.ParseErrorCount))
-$lines.Add(('AcceptanceReceipt: exists={0} state={1} reason={2} updatedAt={3}' -f `
+$lines.Add(('AcceptanceReceipt: exists={0} state={1} reason={2} updatedAt={3} relayMismatch={4} relayMissing={5} relayConfigMissing={6} relaySource={7}' -f `
     $status.AcceptanceReceipt.Exists,
     $status.AcceptanceReceipt.AcceptanceState,
     $status.AcceptanceReceipt.AcceptanceReason,
-    $status.AcceptanceReceipt.LastWriteAt))
-$lines.Add(('Counts: messages={0} summaries={1} done={2} errors={3} supersededErrors={4} zipTargets={5} outboxWaiting={6} seedProcessed={7} seedRetryPending={8} submitUnconfirmed={9} typedWindowRetry={10} typedWindowStalled={11} publishStarted={12} unresponsive={13} manualAttention={14} imported={15} handoffReady={16} dispatchRunning={17} dispatchFailed={18} ready={19} forwarded={20} missingSummary={21} staleSummary={22} doneStale={23} noZip={24} failures={25}' -f `
+    $status.AcceptanceReceipt.LastWriteAt,
+    $status.AcceptanceReceipt.RelayFolderMismatchCount,
+    $status.AcceptanceReceipt.RelayFolderMissingCount,
+    $status.AcceptanceReceipt.RelayFolderConfigMissingCount,
+    $status.AcceptanceReceipt.RelayIssuesSource))
+$lines.Add(('Counts: messages={0} summaries={1} done={2} errors={3} supersededErrors={4} zipTargets={5} outboxWaiting={6} seedProcessed={7} seedRetryPending={8} submitUnconfirmed={9} typedWindowRetry={10} typedWindowStalled={11} publishStarted={12} unresponsive={13} manualAttention={14} imported={15} handoffReady={16} dispatchRunning={17} dispatchFailed={18} relayMismatch={19} relayMissing={20} relayConfigMissing={21} ready={22} forwarded={23} missingSummary={24} staleSummary={25} doneStale={26} noZip={27} failures={28}' -f `
     $status.Counts.MessageFiles,
     $status.Counts.SummaryPresentCount,
     $status.Counts.DonePresentCount,
@@ -1316,6 +1399,9 @@ $lines.Add(('Counts: messages={0} summaries={1} done={2} errors={3} supersededEr
     $status.Counts.HandoffReadyCount,
     $status.Counts.DispatchRunningCount,
     $status.Counts.DispatchFailedCount,
+    $status.Counts.RelayFolderMismatchCount,
+    $status.Counts.RelayFolderMissingCount,
+    $status.Counts.RelayFolderConfigMissingCount,
     $status.Counts.ReadyToForwardCount,
     $status.Counts.ForwardedCount,
     $status.Counts.SummaryMissingCount,
@@ -1323,6 +1409,7 @@ $lines.Add(('Counts: messages={0} summaries={1} done={2} errors={3} supersededEr
     $status.Counts.DoneStaleCount,
     $status.Counts.NoZipCount,
     $status.Counts.FailureLineCount))
+$lines.Add(('FocusLost: observedTargets={0} recoveredTargets={1}' -f $status.Counts.FocusLostObservedCount, $status.Counts.FocusLostRecoveredCount))
 
 if (Test-NonEmptyString $status.Manifest.ParseError) {
     $lines.Add(('Manifest ParseError: {0}' -f $status.Manifest.ParseError))
@@ -1370,10 +1457,13 @@ $targetTable = ($status.Targets |
         @{ Name = 'NextAction'; Expression = { $_.SourceOutboxNextAction } },
         @{ Name = 'Dispatch'; Expression = { $_.DispatchState } },
         @{ Name = 'SeedState'; Expression = { $_.SeedSendState } },
-        @{ Name = 'Submit'; Expression = { $_.SubmitState } },
+        @{ Name = 'Relay'; Expression = { $_.RelayTargetFolderState } },
+        @{ Name = 'Submit'; Expression = { $_.SubmitStateDisplay } },
         @{ Name = 'Probe'; Expression = { $_.SubmitProbeState } },
         @{ Name = 'TypedWin'; Expression = { $_.TypedWindowExecutionState } },
         @{ Name = 'Session'; Expression = { $_.TypedWindowSessionState } },
+        @{ Name = 'Proof'; Expression = { $_.AcceptanceProofGrade } },
+        @{ Name = 'FocusLost'; Expression = { $_.FocusLostCount } },
         @{ Name = 'SubmitModes'; Expression = { $_.SeedSubmitRetrySequenceSummary } },
         SeedAttemptCount, FailureCount |
     Format-Table -AutoSize | Out-String).TrimEnd()

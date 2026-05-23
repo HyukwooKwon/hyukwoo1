@@ -17,6 +17,7 @@ function Assert-True {
 
 $root = Split-Path -Parent $PSScriptRoot
 $sourcePath = Join-Path $root 'show-paired-run-summary.ps1'
+$sourceOutboxHelperPath = Join-Path $root 'tests\lib\PairedSourceOutboxPaths.ps1'
 
 $tempRoot = Join-Path ([System.IO.Path]::GetTempPath()) ('show-paired-run-summary-important-' + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $tempRoot -Force | Out-Null
@@ -24,6 +25,9 @@ New-Item -ItemType Directory -Path $tempRoot -Force | Out-Null
 try {
     $scriptCopyPath = Join-Path $tempRoot 'show-paired-run-summary.ps1'
     Copy-Item -LiteralPath $sourcePath -Destination $scriptCopyPath -Force
+    $helperCopyPath = Join-Path $tempRoot 'tests\lib\PairedSourceOutboxPaths.ps1'
+    New-Item -ItemType Directory -Path (Split-Path -Parent $helperCopyPath) -Force | Out-Null
+    Copy-Item -LiteralPath $sourceOutboxHelperPath -Destination $helperCopyPath -Force
 
     $stubStatusPath = Join-Path $tempRoot 'show-paired-exchange-status.ps1'
     @'
@@ -41,6 +45,12 @@ $payload = [pscustomobject]@{
         AcceptanceState = 'error'
         AcceptanceReason = 'seed-timeout'
     }
+    RelayIssues = [pscustomobject]@{
+        RelayFolderMismatchCount = 1
+        RelayFolderMissingCount = 0
+        RelayFolderConfigMissingCount = 0
+        Source = 'current-receipt'
+    }
     Watcher = [pscustomobject]@{
         Status = 'running'
         StatusReason = 'await-seed-output'
@@ -55,6 +65,9 @@ $payload = [pscustomobject]@{
         ZipPresentCount = 0
         DonePresentCount = 0
         FailureLineCount = 1
+        RelayFolderMismatchCount = 1
+        RelayFolderMissingCount = 0
+        RelayFolderConfigMissingCount = 0
         ManualAttentionCount = 0
         SubmitUnconfirmedCount = 1
         TargetUnresponsiveCount = 0
@@ -70,6 +83,11 @@ $payload = [pscustomobject]@{
             SourceOutboxState = 'empty'
             SeedSendState = 'timeout'
             SubmitState = 'unconfirmed'
+            SubmitReason = 'typed-window-possible-running:codex-cpu-delta'
+            SubmitProbeState = 'typed-window-running-no-artifact'
+            SubmitConfirmationSignal = 'codex-cpu-delta'
+            TypedWindowExecutionState = 'typed-window-running-no-artifact'
+            TypedWindowSessionState = 'dirty-session'
             ManualAttentionRequired = $false
             SummaryPresent = $false
             ZipCount = 0
@@ -175,6 +193,16 @@ partner handoff 대기
             FinalState = 'timeout'
             SubmitState = 'unconfirmed'
             OutboxPublished = $false
+        }
+        RelayIssues = [pscustomobject]@{
+            RelayFolderMismatchCount = 1
+            RelayFolderMissingCount = 0
+            RelayFolderConfigMissingCount = 0
+            Source = 'current-receipt'
+        }
+        Watcher = [pscustomobject]@{
+            StdoutLogPath = (Join-Path $logsRoot 'acceptance-process-logs\watcher.stdout.log')
+            StderrLogPath = (Join-Path $logsRoot 'acceptance-process-logs\watcher.stderr.log')
         }
         Contract = [pscustomobject]@{
             PrimaryContractExternalized = $true
@@ -289,6 +317,11 @@ partner handoff 대기
     'processed payload envelope' | Set-Content -LiteralPath $processedTarget01Path -Encoding UTF8
     '검토 결과 파일이 있으면 먼저 확인하고 최소 smoke 산출물을 만드세요.' | Set-Content -LiteralPath ($processedTarget01Path + '.payload.txt') -Encoding UTF8
     (Get-Item -LiteralPath $processedTarget01Path).LastWriteTime = [datetime]'2026-04-27T07:39:57'
+    $runtimeMapPath = Join-Path $runtimeRoot 'target-runtime.json'
+    '[{"TargetId":"target01","Hwnd":"111"},{"TargetId":"target05","Hwnd":"222"}]' | Set-Content -LiteralPath $runtimeMapPath -Encoding UTF8
+    $bindingProfilePath = Join-Path $runtimeRoot 'window-bindings\bottest-live-visible.json'
+    New-Item -ItemType Directory -Path (Split-Path -Parent $bindingProfilePath) -Force | Out-Null
+    '{"windows":[{"target_id":"target01","hwnd":"111"},{"target_id":"target05","hwnd":"222"}]}' | Set-Content -LiteralPath $bindingProfilePath -Encoding UTF8
     $stubStatusText = Get-Content -LiteralPath $stubStatusPath -Raw -Encoding UTF8
     $stubStatusText = $stubStatusText.Replace('__PROCESSED_TARGET01_PATH__', $processedTarget01Path)
     $stubStatusText = $stubStatusText.Replace('__TARGET05_IMPORTED_SUMMARY_PATH__', $target05ImportedSummaryPath)
@@ -300,6 +333,8 @@ partner handoff 대기
 @{
     LogsRoot = '$logsRoot'
     RuntimeRoot = '$runtimeRoot'
+    RuntimeMapPath = '$runtimeMapPath'
+    BindingProfilePath = '$bindingProfilePath'
     InboxRoot = '$inboxRoot'
     ProcessedRoot = '$processedRoot'
     PairTest = @{
@@ -320,6 +355,10 @@ partner handoff 대기
     $important = $summary.ImportantSummary.Data
     Assert-True ([bool]$important.Contract.PrimaryContractExternalized) 'important summary should include externalization contract flags.'
     Assert-True ([string]$important.KeyPaths.RouterLogPath -eq (Join-Path $logsRoot 'router.log')) 'important summary should surface router log path.'
+    Assert-True ([string]$important.KeyPaths.RuntimeMapPath -eq $runtimeMapPath) 'important summary should surface runtime map path.'
+    Assert-True ([string]$important.KeyPaths.BindingProfilePath -eq $bindingProfilePath) 'important summary should surface binding profile path.'
+    Assert-True ([string]$important.KeyPaths.WatcherStdoutLogPath -eq (Join-Path $logsRoot 'acceptance-process-logs\watcher.stdout.log')) 'important summary should surface watcher stdout log path.'
+    Assert-True ([string]$important.KeyPaths.WatcherStderrLogPath -eq (Join-Path $logsRoot 'acceptance-process-logs\watcher.stderr.log')) 'important summary should surface watcher stderr log path.'
     Assert-True (@($important.Targets).Count -eq 2) 'important summary should surface both targets.'
     Assert-True (@($important.PairRouteMatrix).Count -eq 1) 'important summary should surface pair route matrix.'
     Assert-True ([string]$important.Freshness.GeneratedAt -ne '') 'important summary should surface freshness generated timestamp.'
@@ -328,12 +367,15 @@ partner handoff 대기
     Assert-True ($null -ne $important.Freshness.ProgressStale) 'important summary should surface progress staleness.'
     Assert-True (@($important.RecentEvents).Count -ge 3) 'important summary should surface recent key events.'
     Assert-True ([string]$important.OperatorFocus.AttentionLevel -eq 'action-required') 'important summary should surface operator attention level.'
-    Assert-True ([string]$important.OperatorFocus.CurrentBottleneck -match 'seed payload was not observed') 'important summary should interpret the current bottleneck.'
-    Assert-True ([string]$important.OperatorFocus.NextExpectedStep -match 'source-outbox publish') 'important summary should surface the next expected step.'
+    Assert-True ([string]$important.OperatorFocus.FocusTargetId -eq 'target01') 'important summary should surface the focus target.'
+    Assert-True ([string]$important.OperatorFocus.CurrentBottleneck -match 'did not create source artifacts') 'important summary should interpret the current bottleneck using execution checkpoints.'
+    Assert-True ([string]$important.OperatorFocus.NextExpectedStep -match 'summary\.txt and review\.zip') 'important summary should surface the next expected step from execution checkpoints.'
     Assert-True ((@($important.RecentEvents | Where-Object { [string]$_.Text -match 'request\.json prepared|prepare log updated|AHK log updated' })).Count -gt 0) 'important summary should include recent artifact or log events.'
     Assert-True ((@($important.RecentEvents | Where-Object { [bool]$_.IsProgressSignal })).Count -gt 0) 'important summary should mark progress events separately from supporting signals.'
     Assert-True ((@($important.RecentEvents | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_.EventClass) })).Count -gt 0) 'important summary should classify event types in JSON.'
     Assert-True ([string]@($important.Targets)[0].TargetId -eq 'target01') 'important summary should prioritize incomplete target ahead of already-ready targets.'
+    Assert-True ([int]$important.Acceptance.RelayFolderMismatchCount -eq 1) 'important summary acceptance should surface receipt relay mismatch count.'
+    Assert-True ([string]$important.Acceptance.RelayIssuesSource -eq 'current-receipt') 'important summary acceptance should surface receipt relay issue source.'
 
     $target01 = @($important.Targets | Where-Object { [string]$_.TargetId -eq 'target01' })[0]
     Assert-True ([string]$target01.MessagePath -eq (Join-Path $messagesRoot 'target01.txt')) 'target01 message path should be surfaced.'
@@ -349,6 +391,13 @@ partner handoff 대기
     Assert-True ([string]$target01.ProcessedPayloadSnapshotPreview -match '최소 smoke 산출물을 만드세요') 'target01 processed payload snapshot preview should include the exact sent payload text.'
     Assert-True (-not [string]::IsNullOrWhiteSpace([string]$target01.Timeline.SubmitStartedAt)) 'important summary should surface submit start time from AHK logs.'
     Assert-True (-not [string]::IsNullOrWhiteSpace([string]$target01.Timeline.SubmitCompletedAt)) 'important summary should surface submit completion time from AHK logs.'
+    Assert-True ([string]$target01.ExecutionCheckpoints.CheckpointState -eq 'artifacts-not-created') 'target01 execution checkpoints should identify artifact generation as the first missing step.'
+    Assert-True ([bool]$target01.ExecutionCheckpoints.InputDelivered) 'target01 execution checkpoints should confirm payload delivery.'
+    Assert-True ([bool]$target01.ExecutionCheckpoints.SubmitKeystrokeSent) 'target01 execution checkpoints should confirm submit keystroke delivery.'
+    Assert-True ([bool]$target01.ExecutionCheckpoints.SubmitAckObserved) 'target01 execution checkpoints should confirm submit acknowledgement.'
+    Assert-True ([bool]$target01.ExecutionCheckpoints.CellBusyObserved) 'target01 execution checkpoints should confirm cell busy observation.'
+    Assert-True (-not [bool]$target01.ExecutionCheckpoints.ArtifactCreated) 'target01 execution checkpoints should show missing artifacts.'
+    Assert-True (-not [bool]$target01.ExecutionCheckpoints.PublishMarkerCreated) 'target01 execution checkpoints should show missing publish marker.'
     Assert-True (-not [bool]$target01.SourceSummary.Exists) 'missing summary should be reflected in important summary.'
     Assert-True (-not [bool]$target01.ContractArtifactsReady) 'target01 contract readiness should be false when files are missing.'
     Assert-True (@($target01.MissingContractFiles).Count -eq 3) 'target01 missing contract files should be enumerated.'
@@ -379,6 +428,9 @@ partner handoff 대기
     Assert-True ([bool]$target05.TimelineChecks.HandoffOpenedAfterPublish) 'important summary should confirm handoff opens after publish.'
     Assert-True ([bool]$target05.TimelineChecks.ImportedCopyAfterTrigger) 'important summary should not report imported copy before trigger for archived publish scenario.'
     Assert-True ([string]$target05.FirstOrderingViolation -eq '') 'important summary should leave ordering violation empty when ordering is valid.'
+    Assert-True ([int]$summary.Counts.RelayFolderMismatchCount -eq 1) 'important summary counts should surface relay-folder mismatch count.'
+    Assert-True ([int]$summary.Counts.RelayFolderMissingCount -eq 0) 'important summary counts should surface relay-folder missing count.'
+    Assert-True ([int]$summary.Counts.RelayFolderConfigMissingCount -eq 0) 'important summary counts should surface relay-folder config missing count.'
 
     $pairRoute = @($important.PairRouteMatrix | Where-Object { [string]$_.PairId -eq 'pair01' })[0]
     Assert-True ($null -ne $pairRoute) 'important summary should include pair route row for pair01.'
@@ -398,12 +450,18 @@ partner handoff 대기
     Assert-True ($importantText -match '\[operator-focus\]') 'text summary should include operator-focus section.'
     Assert-True ($importantText -match '\[recent-events\]') 'text summary should include recent-events section.'
     Assert-True ($importantText -match '\[pair-route-matrix\]') 'text summary should include pair route matrix section.'
-    Assert-True ($importantText -match 'CurrentBottleneck: seed payload was not observed') 'text summary should include interpreted bottleneck.'
+    Assert-True ($importantText -match 'AcceptanceRelayIssues: relayMismatch=1 relayMissing=0 relayConfigMissing=0 source=current-receipt') 'text summary should include acceptance receipt relay issue summary.'
+    Assert-True ($importantText -match 'FocusTarget: target01') 'text summary should include focus target.'
+    Assert-True ($importantText -match 'CurrentBottleneck: target01 acknowledged submit but did not create source artifacts') 'text summary should include interpreted bottleneck.'
     Assert-True ($importantText -match 'NewestObservedSignalAt: ') 'text summary should include newest observed signal timestamp.'
     Assert-True ($importantText -match 'NewestProgressSignalAt: ') 'text summary should include newest progress signal timestamp.'
     Assert-True ($importantText -match 'ProgressStale: ') 'text summary should include progress staleness.'
+    Assert-True ($importantText -match 'Counts: forwarded=0 summaries=0 zips=0 failures=1 relayMismatch=1 relayMissing=0 relayConfigMissing=0') 'text summary should include relay-folder issue counts.'
     Assert-True ($importantText -match 'request\.json prepared|prepare log updated|AHK log updated') 'text summary should include recent event lines.'
     Assert-True ($importantText -match 'ContractPathMode: external-workrepo') 'text summary should include contract mode.'
+    Assert-True ($importantText -match 'RuntimeMapPath: ') 'text summary should include runtime map path.'
+    Assert-True ($importantText -match 'BindingProfilePath: ') 'text summary should include binding profile path.'
+    Assert-True ($importantText -match 'WatcherStdoutLogPath: ') 'text summary should include watcher stdout log path.'
     Assert-True ($importantText -match 'ContractArtifactsReady: False') 'text summary should include target contract readiness.'
     Assert-True ($importantText -match 'PairRunRoot: ') 'text summary should include pair run root.'
     Assert-True ($importantText -match 'CurrentTriggerSourceOutboxPath: ') 'text summary should include trigger source outbox path.'
@@ -418,10 +476,12 @@ partner handoff 대기
     Assert-True ($importantText -match 'CurrentImportedSourcePublishSequence: 2') 'text summary should include imported source publish sequence.'
     Assert-True ($importantText -match 'Timeline: summaryAt=') 'text summary should include trigger timeline.'
     Assert-True ($importantText -match 'TimelineDispatch: routerProcessedAt=') 'text summary should include dispatch timeline.'
+    Assert-True ($importantText -match 'SubmitDiagnostics: reason=') 'text summary should include submit diagnostics summary.'
     Assert-True ($importantText -match 'TimelineImport: importedSummaryAt=') 'text summary should include import timeline.'
     Assert-True ($importantText -match 'TimelineChecks: publishAfterArtifacts=') 'text summary should include timeline checks.'
     Assert-True ($importantText -match 'FirstOrderingViolation:') 'text summary should include first ordering violation field.'
     Assert-True ($importantText -match 'ProcessedPayloadSnapshotPreview:') 'text summary should include processed payload snapshot preview.'
+    Assert-True ($importantText -match 'ExecutionCheckpoints: state=artifacts-not-created') 'text summary should include execution checkpoint summary.'
     Assert-True ($importantText -match 'summary.txt: exists=False') 'text summary should show missing output files clearly.'
     Assert-True ($importantText -match 'SourceSummaryContainsForbiddenLiteral: True') 'text summary should surface summary contamination state.'
     Assert-True ($importantText -match 'ForwardBlockedByForbiddenLiteral: True') 'text summary should surface handoff block state.'

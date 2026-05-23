@@ -49,6 +49,12 @@ $receipt = [pscustomobject]@{
         SubmitState = ''
         OutboxPublished = $false
     }
+    RelayIssues = [pscustomobject]@{
+        RelayFolderMismatchCount = 0
+        RelayFolderMissingCount = 0
+        RelayFolderConfigMissingCount = 0
+        Source = 'current-receipt'
+    }
     PhaseHistory = @(
         [pscustomobject]@{
             RecordedAt = '2026-04-25T02:28:39+09:00'
@@ -58,6 +64,10 @@ $receipt = [pscustomobject]@{
             SeedFinalState = ''
             SeedSubmitState = ''
             SeedOutboxPublished = $false
+            RelayFolderMismatchCount = 1
+            RelayFolderMissingCount = 0
+            RelayFolderConfigMissingCount = 0
+            RelayIssuesSource = 'phase-history'
         },
         [pscustomobject]@{
             RecordedAt = '2026-04-25T02:38:56+09:00'
@@ -67,6 +77,10 @@ $receipt = [pscustomobject]@{
             SeedFinalState = ''
             SeedSubmitState = ''
             SeedOutboxPublished = $false
+            RelayFolderMismatchCount = 0
+            RelayFolderMissingCount = 0
+            RelayFolderConfigMissingCount = 0
+            RelayIssuesSource = 'phase-history'
         }
     )
 }
@@ -88,8 +102,18 @@ $summary = Get-AcceptanceSummary -AcceptanceReceipt $receipt -Status $status
 Assert-True ([string]$summary.AcceptanceState -eq 'roundtrip-confirmed') 'summary should prefer phase-history roundtrip-confirmed over trailing preflight-only state.'
 Assert-True ([string]$summary.CurrentAcceptanceState -eq 'preflight-passed') 'summary should still expose the trailing current acceptance state.'
 Assert-True ([string]$summary.EffectiveSource -eq 'phase-history') 'summary should report phase-history as effective source when it overrides the current receipt.'
+Assert-True ([int]$summary.RelayFolderMismatchCount -eq 1) 'summary should prefer phase-history relay mismatch counts over trailing receipt values.'
+Assert-True ([string]$summary.RelayIssuesSource -eq 'phase-history') 'summary should report relay issue source from the effective phase-history entry.'
+Assert-True ([int]$summary.CurrentRelayFolderMismatchCount -eq 0) 'summary should still expose the trailing current receipt relay mismatch count.'
 
 $overallState = Get-OverallState -AcceptanceSummary $summary -Status $status
 Assert-True ([string]$overallState -eq 'success') 'overall state should be success when phase-history contains a completed roundtrip-confirmed acceptance.'
+
+$postCleanupSummary = [pscustomobject]@{
+    Stage = 'post-cleanup'
+    AcceptanceState = 'roundtrip-confirmed'
+}
+$postCleanupOverallState = Get-OverallState -AcceptanceSummary $postCleanupSummary -Status $status
+Assert-True ([string]$postCleanupOverallState -eq 'success') 'post-cleanup roundtrip-confirmed should remain a successful closeout state.'
 
 Write-Host 'show-paired-run-summary effective acceptance helper ok'

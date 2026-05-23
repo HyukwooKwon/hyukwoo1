@@ -56,4 +56,7 @@ $sourceOutboxCloseout = [pscustomobject]@{
 
 Assert-True (Test-VisibleReceiptRoundtripSatisfied -RunSummary $runSummary -PairedStatus $pairedStatus -SourceOutboxCloseout $sourceOutboxCloseout) 'phase-history roundtrip with source-outbox acceptance should satisfy receipt-required confirm even when the current receipt state is preflight-passed.'
 
+$runSummary.Acceptance.Stage = 'post-cleanup'
+Assert-True (Test-VisibleReceiptRoundtripSatisfied -RunSummary $runSummary -PairedStatus $pairedStatus -SourceOutboxCloseout $sourceOutboxCloseout) 'post-cleanup roundtrip phase should keep satisfying receipt-required confirm.'
+
 Write-Host 'confirm shared visible phase-history receipt helper ok'

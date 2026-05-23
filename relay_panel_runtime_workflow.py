@@ -109,6 +109,35 @@ class PanelRuntimeWorkflowService:
         self.status_service = status_service
         self.refresh_controller = refresh_controller
 
+    def _resolve_prepared_run_root_from_effective_config(
+        self,
+        *,
+        config_path: str,
+        pair_id: str,
+    ) -> str:
+        load_effective_config = getattr(self.status_service, "load_effective_config", None)
+        if load_effective_config is None:
+            return ""
+        try:
+            payload = load_effective_config(
+                AppContext(
+                    config_path=config_path,
+                    run_root="",
+                    pair_id=pair_id,
+                    target_id="",
+                )
+            )
+        except Exception:
+            return ""
+        if not isinstance(payload, dict):
+            return ""
+        run_context = payload.get("RunContext", {}) if isinstance(payload.get("RunContext", {}), dict) else {}
+        selected_run_root = str(run_context.get("SelectedRunRoot", "") or "").strip()
+        selected_run_root_source = str(run_context.get("SelectedRunRootSource", "") or "").strip()
+        if not selected_run_root or selected_run_root_source == "next-preview":
+            return ""
+        return selected_run_root
+
     def run_reuse(self, request: ReuseWindowsRequest) -> ReuseWindowsResult:
         refresh_extra = ["-AsJson"]
         if request.pairs_mode:
@@ -170,6 +199,11 @@ class PanelRuntimeWorkflowService:
         completed = self.command_service.run(command)
         output = completed.stdout.strip() or "run root 준비 완료"
         prepared_run_root = extract_prepared_run_root(completed.stdout)
+        if not prepared_run_root and not request.requested_run_root:
+            prepared_run_root = self._resolve_prepared_run_root_from_effective_config(
+                config_path=resolved_config_path,
+                pair_id=request.pair_id,
+            )
         summary_run_root = resolve_run_root_summary_run_root(
             prepared_run_root,
             request.requested_run_root,

@@ -10,10 +10,39 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+. (Join-Path $PSScriptRoot 'lib\RelayTargetFolderPreflight.ps1')
+
 function Test-NonEmptyString {
     param([object]$Value)
 
     return ($Value -is [string] -and -not [string]::IsNullOrWhiteSpace($Value))
+}
+
+function Get-ConfigValue {
+    param(
+        $Object,
+        [Parameter(Mandatory)][string]$Name,
+        $DefaultValue = ''
+    )
+
+    if ($null -eq $Object) {
+        return $DefaultValue
+    }
+
+    if ($Object -is [System.Collections.IDictionary]) {
+        if ($Object.Contains($Name)) {
+            return $Object[$Name]
+        }
+
+        return $DefaultValue
+    }
+
+    $property = $Object.PSObject.Properties[$Name]
+    if ($null -eq $property) {
+        return $DefaultValue
+    }
+
+    return $property.Value
 }
 
 function Import-ConfigDataFile {
@@ -184,6 +213,10 @@ foreach ($row in $selectedTargets) {
         }
     }
     elseif ($typedWindowTransport) {
+        $null = Assert-RelayTargetFolderReady `
+            -ConfiguredFolder ([string](Get-ConfigValue -Object $targetConfig[0] -Name 'Folder' -DefaultValue '')) `
+            -InboxRoot ([string](Get-ConfigValue -Object $config -Name 'InboxRoot' -DefaultValue '')) `
+            -TargetKey $targetKey
         $producerResult = Invoke-ProducerReadyFile `
             -Root $root `
             -ConfigPath $resolvedConfigPath `

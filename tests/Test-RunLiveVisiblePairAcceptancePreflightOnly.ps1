@@ -131,13 +131,70 @@ Assert-True ([bool]$result.Preflight.NonStandardWindowBlock) 'preflight should r
 Assert-True ([string]$result.BlockedBy -eq '') 'preflight-only success should not expose blocked reason.'
 Assert-True ([string]$result.Preflight.BlockedBy -eq '') 'preflight-only success preflight block should not expose blocked reason.'
 Assert-True ([string]$result.Closeout.Status -eq 'not-requested') 'preflight-only should mark closeout as not requested by default.'
+Assert-True ([bool]$result.PreflightPassed) 'preflight-only should set canonical PreflightPassed.'
+Assert-True (-not [bool]$result.ActiveAttempted) 'preflight-only should not mark ActiveAttempted.'
+Assert-True (-not [bool]$result.PostCleanupDone) 'preflight-only should not mark PostCleanupDone.'
+Assert-True (-not [bool]$result.CleanPreflightPassed) 'preflight-only should not mark CleanPreflightPassed.'
 Assert-True ($null -eq $result.Seed) 'preflight-only should not dispatch seed work.'
 Assert-True ($null -ne $result.Primitives) 'preflight-only receipt should still expose primitive slots.'
+Assert-True ($null -ne $result.RelayIssues) 'preflight-only receipt should still expose relay issue summary.'
+Assert-True ([int]$result.RelayIssues.RelayFolderMismatchCount -eq 0) 'preflight-only receipt should report zero relay-folder mismatches by default.'
+Assert-True ([int]$result.RelayIssues.RelayFolderMissingCount -eq 0) 'preflight-only receipt should report zero relay-folder missing counts by default.'
+Assert-True ([int]$result.RelayIssues.RelayFolderConfigMissingCount -eq 0) 'preflight-only receipt should report zero relay-folder config-missing counts by default.'
 Assert-True ($null -eq $result.Primitives.Submit) 'preflight-only should not run submit primitive.'
 Assert-True ($null -eq $result.Primitives.Publish) 'preflight-only should not run publish primitive.'
 Assert-True ($null -eq $result.Primitives.Handoff) 'preflight-only should not run handoff primitive.'
 Assert-True (@($result.PhaseHistory).Count -ge 3) 'preflight-only should record receipt phase history.'
 Assert-True ([string]@($result.PhaseHistory | Select-Object -Last 1)[0].Stage -eq 'completed') 'phase history should keep the completed terminal stage.'
 Assert-True (@($result.PhaseHistory | Where-Object { [string]$_.Stage -eq 'visible-worker-preflight' }).Count -ge 1) 'phase history should preserve the visible-worker-preflight phase.'
+Assert-True ([int]@($result.PhaseHistory | Select-Object -Last 1)[0].RelayFolderMismatchCount -eq 0) 'phase history should keep zero relay-folder mismatch count for preflight-only runs.'
+
+$cleanRecheckRunRoot = Join-Path $pairRoot 'run_preflight_clean_recheck'
+$cleanRecheckStateRoot = Join-Path $cleanRecheckRunRoot '.state'
+New-Item -ItemType Directory -Path $cleanRecheckStateRoot -Force | Out-Null
+$cleanRecheckReceiptPath = Join-Path $cleanRecheckStateRoot 'live-acceptance-result.json'
+$cleanRecheckReceipt = [ordered]@{
+    Stage = 'post-cleanup'
+    Outcome = @{
+        AcceptanceState = 'roundtrip-confirmed'
+        AcceptanceReason = 'prior success'
+    }
+    PhaseHistory = @(
+        @{
+            Stage = 'submit-running'
+            AcceptanceState = 'running'
+        }
+        @{
+            Stage = 'completed'
+            AcceptanceState = 'roundtrip-confirmed'
+        }
+        @{
+            Stage = 'post-cleanup'
+            AcceptanceState = 'roundtrip-confirmed'
+        }
+    )
+}
+$cleanRecheckReceipt | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $cleanRecheckReceiptPath -Encoding UTF8
+
+$cleanRecheckRaw = & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Run-LiveVisiblePairAcceptance.ps1') `
+    -ConfigPath $configPath `
+    -RunRoot $cleanRecheckRunRoot `
+    -PairId pair01 `
+    -SeedTargetId target01 `
+    -SeedWorkRepoRoot $root `
+    -SeedReviewInputPath (Join-Path $root 'README.md') `
+    -PreflightOnly `
+    -AsJson
+
+if ($LASTEXITCODE -ne 0) {
+    throw ('Run-LiveVisiblePairAcceptance clean-preflight recheck failed: ' + (($cleanRecheckRaw | Out-String).Trim()))
+}
+
+$cleanRecheckResult = $cleanRecheckRaw | ConvertFrom-Json
+Assert-True ([string]$cleanRecheckResult.Outcome.AcceptanceState -eq 'preflight-passed') 'clean-preflight recheck should still report preflight-passed.'
+Assert-True ([bool]$cleanRecheckResult.PreflightPassed) 'clean-preflight recheck should keep canonical PreflightPassed.'
+Assert-True ([bool]$cleanRecheckResult.ActiveAttempted) 'clean-preflight recheck should preserve prior active-attempt history.'
+Assert-True ([bool]$cleanRecheckResult.PostCleanupDone) 'clean-preflight recheck should preserve prior post-cleanup history.'
+Assert-True ([bool]$cleanRecheckResult.CleanPreflightPassed) 'clean-preflight recheck should mark canonical CleanPreflightPassed.'
 
 Write-Host 'run-live-visible-pair-acceptance preflight-only ok'

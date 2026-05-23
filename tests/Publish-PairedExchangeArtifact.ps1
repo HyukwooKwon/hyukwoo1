@@ -44,34 +44,7 @@ function Resolve-SourceOutboxContractPaths {
         $Request = $null
     )
 
-    $targetFolder = [string](Get-ConfigValue -Object $TargetEntry -Name 'TargetFolder' -DefaultValue '')
-    $sourceOutboxPath = [string](Get-ConfigValue -Object $Request -Name 'SourceOutboxPath' -DefaultValue ([string](Get-ConfigValue -Object $TargetEntry -Name 'SourceOutboxPath' -DefaultValue '')))
-    if (-not (Test-NonEmptyString $sourceOutboxPath)) {
-        $sourceOutboxPath = Join-Path $targetFolder ([string]$PairTest.SourceOutboxFolderName)
-    }
-
-    $summaryPath = [string](Get-ConfigValue -Object $Request -Name 'SourceSummaryPath' -DefaultValue ([string](Get-ConfigValue -Object $TargetEntry -Name 'SourceSummaryPath' -DefaultValue '')))
-    if (-not (Test-NonEmptyString $summaryPath)) {
-        $summaryPath = Join-Path $sourceOutboxPath ([string]$PairTest.SourceSummaryFileName)
-    }
-
-    $reviewZipPath = [string](Get-ConfigValue -Object $Request -Name 'SourceReviewZipPath' -DefaultValue ([string](Get-ConfigValue -Object $TargetEntry -Name 'SourceReviewZipPath' -DefaultValue '')))
-    if (-not (Test-NonEmptyString $reviewZipPath)) {
-        $reviewZipPath = Join-Path $sourceOutboxPath ([string]$PairTest.SourceReviewZipFileName)
-    }
-
-    $publishReadyPath = [string](Get-ConfigValue -Object $Request -Name 'PublishReadyPath' -DefaultValue ([string](Get-ConfigValue -Object $TargetEntry -Name 'PublishReadyPath' -DefaultValue '')))
-    if (-not (Test-NonEmptyString $publishReadyPath)) {
-        $publishReadyPath = Join-Path $sourceOutboxPath ([string]$PairTest.PublishReadyFileName)
-    }
-
-    return [pscustomobject]@{
-        SourceOutboxPath  = $sourceOutboxPath
-        SourceSummaryPath = $summaryPath
-        SourceReviewZipPath = $reviewZipPath
-        PublishReadyPath  = $publishReadyPath
-        PublishedArchivePath = [string](Get-ConfigValue -Object $Request -Name 'PublishedArchivePath' -DefaultValue ([string](Get-ConfigValue -Object $TargetEntry -Name 'PublishedArchivePath' -DefaultValue (Join-Path $sourceOutboxPath ([string]$PairTest.PublishedArchiveFolderName)))))
-    }
+    return (Resolve-PairedSourceOutboxPaths -PairTest $PairTest -TargetEntry $TargetEntry -Request $Request)
 }
 
 function ConvertTo-IntOrDefault {
@@ -135,6 +108,7 @@ function Get-NextPublishIdentity {
 
 $root = Split-Path -Parent $PSScriptRoot
 . (Join-Path $PSScriptRoot 'PairedExchangeConfig.ps1')
+. (Join-Path $PSScriptRoot 'lib\PairedSourceOutboxPaths.ps1')
 
 if ([string]::IsNullOrWhiteSpace($ConfigPath)) {
     $ConfigPath = Join-Path $root 'config\settings.psd1'
@@ -171,13 +145,21 @@ $checkRaw = & (Join-Path $root 'check-paired-exchange-artifact.ps1') `
     -AsJson
 $checkPayloadText = ($checkRaw | Out-String).Trim()
 $checkPayload = if (Test-NonEmptyString $checkPayloadText) { $checkPayloadText | ConvertFrom-Json } else { $null }
+$validation = Get-ConfigValue -Object $checkPayload -Name 'Validation' -DefaultValue $null
+$validationIssues = @([string[]](Get-ConfigValue -Object $validation -Name 'Issues' -DefaultValue @()))
 
 $issues = New-Object System.Collections.Generic.List[string]
 if ($null -eq $checkPayload) {
     [void]$issues.Add('check-artifact-no-output')
 }
-elseif (-not [bool](Get-ConfigValue -Object (Get-ConfigValue -Object $checkPayload -Name 'Validation' -DefaultValue $null) -Name 'Ok' -DefaultValue $false)) {
+elseif (-not [bool](Get-ConfigValue -Object $validation -Name 'Ok' -DefaultValue $false)) {
     [void]$issues.Add('check-artifact-rejected')
+    foreach ($validationIssue in @($validationIssues)) {
+        if ([string]::IsNullOrWhiteSpace([string]$validationIssue)) {
+            continue
+        }
+        [void]$issues.Add([string]$validationIssue)
+    }
 }
 
 $attemptId = [string](Get-ConfigValue -Object $request -Name 'AttemptId' -DefaultValue ([string](Get-ConfigValue -Object $targetEntry -Name 'AttemptId' -DefaultValue '')))
@@ -254,8 +236,9 @@ $status = [pscustomobject]@{
         RequestPath = [string]$requestPath
     }
     Validation = if ($null -ne $checkPayload) { $checkPayload.Validation } else { [pscustomobject]@{ Ok = $false; Issues = @('check-artifact-no-output') } }
+    ValidationIssues = @($validationIssues)
     Marker = $markerPayload
-    Issues = @($issues)
+    Issues = @($issues | Select-Object -Unique)
     CompletedAt = $completedAt
 }
 

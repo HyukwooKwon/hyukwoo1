@@ -198,6 +198,32 @@ function Invoke-JsonRelayScript {
     return (ConvertFrom-RelayJsonText -Json $raw)
 }
 
+function Sync-RuntimeMapFromBindingsForWrapperLane {
+    param(
+        [Parameter(Mandatory)][string]$Root,
+        [Parameter(Mandatory)][string]$ResolvedConfigPath,
+        [Parameter(Mandatory)]$Config,
+        [Parameter(Mandatory)]$WindowLaunchEvidence
+    )
+
+    if (-not (Test-NonEmptyString ([string]$WindowLaunchEvidence.WrapperPath))) {
+        return @()
+    }
+
+    $bindingProfilePath = [string](Get-ConfigValue -Object $Config -Name 'BindingProfilePath' -DefaultValue '')
+    if (-not (Test-NonEmptyString $bindingProfilePath)) {
+        throw 'wrapper-managed lane is missing BindingProfilePath for attach-only runtime bootstrap.'
+    }
+
+    if (-not (Test-Path -LiteralPath $bindingProfilePath -PathType Leaf)) {
+        throw ("binding profile not found for wrapper-managed lane: {0}" -f $bindingProfilePath)
+    }
+
+    return @(Invoke-ScriptAndCaptureOutput -ScriptPath (Join-Path $Root 'launcher\Attach-TargetsFromBindings.ps1') -Parameters @{
+            ConfigPath = $ResolvedConfigPath
+        })
+}
+
 function Read-JsonObject {
     param([Parameter(Mandatory)][string]$Path)
 
@@ -303,6 +329,109 @@ function Test-MutexHeld {
     }
 }
 
+function Get-MatchingRouterProcesses {
+    param(
+        [Parameter(Mandatory)][string]$Root,
+        [Parameter(Mandatory)][string]$ResolvedConfigPath
+    )
+
+    $routerWrapperPath = [regex]::Escape((Join-Path $Root 'router.ps1'))
+    $routerStartPath = [regex]::Escape((Join-Path $Root 'router\Start-Router.ps1'))
+    $configRegex = [regex]::Escape($ResolvedConfigPath)
+
+    return @(
+        Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+            Where-Object {
+                ($_.Name -match '^(pwsh|powershell)(\.exe)?$') -and
+                (Test-NonEmptyString $_.CommandLine) -and
+                $_.CommandLine -match $configRegex -and
+                ($_.CommandLine -match $routerWrapperPath -or $_.CommandLine -match $routerStartPath)
+            } |
+            Sort-Object ProcessId
+    )
+}
+
+function Wait-ForRouterMutexReleased {
+    param(
+        [Parameter(Mandatory)][string]$RouterMutexName,
+        [Parameter(Mandatory)][int]$TimeoutSeconds
+    )
+
+    $deadline = (Get-Date).AddSeconds([math]::Max(1, $TimeoutSeconds))
+    while ((Get-Date) -lt $deadline) {
+        if (-not (Test-MutexHeld -Name $RouterMutexName)) {
+            return
+        }
+
+        Start-Sleep -Milliseconds 250
+    }
+
+    throw "router mutex release timeout: $RouterMutexName"
+}
+
+function Restart-RouterForAcceptance {
+    param(
+        [Parameter(Mandatory)][string]$Root,
+        [Parameter(Mandatory)][string]$ResolvedConfigPath,
+        [Parameter(Mandatory)][string]$RouterMutexName,
+        [Parameter(Mandatory)][string]$StdoutLogPath,
+        [Parameter(Mandatory)][string]$StderrLogPath,
+        [int]$WaitForReleaseSeconds = 15
+    )
+
+    $matchingProcesses = Get-MatchingRouterProcesses -Root $Root -ResolvedConfigPath $ResolvedConfigPath
+    $matchedProcessIds = @($matchingProcesses | ForEach-Object { [int]$_.ProcessId })
+    $stoppedProcessIds = New-Object System.Collections.Generic.List[int]
+
+    foreach ($process in $matchingProcesses) {
+        $processId = [int]$process.ProcessId
+        try {
+            Stop-Process -Id $processId -Force -ErrorAction Stop
+            $stoppedProcessIds.Add($processId)
+        }
+        catch {
+            if (-not (Get-Process -Id $processId -ErrorAction SilentlyContinue)) {
+                continue
+            }
+
+            throw
+        }
+    }
+
+    if (Test-MutexHeld -Name $RouterMutexName) {
+        Wait-ForRouterMutexReleased -RouterMutexName $RouterMutexName -TimeoutSeconds $WaitForReleaseSeconds
+    }
+
+    $powershellPath = Resolve-PowerShellExecutable
+    $routerArguments = @(
+        '-NoProfile',
+        '-ExecutionPolicy', 'Bypass',
+        '-File', (Join-Path $Root 'router\Start-Router.ps1'),
+        '-ConfigPath', $ResolvedConfigPath
+    )
+    $startedProcess = Start-Process `
+        -FilePath $powershellPath `
+        -ArgumentList $routerArguments `
+        -PassThru `
+        -WindowStyle Hidden `
+        -RedirectStandardOutput $StdoutLogPath `
+        -RedirectStandardError $StderrLogPath
+
+    return [pscustomobject]@{
+        RestartedAt = (Get-Date).ToString('o')
+        ConfigPath = $ResolvedConfigPath
+        RouterMutexName = $RouterMutexName
+        MatchedProcessIds = @($matchedProcessIds)
+        StoppedProcessIds = @($stoppedProcessIds)
+        StartedProcessId = [int]$startedProcess.Id
+        EffectiveRouterPid = [int]$startedProcess.Id
+        StdoutLogPath = $StdoutLogPath
+        StderrLogPath = $StderrLogPath
+        MutexHeld = $false
+        RestartMode = 'inline-acceptance'
+    }
+}
+
 function Get-TargetReadyFileCount {
     param(
         [Parameter(Mandatory)]$Config,
@@ -357,6 +486,7 @@ function New-AcceptanceTargetDiagnostics {
         SeedSendState           = [string]$Row.SeedSendState
         SubmitState             = [string]$Row.SubmitState
         SubmitReason            = [string]$Row.SubmitReason
+        RelayTargetFolderState  = [string](Get-ResultPropertyValue -Object $Row -Name 'RelayTargetFolderState' -DefaultValue '')
         SubmitProbeState        = [string](Get-ResultPropertyValue -Object $Row -Name 'SubmitProbeState' -DefaultValue '')
         SubmitProbeElapsedSeconds = [int](Get-ResultPropertyValue -Object $Row -Name 'SubmitProbeElapsedSeconds' -DefaultValue 0)
         SubmitRetryCount        = [int](Get-ResultPropertyValue -Object $Row -Name 'SubmitRetryCount' -DefaultValue 0)
@@ -364,6 +494,17 @@ function New-AcceptanceTargetDiagnostics {
         TypedWindowExecutionState = [string](Get-ResultPropertyValue -Object $Row -Name 'TypedWindowExecutionState' -DefaultValue '')
         TypedWindowSessionState = [string](Get-ResultPropertyValue -Object $Row -Name 'TypedWindowSessionState' -DefaultValue '')
         TypedWindowLastResetReason = [string](Get-ResultPropertyValue -Object $Row -Name 'TypedWindowLastResetReason' -DefaultValue '')
+        TypedWindowSessionScopeKind = [string](Get-ResultPropertyValue -Object $Row -Name 'TypedWindowSessionScopeKind' -DefaultValue '')
+        TypedWindowSessionScopeId = [string](Get-ResultPropertyValue -Object $Row -Name 'TypedWindowSessionScopeId' -DefaultValue '')
+        TypedWindowSessionRouteKey = [string](Get-ResultPropertyValue -Object $Row -Name 'TypedWindowSessionRouteKey' -DefaultValue '')
+        FocusLostObserved     = [bool](Get-ResultPropertyValue -Object $Row -Name 'FocusLostObserved' -DefaultValue $false)
+        FocusLostCount        = [int](Get-ResultPropertyValue -Object $Row -Name 'FocusLostCount' -DefaultValue 0)
+        FocusLostPolicy       = [string](Get-ResultPropertyValue -Object $Row -Name 'FocusLostPolicy' -DefaultValue '')
+        FocusLostRecoveryMode = [string](Get-ResultPropertyValue -Object $Row -Name 'FocusLostRecoveryMode' -DefaultValue '')
+        FirstFocusLostAt      = [string](Get-ResultPropertyValue -Object $Row -Name 'FirstFocusLostAt' -DefaultValue '')
+        LastFocusLostAt       = [string](Get-ResultPropertyValue -Object $Row -Name 'LastFocusLostAt' -DefaultValue '')
+        FocusLostDebugLogPath = [string](Get-ResultPropertyValue -Object $Row -Name 'FocusLostDebugLogPath' -DefaultValue '')
+        AcceptanceProofGrade  = [string](Get-ResultPropertyValue -Object $Row -Name 'AcceptanceProofGrade' -DefaultValue '')
         SeedProcessedAt         = [string]$Row.SeedProcessedAt
         SeedFirstAttemptedAt    = [string]$Row.SeedFirstAttemptedAt
         SeedLastAttemptedAt     = [string]$Row.SeedLastAttemptedAt
@@ -626,6 +767,10 @@ function Get-TypedWindowPreflightReport {
             Sort-Object -Unique
     ).Count
     $windowPidOnlyFallbackDetected = (@($targets | Where-Object { [string](Get-ResultPropertyValue -Object $_ -Name 'InjectionMethod' -DefaultValue '') -eq 'windowPid' }).Count -gt 0)
+    $activeWindowSnapshot = Get-ResultPropertyValue -Object $visibility.Status -Name 'ActiveWindowSnapshot' -DefaultValue $null
+    $activeWindowSummary = [string](Get-ResultPropertyValue -Object $visibility.Status -Name 'ActiveWindowSummary' -DefaultValue '')
+    $activeWindowIsOfficialTarget = [bool](Get-ResultPropertyValue -Object $visibility.Status -Name 'ActiveWindowIsOfficialTarget' -DefaultValue $false)
+    $activeWindowTargetId = [string](Get-ResultPropertyValue -Object $visibility.Status -Name 'ActiveWindowTargetId' -DefaultValue '')
     $passed = ($visibility.ExitCode -eq 0 -and -not (Test-NonEmptyString $visibility.ParseError) -and $badRows.Count -eq 0 -and [bool]$officialWindowReport.Passed)
     $blockedBy = ''
     $blockedTargetId = ''
@@ -655,6 +800,10 @@ function Get-TypedWindowPreflightReport {
         AllowedMethods                = @($allowedMethods)
         UniqueHwndCount               = [int]$uniqueHwndCount
         WindowPidOnlyFallbackDetected = [bool]$windowPidOnlyFallbackDetected
+        ActiveWindowSnapshot          = $activeWindowSnapshot
+        ActiveWindowSummary           = $activeWindowSummary
+        ActiveWindowIsOfficialTarget  = [bool]$activeWindowIsOfficialTarget
+        ActiveWindowTargetId          = $activeWindowTargetId
         OfficialWindowReport          = $officialWindowReport
         Targets                       = @($targets)
         BlockedBy                     = $blockedBy
@@ -664,7 +813,9 @@ function Get-TypedWindowPreflightReport {
             ('WindowVisibilityOk={0}' -f $passed),
             ('VisibilityPassMode={0}' -f $(if ($passed) { ($allowedMethods -join ',') } else { '' })),
             ('UniqueHwndCount={0}' -f $uniqueHwndCount),
-            ('WindowPidOnlyFallbackDetected={0}' -f $windowPidOnlyFallbackDetected)
+            ('WindowPidOnlyFallbackDetected={0}' -f $windowPidOnlyFallbackDetected),
+            ('ActiveWindow={0}' -f $activeWindowSummary),
+            ('ActiveWindowOfficialTarget={0} target={1}' -f $activeWindowIsOfficialTarget, $activeWindowTargetId)
         ) + @($officialWindowReport.SummaryLines)
     }
 }
@@ -1562,7 +1713,8 @@ function New-WatcherReceiptSummary {
         [string]$StderrLogPath,
         $WatcherStatus,
         [bool]$StopReconciled = $false,
-        [bool]$StopErrorSuppressed = $false
+        [bool]$StopErrorSuppressed = $false,
+        [int]$ForcedStopProcessId = 0
     )
 
     $stopSatisfied = Test-WatcherStopSatisfied -Status ([pscustomobject]@{ Watcher = $WatcherStatus }) -RequestId $StopRequestId
@@ -1585,6 +1737,8 @@ function New-WatcherReceiptSummary {
         StopObservedAt       = $stopObservedAt
         StopReconciled       = $StopReconciled
         StopErrorSuppressed  = $StopErrorSuppressed
+        StopForced           = ($ForcedStopProcessId -gt 0)
+        ForcedStopProcessId  = $ForcedStopProcessId
         StdoutLogPath        = $StdoutLogPath
         StderrLogPath        = $StderrLogPath
         Status               = $WatcherStatus
@@ -1621,6 +1775,82 @@ function Wait-ForWatcherStopped {
     throw "watcher stop timeout: requestId=$RequestId"
 }
 
+function New-AcceptanceRelayIssueSnapshot {
+    param(
+        [int]$RelayFolderMismatchCount = 0,
+        [int]$RelayFolderMissingCount = 0,
+        [int]$RelayFolderConfigMissingCount = 0,
+        [string]$Source = ''
+    )
+
+    $summaryParts = New-Object System.Collections.Generic.List[string]
+    if ($RelayFolderMismatchCount -gt 0) {
+        [void]$summaryParts.Add(('relay-folder-mismatch:{0}' -f $RelayFolderMismatchCount))
+    }
+    if ($RelayFolderMissingCount -gt 0) {
+        [void]$summaryParts.Add(('relay-folder-missing:{0}' -f $RelayFolderMissingCount))
+    }
+    if ($RelayFolderConfigMissingCount -gt 0) {
+        [void]$summaryParts.Add(('relay-folder-config-missing:{0}' -f $RelayFolderConfigMissingCount))
+    }
+
+    return [pscustomobject]@{
+        RelayFolderMismatchCount = [int]$RelayFolderMismatchCount
+        RelayFolderMissingCount = [int]$RelayFolderMissingCount
+        RelayFolderConfigMissingCount = [int]$RelayFolderConfigMissingCount
+        RelayIssueCount = [int]($RelayFolderMismatchCount + $RelayFolderMissingCount + $RelayFolderConfigMissingCount)
+        RelayIssueSummary = if ($summaryParts.Count -gt 0) { ($summaryParts -join ', ') } else { '' }
+        Source = [string]$Source
+    }
+}
+
+function Get-AcceptanceRelayIssueSnapshot {
+    param([Parameter(Mandatory)]$CurrentResult)
+
+    $outcome = Get-ResultPropertyValue -Object $CurrentResult -Name 'Outcome' -DefaultValue $null
+    $finalStatus = Get-ResultPropertyValue -Object $outcome -Name 'FinalStatus' -DefaultValue $null
+    if ($null -ne $finalStatus) {
+        $counts = Get-ResultPropertyValue -Object $finalStatus -Name 'Counts' -DefaultValue $null
+        if ($null -ne $counts) {
+            return (New-AcceptanceRelayIssueSnapshot `
+                -RelayFolderMismatchCount ([int](Get-ResultPropertyValue -Object $counts -Name 'RelayFolderMismatchCount' -DefaultValue 0)) `
+                -RelayFolderMissingCount ([int](Get-ResultPropertyValue -Object $counts -Name 'RelayFolderMissingCount' -DefaultValue 0)) `
+                -RelayFolderConfigMissingCount ([int](Get-ResultPropertyValue -Object $counts -Name 'RelayFolderConfigMissingCount' -DefaultValue 0)) `
+                -Source 'paired-status-final')
+        }
+    }
+
+    $relayFolderMismatchCount = 0
+    $relayFolderMissingCount = 0
+    $relayFolderConfigMissingCount = 0
+    $diagnostics = Get-ResultPropertyValue -Object $outcome -Name 'Diagnostics' -DefaultValue $null
+    $candidates = @(
+        Get-ResultPropertyValue -Object $diagnostics -Name 'Seed' -DefaultValue $null
+        Get-ResultPropertyValue -Object $diagnostics -Name 'Partner' -DefaultValue $null
+        Get-ResultPropertyValue -Object $CurrentResult -Name 'Seed' -DefaultValue $null
+    )
+    foreach ($candidate in $candidates) {
+        if ($null -eq $candidate) {
+            continue
+        }
+        $relayState = [string](Get-ResultPropertyValue -Object $candidate -Name 'RelayTargetFolderState' -DefaultValue '')
+        if (-not (Test-NonEmptyString $relayState)) {
+            $relayState = Get-RelayTargetFolderIssueStateFromMessage -Message ([string](Get-ResultPropertyValue -Object $candidate -Name 'SubmitReason' -DefaultValue ''))
+        }
+        switch ($relayState) {
+            'relay-folder-mismatch' { $relayFolderMismatchCount += 1 }
+            'relay-folder-missing' { $relayFolderMissingCount += 1 }
+            'relay-folder-config-missing' { $relayFolderConfigMissingCount += 1 }
+        }
+    }
+
+    return (New-AcceptanceRelayIssueSnapshot `
+        -RelayFolderMismatchCount $relayFolderMismatchCount `
+        -RelayFolderMissingCount $relayFolderMissingCount `
+        -RelayFolderConfigMissingCount $relayFolderConfigMissingCount `
+        -Source $(if (($relayFolderMismatchCount + $relayFolderMissingCount + $relayFolderConfigMissingCount) -gt 0) { 'acceptance-diagnostics' } else { 'none' }))
+}
+
 function Write-AcceptanceReceipt {
     param(
         [Parameter(Mandatory)][string]$RunRoot,
@@ -1643,6 +1873,7 @@ function Write-AcceptanceReceipt {
         $seed = Get-ResultPropertyValue -Object $CurrentResult -Name 'Seed' -DefaultValue $null
         $preflight = Get-ResultPropertyValue -Object $CurrentResult -Name 'Preflight' -DefaultValue $null
         $bootstrap = Get-ResultPropertyValue -Object $CurrentResult -Name 'Bootstrap' -DefaultValue $null
+        $relayIssues = Get-AcceptanceRelayIssueSnapshot -CurrentResult $CurrentResult
 
         return [ordered]@{
             RecordedAt          = $RecordedAt
@@ -1662,6 +1893,11 @@ function Write-AcceptanceReceipt {
             SeedFinalState      = [string](Get-ResultPropertyValue -Object $seed -Name 'FinalState' -DefaultValue '')
             SeedSubmitState     = [string](Get-ResultPropertyValue -Object $seed -Name 'SubmitState' -DefaultValue '')
             SeedOutboxPublished = [bool](Get-ResultPropertyValue -Object $seed -Name 'OutboxPublished' -DefaultValue $false)
+            RelayFolderMismatchCount = [int](Get-ResultPropertyValue -Object $relayIssues -Name 'RelayFolderMismatchCount' -DefaultValue 0)
+            RelayFolderMissingCount = [int](Get-ResultPropertyValue -Object $relayIssues -Name 'RelayFolderMissingCount' -DefaultValue 0)
+            RelayFolderConfigMissingCount = [int](Get-ResultPropertyValue -Object $relayIssues -Name 'RelayFolderConfigMissingCount' -DefaultValue 0)
+            RelayIssueSummary = [string](Get-ResultPropertyValue -Object $relayIssues -Name 'RelayIssueSummary' -DefaultValue '')
+            RelayIssuesSource = [string](Get-ResultPropertyValue -Object $relayIssues -Name 'Source' -DefaultValue '')
         }
     }
 
@@ -1706,7 +1942,12 @@ function Write-AcceptanceReceipt {
                 'BootstrapVisibleBeaconObserved',
                 'SeedFinalState',
                 'SeedSubmitState',
-                'SeedOutboxPublished'
+                'SeedOutboxPublished',
+                'RelayFolderMismatchCount',
+                'RelayFolderMissingCount',
+                'RelayFolderConfigMissingCount',
+                'RelayIssueSummary',
+                'RelayIssuesSource'
             )
             $shouldAppend = $false
             foreach ($fieldName in $comparisonFields) {
@@ -1726,10 +1967,175 @@ function Write-AcceptanceReceipt {
         return @($history | Select-Object -Last 40)
     }
 
+    function Test-AcceptanceWorkflowPreflightPassedStage {
+        param([string]$Stage)
+
+        return ($Stage -in @(
+                'visible-worker-ready',
+                'typed-window-ready',
+                'typed-window-bootstrap',
+                'typed-window-bootstrap-failed',
+                'typed-window-bootstrapped',
+                'watcher-ready',
+                'submit-running',
+                'seed-finished',
+                'publish-checking',
+                'publish-checked',
+                'seed-pending',
+                'acceptance-failed',
+                'handoff-checking',
+                'closeout-running',
+                'closeout-completed'
+            ))
+    }
+
+    function Get-AcceptanceReceiptWorkflowSnapshot {
+        param(
+            [Parameter(Mandatory)]$CurrentResult,
+            [Parameter(Mandatory)][object[]]$PhaseHistory
+        )
+
+        $outcome = Get-ResultPropertyValue -Object $CurrentResult -Name 'Outcome' -DefaultValue $null
+        $currentStage = [string](Get-ResultPropertyValue -Object $CurrentResult -Name 'Stage' -DefaultValue '')
+        $currentAcceptanceState = [string](Get-ResultPropertyValue -Object $outcome -Name 'AcceptanceState' -DefaultValue '')
+        $seed = Get-ResultPropertyValue -Object $CurrentResult -Name 'Seed' -DefaultValue $null
+        $seedFinalState = [string](Get-ResultPropertyValue -Object $seed -Name 'FinalState' -DefaultValue '')
+        $seedSubmitState = [string](Get-ResultPropertyValue -Object $seed -Name 'SubmitState' -DefaultValue '')
+        $seedOutboxPublished = [bool](Get-ResultPropertyValue -Object $seed -Name 'OutboxPublished' -DefaultValue $false)
+        $submitPrimitive = Get-ResultPropertyValue -Object (Get-ResultPropertyValue -Object $CurrentResult -Name 'Primitives' -DefaultValue $null) -Name 'Submit' -DefaultValue $null
+
+        $preflightPassed = $false
+        $activeAttempted = $false
+        $hasSuccessHistory = $false
+        $postCleanupDone = $false
+
+        foreach ($entry in @($PhaseHistory)) {
+            if ($null -eq $entry) {
+                continue
+            }
+
+            $entryStage = [string](Get-ResultPropertyValue -Object $entry -Name 'Stage' -DefaultValue '')
+            $entryAcceptanceState = [string](Get-ResultPropertyValue -Object $entry -Name 'AcceptanceState' -DefaultValue '')
+            $entrySeedFinalState = [string](Get-ResultPropertyValue -Object $entry -Name 'SeedFinalState' -DefaultValue '')
+            $entrySeedSubmitState = [string](Get-ResultPropertyValue -Object $entry -Name 'SeedSubmitState' -DefaultValue '')
+            $entrySeedOutboxPublished = [bool](Get-ResultPropertyValue -Object $entry -Name 'SeedOutboxPublished' -DefaultValue $false)
+
+            if ($entryAcceptanceState -eq 'preflight-passed' -or (Test-AcceptanceWorkflowPreflightPassedStage -Stage $entryStage)) {
+                $preflightPassed = $true
+            }
+            if (
+                (Test-NonEmptyString $entrySeedFinalState) -or
+                (Test-NonEmptyString $entrySeedSubmitState) -or
+                $entrySeedOutboxPublished -or
+                $entryStage -in @('submit-running', 'seed-finished', 'publish-checking', 'publish-checked', 'seed-pending', 'acceptance-failed', 'handoff-checking', 'closeout-running', 'closeout-completed')
+            ) {
+                $activeAttempted = $true
+            }
+            if (Test-PairedAcceptanceSuccessState -AcceptanceState $entryAcceptanceState) {
+                $hasSuccessHistory = $true
+            }
+            if ($entryStage -eq 'post-cleanup') {
+                $postCleanupDone = $true
+            }
+        }
+
+        if (-not $activeAttempted) {
+            if (
+                (Test-NonEmptyString $seedFinalState) -or
+                (Test-NonEmptyString $seedSubmitState) -or
+                $seedOutboxPublished -or
+                ($null -ne $submitPrimitive)
+            ) {
+                $activeAttempted = $true
+            }
+        }
+
+        if (-not $preflightPassed) {
+            if (
+                $currentAcceptanceState -eq 'preflight-passed' -or
+                $activeAttempted -or
+                (Test-AcceptanceWorkflowPreflightPassedStage -Stage $currentStage)
+            ) {
+                $preflightPassed = $true
+            }
+        }
+
+        if (-not $postCleanupDone -and $currentStage -eq 'post-cleanup') {
+            $postCleanupDone = $true
+        }
+
+        $cleanPreflightPassed = ($currentAcceptanceState -eq 'preflight-passed' -and $hasSuccessHistory)
+
+        return [pscustomobject]@{
+            PreflightPassed = [bool]$preflightPassed
+            ActiveAttempted = [bool]$activeAttempted
+            PostCleanupDone = [bool]$postCleanupDone
+            CleanPreflightPassed = [bool]$cleanPreflightPassed
+        }
+    }
+
+    function Copy-AcceptanceRecoveryFields {
+        param(
+            [Parameter(Mandatory)]$CurrentResult,
+            [string]$ExistingReceiptPath
+        )
+
+        if (-not (Test-NonEmptyString $ExistingReceiptPath) -or -not (Test-Path -LiteralPath $ExistingReceiptPath -PathType Leaf)) {
+            return
+        }
+
+        try {
+            $existing = Read-JsonObject -Path $ExistingReceiptPath
+        }
+        catch {
+            return
+        }
+
+        foreach ($fieldName in @(
+                'RecoveryHistory',
+                'RecoveryAttemptCount',
+                'LastRecoveryAttemptId',
+                'LastRecoveryAction',
+                'LastRecoveryRequestedAt',
+                'LastRecoveryCompletedAt',
+                'LastRecoveryResult',
+                'LastRecoveryTargetId',
+                'LastRecoveryReason',
+                'LastRecoveryUpdatedAt'
+            )) {
+            $existingValue = Get-ResultPropertyValue -Object $existing -Name $fieldName -DefaultValue $null
+            if ($null -eq $existingValue) {
+                continue
+            }
+            $currentProperty = $CurrentResult.PSObject.Properties[$fieldName]
+            $shouldCopy = $false
+            if ($null -eq $currentProperty) {
+                $shouldCopy = $true
+            }
+            elseif ($null -eq $currentProperty.Value) {
+                $shouldCopy = $true
+            }
+            elseif ($fieldName -ne 'RecoveryHistory' -and -not (Test-NonEmptyString ([string]$currentProperty.Value))) {
+                $shouldCopy = $true
+            }
+            if ($shouldCopy) {
+                Add-Member -InputObject $CurrentResult -NotePropertyName $fieldName -NotePropertyValue $existingValue -Force
+            }
+        }
+    }
+
     $recordedAt = (Get-Date).ToString('o')
     $phaseHistory = Get-AcceptanceReceiptPhaseHistory -ExistingReceiptPath $ReceiptPath -CurrentResult $Result -RecordedAt $recordedAt
+    $relayIssues = Get-AcceptanceRelayIssueSnapshot -CurrentResult $Result
+    $workflowSnapshot = Get-AcceptanceReceiptWorkflowSnapshot -CurrentResult $Result -PhaseHistory @($phaseHistory)
     Add-Member -InputObject $Result -NotePropertyName 'LastUpdatedAt' -NotePropertyValue $recordedAt -Force
+    Add-Member -InputObject $Result -NotePropertyName 'RelayIssues' -NotePropertyValue $relayIssues -Force
     Add-Member -InputObject $Result -NotePropertyName 'PhaseHistory' -NotePropertyValue @($phaseHistory) -Force
+    Add-Member -InputObject $Result -NotePropertyName 'PreflightPassed' -NotePropertyValue ([bool]$workflowSnapshot.PreflightPassed) -Force
+    Add-Member -InputObject $Result -NotePropertyName 'ActiveAttempted' -NotePropertyValue ([bool]$workflowSnapshot.ActiveAttempted) -Force
+    Add-Member -InputObject $Result -NotePropertyName 'PostCleanupDone' -NotePropertyValue ([bool]$workflowSnapshot.PostCleanupDone) -Force
+    Add-Member -InputObject $Result -NotePropertyName 'CleanPreflightPassed' -NotePropertyValue ([bool]$workflowSnapshot.CleanPreflightPassed) -Force
+    Copy-AcceptanceRecoveryFields -CurrentResult $Result -ExistingReceiptPath $ReceiptPath
     $Result | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $ReceiptPath -Encoding UTF8
 }
 
@@ -1847,8 +2253,8 @@ function Wait-ForLiveAcceptanceOutcome {
     $roundtripAt = ''
     $acceptanceState = 'waiting'
     $acceptanceReason = ''
-    $seedFailureStates = @('failed', 'timeout', 'submit-unconfirmed', 'worker-not-ready', 'dispatch-accepted-stale', 'dispatch-running-stale-no-heartbeat')
-    $partnerFailureStates = @('failed', 'timeout', 'submit-unconfirmed', 'worker-not-ready', 'dispatch-accepted-stale', 'dispatch-running-stale-no-heartbeat')
+    $seedFailureStates = @('failed', 'ignored', 'timeout', 'submit-unconfirmed', 'worker-not-ready', 'dispatch-accepted-stale', 'dispatch-running-stale-no-heartbeat')
+    $partnerFailureStates = @('failed', 'ignored', 'timeout', 'submit-unconfirmed', 'worker-not-ready', 'dispatch-accepted-stale', 'dispatch-running-stale-no-heartbeat')
 
     while ($true) {
         $lastStatus = Invoke-ShowPairedStatus -Root $Root -ResolvedConfigPath $ResolvedConfigPath -RunRoot $RunRoot
@@ -2003,6 +2409,7 @@ function Wait-ForLiveAcceptanceOutcome {
 $root = Split-Path -Parent $PSScriptRoot
 . (Join-Path $root 'router\RelayMessageMetadata.ps1')
 . (Join-Path $root 'tests\PairedExchangeConfig.ps1')
+. (Join-Path $root 'tests\lib\RelayTargetFolderPreflight.ps1')
 . (Join-Path $root 'launcher\WindowDiscovery.ps1')
 if (-not (Test-NonEmptyString $ConfigPath)) {
     $ConfigPath = Get-DefaultConfigPath -Root $root
@@ -2076,6 +2483,8 @@ else {
 
 $resolvedRunRoot = ''
 $startedWatcher = $false
+$startedWatcherProcessId = 0
+$watcherForcedStopProcessId = 0
 $routerLaunchMode = 'existing'
 $watcherLaunchMode = 'existing'
 $watcherStopRequestId = ''
@@ -2152,6 +2561,14 @@ if (Test-NonEmptyString $resolvedRunRoot) {
         -AutomationRoot $root `
         -BasePath $root `
         -WorkRepoRoot $SeedWorkRepoRoot
+}
+
+if (-not $visibleWorkerEnabled) {
+    [void](Sync-RuntimeMapFromBindingsForWrapperLane `
+            -Root $root `
+            -ResolvedConfigPath $resolvedConfigPath `
+            -Config $config `
+            -WindowLaunchEvidence $windowLaunchEvidence)
 }
 
 $watcherDurationPlan = Get-VisibleWorkerWatcherDurationPlan `
@@ -2264,6 +2681,10 @@ $result = [pscustomobject]@{
             AllowedVisibilityMethods = @()
             UniqueHwndCount = 0
             WindowPidOnlyFallbackDetected = $false
+            ActiveWindowSnapshot = $null
+            ActiveWindowSummary = ''
+            ActiveWindowIsOfficialTarget = $false
+            ActiveWindowTargetId = ''
             UserVisibleCellExecutionRequired = $requireUserVisibleCellExecution
             BlockedBy = ''
             BlockedTargetId = ''
@@ -2365,16 +2786,12 @@ try {
             $result.Stage = 'router-restarting'
             Write-AcceptanceReceipt -RunRoot $resolvedRunRoot -ReceiptPath ([string]$result.ReceiptPath) -Result $result
             $routerLaunchMode = 'restarted'
-            $routerRestartRaw = & (Resolve-PowerShellExecutable) `
-                '-NoProfile' `
-                '-ExecutionPolicy' 'Bypass' `
-                '-File' (Join-Path $root 'router\Restart-RouterForConfig.ps1') `
-                '-ConfigPath' $resolvedConfigPath `
-                '-AsJson'
-            if ($LASTEXITCODE -ne 0) {
-                throw ("Restart-RouterForConfig failed: " + (($routerRestartRaw | Out-String).Trim()))
-            }
-            $routerRestartResult = ConvertFrom-RelayJsonText -Json (($routerRestartRaw | Out-String).Trim())
+            $routerRestartResult = Restart-RouterForAcceptance `
+                -Root $root `
+                -ResolvedConfigPath $resolvedConfigPath `
+                -RouterMutexName $routerMutexName `
+                -StdoutLogPath $routerStdoutLog `
+                -StderrLogPath $routerStderrLog
         }
         elseif (-not (Test-MutexHeld -Name $routerMutexName)) {
             $routerLaunchMode = 'started'
@@ -2538,6 +2955,10 @@ try {
         $result.Preflight.AllowedVisibilityMethods = @($typedWindowPreflight.AllowedMethods)
         $result.Preflight.UniqueHwndCount = [int]$typedWindowPreflight.UniqueHwndCount
         $result.Preflight.WindowPidOnlyFallbackDetected = [bool]$typedWindowPreflight.WindowPidOnlyFallbackDetected
+        $result.Preflight.ActiveWindowSnapshot = $typedWindowPreflight.ActiveWindowSnapshot
+        $result.Preflight.ActiveWindowSummary = [string]$typedWindowPreflight.ActiveWindowSummary
+        $result.Preflight.ActiveWindowIsOfficialTarget = [bool]$typedWindowPreflight.ActiveWindowIsOfficialTarget
+        $result.Preflight.ActiveWindowTargetId = [string]$typedWindowPreflight.ActiveWindowTargetId
         $result.Preflight.BlockedBy = [string]$typedWindowPreflight.BlockedBy
         $result.Preflight.BlockedTargetId = [string]$typedWindowPreflight.BlockedTargetId
         $result.Preflight.BlockedDetail = [string]$typedWindowPreflight.BlockedDetail
@@ -2636,7 +3057,8 @@ try {
         if ($WatcherPairMaxRoundtripCount -gt 0) {
             $watchArguments += @('-PairMaxRoundtripCount', [string]$WatcherPairMaxRoundtripCount)
         }
-        Start-Process -FilePath $powershellPath -ArgumentList $watchArguments -PassThru -RedirectStandardOutput $watcherStdoutLog -RedirectStandardError $watcherStderrLog | Out-Null
+        $watcherProcess = Start-Process -FilePath $powershellPath -ArgumentList $watchArguments -PassThru -RedirectStandardOutput $watcherStdoutLog -RedirectStandardError $watcherStderrLog
+        $startedWatcherProcessId = [int]$watcherProcess.Id
     }
 
     $watcherStatus = Wait-ForWatcherRunning -Root $root -ResolvedConfigPath $resolvedConfigPath -RunRoot $resolvedRunRoot -TimeoutSeconds $WaitForWatcherSeconds
@@ -2716,7 +3138,7 @@ try {
             Write-AcceptanceReceipt -RunRoot $resolvedRunRoot -ReceiptPath ([string]$result.ReceiptPath) -Result $result
         }
         else {
-            $seedFailureReason = "seed publish not detected: finalState=$([string]$seedResult.FinalState) submitState=$([string]$seedResult.SubmitState) publishState=$([string](Get-ResultPropertyValue -Object $publishPrimitive -Name 'PrimitiveState' -DefaultValue '')) publishReason=$([string](Get-ResultPropertyValue -Object $publishPrimitive -Name 'PrimitiveReason' -DefaultValue '')) probeState=$([string](Get-ResultPropertyValue -Object $seedResult -Name 'SubmitProbeState' -DefaultValue '')) typedState=$([string](Get-ResultPropertyValue -Object $seedResult -Name 'TypedWindowExecutionState' -DefaultValue '')) sessionState=$([string](Get-ResultPropertyValue -Object $seedResult -Name 'TypedWindowSessionState' -DefaultValue '')) resetReason=$([string](Get-ResultPropertyValue -Object $seedResult -Name 'TypedWindowLastResetReason' -DefaultValue '')) signal=$([string](Get-ResultPropertyValue -Object $seedResult -Name 'SubmitConfirmationSignal' -DefaultValue '')) reason=$([string]$seedResult.SubmitReason)"
+            $seedFailureReason = "seed publish not detected: finalState=$([string]$seedResult.FinalState) submitState=$([string]$seedResult.SubmitState) publishState=$([string](Get-ResultPropertyValue -Object $publishPrimitive -Name 'PrimitiveState' -DefaultValue '')) publishReason=$([string](Get-ResultPropertyValue -Object $publishPrimitive -Name 'PrimitiveReason' -DefaultValue '')) probeState=$([string](Get-ResultPropertyValue -Object $seedResult -Name 'SubmitProbeState' -DefaultValue '')) typedState=$([string](Get-ResultPropertyValue -Object $seedResult -Name 'TypedWindowExecutionState' -DefaultValue '')) sessionState=$([string](Get-ResultPropertyValue -Object $seedResult -Name 'TypedWindowSessionState' -DefaultValue '')) scopeKind=$([string](Get-ResultPropertyValue -Object $seedResult -Name 'TypedWindowSessionScopeKind' -DefaultValue '')) scopeId=$([string](Get-ResultPropertyValue -Object $seedResult -Name 'TypedWindowSessionScopeId' -DefaultValue '')) routeKey=$([string](Get-ResultPropertyValue -Object $seedResult -Name 'TypedWindowSessionRouteKey' -DefaultValue '')) resetReason=$([string](Get-ResultPropertyValue -Object $seedResult -Name 'TypedWindowLastResetReason' -DefaultValue '')) signal=$([string](Get-ResultPropertyValue -Object $seedResult -Name 'SubmitConfirmationSignal' -DefaultValue '')) reason=$([string]$seedResult.SubmitReason)"
             $result.Stage = 'seed-publish-missing'
             $result.Outcome = [pscustomobject]@{
                 AcceptanceState = 'error'
@@ -2909,6 +3331,26 @@ finally {
                 }
             }
         }
+        if (-not $watcherAlreadyStopped -and $startedWatcherProcessId -gt 0) {
+            try {
+                $watcherProcess = Get-CimInstance Win32_Process -Filter ("ProcessId={0}" -f $startedWatcherProcessId) -ErrorAction SilentlyContinue
+                if ($null -ne $watcherProcess -and
+                    (Test-NonEmptyString ([string]$watcherProcess.CommandLine)) -and
+                    [string]$watcherProcess.CommandLine -like '*Watch-PairedExchange.ps1*' -and
+                    [string]$watcherProcess.CommandLine -like ('*' + $resolvedRunRoot + '*')) {
+                    Stop-Process -Id $startedWatcherProcessId -Force -ErrorAction Stop
+                    $watcherForcedStopProcessId = $startedWatcherProcessId
+                    if (-not (Test-NonEmptyString $watcherStopError)) {
+                        $watcherStopError = ('watcher force-stopped after stop wait timeout pid={0}' -f $startedWatcherProcessId)
+                    }
+                }
+            }
+            catch {
+                if (-not (Test-NonEmptyString $watcherStopError)) {
+                    $watcherStopError = $_.Exception.Message
+                }
+            }
+        }
     }
 
     if ($null -ne $result -and $null -ne $result.Watcher) {
@@ -2939,7 +3381,8 @@ finally {
             -StderrLogPath $watcherStderrLog `
             -WatcherStatus $result.Watcher.Status `
             -StopReconciled:$watcherStopReconciled `
-            -StopErrorSuppressed:$watcherStopErrorSuppressed
+            -StopErrorSuppressed:$watcherStopErrorSuppressed `
+            -ForcedStopProcessId $watcherForcedStopProcessId
         if ($visibleWorkerEnabled) {
             $result.VisibleWorker = Get-VisibleWorkerSnapshot -PairTest $pairTest -TargetIds @($SeedTargetId, $partnerTargetId)
         }

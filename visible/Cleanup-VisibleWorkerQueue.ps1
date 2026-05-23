@@ -4,6 +4,7 @@ param(
     [string[]]$TargetId,
     [string]$KeepRunRoot,
     [int]$StaleAgeSeconds = 300,
+    [switch]$MarkAcceptancePostCleanup,
     [switch]$Apply,
     [switch]$AsJson
 )
@@ -361,6 +362,149 @@ function Save-CleanupWorkerStatus {
     Write-JsonFileAtomically -Path $StatusPath -Payload $payload
 }
 
+function Update-AcceptanceReceiptPostCleanup {
+    param(
+        [string]$RunRoot,
+        [switch]$Apply
+    )
+
+    $normalizedRunRoot = Get-NormalizedPath -PathValue $RunRoot
+    $receiptPath = if (Test-NonEmptyString $normalizedRunRoot) { Join-Path $normalizedRunRoot '.state\live-acceptance-result.json' } else { '' }
+    if (-not (Test-NonEmptyString $receiptPath)) {
+        return [pscustomobject]@{
+            Attempted            = $false
+            Updated              = $false
+            Path                 = ''
+            Reason               = 'missing-run-root'
+            PreflightPassed      = $null
+            ActiveAttempted      = $null
+            PostCleanupDone      = $null
+            CleanPreflightPassed = $null
+        }
+    }
+
+    if (-not [bool]$Apply) {
+        return [pscustomobject]@{
+            Attempted            = $false
+            Updated              = $false
+            Path                 = $receiptPath
+            Reason               = 'dry-run'
+            PreflightPassed      = $null
+            ActiveAttempted      = $null
+            PostCleanupDone      = $null
+            CleanPreflightPassed = $null
+        }
+    }
+
+    if (-not (Test-Path -LiteralPath $receiptPath -PathType Leaf)) {
+        return [pscustomobject]@{
+            Attempted            = $true
+            Updated              = $false
+            Path                 = $receiptPath
+            Reason               = 'receipt-missing'
+            PreflightPassed      = $null
+            ActiveAttempted      = $null
+            PostCleanupDone      = $null
+            CleanPreflightPassed = $null
+        }
+    }
+
+    try {
+        $receipt = Read-JsonObject -Path $receiptPath
+    }
+    catch {
+        return [pscustomobject]@{
+            Attempted            = $true
+            Updated              = $false
+            Path                 = $receiptPath
+            Reason               = ('receipt-parse-failed:' + $_.Exception.Message)
+            PreflightPassed      = $null
+            ActiveAttempted      = $null
+            PostCleanupDone      = $null
+            CleanPreflightPassed = $null
+        }
+    }
+
+    $recordedAt = (Get-Date).ToString('o')
+    $outcome = if ($null -ne $receipt.PSObject.Properties['Outcome']) { $receipt.Outcome } else { $null }
+    $acceptanceState = if ($null -ne $outcome -and $null -ne $outcome.PSObject.Properties['AcceptanceState']) { [string]$outcome.AcceptanceState } else { '' }
+    $acceptanceReason = if ($null -ne $outcome -and $null -ne $outcome.PSObject.Properties['AcceptanceReason']) { [string]$outcome.AcceptanceReason } else { '' }
+
+    $history = New-Object System.Collections.Generic.List[object]
+    foreach ($entry in @($receipt.PhaseHistory)) {
+        if ($null -ne $entry) {
+            [void]$history.Add($entry)
+        }
+    }
+
+    $historyEntry = [pscustomobject][ordered]@{
+        RecordedAt          = $recordedAt
+        Stage               = 'post-cleanup'
+        AcceptanceState     = $acceptanceState
+        AcceptanceReason    = $acceptanceReason
+        BlockedBy           = ''
+        BlockedTargetId     = ''
+        BlockedRunRoot      = ''
+        BlockedPath         = ''
+        BlockedDetail       = ''
+        PreflightPassed     = $true
+        ActiveAttempted     = $true
+        PostCleanupDone     = $true
+        CleanPreflightPassed = $false
+    }
+
+    $shouldAppend = $true
+    if ($history.Count -gt 0) {
+        $lastEntry = $history[$history.Count - 1]
+        if (
+            [string]$lastEntry.Stage -eq 'post-cleanup' -and
+            [string]$lastEntry.AcceptanceState -eq $acceptanceState -and
+            [string]$lastEntry.AcceptanceReason -eq $acceptanceReason
+        ) {
+            $shouldAppend = $false
+            $history[$history.Count - 1] = $historyEntry
+        }
+    }
+    if ($shouldAppend) {
+        [void]$history.Add($historyEntry)
+    }
+
+    Add-Member -InputObject $receipt -NotePropertyName 'Stage' -NotePropertyValue 'post-cleanup' -Force
+    Add-Member -InputObject $receipt -NotePropertyName 'LastUpdatedAt' -NotePropertyValue $recordedAt -Force
+    Add-Member -InputObject $receipt -NotePropertyName 'PhaseHistory' -NotePropertyValue @($history | Select-Object -Last 40) -Force
+    Add-Member -InputObject $receipt -NotePropertyName 'PreflightPassed' -NotePropertyValue $true -Force
+    Add-Member -InputObject $receipt -NotePropertyName 'ActiveAttempted' -NotePropertyValue $true -Force
+    Add-Member -InputObject $receipt -NotePropertyName 'PostCleanupDone' -NotePropertyValue $true -Force
+    Add-Member -InputObject $receipt -NotePropertyName 'CleanPreflightPassed' -NotePropertyValue $false -Force
+
+    try {
+        Write-JsonFileAtomically -Path $receiptPath -Payload $receipt
+    }
+    catch {
+        return [pscustomobject]@{
+            Attempted            = $true
+            Updated              = $false
+            Path                 = $receiptPath
+            Reason               = ('receipt-write-failed:' + $_.Exception.Message)
+            PreflightPassed      = $null
+            ActiveAttempted      = $null
+            PostCleanupDone      = $null
+            CleanPreflightPassed = $null
+        }
+    }
+
+    return [pscustomobject]@{
+        Attempted            = $true
+        Updated              = $true
+        Path                 = $receiptPath
+        Reason               = ''
+        PreflightPassed      = $true
+        ActiveAttempted      = $true
+        PostCleanupDone      = $true
+        CleanPreflightPassed = $false
+    }
+}
+
 function Classify-CommandItem {
     param(
         [Parameter(Mandatory)]$Item,
@@ -676,12 +820,36 @@ $targetResults = foreach ($targetKey in $targetIds) {
     }
 }
 
+$receiptUpdate = if ($MarkAcceptancePostCleanup) {
+    Update-AcceptanceReceiptPostCleanup -RunRoot $resolvedKeepRunRoot -Apply:$Apply
+}
+else {
+    [pscustomobject]@{
+        Attempted            = $false
+        Updated              = $false
+        Path                 = if (Test-NonEmptyString $resolvedKeepRunRoot) { Join-Path $resolvedKeepRunRoot '.state\live-acceptance-result.json' } else { '' }
+        Reason               = ''
+        PreflightPassed      = $null
+        ActiveAttempted      = $null
+        PostCleanupDone      = $null
+        CleanPreflightPassed = $null
+    }
+}
+
 $payload = [pscustomobject]@{
     SchemaVersion = '1.0.0'
     GeneratedAt = (Get-Date).ToString('o')
     ConfigPath = $resolvedConfigPath
     KeepRunRoot = $resolvedKeepRunRoot
+    ReceiptPath = [string]$receiptUpdate.Path
+    ReceiptUpdated = [bool]$receiptUpdate.Updated
+    ReceiptUpdateReason = [string]$receiptUpdate.Reason
+    PreflightPassed = $receiptUpdate.PreflightPassed
+    ActiveAttempted = $receiptUpdate.ActiveAttempted
+    PostCleanupDone = $receiptUpdate.PostCleanupDone
+    CleanPreflightPassed = $receiptUpdate.CleanPreflightPassed
     StaleAgeSeconds = $StaleAgeSeconds
+    MarkAcceptancePostCleanup = [bool]$MarkAcceptancePostCleanup
     Apply = [bool]$Apply
     Targets = @($targetResults)
     Summary = [pscustomobject]@{

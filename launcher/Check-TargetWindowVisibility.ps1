@@ -156,6 +156,26 @@ function Select-FirstVisibleLocator {
     }
 }
 
+function Format-WindowSnapshotSummary {
+    param($Window)
+
+    if ($null -eq $Window) {
+        return 'hwnd=0'
+    }
+
+    $hwnd = [string](Get-ObjectPropertyValue -Object $Window -Name 'Hwnd' -DefaultValue '')
+    if (-not (Test-NonEmptyString $hwnd) -or $hwnd -eq '0') {
+        return 'hwnd=0'
+    }
+
+    $title = [string](Get-ObjectPropertyValue -Object $Window -Name 'Title' -DefaultValue '')
+    $processName = [string](Get-ObjectPropertyValue -Object $Window -Name 'ProcessName' -DefaultValue '')
+    $processId = [string](Get-ObjectPropertyValue -Object $Window -Name 'ProcessId' -DefaultValue '')
+    $className = [string](Get-ObjectPropertyValue -Object $Window -Name 'ClassName' -DefaultValue '')
+
+    return ('title={0} process={1} pid={2} hwnd={3} class={4}' -f $title, $processName, $processId, $hwnd, $className)
+}
+
 function Read-RuntimeItems {
     param([Parameter(Mandatory)][string]$Path)
 
@@ -284,6 +304,7 @@ $runtimeDoc = Read-RuntimeItems -Path ([string]$config.RuntimeMapPath)
 $bindingProfileDoc = Read-BindingDocument -Path ([string]$config.BindingProfilePath)
 $bindingScope = Get-BindingSessionScope -Config $config -BindingDocument $bindingProfileDoc
 $visibleWindows = @(Get-VisibleWindows)
+$activeWindowSnapshot = Get-ForegroundWindowInfo
 $bindingLastWriteAt = [string]$bindingProfileDoc.LastWriteAt
 $runtimeLastWriteAt = [string]$runtimeDoc.LastWriteAt
 $bindingTimestamp = Convert-ToUtcDateTime -Value $bindingLastWriteAt
@@ -434,6 +455,22 @@ foreach ($target in @($config.Targets | Where-Object { [string]$_.Id -in $bindin
     }
 }
 
+$activeWindowSummary = Format-WindowSnapshotSummary -Window $activeWindowSnapshot
+$activeWindowHwnd = [string](Get-ObjectPropertyValue -Object $activeWindowSnapshot -Name 'Hwnd' -DefaultValue '')
+$activeTargetRows = @()
+if (Test-NonEmptyString $activeWindowHwnd -and $activeWindowHwnd -ne '0') {
+    $activeTargetRows = @(
+        $rows |
+            Where-Object {
+                ([string]$_.RuntimeHwnd -eq $activeWindowHwnd) -or
+                ([string]$_.MatchHwnd -eq $activeWindowHwnd)
+            } |
+            Select-Object -First 1
+    )
+}
+$activeWindowIsOfficialTarget = ($activeTargetRows.Count -gt 0)
+$activeWindowTargetId = if ($activeWindowIsOfficialTarget) { [string]$activeTargetRows[0].TargetId } else { '' }
+
 $status = [pscustomobject]@{
     Root                = [string]$config.Root
     ConfigPath          = $resolvedConfigPath
@@ -445,6 +482,10 @@ $status = [pscustomobject]@{
     BindingProfileLastWriteAt = $bindingLastWriteAt
     RuntimeStaleAgainstBinding = [bool]$runtimeStaleAgainstBinding
     VisibleWindowCount  = @($visibleWindows).Count
+    ActiveWindowSnapshot = $activeWindowSnapshot
+    ActiveWindowSummary = $activeWindowSummary
+    ActiveWindowIsOfficialTarget = [bool]$activeWindowIsOfficialTarget
+    ActiveWindowTargetId = $activeWindowTargetId
     ReuseMode           = [string]$bindingScope.ReuseMode
     PartialReuse        = [bool]$bindingScope.PartialReuse
     ConfiguredTargetCount = [int]$bindingScope.ConfiguredTargetCount
@@ -494,6 +535,8 @@ else {
     if ($status.DuplicateTargetIds.Count -gt 0) {
         $lines.Add(('Runtime Duplicates: {0}' -f ($status.DuplicateTargetIds -join ', ')))
     }
+    $lines.Add(('ActiveWindow: {0}' -f $status.ActiveWindowSummary))
+    $lines.Add(('ActiveWindowOfficialTarget: {0} target={1}' -f [bool]$status.ActiveWindowIsOfficialTarget, $(if (Test-NonEmptyString $status.ActiveWindowTargetId) { $status.ActiveWindowTargetId } else { '' })))
     $lines.Add(('Injectable: ok={0} fail={1} missingRuntime={2}' -f $status.InjectableCount, $status.NonInjectableCount, $status.MissingRuntimeCount))
     $lines.Add(('AllowedInjectionMethods: {0}' -f ($status.AllowedInjectionMethods -join ', ')))
     $lines.Add(('WindowPidOnlyFallbackDetected: {0}' -f [bool]$status.WindowPidOnlyFallbackDetected))

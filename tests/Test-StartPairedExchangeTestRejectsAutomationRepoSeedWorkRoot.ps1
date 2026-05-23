@@ -16,6 +16,7 @@ function Assert-True {
 }
 
 $root = Split-Path -Parent $PSScriptRoot
+. (Join-Path $root 'tests\lib\ConfigMutationHelpers.ps1')
 $externalFixtureRoot = 'C:\dev\python\_relay-test-fixtures'
 $tmpRoot = Join-Path $externalFixtureRoot 'Test-StartPairedExchangeTestRejectsAutomationRepoSeedWorkRoot'
 $workRepoRoot = Join-Path $tmpRoot 'work-repo'
@@ -28,9 +29,8 @@ New-Item -ItemType Directory -Path $workRepoRoot -Force | Out-Null
 
 $baseConfigPath = Join-Path $root 'config\settings.bottest-live-visible.psd1'
 $baseConfigText = Get-Content -LiteralPath $baseConfigPath -Raw -Encoding UTF8
-$configText = $baseConfigText `
-    -replace 'UseExternalWorkRepoRunRoot = \$true', 'UseExternalWorkRepoRunRoot = $false' `
-    -replace 'RequireExternalRunRoot = \$true', 'RequireExternalRunRoot = $false'
+$configText = Set-BooleanPairPolicyAssignment -Text $baseConfigText -PairId 'pair01' -Name 'UseExternalWorkRepoRunRoot' -Value $false
+$configText = Set-BooleanPairPolicyAssignment -Text $configText -PairId 'pair01' -Name 'RequireExternalRunRoot' -Value $false
 Set-Content -LiteralPath $configPath -Value $configText -Encoding UTF8
 
 $output = @(
@@ -46,6 +46,9 @@ $exitCode = $LASTEXITCODE
 
 Assert-True ($exitCode -ne 0) 'Start-PairedExchangeTest should reject automation repo as seed work repo.'
 $detail = ($output | Out-String)
-Assert-True ($detail.Contains('automation-repo-workrepo-disallowed')) 'failure output should mention automation-repo-workrepo-disallowed.'
+Assert-True (
+    $detail.Contains('automation-repo-workrepo-disallowed') -or
+    $detail.Contains('bookkeeping-root-outside-workrepo')
+) 'failure output should mention either the direct seed work repo guard or the downstream bookkeeping root guard.'
 
 Write-Host 'start-paired-exchange-test external work repo guard ok'

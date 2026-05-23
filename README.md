@@ -199,7 +199,7 @@ watcher 제어 의미는 패널에도 고정 안내로 표시합니다. `pause/r
 또 target 블록에는 `PayloadContainsForbiddenLiteral`, `SourceSummaryContainsForbiddenLiteral`, `SourceReviewZipContainsForbiddenLiteral`, `ForwardBlockedByForbiddenLiteral` 도 같이 남겨서, “자동화가 실제로 보낸 payload 오염”과 “target이 만든 산출물 오염”을 한 장에서 바로 구분할 수 있게 유지합니다.
 여기서 `StaleSummary` 는 최근 어떤 관측 신호든 있었는지를 뜻하고, `ProgressStale` 는 실제 relay/orchestration 진전 신호가 최근에 있었는지를 뜻합니다. 따라서 `StaleSummary=false` 이면서 `ProgressStale=true` 인 경우는 "로그와 준비 흔적은 최근에 있었지만 실제 relay 진전은 멈춘 상태"로 읽으면 됩니다.
 또 `RunRoot 준비`와 `준비 전체 실행`이 성공하면 output 영역에 같은 `[runroot 요약]` 블록을 한 번 자동으로 붙여 현재 기준선을 바로 확인할 수 있습니다.
-또 `고정문구 / 순서 편집` 탭 우측의 `최종 전달문`, `경로 요약` 탭에서 현재 target 기준 완성 preview와 자동 주입 경로를 panel 안에서 바로 확인할 수 있습니다.
+또 `문구 편집` 탭 우측의 `전달문`, `경로` 탭에서 현재 target 기준 완성 preview와 자동 주입 경로를 panel 안에서 바로 확인할 수 있습니다.
 패널 재실행 후 complete pair만 남아 있으면 보드 탭 `열린 pair 재사용`으로 partial session을 다시 붙일 수 있습니다. 이 경우 attach/visibility 기대 개수는 전체 8개가 아니라 active pair scope 기준 `2/2`, `4/4`, `6/6`으로 표시됩니다.
 summary 계약만 빠르게 다시 확인하려면 아래 wrapper를 사용합니다.
 
@@ -333,6 +333,18 @@ handoff 메시지에는 아래 정보가 항상 들어갑니다.
 
 `relay_operator_panel.py`는 위 정보를 작은 Tkinter 운영 패널로 묶어 보여줍니다. 현재는 읽기/확인 중심 UI이며 source of truth는 `show-effective-config.ps1 -AsJson`입니다. 아래를 한 화면에서 확인할 수 있습니다.
 
+운영 패널 상위 탭은 업무 단위로 읽습니다.
+
+- `홈`: 현재 상태, 추천 조치, 자주 쓰는 시작/복구 버튼
+- `8창 보드`: 공식 8창 attach / injectable / pair 매칭 상태
+- `Pair 설정`: pair repo / runroot / roundtrip / contract 경로 정책
+- `8 Cell Autoloop`: target별 독립 감지 / queue / watcher 제어와 seed composer
+- `문구 편집`: Initial / Handoff / 고정문구 / target 문구 편집
+- `결과 / 산출물`: summary / review / publish 산출물 확인
+- `Visible Acceptance`: shared visible 공식 검증
+- `Headless Drill / 진단`: 개발/진단용 helper
+- `스냅샷`: effective config와 runroot snapshot 확인
+
 - config / lane / binding / launcher 메타
 - 최신 run root와 pair별 target 매핑
 - initial / handoff preview
@@ -345,7 +357,7 @@ handoff 메시지에는 아래 정보가 항상 들어갑니다.
 - 선택 row 기준 `envelope.json` / `rendered.txt` preview 저장
 - 선택된 pair의 headless 단일 왕복 드릴 실행
 - 선택한 row의 target/review 폴더 열기와 summary 경로 복사
-- `설정 / 문구` 탭의 `4 Pair 설정 / 실효 경로` 카드
+- `Pair 설정` 탭의 `4 Pair 설정 / 실효 경로` 카드
   - pair별 `DefaultSeedWorkRepoRoot`, `DefaultSeedTargetId`, `DefaultPairMaxRoundtripCount`, `UseExternalWorkRepoRunRoot`, `UseExternalWorkRepoContractPaths` 를 바로 수정
   - 상단 `RunRoot Override` 입력칸은 pair 정책 자체가 아니라 실행 컨텍스트 override입니다. 비워두면 pair 정책 기준 selected/new RunRoot를 사용하고, 값이 있으면 그 경로가 우선합니다.
   - `Repo 선택`, `Repo 열기` 버튼으로 pair repo root를 직접 고르거나 바로 열기
@@ -362,7 +374,7 @@ handoff 메시지에는 아래 정보가 항상 들어갑니다.
   - `RUNNING`, `WAITING`, `DONE`, `ERROR`, `STOPPED` runtime 배지로 현재 RunRoot의 pair 진행 상태를 바로 확인
   - runtime 배지는 현재 RunRoot의 `.state\wrapper-status.json` 을 우선 읽고, 없으면 기존 paired status로 fallback 해서 `WatcherState`, `RoundtripCount`, `CurrentPhase`, `LastForwardedAt` 를 보여줌
   - `pair 설정 저장 + 새로고침`으로 pair 정책 draft를 config에 반영
-- 같은 탭의 `초기 실행 준비 / Seed Kickoff Composer`
+- `Pair 설정` 탭의 `초기 실행 준비 / Seed Kickoff Composer`
   - 사용자는 `Pair`, `SeedTarget`, `입력 파일`, `작업 설명`만 직접 입력
   - 상단에 `붙여넣기 대상`과 `시작 가능 여부`를 고정으로 보여주고, `빠른 시작`에서 `미리보기`, `초간단 시작문 복사`, `상세 시작문 복사`, `초기 입력 큐잉`을 바로 실행 가능
   - `초간단 시작문 미리보기` 박스에 실제로 복사될 기본 시작문을 항상 먼저 보여줌
@@ -372,6 +384,14 @@ handoff 메시지에는 아래 정보가 항상 들어갑니다.
   - `초기 입력 큐잉`은 영구 `Initial/Handoff` 설정을 바꾸지 않고 one-time queue에만 등록
   - queue 등록 시에는 작업 설명 블록만 저장되고, 경로/파일 계약/helper 안내는 seed/handoff scaffold가 별도로 자동 추가됨
   - 권장 흐름은 `pair 설정 저장 + 새로고침 -> 실효값 확인 -> 초간단 시작문 복사 또는 초기 입력 큐잉`
+- `8 Cell Autoloop` 탭
+  - `8 Target 설정 / 실효 경로`에서 target별 Enabled / TriggerKinds / MaxCycleCount를 편집
+  - `Status + Control`에서 pause / resume / stop / restart 의미를 구분해 확인
+  - `Seed Composer`에서 target-local summary / review / publish 경로가 주입된 시작문을 preview
+- `문구 편집` 탭
+  - 편집 문맥 상단에서 `현재 편집 중`과 `적용 범위`를 먼저 확인
+  - `PAIR Target Extra / target01`은 선택한 Initial 또는 Handoff 템플릿의 해당 target에만 적용
+  - `기본 고정문구`는 Pair Initial/Handoff 공통 suffix이고, `Target 고정문구`는 Pair와 8 Cell Autoloop target prompt에 함께 적용
 - `_tmp\effective-config*.json` 최근 20개 스냅샷의 stale/warnings 메타 조회, snapshot/run root 열기, 경로 복사, JSON 본문 확인
 - typed-window 실테스트 기준선과 submit sequence 요약 표시
 - 실행 중 `Operator Status`와 마지막 결과 요약 표시

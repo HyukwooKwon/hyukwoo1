@@ -7,9 +7,12 @@ from relay_panel_services import CommandService
 from relay_panel_watchers import (
     DEFAULT_WATCHER_MAX_FORWARD_COUNT,
     DEFAULT_WATCHER_RUN_DURATION_SEC,
+    START_MODE_CURRENT_RUN,
+    START_MODE_NEW_RUN,
     StatusLoader,
     WatcherControlResult,
     WatcherStartEligibility,
+    WatcherStartRequestReview,
     WatcherService,
     WatcherStartRequest,
 )
@@ -35,7 +38,7 @@ class WatcherController:
 
     def start_preset_note(self) -> str:
         default_request = self.default_start_request(config_path="", run_root="")
-        return "기본 " + self.describe_start_request(default_request)
+        return "controller compiled fallback " + self.describe_start_request(default_request)
 
     def configured_start_request(
         self,
@@ -54,7 +57,13 @@ class WatcherController:
             max_forward_count=int(watcher.get("ConfiguredMaxForwardCount", 0) or 0),
             run_duration_sec=int(watcher.get("ConfiguredRunDurationSec", 0) or 0),
             pair_max_roundtrip_count=int(watcher.get("ConfiguredMaxRoundtripCount", 0) or 0),
+            pair_roundtrip_limit_map=self._all_pair_roundtrip_limits(paired_status),
+            start_mode=START_MODE_CURRENT_RUN,
         )
+
+    @staticmethod
+    def _start_mode_label(start_mode: str) -> str:
+        return "새 Run 시작" if str(start_mode or "").strip() == START_MODE_NEW_RUN else "현재 Run 시작"
 
     def describe_start_request(self, request: WatcherStartRequest) -> str:
         forward_limit = (
@@ -68,17 +77,30 @@ class WatcherController:
             else f"run {request.run_duration_sec}초"
         )
         pair_roundtrip_limit = (
-            "pair 왕복 제한 없음"
+            "global pair override 없음(0; pair별 카드 설정 사용)"
             if request.pair_max_roundtrip_count <= 0
-            else f"pair별 왕복 {request.pair_max_roundtrip_count}회"
+            else f"global pair override {request.pair_max_roundtrip_count}회"
         )
         dispatch_mode = "headless dispatch" if request.use_headless_dispatch else "direct dispatch"
-        return f"watch 시작 preset: {forward_limit} / {run_duration} / {pair_roundtrip_limit} / {dispatch_mode}"
+        start_label = self._start_mode_label(request.start_mode)
+        return f"{start_label} preset: {forward_limit} / {run_duration} / {pair_roundtrip_limit} / {dispatch_mode}"
 
     def continuous_watch_guidance(self, configured_forward_limit: int | None = None) -> str:
-        effective_limit = DEFAULT_WATCHER_MAX_FORWARD_COUNT if configured_forward_limit is None else configured_forward_limit
+        if configured_forward_limit is None:
+            effective_limit = DEFAULT_WATCHER_MAX_FORWARD_COUNT
+            if effective_limit <= 0:
+                return (
+                    "watcher status에 configured forward limit이 없어 controller compiled fallback 기준으로 해석했습니다. "
+                    "현재 fallback에는 forward 횟수 제한이 없습니다."
+                )
+            return (
+                "watcher status에 configured forward limit이 없어 controller compiled fallback 기준으로 해석했습니다. "
+                f"현재 fallback은 watcher 전체 기준 {effective_limit}회 forward 후 멈춥니다. "
+                "실제 실행값은 start 요청 또는 watcher status payload를 다시 확인하세요."
+            )
+        effective_limit = configured_forward_limit
         if effective_limit <= 0:
-            return "현재 기본 watch 시작에는 forward 횟수 제한이 없습니다."
+            return "현재 watcher는 forward 횟수 제한 없이 실행 중입니다."
         return (
             f"현재 watcher는 watcher 전체 기준으로 {effective_limit}회 forward 후 멈춥니다. "
             "이 값은 pair별 왕복 제한이 아닙니다. 계속 왕복이 필요하면 MaxForwardCount를 0 또는 더 큰 값으로 별도 실행하세요."
@@ -137,6 +159,27 @@ class WatcherController:
         return limits
 
     @classmethod
+    def _all_pair_roundtrip_limits(cls, paired_status: dict | None) -> dict[str, int]:
+        limits: dict[str, int] = {}
+        for row in (((paired_status or {}).get("Pairs", []) or [])):
+            if not isinstance(row, dict):
+                continue
+            pair_id = str(row.get("PairId", "") or "")
+            if not pair_id:
+                continue
+            limit = int(row.get("ConfiguredMaxRoundtripCount", 0) or 0)
+            if limit <= 0:
+                limit = int(row.get("PolicyPairMaxRoundtripCount", 0) or 0)
+            limits[pair_id] = max(0, limit)
+        return limits
+
+    @staticmethod
+    def _format_pair_roundtrip_limit_map(limit_map: dict[str, int]) -> str:
+        if not limit_map:
+            return ""
+        return ", ".join(f"{pair_id}:{int(limit_map[pair_id])}" for pair_id in sorted(limit_map))
+
+    @classmethod
     def _effective_pair_roundtrip_limit(cls, paired_status: dict | None) -> int:
         configured_limit = cls._configured_pair_roundtrip_limit(paired_status)
         if configured_limit > 0:
@@ -147,13 +190,31 @@ class WatcherController:
         return 0
 
     @staticmethod
+    def _configured_forward_limit_or_none(paired_status: dict | None) -> int | None:
+        watcher = ((paired_status or {}).get("Watcher", {}) or {})
+        if "ConfiguredMaxForwardCount" not in watcher:
+            return None
+        return int(watcher.get("ConfiguredMaxForwardCount", 0) or 0)
+
+    @staticmethod
     def _configured_forward_limit(paired_status: dict | None) -> int:
-        value = int(((paired_status or {}).get("Watcher", {}) or {}).get("ConfiguredMaxForwardCount", 0) or 0)
+        value = WatcherController._configured_forward_limit_or_none(paired_status)
+        if value is None:
+            return DEFAULT_WATCHER_MAX_FORWARD_COUNT
         return value if value > 0 else DEFAULT_WATCHER_MAX_FORWARD_COUNT
 
     @staticmethod
+    def _configured_run_duration_sec_or_none(paired_status: dict | None) -> int | None:
+        watcher = ((paired_status or {}).get("Watcher", {}) or {})
+        if "ConfiguredRunDurationSec" not in watcher:
+            return None
+        return int(watcher.get("ConfiguredRunDurationSec", 0) or 0)
+
+    @staticmethod
     def _configured_run_duration_sec(paired_status: dict | None) -> int:
-        value = int(((paired_status or {}).get("Watcher", {}) or {}).get("ConfiguredRunDurationSec", 0) or 0)
+        value = WatcherController._configured_run_duration_sec_or_none(paired_status)
+        if value is None:
+            return DEFAULT_WATCHER_RUN_DURATION_SEC
         return value if value > 0 else DEFAULT_WATCHER_RUN_DURATION_SEC
 
     @staticmethod
@@ -184,6 +245,9 @@ class WatcherController:
     def start_eligibility(self, paired_status: dict | None, run_root: str) -> WatcherStartEligibility:
         return self.watcher_service.get_start_eligibility(paired_status, run_root)
 
+    def review_start_request(self, request: WatcherStartRequest) -> WatcherStartRequestReview:
+        return self.watcher_service.review_start_request(request)
+
     def runtime_hint(self, paired_status: dict | None, run_root: str) -> str:
         status = self.runtime_status(paired_status, run_root)
         configured_forward_limit = self._configured_forward_limit(paired_status)
@@ -209,6 +273,9 @@ class WatcherController:
             parts.append("control=" + status.control_pending_action)
         if status.last_handled_request_id:
             parts.append("ack=" + status.last_handled_request_id)
+        pair_limit_map = self._all_pair_roundtrip_limits(paired_status)
+        if pair_limit_map:
+            parts.append("pair_limits=" + self._format_pair_roundtrip_limit_map(pair_limit_map))
         if status.reason_codes:
             parts.append("reasons=" + ",".join(status.reason_codes))
         return " / ".join(parts)
@@ -217,7 +284,7 @@ class WatcherController:
         status = self.runtime_status(paired_status, run_root)
         start_eligibility = self.start_eligibility(paired_status, run_root)
         stop_eligibility = self.stop_eligibility(paired_status, run_root)
-        configured_forward_limit = self._configured_forward_limit(paired_status)
+        configured_forward_limit = self._configured_forward_limit_or_none(paired_status)
         configured_run_duration_sec = self._configured_run_duration_sec(paired_status)
 
         if self._is_pair_roundtrip_limit_stop(status):
@@ -228,13 +295,13 @@ class WatcherController:
                 if configured_limit > 0
                 else "현재 watcher는 pair별 왕복 한도에 도달해 정지했습니다. 계속하려면 roundtrip limit 또는 pair policy limit을 조정해 다시 시작하세요."
             )
-            return WatcherRecommendation("start_watcher", "watch 다시 시작", detail)
+            return WatcherRecommendation("start_new_watcher_run", "새 Run 시작", detail)
         if self._is_expected_forward_limit_stop(status, paired_status):
-            return WatcherRecommendation("start_watcher", "watch 다시 시작", self.continuous_watch_guidance(configured_forward_limit))
+            return WatcherRecommendation("start_new_watcher_run", "새 Run 시작", self.continuous_watch_guidance(configured_forward_limit))
         if status.status_reason == "run-duration-reached":
             return WatcherRecommendation(
-                "start_watcher",
-                "watch 다시 시작",
+                "start_new_watcher_run",
+                "새 Run 시작",
                 (
                     f"현재 watcher는 run {configured_run_duration_sec}초 후 멈춥니다. "
                     "더 오래 돌리려면 RunDurationSec 값을 늘려 실행하세요."
@@ -253,7 +320,7 @@ class WatcherController:
         if "pending_forward_exists" in stop_eligibility.reason_codes:
             return WatcherRecommendation("focus_ready_to_forward_artifact", "전달 가능 target 보기", "결과 탭에서 다음 전달 가능 target을 먼저 확인하세요.")
         if start_eligibility.allowed and status.state == "stopped":
-            return WatcherRecommendation("start_watcher", "watch 시작", "현재 watcher 시작 조건을 만족합니다.")
+            return WatcherRecommendation("start_current_watcher_run", "현재 Run 시작", "현재 RunRoot 기준 watcher 시작 조건을 만족합니다.")
         if status.state in {"running", "starting", "pause_requested", "resume_requested", "stop_requested", "stopping"}:
             return WatcherRecommendation("run_paired_status", "Pair 상태 보기", "paired status를 다시 확인해 최신 상태를 보세요.")
         return None
@@ -291,9 +358,9 @@ class WatcherController:
             f"LastHandledResult: {status.last_handled_result or '(없음)'}",
             f"LastHandledAt: {status.last_handled_at or '(없음)'}",
             f"AuditLogPath: {self.audit_log_path()}",
-            f"StartPresetMaxForwardCount: {DEFAULT_WATCHER_MAX_FORWARD_COUNT}",
-            f"StartPresetRunDurationSec: {DEFAULT_WATCHER_RUN_DURATION_SEC}",
-            f"StartPresetNote: {self.start_preset_note()}",
+            f"CompiledFallbackMaxForwardCount: {DEFAULT_WATCHER_MAX_FORWARD_COUNT}",
+            f"CompiledFallbackRunDurationSec: {DEFAULT_WATCHER_RUN_DURATION_SEC}",
+            f"CompiledFallbackStartPreset: {self.start_preset_note()}",
             f"StartAllowed: {'예' if start_eligibility.allowed else '아니오'}",
             f"StartMessage: {start_eligibility.message or '(없음)'}",
             f"StartCleanupAllowed: {'예' if start_eligibility.cleanup_allowed else '아니오'}",
@@ -328,6 +395,12 @@ class WatcherController:
         configured_run_duration_sec = int(((paired_status or {}).get("Watcher", {}) or {}).get("ConfiguredRunDurationSec", 0) or 0)
         if configured_run_duration_sec > 0:
             lines.append(f"ConfiguredRunDurationSec: {configured_run_duration_sec}초")
+        global_roundtrip_override = int(((paired_status or {}).get("Watcher", {}) or {}).get("ConfiguredMaxRoundtripCount", 0) or 0)
+        lines.append(f"GlobalPairRoundtripOverride: {global_roundtrip_override}")
+        all_pair_roundtrip_limits = self._all_pair_roundtrip_limits(paired_status)
+        if all_pair_roundtrip_limits:
+            lines.append("EffectivePairRoundtripLimits: " + self._format_pair_roundtrip_limit_map(all_pair_roundtrip_limits))
+            lines.append("StopRule: all limited pairs reached; unlimited pairs do not trigger global stop")
         configured_roundtrip_limit = self._effective_pair_roundtrip_limit(paired_status)
         if configured_roundtrip_limit > 0:
             lines.append(f"ConfiguredPairRoundtripLimit: pair별 왕복 {configured_roundtrip_limit}회 기준입니다.")
@@ -339,8 +412,8 @@ class WatcherController:
             else:
                 lines.append("StatusInterpretation: watcher가 pair별 왕복 한도에 도달해 정지했습니다.")
         elif self._is_expected_forward_limit_stop(status, paired_status):
-            lines.append("StatusInterpretation: 기본 watch 시작 preset의 forward 한도에 도달해 정지했습니다.")
-            lines.append("ContinuousWatchGuidance: " + self.continuous_watch_guidance(self._configured_forward_limit(paired_status)))
+            lines.append("StatusInterpretation: watcher가 forward 한도에 도달해 정지했습니다.")
+            lines.append("ContinuousWatchGuidance: " + self.continuous_watch_guidance(self._configured_forward_limit_or_none(paired_status)))
         elif status.status_reason == "run-duration-reached":
             lines.append(
                 "StatusInterpretation: 현재 watcher의 run duration 한도에 도달해 정지했습니다."
@@ -380,6 +453,7 @@ class WatcherController:
             use_headless_dispatch=True,
             max_forward_count=DEFAULT_WATCHER_MAX_FORWARD_COUNT,
             run_duration_sec=DEFAULT_WATCHER_RUN_DURATION_SEC,
+            start_mode=START_MODE_CURRENT_RUN,
         )
 
     def start(
@@ -436,6 +510,44 @@ class WatcherController:
                 return blocked_result, notes
 
         effective_request = request or self.default_start_request(config_path=config_path, run_root=run_root)
+        if request is not None and (not effective_request.config_path or not effective_request.run_root):
+            effective_request = WatcherStartRequest(
+                config_path=effective_request.config_path or config_path,
+                run_root=effective_request.run_root or run_root,
+                use_headless_dispatch=effective_request.use_headless_dispatch,
+                max_forward_count=effective_request.max_forward_count,
+                run_duration_sec=effective_request.run_duration_sec,
+                pair_max_roundtrip_count=effective_request.pair_max_roundtrip_count,
+                pair_roundtrip_limit_map=dict(effective_request.pair_roundtrip_limit_map),
+                start_mode=effective_request.start_mode,
+            )
+        request_review = self.review_start_request(effective_request)
+        if not request_review.allowed:
+            blocked_result = WatcherControlResult(
+                ok=False,
+                action="start",
+                run_root=run_root,
+                state=eligibility.state,
+                message=request_review.message or "Run 시작 옵션이 현재 watcher 계약과 충돌합니다.",
+                reason_codes=["watcher_start_option_conflict"],
+            )
+            self._record_audit(
+                action="start",
+                result=blocked_result,
+                extra={
+                    "Mode": "start_request_review_block",
+                    "Notes": list(notes),
+                    "MaxForwardCount": effective_request.max_forward_count,
+                    "RunDurationSec": effective_request.run_duration_sec,
+                    "PairMaxRoundtripCount": effective_request.pair_max_roundtrip_count,
+                    "PairRoundtripLimitMap": dict(effective_request.pair_roundtrip_limit_map),
+                    "StartMode": effective_request.start_mode,
+                    "UseHeadlessDispatch": effective_request.use_headless_dispatch,
+                },
+            )
+            return blocked_result, notes
+        if request_review.warning:
+            notes.append("시작 옵션 경고: " + request_review.warning)
         result = self.watcher_service.start_detached(command_service, effective_request)
         self._record_audit(
             action="start",
@@ -447,6 +559,9 @@ class WatcherController:
                 "MaxForwardCount": effective_request.max_forward_count,
                 "RunDurationSec": effective_request.run_duration_sec,
                 "PairMaxRoundtripCount": effective_request.pair_max_roundtrip_count,
+                "PairRoundtripLimitMap": dict(effective_request.pair_roundtrip_limit_map),
+                "RequestReviewWarning": request_review.warning,
+                "StartMode": effective_request.start_mode,
                 "UseHeadlessDispatch": effective_request.use_headless_dispatch,
             },
         )
@@ -467,6 +582,63 @@ class WatcherController:
         self._record_audit(action="resume", result=result)
         return result
 
+    def wait_for_stopped(
+        self,
+        status_loader: StatusLoader,
+        run_root: str,
+        *,
+        request_id: str = "",
+        timeout_sec: float = 20.0,
+        poll_interval_sec: float = 1.0,
+    ) -> WatcherControlResult:
+        result = self.watcher_service.wait_for_stopped(
+            status_loader,
+            run_root,
+            request_id=request_id,
+            timeout_sec=timeout_sec,
+            poll_interval_sec=poll_interval_sec,
+        )
+        self._record_audit(action="wait_stop", result=result)
+        return result
+
+    def wait_for_paused(
+        self,
+        status_loader: StatusLoader,
+        run_root: str,
+        *,
+        request_id: str = "",
+        timeout_sec: float = 15.0,
+        poll_interval_sec: float = 1.0,
+    ) -> WatcherControlResult:
+        result = self.watcher_service.wait_for_paused(
+            status_loader,
+            run_root,
+            request_id=request_id,
+            timeout_sec=timeout_sec,
+            poll_interval_sec=poll_interval_sec,
+        )
+        self._record_audit(action="wait_pause", result=result)
+        return result
+
+    def wait_for_resumed(
+        self,
+        status_loader: StatusLoader,
+        run_root: str,
+        *,
+        request_id: str = "",
+        timeout_sec: float = 15.0,
+        poll_interval_sec: float = 1.0,
+    ) -> WatcherControlResult:
+        result = self.watcher_service.wait_for_resumed(
+            status_loader,
+            run_root,
+            request_id=request_id,
+            timeout_sec=timeout_sec,
+            poll_interval_sec=poll_interval_sec,
+        )
+        self._record_audit(action="wait_resume", result=result)
+        return result
+
     def recover_start_blockers(self, paired_status: dict | None, run_root: str) -> WatcherControlResult:
         result = self.watcher_service.recover_stale_start_blockers(run_root, paired_status)
         self._record_audit(action="recover_start_blockers", result=result)
@@ -484,6 +656,31 @@ class WatcherController:
         request: WatcherStartRequest | None = None,
     ) -> WatcherControlResult:
         effective_request = request or self.default_start_request(config_path=config_path, run_root=run_root)
+        request_review = self.review_start_request(effective_request)
+        if not request_review.allowed:
+            blocked_result = WatcherControlResult(
+                ok=False,
+                action="restart",
+                run_root=run_root,
+                state=self.runtime_status(paired_status, run_root).state,
+                message=request_review.message or "watch 재시작 옵션이 현재 watcher 계약과 충돌합니다.",
+                reason_codes=["watcher_start_option_conflict"],
+            )
+            self._record_audit(
+                action="restart",
+                result=blocked_result,
+                extra={
+                    "ConfigPath": config_path,
+                    "Mode": "restart_request_review_block",
+                    "MaxForwardCount": effective_request.max_forward_count,
+                    "RunDurationSec": effective_request.run_duration_sec,
+                    "PairMaxRoundtripCount": effective_request.pair_max_roundtrip_count,
+                    "PairRoundtripLimitMap": dict(effective_request.pair_roundtrip_limit_map),
+                    "StartMode": effective_request.start_mode,
+                    "UseHeadlessDispatch": effective_request.use_headless_dispatch,
+                },
+            )
+            return blocked_result
         result = self.watcher_service.restart(
             command_service,
             status_loader,
@@ -499,6 +696,8 @@ class WatcherController:
                 "MaxForwardCount": effective_request.max_forward_count,
                 "RunDurationSec": effective_request.run_duration_sec,
                 "PairMaxRoundtripCount": effective_request.pair_max_roundtrip_count,
+                "PairRoundtripLimitMap": dict(effective_request.pair_roundtrip_limit_map),
+                "StartMode": effective_request.start_mode,
                 "UseHeadlessDispatch": effective_request.use_headless_dispatch,
             },
         )

@@ -262,7 +262,7 @@ function Test-VisibleReceiptRoundtripSatisfied {
     return (
         $receiptExists -and
         (Test-SuccessAcceptanceState -AcceptanceState $effectiveAcceptanceState) -and
-        $effectiveStage -eq 'completed' -and
+        $effectiveStage -in @('completed', 'post-cleanup') -and
         $seedOrOutboxEvidence
     )
 }
@@ -330,12 +330,16 @@ $checks += New-CheckResult -Name 'visible-receipt-roundtrip' -Passed $receiptPas
 $failedRequiredChecks = @($checks | Where-Object { $_.Required -and -not $_.Passed })
 $overall = if (@($failedRequiredChecks).Count -eq 0) { 'success' } else { 'failing' }
 $mode = if ($RequireVisibleReceipt) { 'shared-visible-receipt-required' } else { 'passive-runroot-verification' }
+$confirmPassed = ([bool](-not $RequireVisibleReceipt) -and @($failedRequiredChecks).Count -eq 0)
+$receiptConfirmPassed = ([bool]$RequireVisibleReceipt -and @($failedRequiredChecks).Count -eq 0)
 
 $payload = [pscustomobject][ordered]@{
     SchemaVersion = '1.0.0'
     GeneratedAt = (Get-Date).ToString('o')
     Mode = $mode
     Overall = $overall
+    ConfirmPassed = $confirmPassed
+    ReceiptConfirmPassed = $receiptConfirmPassed
     ConfigPath = $resolvedConfigPath
     RunRoot = $resolvedRunRoot
     PairId = $PairId

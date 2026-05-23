@@ -42,6 +42,9 @@ $pair01 = & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'test
     -BaseConfigPath $baseConfigPath `
     -WorkRepoRoot $workRepoRoot `
     -PairId 'pair01' `
+    -ReviewInputPath '' `
+    -ExternalWorkRepoContractRelativeRoot '.relay-contract\pair01-custom-contract' `
+    -DefaultSeedReviewInputRequireSingleCandidate:$true `
     -AsJson | ConvertFrom-Json
 
 $pair02 = & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Write-ExternalizedRelayConfig.ps1') `
@@ -61,6 +64,12 @@ $expectedPair01BookkeepingRoot = Join-Path $workRepoRoot '.relay-bookkeeping\bot
 $expectedPair02BookkeepingRoot = Join-Path $workRepoRoot '.relay-bookkeeping\bottest-live-visible\pairs\pair02'
 $expectedPair01RunRootBase = Join-Path $workRepoRoot '.relay-runs\bottest-live-visible\pairs\pair01'
 $expectedPair02RunRootBase = Join-Path $workRepoRoot '.relay-runs\bottest-live-visible\pairs\pair02'
+$expectedPair01TargetAutoloopRunRootBase = Join-Path $workRepoRoot '.relay-runs\bottest-live-visible\pairs\pair01\target-autoloop'
+$expectedPair02TargetAutoloopRunRootBase = Join-Path $workRepoRoot '.relay-runs\bottest-live-visible\pairs\pair02\target-autoloop'
+$expectedPair01TargetAutoloopStatusRoot = Join-Path $workRepoRoot '.relay-bookkeeping\bottest-live-visible\pairs\pair01\target-autoloop\status'
+$expectedPair02TargetAutoloopStatusRoot = Join-Path $workRepoRoot '.relay-bookkeeping\bottest-live-visible\pairs\pair02\target-autoloop\status'
+$expectedPair01TargetAutoloopQueueRoot = Join-Path $workRepoRoot '.relay-bookkeeping\bottest-live-visible\pairs\pair01\target-autoloop\queue'
+$expectedPair02TargetAutoloopQueueRoot = Join-Path $workRepoRoot '.relay-bookkeeping\bottest-live-visible\pairs\pair02\target-autoloop\queue'
 
 Assert-Equal $expectedPair01BookkeepingRoot ([string]$pair01.BookkeepingRoot) 'pair01 bookkeeping root'
 Assert-Equal $expectedPair02BookkeepingRoot ([string]$pair02.BookkeepingRoot) 'pair02 bookkeeping root'
@@ -74,5 +83,17 @@ Assert-Equal ([string]$pair01.RouterMutexName) ([string]$pair01Config.RouterMute
 Assert-Equal ([string]$pair02.RouterMutexName) ([string]$pair02Config.RouterMutexName) 'pair02 mutex in config'
 Assert-Equal (Join-Path $expectedPair01BookkeepingRoot 'inbox') ([string]$pair01Config.InboxRoot) 'pair01 inbox root'
 Assert-Equal (Join-Path $expectedPair02BookkeepingRoot 'inbox') ([string]$pair02Config.InboxRoot) 'pair02 inbox root'
+Assert-Equal $workRepoRoot ([string]$pair01Config.PairTest.DefaultSeedWorkRepoRoot) 'pair01 pairtest work repo root'
+Assert-Equal $workRepoRoot ([string]$pair01Config.PairTest.PairPolicies.pair01.DefaultSeedWorkRepoRoot) 'pair01 pair policy work repo root'
+Assert-Equal '' ([string]$pair01Config.PairTest.DefaultSeedReviewInputPath) 'pair01 pairtest review input path should clear when explicitly bound empty'
+Assert-Equal '' ([string]$pair01Config.PairTest.PairPolicies.pair01.DefaultSeedReviewInputPath) 'pair01 pair policy review input path should clear when explicitly bound empty'
+Assert-Equal '.relay-contract\pair01-custom-contract' ([string]$pair01Config.PairTest.ExternalWorkRepoContractRelativeRoot) 'pair01 custom contract relative root'
+Assert-True ([bool]$pair01Config.PairTest.DefaultSeedReviewInputRequireSingleCandidate) 'pair01 config should honor explicit single-candidate requirement override.'
+Assert-Equal $expectedPair01TargetAutoloopRunRootBase ([string]$pair01Config.TargetAutoloop.RunRootBase) 'pair01 target-autoloop run root base'
+Assert-Equal $expectedPair02TargetAutoloopRunRootBase ([string]$pair02Config.TargetAutoloop.RunRootBase) 'pair02 target-autoloop run root base'
+Assert-Equal $expectedPair01TargetAutoloopStatusRoot ([string]$pair01Config.TargetAutoloop.StatusRoot) 'pair01 target-autoloop status root'
+Assert-Equal $expectedPair02TargetAutoloopStatusRoot ([string]$pair02Config.TargetAutoloop.StatusRoot) 'pair02 target-autoloop status root'
+Assert-Equal $expectedPair01TargetAutoloopQueueRoot ([string]$pair01Config.TargetAutoloop.QueueRoot) 'pair01 target-autoloop queue root'
+Assert-Equal $expectedPair02TargetAutoloopQueueRoot ([string]$pair02Config.TargetAutoloop.QueueRoot) 'pair02 target-autoloop queue root'
 
 Write-Host 'write-externalized-relay-config pair scoped ok'

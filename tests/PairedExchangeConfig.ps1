@@ -788,7 +788,7 @@ function Test-PairedRoundtripDetected {
         )
     }
 
-    return ($SeedReadyCount -gt $RoundtripBaselineSeedInboxCount)
+    return ($ForwardedCount -ge 2)
 }
 
 function Get-PairedAcceptanceManualAttentionOutcome {
@@ -830,7 +830,7 @@ function Get-PairedAcceptanceSuccessOutcome {
     if ($Roundtrip) {
         return [pscustomobject]@{
             AcceptanceState = 'roundtrip-confirmed'
-            AcceptanceReason = if ($UseVisibleWorker) { 'forwarded-state-roundtrip-detected' } else { 'seed-target-received-followup-ready-file' }
+            AcceptanceReason = 'forwarded-state-roundtrip-detected'
         }
     }
 
@@ -856,7 +856,7 @@ function Get-PairedAcceptanceTimeoutOutcome {
 
     if ($FirstHandoffConfirmed) {
         $state = 'roundtrip-timeout'
-        $reason = if ($UseVisibleWorker) { 'roundtrip-forwarded-state-not-detected' } else { 'seed-target-followup-ready-file-not-detected' }
+        $reason = 'roundtrip-forwarded-state-not-detected'
     }
     else {
         $state = 'first-handoff-timeout'
@@ -1020,27 +1020,76 @@ function Get-BookkeepingResidualRootsEvidence {
         [Parameter(Mandatory)][string]$BasePath
     )
 
-    $rootKeys = @(
-        'InboxRoot',
-        'ProcessedRoot',
-        'RuntimeRoot',
-        'LogsRoot'
-    )
+    $items = New-Object System.Collections.Generic.List[object]
+    $seenKeys = @{}
 
-    $items = @()
-    foreach ($key in $rootKeys) {
-        $rawValue = [string](Get-ConfigValue -Object $Config -Name $key -DefaultValue '')
-        if (-not (Test-NonEmptyString $rawValue)) {
-            continue
+    function Add-BookkeepingResidualRootEvidence {
+        param(
+            [Parameter(Mandatory)][string]$Name,
+            [AllowEmptyString()][string]$PathValue
+        )
+
+        if (-not (Test-NonEmptyString $PathValue)) {
+            return
         }
 
-        $items += [pscustomobject]@{
-            Name = [string]$key
-            Path = (Resolve-FullPathFromBase -PathValue $rawValue -BasePath $BasePath)
+        $resolvedPath = Resolve-FullPathFromBase -PathValue $PathValue -BasePath $BasePath
+        $dedupeKey = ('{0}|{1}' -f $Name, $resolvedPath).ToLowerInvariant()
+        if ($seenKeys.ContainsKey($dedupeKey)) {
+            return
         }
+
+        $seenKeys[$dedupeKey] = $true
+        $items.Add([pscustomobject]@{
+                Name = [string]$Name
+                Path = [string]$resolvedPath
+            }) | Out-Null
     }
 
-    return @($items)
+    foreach ($key in @(
+            'InboxRoot',
+            'ProcessedRoot',
+            'FailedRoot',
+            'IgnoredRoot',
+            'RetryPendingRoot',
+            'RuntimeRoot',
+            'RuntimeMapPath',
+            'LogsRoot',
+            'RouterStatePath',
+            'RouterLogPath',
+            'BindingProfilePath'
+        )) {
+        Add-BookkeepingResidualRootEvidence -Name ([string]$key) -PathValue ([string](Get-ConfigValue -Object $Config -Name $key -DefaultValue ''))
+    }
+
+    $pairActivation = Get-ConfigValue -Object $Config -Name 'PairActivation' -DefaultValue @{}
+    Add-BookkeepingResidualRootEvidence -Name 'PairActivation.StatePath' -PathValue ([string](Get-ConfigValue -Object $pairActivation -Name 'StatePath' -DefaultValue ''))
+
+    $pairTest = Get-ConfigValue -Object $Config -Name 'PairTest' -DefaultValue @{}
+    Add-BookkeepingResidualRootEvidence -Name 'PairTest.RunRootBase' -PathValue ([string](Get-ConfigValue -Object $pairTest -Name 'RunRootBase' -DefaultValue ''))
+
+    $visibleWorker = Get-ConfigValue -Object $pairTest -Name 'VisibleWorker' -DefaultValue @{}
+    Add-BookkeepingResidualRootEvidence -Name 'PairTest.VisibleWorker.QueueRoot' -PathValue ([string](Get-ConfigValue -Object $visibleWorker -Name 'QueueRoot' -DefaultValue ''))
+    Add-BookkeepingResidualRootEvidence -Name 'PairTest.VisibleWorker.StatusRoot' -PathValue ([string](Get-ConfigValue -Object $visibleWorker -Name 'StatusRoot' -DefaultValue ''))
+    Add-BookkeepingResidualRootEvidence -Name 'PairTest.VisibleWorker.LogRoot' -PathValue ([string](Get-ConfigValue -Object $visibleWorker -Name 'LogRoot' -DefaultValue ''))
+
+    $targetAutoloop = Get-ConfigValue -Object $Config -Name 'TargetAutoloop' -DefaultValue @{}
+    Add-BookkeepingResidualRootEvidence -Name 'TargetAutoloop.RunRootBase' -PathValue ([string](Get-ConfigValue -Object $targetAutoloop -Name 'RunRootBase' -DefaultValue ''))
+    Add-BookkeepingResidualRootEvidence -Name 'TargetAutoloop.StatusRoot' -PathValue ([string](Get-ConfigValue -Object $targetAutoloop -Name 'StatusRoot' -DefaultValue ''))
+    Add-BookkeepingResidualRootEvidence -Name 'TargetAutoloop.QueueRoot' -PathValue ([string](Get-ConfigValue -Object $targetAutoloop -Name 'QueueRoot' -DefaultValue ''))
+
+    foreach ($target in @((Get-ConfigValue -Object $Config -Name 'Targets' -DefaultValue @()))) {
+        $targetId = [string](Get-ConfigValue -Object $target -Name 'Id' -DefaultValue '')
+        if (-not (Test-NonEmptyString $targetId)) {
+            $targetId = [string](Get-ConfigValue -Object $target -Name 'TargetId' -DefaultValue '')
+        }
+        if (-not (Test-NonEmptyString $targetId)) {
+            $targetId = 'unknown'
+        }
+        Add-BookkeepingResidualRootEvidence -Name ('Targets.{0}.Folder' -f $targetId) -PathValue ([string](Get-ConfigValue -Object $target -Name 'Folder' -DefaultValue ''))
+    }
+
+    return @($items.ToArray())
 }
 
 function Test-PathInsideAnyAllowedRoot {
@@ -1094,7 +1143,8 @@ function Test-BookkeepingRootsPolicy {
 
     $requiresExternalBookkeeping = (
         [bool](Get-ConfigValue -Object $PairPolicy -Name 'RequireExternalRunRoot' -DefaultValue ([bool](Get-ConfigValue -Object $PairTest -Name 'RequireExternalRunRoot' -DefaultValue $false))) -or
-        [bool](Get-ConfigValue -Object $PairPolicy -Name 'UseExternalWorkRepoRunRoot' -DefaultValue ([bool](Get-ConfigValue -Object $PairTest -Name 'UseExternalWorkRepoRunRoot' -DefaultValue $false)))
+        [bool](Get-ConfigValue -Object $PairPolicy -Name 'UseExternalWorkRepoRunRoot' -DefaultValue ([bool](Get-ConfigValue -Object $PairTest -Name 'UseExternalWorkRepoRunRoot' -DefaultValue $false))) -or
+        [bool](Get-ConfigValue -Object $PairPolicy -Name 'UseExternalWorkRepoContractPaths' -DefaultValue ([bool](Get-ConfigValue -Object $PairTest -Name 'UseExternalWorkRepoContractPaths' -DefaultValue $false)))
     )
 
     if (-not $requiresExternalBookkeeping) {

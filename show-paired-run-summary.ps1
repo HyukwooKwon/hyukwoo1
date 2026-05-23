@@ -9,6 +9,8 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+. (Join-Path $PSScriptRoot 'tests\lib\PairedSourceOutboxPaths.ps1')
+
 function Test-NonEmptyString {
     param([object]$Value)
 
@@ -40,6 +42,16 @@ function Get-ObjectPropertyValue {
     }
 
     return $property.Value
+}
+
+function Get-ConfigValue {
+    param(
+        $Object,
+        [Parameter(Mandatory)][string]$Name,
+        $DefaultValue = ''
+    )
+
+    return (Get-ObjectPropertyValue -Object $Object -Name $Name -DefaultValue $DefaultValue)
 }
 
 function Read-JsonObjectSafe {
@@ -77,6 +89,11 @@ function Get-AcceptanceSummary {
     $rawSeedFinalState = if ($null -ne $acceptanceReceipt) { [string](Get-ObjectPropertyValue -Object $rawSeed -Name 'FinalState' -DefaultValue '') } else { '' }
     $rawSeedSubmitState = if ($null -ne $acceptanceReceipt) { [string](Get-ObjectPropertyValue -Object $rawSeed -Name 'SubmitState' -DefaultValue '') } else { '' }
     $rawSeedOutboxPublished = if ($null -ne $acceptanceReceipt) { [bool](Get-ObjectPropertyValue -Object $rawSeed -Name 'OutboxPublished' -DefaultValue $false) } else { $false }
+    $rawRelayIssues = Get-ObjectPropertyValue -Object $AcceptanceReceipt -Name 'RelayIssues' -DefaultValue $null
+    $rawRelayFolderMismatchCount = if ($null -ne $acceptanceReceipt) { [int](Get-ObjectPropertyValue -Object $rawRelayIssues -Name 'RelayFolderMismatchCount' -DefaultValue 0) } else { [int](Get-ObjectPropertyValue -Object $Status.Counts -Name 'RelayFolderMismatchCount' -DefaultValue 0) }
+    $rawRelayFolderMissingCount = if ($null -ne $acceptanceReceipt) { [int](Get-ObjectPropertyValue -Object $rawRelayIssues -Name 'RelayFolderMissingCount' -DefaultValue 0) } else { [int](Get-ObjectPropertyValue -Object $Status.Counts -Name 'RelayFolderMissingCount' -DefaultValue 0) }
+    $rawRelayFolderConfigMissingCount = if ($null -ne $acceptanceReceipt) { [int](Get-ObjectPropertyValue -Object $rawRelayIssues -Name 'RelayFolderConfigMissingCount' -DefaultValue 0) } else { [int](Get-ObjectPropertyValue -Object $Status.Counts -Name 'RelayFolderConfigMissingCount' -DefaultValue 0) }
+    $rawRelayIssuesSource = if ($null -ne $acceptanceReceipt) { [string](Get-ObjectPropertyValue -Object $rawRelayIssues -Name 'Source' -DefaultValue 'current-receipt') } else { 'paired-status-counts' }
 
     $effectiveEntry = $null
     $phaseHistoryEntries = @((Get-ObjectPropertyValue -Object $AcceptanceReceipt -Name 'PhaseHistory' -DefaultValue @()))
@@ -101,6 +118,10 @@ function Get-AcceptanceSummary {
     $effectiveSeedFinalState = $rawSeedFinalState
     $effectiveSeedSubmitState = $rawSeedSubmitState
     $effectiveSeedOutboxPublished = $rawSeedOutboxPublished
+    $effectiveRelayFolderMismatchCount = $rawRelayFolderMismatchCount
+    $effectiveRelayFolderMissingCount = $rawRelayFolderMissingCount
+    $effectiveRelayFolderConfigMissingCount = $rawRelayFolderConfigMissingCount
+    $effectiveRelayIssuesSource = $rawRelayIssuesSource
     $effectiveRecordedAt = ''
     $effectiveSource = 'current-receipt'
 
@@ -111,6 +132,10 @@ function Get-AcceptanceSummary {
         $effectiveSeedFinalState = [string](Get-ObjectPropertyValue -Object $effectiveEntry -Name 'SeedFinalState' -DefaultValue $effectiveSeedFinalState)
         $effectiveSeedSubmitState = [string](Get-ObjectPropertyValue -Object $effectiveEntry -Name 'SeedSubmitState' -DefaultValue $effectiveSeedSubmitState)
         $effectiveSeedOutboxPublished = [bool](Get-ObjectPropertyValue -Object $effectiveEntry -Name 'SeedOutboxPublished' -DefaultValue $effectiveSeedOutboxPublished)
+        $effectiveRelayFolderMismatchCount = [int](Get-ObjectPropertyValue -Object $effectiveEntry -Name 'RelayFolderMismatchCount' -DefaultValue $effectiveRelayFolderMismatchCount)
+        $effectiveRelayFolderMissingCount = [int](Get-ObjectPropertyValue -Object $effectiveEntry -Name 'RelayFolderMissingCount' -DefaultValue $effectiveRelayFolderMissingCount)
+        $effectiveRelayFolderConfigMissingCount = [int](Get-ObjectPropertyValue -Object $effectiveEntry -Name 'RelayFolderConfigMissingCount' -DefaultValue $effectiveRelayFolderConfigMissingCount)
+        $effectiveRelayIssuesSource = [string](Get-ObjectPropertyValue -Object $effectiveEntry -Name 'RelayIssuesSource' -DefaultValue $effectiveRelayIssuesSource)
         $effectiveRecordedAt = [string](Get-ObjectPropertyValue -Object $effectiveEntry -Name 'RecordedAt' -DefaultValue '')
         $effectiveSource = 'phase-history'
     }
@@ -124,12 +149,20 @@ function Get-AcceptanceSummary {
         SeedFinalState          = $effectiveSeedFinalState
         SeedSubmitState         = $effectiveSeedSubmitState
         SeedOutboxPublished     = $effectiveSeedOutboxPublished
+        RelayFolderMismatchCount = $effectiveRelayFolderMismatchCount
+        RelayFolderMissingCount = $effectiveRelayFolderMissingCount
+        RelayFolderConfigMissingCount = $effectiveRelayFolderConfigMissingCount
+        RelayIssuesSource       = $effectiveRelayIssuesSource
         CurrentStage            = $rawStage
         CurrentAcceptanceState  = $rawAcceptanceState
         CurrentAcceptanceReason = $rawAcceptanceReason
         CurrentSeedFinalState   = $rawSeedFinalState
         CurrentSeedSubmitState  = $rawSeedSubmitState
         CurrentSeedOutboxPublished = $rawSeedOutboxPublished
+        CurrentRelayFolderMismatchCount = $rawRelayFolderMismatchCount
+        CurrentRelayFolderMissingCount = $rawRelayFolderMissingCount
+        CurrentRelayFolderConfigMissingCount = $rawRelayFolderConfigMissingCount
+        CurrentRelayIssuesSource = $rawRelayIssuesSource
         EffectiveRecordedAt     = $effectiveRecordedAt
         EffectiveSource         = $effectiveSource
     }
@@ -148,7 +181,7 @@ function Get-OverallState {
     $submitUnconfirmedCount = [int]$Status.Counts.SubmitUnconfirmedCount
     $targetUnresponsiveCount = [int]$Status.Counts.TargetUnresponsiveCount
 
-    if ($acceptanceStage -eq 'completed' -and (Test-SuccessAcceptanceState -AcceptanceState $acceptanceState)) {
+    if ($acceptanceStage -in @('completed', 'post-cleanup') -and (Test-SuccessAcceptanceState -AcceptanceState $acceptanceState)) {
         return 'success'
     }
 
@@ -178,6 +211,19 @@ function Read-ConfigObjectSafe {
     }
     catch {
         return $null
+    }
+}
+
+function Get-ImportantSummaryPairTestDefaults {
+    param($Config)
+
+    $pairTest = Get-ObjectPropertyValue -Object $Config -Name 'PairTest' -DefaultValue $null
+    return [pscustomobject]@{
+        SourceOutboxFolderName    = [string](Get-ConfigValue -Object $pairTest -Name 'SourceOutboxFolderName' -DefaultValue 'source-outbox')
+        SourceSummaryFileName     = [string](Get-ConfigValue -Object $pairTest -Name 'SourceSummaryFileName' -DefaultValue 'summary.txt')
+        SourceReviewZipFileName   = [string](Get-ConfigValue -Object $pairTest -Name 'SourceReviewZipFileName' -DefaultValue 'review.zip')
+        PublishReadyFileName      = [string](Get-ConfigValue -Object $pairTest -Name 'PublishReadyFileName' -DefaultValue 'publish.ready.json')
+        PublishedArchiveFolderName = [string](Get-ConfigValue -Object $pairTest -Name 'PublishedArchiveFolderName' -DefaultValue '.published')
     }
 }
 
@@ -486,6 +532,115 @@ function Test-DateTimeOnOrAfter {
     }
 
     return ($laterValue.UtcDateTime.Ticks -ge $earlierValue.UtcDateTime.Ticks)
+}
+
+function Test-AnyNonEmptyText {
+    param([object[]]$Values)
+
+    foreach ($value in @($Values)) {
+        if (Test-NonEmptyString ([string]$value)) {
+            return $true
+        }
+    }
+
+    return $false
+}
+
+function Get-TargetExecutionCheckpointSummary {
+    param(
+        $StatusTarget,
+        $Timeline,
+        $ProcessedPayloadSnapshot,
+        $SourceSummary,
+        $SourceReviewZip,
+        $PublishReady,
+        [bool]$ContractArtifactsReady
+    )
+
+    $submitState = [string](Get-ObjectPropertyValue -Object $StatusTarget -Name 'SubmitState' -DefaultValue '')
+    $submitConfirmationSignal = [string](Get-ObjectPropertyValue -Object $StatusTarget -Name 'SubmitConfirmationSignal' -DefaultValue '')
+    $typedWindowExecutionState = [string](Get-ObjectPropertyValue -Object $StatusTarget -Name 'TypedWindowExecutionState' -DefaultValue '')
+
+    $inputDelivered = (
+        [bool](Get-ObjectPropertyValue -Object $ProcessedPayloadSnapshot -Name 'Exists' -DefaultValue $false) -or
+        (Test-AnyNonEmptyText @(
+                [string](Get-ObjectPropertyValue -Object $Timeline -Name 'PayloadEnteredAt' -DefaultValue ''),
+                [string](Get-ObjectPropertyValue -Object $Timeline -Name 'SendCompletedAt' -DefaultValue ''),
+                [string](Get-ObjectPropertyValue -Object $Timeline -Name 'SubmitStartedAt' -DefaultValue '')
+            ))
+    )
+    $submitKeystrokeSent = (Test-AnyNonEmptyText @(
+            [string](Get-ObjectPropertyValue -Object $Timeline -Name 'SubmitStartedAt' -DefaultValue ''),
+            [string](Get-ObjectPropertyValue -Object $Timeline -Name 'SubmitCompletedAt' -DefaultValue '')
+        ))
+    $submitAckObserved = (
+        $submitState -in @('confirmed', 'possible-running', 'unconfirmed') -or
+        (Test-NonEmptyString $submitConfirmationSignal) -or
+        $typedWindowExecutionState -in @(
+            'typed-window-running-confirmed',
+            'typed-window-possible-running',
+            'typed-window-running-no-artifact',
+            'typed-window-stalled-after-submit'
+        )
+    )
+    $cellBusyObserved = (
+        (Test-NonEmptyString $submitConfirmationSignal) -or
+        $submitState -eq 'possible-running' -or
+        $typedWindowExecutionState -in @(
+            'typed-window-running-confirmed',
+            'typed-window-possible-running',
+            'typed-window-running-no-artifact',
+            'typed-window-stalled-after-submit'
+        )
+    )
+    $artifactCreated = (
+        [bool](Get-ObjectPropertyValue -Object $SourceSummary -Name 'Exists' -DefaultValue $false) -or
+        [bool](Get-ObjectPropertyValue -Object $SourceReviewZip -Name 'Exists' -DefaultValue $false)
+    )
+    $publishMarkerCreated = [bool](Get-ObjectPropertyValue -Object $PublishReady -Name 'Exists' -DefaultValue $false)
+
+    $checkpointState = if (-not $inputDelivered) {
+        'input-not-delivered'
+    }
+    elseif (-not $submitKeystrokeSent) {
+        'submit-not-sent'
+    }
+    elseif (-not $submitAckObserved) {
+        'submit-ack-not-observed'
+    }
+    elseif (-not $artifactCreated) {
+        'artifacts-not-created'
+    }
+    elseif (-not $publishMarkerCreated) {
+        'publish-marker-not-created'
+    }
+    elseif ($ContractArtifactsReady) {
+        'contract-artifacts-ready'
+    }
+    else {
+        'artifacts-created-partial-contract'
+    }
+
+    $summary = 'state={0} inputDelivered={1} submitKeystrokeSent={2} submitAckObserved={3} cellBusyObserved={4} artifactCreated={5} publishMarkerCreated={6}' -f `
+        $checkpointState,
+        $inputDelivered,
+        $submitKeystrokeSent,
+        $submitAckObserved,
+        $cellBusyObserved,
+        $artifactCreated,
+        $publishMarkerCreated
+
+    return [pscustomobject]@{
+        CheckpointState        = $checkpointState
+        InputDelivered         = $inputDelivered
+        SubmitKeystrokeSent    = $submitKeystrokeSent
+        SubmitAckObserved      = $submitAckObserved
+        CellBusyObserved       = $cellBusyObserved
+        ArtifactCreated        = $artifactCreated
+        PublishMarkerCreated   = $publishMarkerCreated
+        ContractArtifactsReady = $ContractArtifactsReady
+        Summary                = $summary
+    }
 }
 
 function Get-LatestTimestamp {
@@ -933,6 +1088,7 @@ function Format-InternalResidualRootsDisplay {
 
 function Get-ImportantTargetSummary {
     param(
+        $PairTest,
         $ManifestTarget,
         $StatusTarget,
         $SourceOutboxStatusTarget = $null,
@@ -951,10 +1107,19 @@ function Get-ImportantTargetSummary {
     $reviewInputPath = [string](Get-ObjectPropertyValue -Object $ManifestTarget -Name 'ReviewInputPath' -DefaultValue '')
     $processedPath = [string](Get-ObjectPropertyValue -Object $StatusTarget -Name 'ProcessedPath' -DefaultValue '')
     $targetFolder = [string](Get-ObjectPropertyValue -Object $StatusTarget -Name 'TargetFolder' -DefaultValue '')
-    $sourceSummaryPath = [string](Get-ObjectPropertyValue -Object $ManifestTarget -Name 'SourceSummaryPath' -DefaultValue '')
-    $sourceReviewZipPath = [string](Get-ObjectPropertyValue -Object $ManifestTarget -Name 'SourceReviewZipPath' -DefaultValue '')
-    $publishReadyPath = [string](Get-ObjectPropertyValue -Object $ManifestTarget -Name 'PublishReadyPath' -DefaultValue '')
-    $sourceOutboxPath = [string](Get-ObjectPropertyValue -Object $ManifestTarget -Name 'SourceOutboxPath' -DefaultValue '')
+    $sourceOutboxPaths = Resolve-PairedSourceOutboxPaths -PairTest $PairTest -TargetEntry ([pscustomobject]@{
+            TargetFolder         = $targetFolder
+            Folder               = $targetFolder
+            SourceOutboxPath     = [string](Get-ObjectPropertyValue -Object $ManifestTarget -Name 'SourceOutboxPath' -DefaultValue '')
+            SourceSummaryPath    = [string](Get-ObjectPropertyValue -Object $ManifestTarget -Name 'SourceSummaryPath' -DefaultValue '')
+            SourceReviewZipPath  = [string](Get-ObjectPropertyValue -Object $ManifestTarget -Name 'SourceReviewZipPath' -DefaultValue '')
+            PublishReadyPath     = [string](Get-ObjectPropertyValue -Object $ManifestTarget -Name 'PublishReadyPath' -DefaultValue '')
+            PublishedArchivePath = [string](Get-ObjectPropertyValue -Object $ManifestTarget -Name 'PublishedArchivePath' -DefaultValue '')
+        })
+    $sourceSummaryPath = [string]$sourceOutboxPaths.SourceSummaryPath
+    $sourceReviewZipPath = [string]$sourceOutboxPaths.SourceReviewZipPath
+    $publishReadyPath = [string]$sourceOutboxPaths.PublishReadyPath
+    $sourceOutboxPath = [string]$sourceOutboxPaths.SourceOutboxPath
     if (-not (Test-NonEmptyString $sourceOutboxPath) -and (Test-NonEmptyString $sourceSummaryPath)) {
         try {
             $sourceOutboxPath = Split-Path -LiteralPath $sourceSummaryPath -Parent
@@ -1166,6 +1331,14 @@ function Get-ImportantTargetSummary {
     if (-not [bool]$triggerPublishReady.Exists) {
         $missingContractFiles.Add('publish.ready.json')
     }
+    $executionCheckpoints = Get-TargetExecutionCheckpointSummary `
+        -StatusTarget $StatusTarget `
+        -Timeline $timeline `
+        -ProcessedPayloadSnapshot $processedPayloadSnapshot `
+        -SourceSummary $sourceSummary `
+        -SourceReviewZip $sourceReviewZip `
+        -PublishReady $triggerPublishReady `
+        -ContractArtifactsReady ($missingContractFiles.Count -eq 0)
 
     return [pscustomobject]@{
         PairId             = [string](Get-ObjectPropertyValue -Object $StatusTarget -Name 'PairId' -DefaultValue (Get-ObjectPropertyValue -Object $ManifestTarget -Name 'PairId' -DefaultValue ''))
@@ -1179,6 +1352,19 @@ function Get-ImportantTargetSummary {
         SourceOutboxNextAction = [string](Get-ObjectPropertyValue -Object $StatusTarget -Name 'SourceOutboxNextAction' -DefaultValue '')
         SeedSendState      = [string](Get-ObjectPropertyValue -Object $StatusTarget -Name 'SeedSendState' -DefaultValue '')
         SubmitState        = [string](Get-ObjectPropertyValue -Object $StatusTarget -Name 'SubmitState' -DefaultValue '')
+        SubmitReason       = [string](Get-ObjectPropertyValue -Object $StatusTarget -Name 'SubmitReason' -DefaultValue '')
+        SubmitProbeState   = [string](Get-ObjectPropertyValue -Object $StatusTarget -Name 'SubmitProbeState' -DefaultValue '')
+        SubmitConfirmationSignal = [string](Get-ObjectPropertyValue -Object $StatusTarget -Name 'SubmitConfirmationSignal' -DefaultValue '')
+        TypedWindowExecutionState = [string](Get-ObjectPropertyValue -Object $StatusTarget -Name 'TypedWindowExecutionState' -DefaultValue '')
+        TypedWindowSessionState = [string](Get-ObjectPropertyValue -Object $StatusTarget -Name 'TypedWindowSessionState' -DefaultValue '')
+        AcceptanceProofGrade = [string](Get-ObjectPropertyValue -Object $StatusTarget -Name 'AcceptanceProofGrade' -DefaultValue '')
+        FocusLostObserved = [bool](Get-ObjectPropertyValue -Object $StatusTarget -Name 'FocusLostObserved' -DefaultValue $false)
+        FocusLostCount = [int](Get-ObjectPropertyValue -Object $StatusTarget -Name 'FocusLostCount' -DefaultValue 0)
+        FocusLostPolicy = [string](Get-ObjectPropertyValue -Object $StatusTarget -Name 'FocusLostPolicy' -DefaultValue '')
+        FocusLostRecoveryMode = [string](Get-ObjectPropertyValue -Object $StatusTarget -Name 'FocusLostRecoveryMode' -DefaultValue '')
+        FirstFocusLostAt = [string](Get-ObjectPropertyValue -Object $StatusTarget -Name 'FirstFocusLostAt' -DefaultValue '')
+        LastFocusLostAt = [string](Get-ObjectPropertyValue -Object $StatusTarget -Name 'LastFocusLostAt' -DefaultValue '')
+        FocusLostDebugLogPath = [string](Get-ObjectPropertyValue -Object $StatusTarget -Name 'FocusLostDebugLogPath' -DefaultValue '')
         DispatchState      = [string](Get-ObjectPropertyValue -Object $StatusTarget -Name 'DispatchState' -DefaultValue '')
         ManualAttentionRequired = [bool](Get-ObjectPropertyValue -Object $StatusTarget -Name 'ManualAttentionRequired' -DefaultValue $false)
         FailureCount       = [int](Get-ObjectPropertyValue -Object $StatusTarget -Name 'FailureCount' -DefaultValue 0)
@@ -1241,6 +1427,7 @@ function Get-ImportantTargetSummary {
         PublishReady       = $triggerPublishReady
         Timeline           = $timeline
         TimelineChecks     = $timelineChecks
+        ExecutionCheckpoints = $executionCheckpoints
         FirstOrderingViolation = $firstOrderingViolation
         ContractArtifactsReady = ($missingContractFiles.Count -eq 0)
         MissingContractFiles = @($missingContractFiles)
@@ -1474,6 +1661,107 @@ function Get-ImportantPairSummaries {
     return @($pairSummaries)
 }
 
+function Get-PrimaryAttentionTarget {
+    param(
+        [object[]]$Targets,
+        [string]$FocusPairId = ''
+    )
+
+    $orderedTargets = @($Targets)
+    if (Test-NonEmptyString $FocusPairId) {
+        $preferredTargets = @($orderedTargets | Where-Object { [string](Get-ObjectPropertyValue -Object $_ -Name 'PairId' -DefaultValue '') -eq $FocusPairId })
+        if ($preferredTargets.Count -gt 0) {
+            $orderedTargets = @($preferredTargets) + @($orderedTargets | Where-Object { [string](Get-ObjectPropertyValue -Object $_ -Name 'PairId' -DefaultValue '') -ne $FocusPairId })
+        }
+    }
+
+    foreach ($target in @($orderedTargets)) {
+        if ($null -eq $target) {
+            continue
+        }
+        if (-not [bool](Get-ObjectPropertyValue -Object $target -Name 'ContractArtifactsReady' -DefaultValue $false)) {
+            return $target
+        }
+    }
+
+    foreach ($target in @($orderedTargets)) {
+        if ($null -ne $target) {
+            return $target
+        }
+    }
+
+    return $null
+}
+
+function Get-ExecutionCheckpointGuidance {
+    param($Target)
+
+    if ($null -eq $Target) {
+        return $null
+    }
+
+    $executionCheckpoints = Get-ObjectPropertyValue -Object $Target -Name 'ExecutionCheckpoints' -DefaultValue $null
+    if ($null -eq $executionCheckpoints) {
+        return $null
+    }
+
+    $targetId = [string](Get-ObjectPropertyValue -Object $Target -Name 'TargetId' -DefaultValue '')
+    $checkpointState = [string](Get-ObjectPropertyValue -Object $executionCheckpoints -Name 'CheckpointState' -DefaultValue '')
+    if (-not (Test-NonEmptyString $checkpointState)) {
+        return $null
+    }
+
+    switch ($checkpointState) {
+        'input-not-delivered' {
+            return [pscustomobject]@{
+                FocusTargetId     = $targetId
+                BottleneckCode    = $checkpointState
+                Bottleneck        = ('{0} payload did not reach the visible cell input path' -f $targetId)
+                NextExpectedStep  = 'payload enter must complete before submit can start'
+                RecommendedAction = 'check ProcessedPayloadSnapshotPath, LatestPrepareLogPath, LatestAhkLogPath, and window focus state'
+            }
+        }
+        'submit-not-sent' {
+            return [pscustomobject]@{
+                FocusTargetId     = $targetId
+                BottleneckCode    = $checkpointState
+                Bottleneck        = ('{0} payload entered but submit keystroke was not observed' -f $targetId)
+                NextExpectedStep  = 'submit keystroke must be delivered to the same visible cell after paste'
+                RecommendedAction = 'check submit guard timing, LatestPrepareLogPath, LatestAhkLogPath, and any focus change just before submit'
+            }
+        }
+        'submit-ack-not-observed' {
+            return [pscustomobject]@{
+                FocusTargetId     = $targetId
+                BottleneckCode    = $checkpointState
+                Bottleneck        = ('{0} submit was sent but no cell-busy acknowledgement was observed' -f $targetId)
+                NextExpectedStep  = 'the target cell should show a running/busy signal before artifact generation'
+                RecommendedAction = 'check SubmitConfirmationSignal, TypedWindowExecutionState, visible beacon, and submit key handling in the target cell'
+            }
+        }
+        'artifacts-not-created' {
+            return [pscustomobject]@{
+                FocusTargetId     = $targetId
+                BottleneckCode    = $checkpointState
+                Bottleneck        = ('{0} acknowledged submit but did not create source artifacts' -f $targetId)
+                NextExpectedStep  = 'summary.txt and review.zip must be created before publish.ready.json can appear'
+                RecommendedAction = 'check EffectiveWorkingDirectory, processed payload snapshot, LatestPrepareLogPath, LatestAhkLogPath, and the live cell prompt/session state'
+            }
+        }
+        'publish-marker-not-created' {
+            return [pscustomobject]@{
+                FocusTargetId     = $targetId
+                BottleneckCode    = $checkpointState
+                Bottleneck        = ('{0} created artifacts but did not create publish.ready.json' -f $targetId)
+                NextExpectedStep  = 'publish.ready.json must be written after summary.txt and review.zip'
+                RecommendedAction = 'check target-local publish helper output, marker validation inputs, and source-outbox file ordering'
+            }
+        }
+    }
+
+    return $null
+}
+
 function Get-FocusPairSummary {
     param(
         [object[]]$Pairs,
@@ -1560,6 +1848,9 @@ function Get-OperatorFocusSummary {
     $focusPair = Get-FocusPairSummary -Pairs @($Pairs) -Targets @($Targets)
 
     $focusPairId = if ($null -ne $focusPair) { [string](Get-ObjectPropertyValue -Object $focusPair -Name 'PairId' -DefaultValue '') } else { '' }
+    $focusTarget = Get-PrimaryAttentionTarget -Targets @($Targets) -FocusPairId $focusPairId
+    $focusTargetId = if ($null -ne $focusTarget) { [string](Get-ObjectPropertyValue -Object $focusTarget -Name 'TargetId' -DefaultValue '') } else { '' }
+    $checkpointGuidance = Get-ExecutionCheckpointGuidance -Target $focusTarget
     $pairPhase = if ($null -ne $focusPair) { [string](Get-ObjectPropertyValue -Object $focusPair -Name 'CurrentPhase' -DefaultValue '') } else { '' }
     $pairNextAction = if ($null -ne $focusPair) { [string](Get-ObjectPropertyValue -Object $focusPair -Name 'NextAction' -DefaultValue '') } else { '' }
     $nextExpectedHandoff = if ($null -ne $focusPair) { [string](Get-ObjectPropertyValue -Object $focusPair -Name 'NextExpectedHandoff' -DefaultValue '') } else { '' }
@@ -1604,20 +1895,36 @@ function Get-OperatorFocusSummary {
     }
     elseif ([int]$CountsSummary.TargetUnresponsiveCount -gt 0 -or [string]$AcceptanceSummary.AcceptanceState -eq 'target-unresponsive-after-send') {
         $attentionLevel = 'action-required'
-        $bottleneckCode = 'target-unresponsive-after-send'
-        $bottleneck = 'a target stopped responding after submit'
-        $nextStep = 'recover target responsiveness before sending the next payload'
-        $recommendedAction = 'verify foreground focus policy, target window health, and router/AHK logs'
+        if ($null -ne $checkpointGuidance) {
+            $bottleneckCode = [string]$checkpointGuidance.BottleneckCode
+            $bottleneck = [string]$checkpointGuidance.Bottleneck
+            $nextStep = [string]$checkpointGuidance.NextExpectedStep
+            $recommendedAction = [string]$checkpointGuidance.RecommendedAction
+        }
+        else {
+            $bottleneckCode = 'target-unresponsive-after-send'
+            $bottleneck = 'a target stopped responding after submit'
+            $nextStep = 'recover target responsiveness before sending the next payload'
+            $recommendedAction = 'verify foreground focus policy, target window health, and router/AHK logs'
+        }
     }
     elseif ([string]$AcceptanceSummary.Stage -eq 'seed-publish-missing' -or [string]$AcceptanceSummary.AcceptanceState -eq 'seed-send-timeout') {
         $attentionLevel = 'action-required'
-        $bottleneckCode = 'seed-publish-missing'
-        $bottleneck = 'seed payload was not observed at the source-outbox publish stage'
-        if ([int]$CountsSummary.SubmitUnconfirmedCount -gt 0) {
-            $bottleneck += ' (submit evidence is also unconfirmed)'
+        if ($null -ne $checkpointGuidance) {
+            $bottleneckCode = [string]$checkpointGuidance.BottleneckCode
+            $bottleneck = [string]$checkpointGuidance.Bottleneck
+            $nextStep = [string]$checkpointGuidance.NextExpectedStep
+            $recommendedAction = [string]$checkpointGuidance.RecommendedAction
         }
-        $nextStep = 'typed-window -> router/AHK -> source-outbox publish must complete for the seed target'
-        $recommendedAction = 'check the seed target message preview, request path, router.log, and prepare/AHK logs'
+        else {
+            $bottleneckCode = 'seed-publish-missing'
+            $bottleneck = 'seed payload was not observed at the source-outbox publish stage'
+            if ([int]$CountsSummary.SubmitUnconfirmedCount -gt 0) {
+                $bottleneck += ' (submit evidence is also unconfirmed)'
+            }
+            $nextStep = 'typed-window -> router/AHK -> source-outbox publish must complete for the seed target'
+            $recommendedAction = 'check the seed target message preview, request path, router.log, and prepare/AHK logs'
+        }
     }
     elseif ([int]$CountsSummary.SubmitUnconfirmedCount -gt 0 -or [string]$AcceptanceSummary.AcceptanceState -eq 'submit-unconfirmed') {
         $attentionLevel = 'action-required'
@@ -1673,6 +1980,7 @@ function Get-OperatorFocusSummary {
     return [pscustomobject]@{
         AttentionLevel          = $attentionLevel
         FocusPairId             = $focusPairId
+        FocusTargetId           = $focusTargetId
         PairPhase               = $pairPhase
         PairNextAction          = $pairNextAction
         NextExpectedHandoff     = $nextExpectedHandoff
@@ -1906,8 +2214,11 @@ function New-ImportantSummaryData {
     $contractSummary = Get-ContractSummary -AcceptanceReceipt $AcceptanceReceipt
     $config = Read-ConfigObjectSafe -Path $ConfigPath
     $forbiddenArtifactPolicy = Get-ForbiddenArtifactPolicyFromConfig -Config $config
+    $pairTest = Get-ImportantSummaryPairTestDefaults -Config $config
     $logsRoot = Normalize-DisplayPath -Path ([string](Get-ObjectPropertyValue -Object $config -Name 'LogsRoot' -DefaultValue ''))
     $runtimeRoot = Normalize-DisplayPath -Path ([string](Get-ObjectPropertyValue -Object $config -Name 'RuntimeRoot' -DefaultValue ''))
+    $runtimeMapPath = Normalize-DisplayPath -Path ([string](Get-ObjectPropertyValue -Object $config -Name 'RuntimeMapPath' -DefaultValue ''))
+    $bindingProfilePath = Normalize-DisplayPath -Path ([string](Get-ObjectPropertyValue -Object $config -Name 'BindingProfilePath' -DefaultValue ''))
     $inboxRoot = Normalize-DisplayPath -Path ([string](Get-ObjectPropertyValue -Object $config -Name 'InboxRoot' -DefaultValue ''))
     $processedRoot = Normalize-DisplayPath -Path ([string](Get-ObjectPropertyValue -Object $config -Name 'ProcessedRoot' -DefaultValue ''))
     $statusTargetLookup = Get-StatusTargetLookup -Targets @($Status.Targets)
@@ -1926,7 +2237,7 @@ function New-ImportantSummaryData {
             $sourceOutboxStatusTarget = $sourceOutboxTargetLookup[$targetId]
         }
 
-        $importantTargets += Get-ImportantTargetSummary -ManifestTarget $manifestTarget -StatusTarget $statusTarget -SourceOutboxStatusTarget $sourceOutboxStatusTarget -LogsRoot $logsRoot -ForbiddenArtifactPolicy $forbiddenArtifactPolicy
+        $importantTargets += Get-ImportantTargetSummary -PairTest $pairTest -ManifestTarget $manifestTarget -StatusTarget $statusTarget -SourceOutboxStatusTarget $sourceOutboxStatusTarget -LogsRoot $logsRoot -ForbiddenArtifactPolicy $forbiddenArtifactPolicy
     }
 
     $generatedAt = (Get-Date).ToString('o')
@@ -1973,10 +2284,14 @@ function New-ImportantSummaryData {
             SeedSendStatusPath     = (Join-Path $stateRoot 'seed-send-status.json')
             PairStatePath          = (Join-Path $stateRoot 'pair-state.json')
             WatcherStatusPath      = [string]$WatcherSummary.StatusPath
+            WatcherStdoutLogPath   = [string](Get-ObjectPropertyValue -Object (Get-ObjectPropertyValue -Object $AcceptanceReceipt -Name 'Watcher' -DefaultValue $null) -Name 'StdoutLogPath' -DefaultValue '')
+            WatcherStderrLogPath   = [string](Get-ObjectPropertyValue -Object (Get-ObjectPropertyValue -Object $AcceptanceReceipt -Name 'Watcher' -DefaultValue $null) -Name 'StderrLogPath' -DefaultValue '')
             MessagesRoot           = (Join-Path $RunRoot 'messages')
             LogsRoot               = $logsRoot
             RouterLogPath          = if (Test-NonEmptyString $logsRoot) { Join-Path $logsRoot 'router.log' } else { '' }
             RuntimeRoot            = $runtimeRoot
+            RuntimeMapPath         = $runtimeMapPath
+            BindingProfilePath     = $bindingProfilePath
             InboxRoot              = $inboxRoot
             ProcessedRoot          = $processedRoot
         }
@@ -2011,13 +2326,17 @@ function Format-ImportantSummaryText {
     $lines.Add(('ProgressStaleReason: {0}' -f [string]$ImportantSummary.Freshness.ProgressStaleReason))
     $lines.Add(('Acceptance: stage={0} state={1} reason={2}' -f [string]$ImportantSummary.Acceptance.Stage, [string]$ImportantSummary.Acceptance.AcceptanceState, [string]$ImportantSummary.Acceptance.AcceptanceReason))
     $lines.Add(('Seed: final={0} submit={1} outboxPublished={2}' -f [string]$ImportantSummary.Acceptance.SeedFinalState, [string]$ImportantSummary.Acceptance.SeedSubmitState, [bool]$ImportantSummary.Acceptance.SeedOutboxPublished))
+    $lines.Add(('AcceptanceRelayIssues: relayMismatch={0} relayMissing={1} relayConfigMissing={2} source={3}' -f [int]$ImportantSummary.Acceptance.RelayFolderMismatchCount, [int]$ImportantSummary.Acceptance.RelayFolderMissingCount, [int]$ImportantSummary.Acceptance.RelayFolderConfigMissingCount, [string]$ImportantSummary.Acceptance.RelayIssuesSource))
     $lines.Add(('Watcher: status={0} reason={1} lastHandled={2}' -f [string]$ImportantSummary.Watcher.Status, [string]$ImportantSummary.Watcher.Reason, [string]$ImportantSummary.Watcher.LastHandled))
-    $lines.Add(('Counts: forwarded={0} summaries={1} zips={2} failures={3}' -f [int]$ImportantSummary.Counts.ForwardedCount, [int]$ImportantSummary.Counts.SummaryPresentCount, [int]$ImportantSummary.Counts.ZipPresentCount, [int]$ImportantSummary.Counts.FailureLineCount))
+    $lines.Add(('Counts: forwarded={0} summaries={1} zips={2} failures={3} relayMismatch={4} relayMissing={5} relayConfigMissing={6}' -f [int]$ImportantSummary.Counts.ForwardedCount, [int]$ImportantSummary.Counts.SummaryPresentCount, [int]$ImportantSummary.Counts.ZipPresentCount, [int]$ImportantSummary.Counts.FailureLineCount, [int]$ImportantSummary.Counts.RelayFolderMismatchCount, [int]$ImportantSummary.Counts.RelayFolderMissingCount, [int]$ImportantSummary.Counts.RelayFolderConfigMissingCount))
     $lines.Add('')
     $lines.Add('[operator-focus]')
     $lines.Add(('AttentionLevel: {0}' -f [string]$ImportantSummary.OperatorFocus.AttentionLevel))
     if (Test-NonEmptyString ([string]$ImportantSummary.OperatorFocus.FocusPairId)) {
         $lines.Add(('FocusPair: {0}' -f [string]$ImportantSummary.OperatorFocus.FocusPairId))
+    }
+    if (Test-NonEmptyString ([string]$ImportantSummary.OperatorFocus.FocusTargetId)) {
+        $lines.Add(('FocusTarget: {0}' -f [string]$ImportantSummary.OperatorFocus.FocusTargetId))
     }
     if (Test-NonEmptyString [string]$ImportantSummary.OperatorFocus.PairPhase) {
         $lines.Add(('PairPhase: {0}' -f [string]$ImportantSummary.OperatorFocus.PairPhase))
@@ -2062,10 +2381,14 @@ function Format-ImportantSummaryText {
             @('SeedSendStatusPath', [string]$ImportantSummary.KeyPaths.SeedSendStatusPath),
             @('PairStatePath', [string]$ImportantSummary.KeyPaths.PairStatePath),
             @('WatcherStatusPath', [string]$ImportantSummary.KeyPaths.WatcherStatusPath),
+            @('WatcherStdoutLogPath', [string]$ImportantSummary.KeyPaths.WatcherStdoutLogPath),
+            @('WatcherStderrLogPath', [string]$ImportantSummary.KeyPaths.WatcherStderrLogPath),
             @('MessagesRoot', [string]$ImportantSummary.KeyPaths.MessagesRoot),
             @('LogsRoot', [string]$ImportantSummary.KeyPaths.LogsRoot),
             @('RouterLogPath', [string]$ImportantSummary.KeyPaths.RouterLogPath),
             @('RuntimeRoot', [string]$ImportantSummary.KeyPaths.RuntimeRoot),
+            @('RuntimeMapPath', [string]$ImportantSummary.KeyPaths.RuntimeMapPath),
+            @('BindingProfilePath', [string]$ImportantSummary.KeyPaths.BindingProfilePath),
             @('InboxRoot', [string]$ImportantSummary.KeyPaths.InboxRoot),
             @('ProcessedRoot', [string]$ImportantSummary.KeyPaths.ProcessedRoot)
         )) {
@@ -2131,6 +2454,7 @@ function Format-ImportantSummaryText {
         $lines.Add(('ContractRootPath: {0}' -f [string]$target.ContractRootPath))
         $lines.Add(('ContractReferenceTimeUtc: {0}' -f [string]$target.ContractReferenceTimeUtc))
         $lines.Add(('ContractArtifactsReady: {0}' -f [bool]$target.ContractArtifactsReady))
+        $lines.Add(('ExecutionCheckpoints: {0}' -f [string]$target.ExecutionCheckpoints.Summary))
         if (Test-NonEmptyString ([string]$target.SourceOutboxOriginalReadyReason)) {
             $lines.Add(('SourceOutboxOriginalReadyReason: {0}' -f [string]$target.SourceOutboxOriginalReadyReason))
         }
@@ -2204,6 +2528,10 @@ function Format-ImportantSummaryText {
         $lines.Add(('AttemptStartedAt: {0}' -f [string]$target.AttemptStartedAt))
         $lines.Add(('Timeline: summaryAt={0} reviewZipAt={1} publishReadyAt={2} watcherReadyAt={3} handoffOpenedAt={4}' -f [string]$target.Timeline.SummaryWrittenAt, [string]$target.Timeline.ReviewZipWrittenAt, [string]$target.Timeline.PublishReadyWrittenAt, [string]$target.Timeline.WatcherReadyObservedAt, [string]$target.Timeline.HandoffOpenedAt))
         $lines.Add(('TimelineDispatch: routerProcessedAt={0} sendBeginAt={1} payloadEnteredAt={2} submitStartedAt={3} submitCompletedAt={4}' -f [string]$target.Timeline.RouterProcessedAt, [string]$target.Timeline.SendBeginAt, [string]$target.Timeline.PayloadEnteredAt, [string]$target.Timeline.SubmitStartedAt, [string]$target.Timeline.SubmitCompletedAt))
+        $lines.Add(('SubmitDiagnostics: reason={0} probeState={1} confirmationSignal={2} typedState={3} sessionState={4} proof={5} focusLost={6} recovery={7}' -f [string]$target.SubmitReason, [string]$target.SubmitProbeState, [string]$target.SubmitConfirmationSignal, [string]$target.TypedWindowExecutionState, [string]$target.TypedWindowSessionState, [string]$target.AcceptanceProofGrade, [string]$target.FocusLostCount, [string]$target.FocusLostRecoveryMode))
+        if (Test-NonEmptyString ([string]$target.FocusLostDebugLogPath)) {
+            $lines.Add(('FocusLostDebugLogPath: {0}' -f [string]$target.FocusLostDebugLogPath))
+        }
         $lines.Add(('TimelineImport: importedSummaryAt={0} importedReviewCopyAt={1} doneAt={2} resultAt={3}' -f [string]$target.Timeline.ImportedSummaryCreatedAt, [string]$target.Timeline.ImportedReviewCopyCreatedAt, [string]$target.Timeline.DoneWrittenAt, [string]$target.Timeline.ResultWrittenAt))
         $lines.Add(('TimelineChecks: publishAfterArtifacts={0} currentArtifactsAheadOfObservedPublish={1} watcherObservedAfterPublish={2} handoffOpenedAfterPublish={3} importedCopyAfterTrigger={4}' -f [string]$target.TimelineChecks.PublishAfterArtifacts, [string]$target.TimelineChecks.CurrentArtifactsAheadOfObservedPublish, [string]$target.TimelineChecks.WatcherObservedAfterPublish, [string]$target.TimelineChecks.HandoffOpenedAfterPublish, [string]$target.TimelineChecks.ImportedCopyAfterTrigger))
         $lines.Add(('FirstOrderingViolation: {0}' -f [string]$target.FirstOrderingViolation))
@@ -2288,6 +2616,10 @@ $targets = @(
             SourceOutboxState       = [string]$_.SourceOutboxState
             SeedSendState           = [string]$_.SeedSendState
             SubmitState             = [string]$_.SubmitState
+            AcceptanceProofGrade    = [string](Get-ObjectPropertyValue -Object $_ -Name 'AcceptanceProofGrade' -DefaultValue '')
+            FocusLostObserved       = [bool](Get-ObjectPropertyValue -Object $_ -Name 'FocusLostObserved' -DefaultValue $false)
+            FocusLostCount          = [int](Get-ObjectPropertyValue -Object $_ -Name 'FocusLostCount' -DefaultValue 0)
+            FocusLostRecoveryMode   = [string](Get-ObjectPropertyValue -Object $_ -Name 'FocusLostRecoveryMode' -DefaultValue '')
             ManualAttentionRequired = [bool]$_.ManualAttentionRequired
             SummaryPresent          = [bool]$_.SummaryPresent
             ZipCount                = [int]$_.ZipCount
@@ -2321,16 +2653,21 @@ $countsSummary = [pscustomobject]@{
     ZipPresentCount          = [int]$status.Counts.ZipPresentCount
     DonePresentCount         = [int]$status.Counts.DonePresentCount
     FailureLineCount         = [int]$status.Counts.FailureLineCount
+    RelayFolderMismatchCount = [int](Get-ObjectPropertyValue -Object $status.Counts -Name 'RelayFolderMismatchCount' -DefaultValue 0)
+    RelayFolderMissingCount = [int](Get-ObjectPropertyValue -Object $status.Counts -Name 'RelayFolderMissingCount' -DefaultValue 0)
+    RelayFolderConfigMissingCount = [int](Get-ObjectPropertyValue -Object $status.Counts -Name 'RelayFolderConfigMissingCount' -DefaultValue 0)
     ManualAttentionCount     = [int]$status.Counts.ManualAttentionCount
     SubmitUnconfirmedCount   = [int]$status.Counts.SubmitUnconfirmedCount
     TargetUnresponsiveCount  = [int]$status.Counts.TargetUnresponsiveCount
+    FocusLostObservedCount   = [int](Get-ObjectPropertyValue -Object $status.Counts -Name 'FocusLostObservedCount' -DefaultValue 0)
+    FocusLostRecoveredCount  = [int](Get-ObjectPropertyValue -Object $status.Counts -Name 'FocusLostRecoveredCount' -DefaultValue 0)
     ReadyToForwardCount      = [int]$status.Counts.ReadyToForwardCount
     DispatchRunningCount     = [int](Get-ObjectPropertyValue -Object $status.Counts -Name 'DispatchRunningCount' -DefaultValue 0)
 }
 
 $overallState = Get-OverallState -AcceptanceSummary $acceptanceSummary -Status $status
 $runName = Split-Path -Leaf ([string]$status.RunRoot)
-$summaryLine = '{0} overall={1} acceptance={2} stage={3} watcher={4} forwarded={5} summaries={6} zips={7} failures={8}' -f `
+$summaryLine = '{0} overall={1} acceptance={2} stage={3} watcher={4} forwarded={5} summaries={6} zips={7} failures={8} relayMismatch={9} relayMissing={10} relayConfigMissing={11}' -f `
     $runName,
     $overallState,
     $acceptanceSummary.AcceptanceState,
@@ -2339,7 +2676,10 @@ $summaryLine = '{0} overall={1} acceptance={2} stage={3} watcher={4} forwarded={
     $countsSummary.ForwardedCount,
     $countsSummary.SummaryPresentCount,
     $countsSummary.ZipPresentCount,
-    $countsSummary.FailureLineCount
+    $countsSummary.FailureLineCount,
+    $countsSummary.RelayFolderMismatchCount,
+    $countsSummary.RelayFolderMissingCount,
+    $countsSummary.RelayFolderConfigMissingCount
 
 $importantSummary = New-ImportantSummaryData `
     -RunRoot ([string]$status.RunRoot) `
@@ -2377,8 +2717,10 @@ Write-Output $summaryLine
 Write-Output ('RunRoot: ' + [string]$result.RunRoot)
 Write-Output ('Acceptance: stage={0} state={1} reason={2}' -f $acceptanceSummary.Stage, $acceptanceSummary.AcceptanceState, $acceptanceSummary.AcceptanceReason)
 Write-Output ('Seed: final={0} submit={1} outboxPublished={2}' -f $acceptanceSummary.SeedFinalState, $acceptanceSummary.SeedSubmitState, $acceptanceSummary.SeedOutboxPublished)
+Write-Output ('AcceptanceRelayIssues: relayMismatch={0} relayMissing={1} relayConfigMissing={2} source={3}' -f $acceptanceSummary.RelayFolderMismatchCount, $acceptanceSummary.RelayFolderMissingCount, $acceptanceSummary.RelayFolderConfigMissingCount, $acceptanceSummary.RelayIssuesSource)
 Write-Output ('Watcher: status={0} reason={1} lastHandled={2}' -f $watcherSummary.Status, $watcherSummary.Reason, $watcherSummary.LastHandled)
-Write-Output ('Counts: messages={0} forwarded={1} summaries={2} zips={3} failures={4}' -f $countsSummary.MessageFiles, $countsSummary.ForwardedCount, $countsSummary.SummaryPresentCount, $countsSummary.ZipPresentCount, $countsSummary.FailureLineCount)
+Write-Output ('Counts: messages={0} forwarded={1} summaries={2} zips={3} failures={4} relayMismatch={5} relayMissing={6} relayConfigMissing={7}' -f $countsSummary.MessageFiles, $countsSummary.ForwardedCount, $countsSummary.SummaryPresentCount, $countsSummary.ZipPresentCount, $countsSummary.FailureLineCount, $countsSummary.RelayFolderMismatchCount, $countsSummary.RelayFolderMissingCount, $countsSummary.RelayFolderConfigMissingCount)
+Write-Output ('FocusLost: observedTargets={0} recoveredTargets={1}' -f $countsSummary.FocusLostObservedCount, $countsSummary.FocusLostRecoveredCount)
 Write-Output ('Freshness: stale={0} reason={1} newestSignalAt={2} signalAgeSec={3}' -f [bool]$importantSummary.Freshness.StaleSummary, [string]$importantSummary.Freshness.StaleReason, [string]$importantSummary.Freshness.NewestObservedSignalAt, [string]$importantSummary.Freshness.SignalAgeSeconds)
 Write-Output ('ProgressFreshness: stale={0} reason={1} newestProgressSignalAt={2} progressSignalAgeSec={3}' -f [bool]$importantSummary.Freshness.ProgressStale, [string]$importantSummary.Freshness.ProgressStaleReason, [string]$importantSummary.Freshness.NewestProgressSignalAt, [string]$importantSummary.Freshness.ProgressSignalAgeSeconds)
 Write-Output ('Bottleneck: ' + [string]$importantSummary.OperatorFocus.CurrentBottleneck)
@@ -2392,13 +2734,15 @@ foreach ($event in @($importantSummary.RecentEvents)) {
 }
 Write-Output 'Targets:'
 foreach ($target in $targets) {
-    Write-Output ('- {0}({1}): latest={2} outbox={3} seed={4} submit={5} summary={6} zip={7} failures={8}' -f `
+    Write-Output ('- {0}({1}): latest={2} outbox={3} seed={4} submit={5} proof={6} focusLost={7} summary={8} zip={9} failures={10}' -f `
         $target.TargetId,
         $target.RoleName,
         $target.LatestState,
         $target.SourceOutboxState,
         $target.SeedSendState,
         $target.SubmitState,
+        $target.AcceptanceProofGrade,
+        $target.FocusLostCount,
         $target.SummaryPresent,
         $target.ZipCount,
         $target.FailureCount)

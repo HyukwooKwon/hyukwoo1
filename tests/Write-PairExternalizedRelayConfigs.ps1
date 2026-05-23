@@ -46,12 +46,18 @@ foreach ($pair in @($selectedPairs)) {
     }
 
     $invokeParams = @{
-        BaseConfigPath          = $resolvedBaseConfigPath
-        WorkRepoRoot            = $pairWorkRepoRoot
-        PairId                  = $pairIdValue
-        BootstrapBindingProfile = [bool]$BootstrapBindingProfile
-        BootstrapRuntimeMap     = [bool]$BootstrapRuntimeMap
-        AsJson                  = $true
+        BaseConfigPath = $resolvedBaseConfigPath
+        WorkRepoRoot   = $pairWorkRepoRoot
+        PairId         = $pairIdValue
+        AsJson         = $true
+    }
+
+    if ($BootstrapBindingProfile) {
+        $invokeParams.BootstrapBindingProfile = $true
+    }
+
+    if ($BootstrapRuntimeMap) {
+        $invokeParams.BootstrapRuntimeMap = $true
     }
 
     $pairReviewInputPath = [string](Get-ConfigValue -Object $pairPolicy -Name 'DefaultSeedReviewInputPath' -DefaultValue '')
@@ -59,18 +65,22 @@ foreach ($pair in @($selectedPairs)) {
         $invokeParams.ReviewInputPath = $pairReviewInputPath
     }
 
-    $result = & pwsh -NoProfile -ExecutionPolicy Bypass -File $writerScriptPath @invokeParams | ConvertFrom-Json
+    $result = & $writerScriptPath @invokeParams | ConvertFrom-Json
     $generated += [pscustomobject]@{
-        PairId           = $pairIdValue
-        WorkRepoRoot     = [string]$result.WorkRepoRoot
-        OutputConfigPath = [string]$result.OutputConfigPath
-        BookkeepingRoot  = [string]$result.BookkeepingRoot
-        PairRunRootBase  = [string]$result.PairRunRootBase
-        InboxRoot        = [string]$result.InboxRoot
-        ProcessedRoot    = [string]$result.ProcessedRoot
-        RuntimeRoot      = [string]$result.RuntimeRoot
-        LogsRoot         = [string]$result.LogsRoot
-        RouterMutexName  = [string]$result.RouterMutexName
+        PairId                  = $pairIdValue
+        WorkRepoRoot            = [string]$result.WorkRepoRoot
+        OutputConfigPath        = [string]$result.OutputConfigPath
+        BookkeepingRoot         = [string]$result.BookkeepingRoot
+        PairRunRootBase         = [string]$result.PairRunRootBase
+        InboxRoot               = [string]$result.InboxRoot
+        ProcessedRoot           = [string]$result.ProcessedRoot
+        RuntimeRoot             = [string]$result.RuntimeRoot
+        RuntimeMapPath          = [string]$result.RuntimeMapPath
+        LogsRoot                = [string]$result.LogsRoot
+        BindingProfilePath      = [string]$result.BindingProfilePath
+        RouterMutexName         = [string]$result.RouterMutexName
+        BootstrapBindingProfile = [bool]$result.BootstrapBindingProfile
+        BootstrapRuntimeMap     = [bool]$result.BootstrapRuntimeMap
     }
 }
 

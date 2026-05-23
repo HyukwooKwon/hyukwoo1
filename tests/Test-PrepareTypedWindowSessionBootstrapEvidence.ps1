@@ -71,6 +71,9 @@ $resultRaw = & (Join-Path $root 'tests\Prepare-TypedWindowSession.ps1') `
 $result = $resultRaw | ConvertFrom-Json
 
 Assert-True ([string]$result.FinalState -eq 'reused') 'prepare script should reuse an active matching session.'
+Assert-True ([string]$result.TypedWindowSessionScopeKind -eq 'pair') 'prepare result should infer pair scope kind from the legacy session payload.'
+Assert-True ([string]$result.TypedWindowSessionScopeId -eq 'pair01') 'prepare result should infer pair scope id from the legacy session payload.'
+Assert-True ([string]$result.TypedWindowSessionRouteKey -eq 'pair:pair01:target01') 'prepare result should infer the canonical pair route key from the legacy session payload.'
 Assert-True ($result.PSObject.Properties.Name -contains 'VisibleBeaconObserved') 'prepare result should expose VisibleBeaconObserved.'
 Assert-True ($result.PSObject.Properties.Name -contains 'FocusStealDetected') 'prepare result should expose FocusStealDetected.'
 Assert-True ($result.PSObject.Properties.Name -contains 'VisibleFailureReason') 'prepare result should expose VisibleFailureReason.'

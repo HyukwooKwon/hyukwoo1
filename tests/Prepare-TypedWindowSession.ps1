@@ -2,8 +2,11 @@
 param(
     [string]$ConfigPath,
     [Parameter(Mandatory)][string]$RunRoot,
-    [Parameter(Mandatory)][string]$PairId,
+    [string]$PairId = '',
     [Parameter(Mandatory)][string]$TargetId,
+    [string]$SessionScopeKind = '',
+    [string]$SessionScopeId = '',
+    [string]$SessionRouteKey = '',
     [switch]$AsJson
 )
 
@@ -69,115 +72,7 @@ function New-Utf8NoBomEncoding {
     return [System.Text.UTF8Encoding]::new($false)
 }
 
-function Get-TypedWindowSessionRoot {
-    param([Parameter(Mandatory)]$Config)
-    $runtimeRoot = [string](Get-ConfigValue -Object $Config -Name 'RuntimeRoot' -DefaultValue '')
-    if (-not (Test-NonEmptyString $runtimeRoot)) {
-        $runtimeRoot = Join-Path $script:root 'runtime\bottest-live-visible'
-    }
-
-    $sessionRoot = Join-Path $runtimeRoot 'typed-window-session'
-    Ensure-Directory -Path $sessionRoot
-    return $sessionRoot
-}
-
-function Get-TypedWindowSessionStatePath {
-    param(
-        [Parameter(Mandatory)]$Config,
-        [Parameter(Mandatory)][string]$TargetKey
-    )
-    return (Join-Path (Get-TypedWindowSessionRoot -Config $Config) ($TargetKey + '.json'))
-}
-
-function New-TypedWindowSessionState {
-    param(
-        [Parameter(Mandatory)][string]$TargetKey,
-        [string]$State = 'bootstrap-needed',
-        [string]$RunRootValue = '',
-        [string]$PairIdValue = '',
-        [string]$ResetReason = ''
-    )
-
-    return [ordered]@{
-        SchemaVersion                     = '1.0.0'
-        TargetId                          = $TargetKey
-        State                             = $State
-        SessionRunRoot                    = $RunRootValue
-        SessionPairId                     = $PairIdValue
-        SessionTargetId                   = $TargetKey
-        SessionEpoch                      = 0
-        LastPrepareAt                     = ''
-        LastSubmitAt                      = ''
-        LastProgressAt                    = ''
-        LastConfirmedArtifactAt           = ''
-        LastResetReason                   = $ResetReason
-        ConsecutiveSubmitUnconfirmedCount = 0
-        UpdatedAt                         = (Get-Date).ToString('o')
-    }
-}
-
-function Read-TypedWindowSessionState {
-    param(
-        [Parameter(Mandatory)]$Config,
-        [Parameter(Mandatory)][string]$TargetKey
-    )
-
-    $path = Get-TypedWindowSessionStatePath -Config $Config -TargetKey $TargetKey
-    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
-        return [pscustomobject](New-TypedWindowSessionState -TargetKey $TargetKey)
-    }
-
-    try {
-        $session = Read-JsonObject -Path $path
-        return [pscustomobject]@{
-            SchemaVersion                     = [string](Get-ConfigValue -Object $session -Name 'SchemaVersion' -DefaultValue '1.0.0')
-            TargetId                          = [string](Get-ConfigValue -Object $session -Name 'TargetId' -DefaultValue $TargetKey)
-            State                             = [string](Get-ConfigValue -Object $session -Name 'State' -DefaultValue 'bootstrap-needed')
-            SessionRunRoot                    = [string](Get-ConfigValue -Object $session -Name 'SessionRunRoot' -DefaultValue '')
-            SessionPairId                     = [string](Get-ConfigValue -Object $session -Name 'SessionPairId' -DefaultValue '')
-            SessionTargetId                   = [string](Get-ConfigValue -Object $session -Name 'SessionTargetId' -DefaultValue $TargetKey)
-            SessionEpoch                      = [int](Get-ConfigValue -Object $session -Name 'SessionEpoch' -DefaultValue 0)
-            LastPrepareAt                     = [string](Get-ConfigValue -Object $session -Name 'LastPrepareAt' -DefaultValue '')
-            LastSubmitAt                      = [string](Get-ConfigValue -Object $session -Name 'LastSubmitAt' -DefaultValue '')
-            LastProgressAt                    = [string](Get-ConfigValue -Object $session -Name 'LastProgressAt' -DefaultValue '')
-            LastConfirmedArtifactAt           = [string](Get-ConfigValue -Object $session -Name 'LastConfirmedArtifactAt' -DefaultValue '')
-            LastResetReason                   = [string](Get-ConfigValue -Object $session -Name 'LastResetReason' -DefaultValue '')
-            ConsecutiveSubmitUnconfirmedCount = [int](Get-ConfigValue -Object $session -Name 'ConsecutiveSubmitUnconfirmedCount' -DefaultValue 0)
-            UpdatedAt                         = [string](Get-ConfigValue -Object $session -Name 'UpdatedAt' -DefaultValue '')
-        }
-    }
-    catch {
-        return [pscustomobject](New-TypedWindowSessionState -TargetKey $TargetKey -State 'dirty-session' -ResetReason 'session-parse-failed')
-    }
-}
-
-function Save-TypedWindowSessionState {
-    param(
-        [Parameter(Mandatory)]$Config,
-        [Parameter(Mandatory)][string]$TargetKey,
-        [Parameter(Mandatory)]$Session
-    )
-
-    $path = Get-TypedWindowSessionStatePath -Config $Config -TargetKey $TargetKey
-    $payload = [ordered]@{
-        SchemaVersion                     = '1.0.0'
-        TargetId                          = $TargetKey
-        State                             = [string](Get-ConfigValue -Object $Session -Name 'State' -DefaultValue 'bootstrap-needed')
-        SessionRunRoot                    = [string](Get-ConfigValue -Object $Session -Name 'SessionRunRoot' -DefaultValue '')
-        SessionPairId                     = [string](Get-ConfigValue -Object $Session -Name 'SessionPairId' -DefaultValue '')
-        SessionTargetId                   = [string](Get-ConfigValue -Object $Session -Name 'SessionTargetId' -DefaultValue $TargetKey)
-        SessionEpoch                      = [int](Get-ConfigValue -Object $Session -Name 'SessionEpoch' -DefaultValue 0)
-        LastPrepareAt                     = [string](Get-ConfigValue -Object $Session -Name 'LastPrepareAt' -DefaultValue '')
-        LastSubmitAt                      = [string](Get-ConfigValue -Object $Session -Name 'LastSubmitAt' -DefaultValue '')
-        LastProgressAt                    = [string](Get-ConfigValue -Object $Session -Name 'LastProgressAt' -DefaultValue '')
-        LastConfirmedArtifactAt           = [string](Get-ConfigValue -Object $Session -Name 'LastConfirmedArtifactAt' -DefaultValue '')
-        LastResetReason                   = [string](Get-ConfigValue -Object $Session -Name 'LastResetReason' -DefaultValue '')
-        ConsecutiveSubmitUnconfirmedCount = [int](Get-ConfigValue -Object $Session -Name 'ConsecutiveSubmitUnconfirmedCount' -DefaultValue 0)
-        UpdatedAt                         = (Get-Date).ToString('o')
-    }
-
-    $payload | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $path -Encoding UTF8
-}
+. (Join-Path $PSScriptRoot 'lib\TypedWindowSessionState.ps1')
 
 function New-TypedWindowDebugLogPath {
     param(
@@ -337,7 +232,9 @@ function Resolve-TypedWindowPrepareRequirement {
     param(
         [Parameter(Mandatory)]$Session,
         [Parameter(Mandatory)][string]$RunRootValue,
-        [Parameter(Mandatory)][string]$PairIdValue,
+        [Parameter(Mandatory)][string]$ExpectedScopeKind,
+        [Parameter(Mandatory)][string]$ExpectedScopeId,
+        [Parameter(Mandatory)][string]$ExpectedRouteKey,
         [Parameter(Mandatory)][string]$TargetKey
     )
 
@@ -353,11 +250,22 @@ function Resolve-TypedWindowPrepareRequirement {
     if ([string](Get-ConfigValue -Object $Session -Name 'SessionRunRoot' -DefaultValue '') -ne $RunRootValue) {
         return [pscustomobject]@{ Required = $true; Reason = 'runroot-changed' }
     }
-    if ([string](Get-ConfigValue -Object $Session -Name 'SessionPairId' -DefaultValue '') -ne $PairIdValue) {
-        return [pscustomobject]@{ Required = $true; Reason = 'pair-changed' }
+    if ([string](Get-ConfigValue -Object $Session -Name 'SessionScopeKind' -DefaultValue '') -ne $ExpectedScopeKind) {
+        return [pscustomobject]@{ Required = $true; Reason = if ($ExpectedScopeKind -eq 'pair') { 'pair-changed' } else { 'scope-kind-changed' } }
     }
     if ([string](Get-ConfigValue -Object $Session -Name 'SessionTargetId' -DefaultValue '') -ne $TargetKey) {
         return [pscustomobject]@{ Required = $true; Reason = 'target-changed' }
+    }
+    if ($ExpectedScopeKind -eq 'pair') {
+        if ([string](Get-ConfigValue -Object $Session -Name 'SessionPairId' -DefaultValue '') -ne $ExpectedScopeId) {
+            return [pscustomobject]@{ Required = $true; Reason = 'pair-changed' }
+        }
+    }
+    elseif ([string](Get-ConfigValue -Object $Session -Name 'SessionScopeId' -DefaultValue '') -ne $ExpectedScopeId) {
+        return [pscustomobject]@{ Required = $true; Reason = 'scope-id-changed' }
+    }
+    if ([string](Get-ConfigValue -Object $Session -Name 'SessionRouteKey' -DefaultValue '') -ne $ExpectedRouteKey) {
+        return [pscustomobject]@{ Required = $true; Reason = 'route-changed' }
     }
 
     return [pscustomobject]@{ Required = $false; Reason = 'reuse-session' }
@@ -374,14 +282,35 @@ $script:stateRoot = Join-Path $resolvedRunRoot '.state'
 Ensure-Directory -Path $script:stateRoot
 $config = Import-ConfigDataFile -Path $resolvedConfigPath
 
-$session = Read-TypedWindowSessionState -Config $config -TargetKey $TargetId
-$requirement = Resolve-TypedWindowPrepareRequirement -Session $session -RunRootValue $resolvedRunRoot -PairIdValue $PairId -TargetKey $TargetId
+$requestedScope = Resolve-TypedWindowSessionScope `
+    -TargetKey $TargetId `
+    -PairIdValue $PairId `
+    -ScopeKindValue $SessionScopeKind `
+    -ScopeIdValue $SessionScopeId `
+    -RouteKeyValue $SessionRouteKey
+$session = Read-TypedWindowSessionState `
+    -Config $config `
+    -TargetKey $TargetId `
+    -DefaultPairIdValue ([string]$requestedScope.PairId) `
+    -DefaultScopeKindValue ([string]$requestedScope.ScopeKind) `
+    -DefaultScopeIdValue ([string]$requestedScope.ScopeId) `
+    -DefaultRouteKeyValue ([string]$requestedScope.RouteKey)
+$requirement = Resolve-TypedWindowPrepareRequirement `
+    -Session $session `
+    -RunRootValue $resolvedRunRoot `
+    -ExpectedScopeKind ([string]$requestedScope.ScopeKind) `
+    -ExpectedScopeId ([string]$requestedScope.ScopeId) `
+    -ExpectedRouteKey ([string]$requestedScope.RouteKey) `
+    -TargetKey $TargetId
 
 $result = [ordered]@{
     RunRoot = $resolvedRunRoot
     ConfigPath = $resolvedConfigPath
     PairId = $PairId
     TargetId = $TargetId
+    TypedWindowSessionScopeKind = [string](Get-ConfigValue -Object $session -Name 'SessionScopeKind' -DefaultValue '')
+    TypedWindowSessionScopeId = [string](Get-ConfigValue -Object $session -Name 'SessionScopeId' -DefaultValue '')
+    TypedWindowSessionRouteKey = [string](Get-ConfigValue -Object $session -Name 'SessionRouteKey' -DefaultValue '')
     PrepareRequired = [bool]$requirement.Required
     PrepareReason = [string]$requirement.Reason
     FinalState = ''
@@ -457,7 +386,10 @@ if ([bool]$prepareResult.Executed -and [int]$prepareResult.ExitCode -ne 0) {
 else {
     $session.State = 'active-run'
     $session.SessionRunRoot = $resolvedRunRoot
-    $session.SessionPairId = $PairId
+    $session.SessionPairId = [string]$requestedScope.PairId
+    $session.SessionScopeKind = [string]$requestedScope.ScopeKind
+    $session.SessionScopeId = [string]$requestedScope.ScopeId
+    $session.SessionRouteKey = [string]$requestedScope.RouteKey
     $session.SessionTargetId = $TargetId
     $session.SessionEpoch = [int](Get-ConfigValue -Object $session -Name 'SessionEpoch' -DefaultValue 0) + 1
     $session.LastPrepareAt = (Get-Date).ToString('o')
@@ -469,6 +401,9 @@ else {
     $result.TypedWindowLastResetReason = [string](Get-ConfigValue -Object $session -Name 'LastResetReason' -DefaultValue '')
 }
 
+$result.TypedWindowSessionScopeKind = [string](Get-ConfigValue -Object $session -Name 'SessionScopeKind' -DefaultValue '')
+$result.TypedWindowSessionScopeId = [string](Get-ConfigValue -Object $session -Name 'SessionScopeId' -DefaultValue '')
+$result.TypedWindowSessionRouteKey = [string](Get-ConfigValue -Object $session -Name 'SessionRouteKey' -DefaultValue '')
 $result.CompletedAt = (Get-Date).ToString('o')
 
 if ($AsJson) {

@@ -4,6 +4,8 @@ param(
     [Parameter(Mandatory)][string]$WorkRepoRoot,
     [string]$OutputConfigPath,
     [string]$ReviewInputPath,
+    [string]$ExternalWorkRepoContractRelativeRoot,
+    [bool]$DefaultSeedReviewInputRequireSingleCandidate,
     [string]$PairId,
     [string]$BookkeepingRoot,
     [string]$PairRunRootBase,
@@ -132,7 +134,7 @@ function Replace-QuotedAssignment {
     param(
         [Parameter(Mandatory)][string]$Text,
         [Parameter(Mandatory)][string]$Name,
-        [Parameter(Mandatory)][string]$Value
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Value
     )
 
     $escapedValue = $Value.Replace("'", "''")
@@ -142,6 +144,84 @@ function Replace-QuotedAssignment {
         return ($match.Groups[1].Value + "'" + $escapedValue + "'")
     }
     return [regex]::Replace($Text, $pattern, $evaluator)
+}
+
+function Replace-QuotedAssignmentAfterAnchor {
+    param(
+        [Parameter(Mandatory)][string]$Text,
+        [Parameter(Mandatory)][string]$AnchorPattern,
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Value
+    )
+
+    $escapedValue = $Value.Replace("'", "''")
+    $pattern = ("(?s)({0}.*?\b{1}\s*=\s*)'.*?'" -f $AnchorPattern, [regex]::Escape($Name))
+    $evaluator = {
+        param($match)
+        return ($match.Groups[1].Value + "'" + $escapedValue + "'")
+    }
+    return [regex]::Replace($Text, $pattern, $evaluator, 1)
+}
+
+function Replace-QuotedAssignmentAfterAnchorIfPresent {
+    param(
+        [Parameter(Mandatory)][string]$Text,
+        [Parameter(Mandatory)][string]$AnchorPattern,
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Value
+    )
+
+    $escapedValue = $Value.Replace("'", "''")
+    $pattern = ("(?s)({0}.*?\b{1}\s*=\s*)'.*?'" -f $AnchorPattern, [regex]::Escape($Name))
+    $match = [regex]::Match($Text, $pattern)
+    if (-not $match.Success) {
+        return $Text
+    }
+
+    $evaluator = {
+        param($capture)
+        return ($capture.Groups[1].Value + "'" + $escapedValue + "'")
+    }
+    return [regex]::Replace($Text, $pattern, $evaluator, 1)
+}
+
+function Replace-BooleanAssignmentAfterAnchor {
+    param(
+        [Parameter(Mandatory)][string]$Text,
+        [Parameter(Mandatory)][string]$AnchorPattern,
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)][bool]$Value
+    )
+
+    $boolLiteral = if ($Value) { '$true' } else { '$false' }
+    $pattern = ('(?s)({0}.*?\b{1}\s*=\s*)\$(?:true|false)' -f $AnchorPattern, [regex]::Escape($Name))
+    $evaluator = {
+        param($match)
+        return ($match.Groups[1].Value + $boolLiteral)
+    }
+    return [regex]::Replace($Text, $pattern, $evaluator, 1)
+}
+
+function Replace-BooleanAssignmentAfterAnchorIfPresent {
+    param(
+        [Parameter(Mandatory)][string]$Text,
+        [Parameter(Mandatory)][string]$AnchorPattern,
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)][bool]$Value
+    )
+
+    $boolLiteral = if ($Value) { '$true' } else { '$false' }
+    $pattern = ('(?s)({0}.*?\b{1}\s*=\s*)\$(?:true|false)' -f $AnchorPattern, [regex]::Escape($Name))
+    $match = [regex]::Match($Text, $pattern)
+    if (-not $match.Success) {
+        return $Text
+    }
+
+    $evaluator = {
+        param($capture)
+        return ($capture.Groups[1].Value + $boolLiteral)
+    }
+    return [regex]::Replace($Text, $pattern, $evaluator, 1)
 }
 
 $root = Split-Path -Parent $PSScriptRoot
@@ -155,11 +235,24 @@ if (-not (Test-Path -LiteralPath $resolvedWorkRepoRoot -PathType Container)) {
     throw "WorkRepoRoot not found: $resolvedWorkRepoRoot"
 }
 $pairScopeSegment = if ([string]::IsNullOrWhiteSpace($PairId)) { '' } else { ConvertTo-SafePathSegment -Value $PairId -Fallback 'pair' }
+$pairTestAnchorPattern = 'PairTest\s*=\s*@\{'
+$pairPolicyAnchorPattern = if ([string]::IsNullOrWhiteSpace($PairId)) {
+    ''
+}
+else {
+    ('\b{0}\s*=\s*@\{{' -f [regex]::Escape([string]$PairId))
+}
 
 $config = Import-PowerShellDataFile -Path $resolvedBaseConfigPath
 $externalizedRouterMutexName = Get-ExternalizedRouterMutexName -BaseMutexName ([string]$config.RouterMutexName) -WorkRepoRoot $resolvedWorkRepoRoot -ScopeKey $pairScopeSegment
 $pairTestConfig = Get-ConfigValue -Object $config -Name 'PairTest' -DefaultValue @{}
-$defaultReviewInputPath = if ([string]::IsNullOrWhiteSpace($ReviewInputPath)) {
+$reviewInputPathSpecified = $PSBoundParameters.ContainsKey('ReviewInputPath')
+$externalContractRelativeRootSpecified = $PSBoundParameters.ContainsKey('ExternalWorkRepoContractRelativeRoot')
+$requireSingleReviewCandidateSpecified = $PSBoundParameters.ContainsKey('DefaultSeedReviewInputRequireSingleCandidate')
+$defaultReviewInputPath = if ($reviewInputPathSpecified) {
+    [string]$ReviewInputPath
+}
+elseif ([string]::IsNullOrWhiteSpace($ReviewInputPath)) {
     [string](Get-ConfigValue -Object $pairTestConfig -Name 'DefaultSeedReviewInputPath' -DefaultValue '')
 }
 else {
@@ -207,6 +300,14 @@ $routerLogPath = Join-Path $logsRoot 'router.log'
 $visibleWorkerQueueRoot = Join-Path $runtimeRoot 'visible-worker\queue'
 $visibleWorkerStatusRoot = Join-Path $runtimeRoot 'visible-worker\status'
 $visibleWorkerLogRoot = Join-Path $runtimeRoot 'visible-worker\logs'
+$targetAutoloopBookkeepingRoot = if ([string]::IsNullOrWhiteSpace($pairScopeSegment)) {
+    Join-Path $bookkeepingRoot 'target-autoloop'
+}
+else {
+    Join-Path $bookkeepingRoot 'target-autoloop'
+}
+$targetAutoloopStatusRoot = Join-Path $targetAutoloopBookkeepingRoot 'status'
+$targetAutoloopQueueRoot = Join-Path $targetAutoloopBookkeepingRoot 'queue'
 if (-not [string]::IsNullOrWhiteSpace($PairRunRootBase)) {
     $pairRunRootBase = [System.IO.Path]::GetFullPath($PairRunRootBase)
 }
@@ -215,6 +316,12 @@ elseif ([string]::IsNullOrWhiteSpace($pairScopeSegment)) {
 }
 else {
     $pairRunRootBase = Join-Path $resolvedWorkRepoRoot ('.relay-runs\bottest-live-visible\pairs\{0}' -f $pairScopeSegment)
+}
+$targetAutoloopRunRootBase = if ([string]::IsNullOrWhiteSpace($pairScopeSegment)) {
+    Join-Path $resolvedWorkRepoRoot '.relay-runs\bottest-live-visible\target-autoloop'
+}
+else {
+    Join-Path $resolvedWorkRepoRoot ('.relay-runs\bottest-live-visible\pairs\{0}\target-autoloop' -f $pairScopeSegment)
 }
 
 foreach ($path in @(
@@ -230,15 +337,36 @@ foreach ($path in @(
     $visibleWorkerQueueRoot,
     $visibleWorkerStatusRoot,
     $visibleWorkerLogRoot,
-    $pairRunRootBase
+    $pairRunRootBase,
+    $targetAutoloopStatusRoot,
+    $targetAutoloopQueueRoot,
+    $targetAutoloopRunRootBase
 )) {
     Ensure-Directory -Path $path
 }
 
 $configText = Get-Content -LiteralPath $resolvedBaseConfigPath -Raw -Encoding UTF8
-$configText = Replace-QuotedAssignment -Text $configText -Name 'DefaultSeedWorkRepoRoot' -Value $resolvedWorkRepoRoot
-if (-not [string]::IsNullOrWhiteSpace($resolvedReviewInputPath)) {
-    $configText = Replace-QuotedAssignment -Text $configText -Name 'DefaultSeedReviewInputPath' -Value $resolvedReviewInputPath
+$configText = Replace-QuotedAssignmentAfterAnchor -Text $configText -AnchorPattern $pairTestAnchorPattern -Name 'DefaultSeedWorkRepoRoot' -Value $resolvedWorkRepoRoot
+if (-not [string]::IsNullOrWhiteSpace($pairPolicyAnchorPattern)) {
+    $configText = Replace-QuotedAssignmentAfterAnchorIfPresent -Text $configText -AnchorPattern $pairPolicyAnchorPattern -Name 'DefaultSeedWorkRepoRoot' -Value $resolvedWorkRepoRoot
+}
+if ($reviewInputPathSpecified) {
+    $configText = Replace-QuotedAssignmentAfterAnchor -Text $configText -AnchorPattern $pairTestAnchorPattern -Name 'DefaultSeedReviewInputPath' -Value $resolvedReviewInputPath
+    if (-not [string]::IsNullOrWhiteSpace($pairPolicyAnchorPattern)) {
+        $configText = Replace-QuotedAssignmentAfterAnchorIfPresent -Text $configText -AnchorPattern $pairPolicyAnchorPattern -Name 'DefaultSeedReviewInputPath' -Value $resolvedReviewInputPath
+    }
+}
+if ($externalContractRelativeRootSpecified) {
+    $configText = Replace-QuotedAssignmentAfterAnchor -Text $configText -AnchorPattern $pairTestAnchorPattern -Name 'ExternalWorkRepoContractRelativeRoot' -Value ([string]$ExternalWorkRepoContractRelativeRoot)
+    if (-not [string]::IsNullOrWhiteSpace($pairPolicyAnchorPattern)) {
+        $configText = Replace-QuotedAssignmentAfterAnchorIfPresent -Text $configText -AnchorPattern $pairPolicyAnchorPattern -Name 'ExternalWorkRepoContractRelativeRoot' -Value ([string]$ExternalWorkRepoContractRelativeRoot)
+    }
+}
+if ($requireSingleReviewCandidateSpecified) {
+    $configText = Replace-BooleanAssignmentAfterAnchor -Text $configText -AnchorPattern $pairTestAnchorPattern -Name 'DefaultSeedReviewInputRequireSingleCandidate' -Value ([bool]$DefaultSeedReviewInputRequireSingleCandidate)
+    if (-not [string]::IsNullOrWhiteSpace($pairPolicyAnchorPattern)) {
+        $configText = Replace-BooleanAssignmentAfterAnchorIfPresent -Text $configText -AnchorPattern $pairPolicyAnchorPattern -Name 'DefaultSeedReviewInputRequireSingleCandidate' -Value ([bool]$DefaultSeedReviewInputRequireSingleCandidate)
+    }
 }
 $pairScopedExternalRunRootRelativeRoot = if ([string]::IsNullOrWhiteSpace($pairScopeSegment)) {
     ''
@@ -247,7 +375,7 @@ else {
     ('.relay-runs\bottest-live-visible\pairs\{0}' -f $pairScopeSegment)
 }
 if (-not [string]::IsNullOrWhiteSpace($pairScopedExternalRunRootRelativeRoot)) {
-    $configText = Replace-QuotedAssignment -Text $configText -Name 'ExternalWorkRepoRunRootRelativeRoot' -Value $pairScopedExternalRunRootRelativeRoot
+    $configText = Replace-QuotedAssignmentAfterAnchor -Text $configText -AnchorPattern $pairTestAnchorPattern -Name 'ExternalWorkRepoRunRootRelativeRoot' -Value $pairScopedExternalRunRootRelativeRoot
 }
 $configText = Replace-QuotedAssignment -Text $configText -Name 'RuntimeRoot' -Value $runtimeRoot
 $configText = Replace-QuotedAssignment -Text $configText -Name 'RuntimeMapPath' -Value $runtimeMapPath
@@ -261,11 +389,14 @@ $configText = Replace-QuotedAssignment -Text $configText -Name 'BindingProfilePa
 $configText = Replace-QuotedAssignment -Text $configText -Name 'RouterStatePath' -Value $routerStatePath
 $configText = Replace-QuotedAssignment -Text $configText -Name 'RouterLogPath' -Value $routerLogPath
 $configText = Replace-QuotedAssignment -Text $configText -Name 'RouterMutexName' -Value $externalizedRouterMutexName
-$configText = Replace-QuotedAssignment -Text $configText -Name 'StatePath' -Value $pairActivationStatePath
-$configText = Replace-QuotedAssignment -Text $configText -Name 'QueueRoot' -Value $visibleWorkerQueueRoot
-$configText = Replace-QuotedAssignment -Text $configText -Name 'StatusRoot' -Value $visibleWorkerStatusRoot
-$configText = Replace-QuotedAssignment -Text $configText -Name 'LogRoot' -Value $visibleWorkerLogRoot
-$configText = Replace-QuotedAssignment -Text $configText -Name 'RunRootBase' -Value $pairRunRootBase
+$configText = Replace-QuotedAssignmentAfterAnchor -Text $configText -AnchorPattern 'PairActivation\s*=\s*@\{' -Name 'StatePath' -Value $pairActivationStatePath
+$configText = Replace-QuotedAssignmentAfterAnchor -Text $configText -AnchorPattern 'VisibleWorker\s*=\s*@\{' -Name 'QueueRoot' -Value $visibleWorkerQueueRoot
+$configText = Replace-QuotedAssignmentAfterAnchor -Text $configText -AnchorPattern 'VisibleWorker\s*=\s*@\{' -Name 'StatusRoot' -Value $visibleWorkerStatusRoot
+$configText = Replace-QuotedAssignmentAfterAnchor -Text $configText -AnchorPattern 'VisibleWorker\s*=\s*@\{' -Name 'LogRoot' -Value $visibleWorkerLogRoot
+$configText = Replace-QuotedAssignmentAfterAnchor -Text $configText -AnchorPattern 'PairTest\s*=\s*@\{' -Name 'RunRootBase' -Value $pairRunRootBase
+$configText = Replace-QuotedAssignmentAfterAnchor -Text $configText -AnchorPattern 'TargetAutoloop\s*=\s*@\{' -Name 'RunRootBase' -Value $targetAutoloopRunRootBase
+$configText = Replace-QuotedAssignmentAfterAnchor -Text $configText -AnchorPattern 'TargetAutoloop\s*=\s*@\{' -Name 'StatusRoot' -Value $targetAutoloopStatusRoot
+$configText = Replace-QuotedAssignmentAfterAnchor -Text $configText -AnchorPattern 'TargetAutoloop\s*=\s*@\{' -Name 'QueueRoot' -Value $targetAutoloopQueueRoot
 
 foreach ($targetId in @('target01','target02','target03','target04','target05','target06','target07','target08')) {
     $targetFolder = Join-Path $inboxRoot $targetId
@@ -298,6 +429,9 @@ $result = [pscustomobject]@{
     PairScopeSegment = $pairScopeSegment
     OutputConfigPath = $resolvedOutputConfigPath
     ReviewInputPath = $resolvedReviewInputPath
+    ReviewInputPathSpecified = [bool]$reviewInputPathSpecified
+    ExternalWorkRepoContractRelativeRoot = if ($externalContractRelativeRootSpecified) { [string]$ExternalWorkRepoContractRelativeRoot } else { [string](Get-ConfigValue -Object $pairTestConfig -Name 'ExternalWorkRepoContractRelativeRoot' -DefaultValue '') }
+    DefaultSeedReviewInputRequireSingleCandidate = if ($requireSingleReviewCandidateSpecified) { [bool]$DefaultSeedReviewInputRequireSingleCandidate } else { [bool](Get-ConfigValue -Object $pairTestConfig -Name 'DefaultSeedReviewInputRequireSingleCandidate' -DefaultValue $false) }
     BookkeepingRoot = $bookkeepingRoot
     InboxRoot = $inboxRoot
     ProcessedRoot = $processedRoot
@@ -316,6 +450,9 @@ $result = [pscustomobject]@{
     VisibleWorkerStatusRoot = $visibleWorkerStatusRoot
     VisibleWorkerLogRoot = $visibleWorkerLogRoot
     PairRunRootBase = $pairRunRootBase
+    TargetAutoloopRunRootBase = $targetAutoloopRunRootBase
+    TargetAutoloopStatusRoot = $targetAutoloopStatusRoot
+    TargetAutoloopQueueRoot = $targetAutoloopQueueRoot
     BootstrapBindingProfile = [bool]$BootstrapBindingProfile
     BootstrapRuntimeMap = [bool]$BootstrapRuntimeMap
 }

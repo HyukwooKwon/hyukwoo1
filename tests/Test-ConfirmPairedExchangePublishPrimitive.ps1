@@ -62,22 +62,28 @@ $resolvedConfigPath = (Resolve-Path -LiteralPath $ConfigPath).Path
 $originalConfig = Import-PowerShellDataFile -Path $resolvedConfigPath
 $originalWorkRepoRoot = [string]$originalConfig.PairTest.DefaultSeedWorkRepoRoot
 $testWorkRepoRoot = Join-Path $originalWorkRepoRoot '__codex-tests\publish-primitive'
+$runtimeBaseRoot = Join-Path $testWorkRepoRoot 'runtime'
 $runtimeRoot = Join-Path $testWorkRepoRoot 'runtime'
 $logsRoot = Join-Path $testWorkRepoRoot 'logs'
 $inboxRoot = Join-Path $testWorkRepoRoot 'inbox'
 $retryPendingRoot = Join-Path $testWorkRepoRoot 'retry-pending'
 $failedRoot = Join-Path $testWorkRepoRoot 'failed'
 $processedRoot = Join-Path $testWorkRepoRoot 'processed'
+$ignoredRoot = Join-Path $testWorkRepoRoot 'ignored'
+$bindingProfilePath = Join-Path $runtimeRoot 'window-bindings\bottest-live-visible.json'
 $configCopyPath = Join-Path $testWorkRepoRoot 'settings.publish-primitive.psd1'
 New-Item -ItemType Directory -Path $testWorkRepoRoot -Force | Out-Null
 $configText = Get-Content -LiteralPath $resolvedConfigPath -Raw -Encoding UTF8
 $configText = $configText.Replace($originalWorkRepoRoot, $testWorkRepoRoot)
+$configText = $configText.Replace('C:\dev\python\hyukwoo\hyukwoo1\runtime\', ($runtimeBaseRoot + '\'))
 $configText = $configText.Replace('C:\dev\python\hyukwoo\hyukwoo1\runtime\bottest-live-visible', $runtimeRoot)
 $configText = $configText.Replace('C:\dev\python\hyukwoo\hyukwoo1\logs\bottest-live-visible', $logsRoot)
 $configText = $configText.Replace('C:\dev\python\hyukwoo\hyukwoo1\inbox\bottest-live-visible', $inboxRoot)
 $configText = $configText.Replace('C:\dev\python\hyukwoo\hyukwoo1\retry-pending\bottest-live-visible', $retryPendingRoot)
 $configText = $configText.Replace('C:\dev\python\hyukwoo\hyukwoo1\failed\bottest-live-visible', $failedRoot)
 $configText = $configText.Replace('C:\dev\python\hyukwoo\hyukwoo1\processed\bottest-live-visible', $processedRoot)
+$configText = $configText.Replace('C:\dev\python\hyukwoo\hyukwoo1\ignored\bottest-live-visible', $ignoredRoot)
+$configText = $configText.Replace('C:\dev\python\hyukwoo\hyukwoo1\runtime\window-bindings\bottest-live-visible.json', $bindingProfilePath)
 [System.IO.File]::WriteAllText($configCopyPath, $configText, (New-Utf8NoBomEncoding))
 $resolvedConfigPath = $configCopyPath
 $config = Import-PowerShellDataFile -Path $resolvedConfigPath
@@ -142,6 +148,9 @@ $seedSendPayload = [ordered]@{
             OutboxObservedAt = ''
             LastReadyPath = ''
             LastReadyBaseName = ''
+            TypedWindowSessionScopeKind = 'pair'
+            TypedWindowSessionScopeId = 'pair01'
+            TypedWindowSessionRouteKey = 'pair:pair01:target01'
         }
     )
 }
@@ -159,24 +168,24 @@ $payloadNotePath = Join-Path $target01Outbox 'publish-primitive-note.txt'
 [System.IO.File]::WriteAllText($payloadNotePath, 'publish primitive payload', (New-Utf8NoBomEncoding))
 Compress-Archive -LiteralPath $payloadNotePath -DestinationPath $target01ReviewZipPath -Force
 Remove-Item -LiteralPath $payloadNotePath -Force
-$publishReadyPayload = [ordered]@{
-    SchemaVersion = '1.0.0'
-    PairId = 'pair01'
-    TargetId = 'target01'
-    SummaryPath = $target01SummaryPath
-    ReviewZipPath = $target01ReviewZipPath
-    PublishedAt = (Get-Date).ToUniversalTime().ToString('o')
-    SummarySizeBytes = (Get-Item -LiteralPath $target01SummaryPath).Length
-    ReviewZipSizeBytes = (Get-Item -LiteralPath $target01ReviewZipPath).Length
-    SummarySha256 = (Get-FileHash -LiteralPath $target01SummaryPath -Algorithm SHA256).Hash.ToLowerInvariant()
-    ReviewZipSha256 = (Get-FileHash -LiteralPath $target01ReviewZipPath -Algorithm SHA256).Hash.ToLowerInvariant()
-}
-$publishReadyPayload | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $target01PublishReadyPath -Encoding UTF8
+$publishHelper = Invoke-PowerShellProcess -ScriptPath (Join-Path $root 'tests\Publish-PairedExchangeArtifact.ps1') -Arguments @(
+    '-ConfigPath', $resolvedConfigPath,
+    '-RunRoot', $runRoot,
+    '-TargetId', 'target01',
+    '-AsJson'
+)
+Assert-True ($publishHelper.ExitCode -eq 0) 'publish helper should exit cleanly for publish primitive test.'
+$publishHelperJson = $publishHelper.Raw | ConvertFrom-Json
+Assert-True ([bool]$publishHelperJson.PublishReadyCreated) 'publish helper should create a strict publish.ready marker.'
+Assert-True ([string]$publishHelperJson.Target.PairId -eq 'pair01') 'publish helper should preserve pair01 target mapping.'
+Assert-True ([string]$publishHelperJson.Target.TargetId -eq 'target01') 'publish helper should preserve selected target when writing publish marker.'
+Assert-True ([string]$publishHelperJson.Contract.PublishReadyPath -eq $target01PublishReadyPath) 'publish helper should write marker to the manifest contract path.'
 
 $watcherSecondRun = Invoke-PowerShellProcess -ScriptPath (Join-Path $root 'tests\Watch-PairedExchange.ps1') -Arguments @(
     '-ConfigPath', $resolvedConfigPath,
     '-RunRoot', $runRoot,
-    '-RunDurationSec', '2'
+    '-RunDurationSec', '2',
+    '-ImportSourceOutboxOnly'
 )
 Assert-True ($watcherSecondRun.ExitCode -eq 0) 'watcher should exit cleanly for second publish primitive pass.'
 
@@ -192,13 +201,18 @@ Assert-True ([string]$result.PairId -eq 'pair01') 'wrapper should resolve pair01
 Assert-True ([string]$result.TargetId -eq 'target01') 'wrapper should preserve selected target.'
 Assert-True ([string]$result.PartnerTargetId -eq 'target05') 'wrapper should resolve partner target.'
 Assert-True ([bool]$result.PrimitiveSuccess) 'wrapper should mark publish observation success when source-outbox changes.'
-Assert-True (-not [bool]$result.PrimitiveAccepted) 'publish-started should not yet count as accepted handoff.'
-Assert-True ([string]$result.PrimitiveState -eq 'observed') 'wrapper should classify publish-started as observed.'
-Assert-True ([string]$result.NextPrimitiveAction -eq 'wait-for-import') 'publish-started should recommend waiting for import.'
-Assert-True ([string]$result.Evidence.SourceOutboxState -eq 'publish-started') 'wrapper should surface source-outbox state in evidence.'
-Assert-True ([string]$result.Evidence.Target.SourceOutboxState -eq 'publish-started') 'wrapper should attach target evidence row.'
-Assert-True ([string]$result.SourceOutboxState -eq 'publish-started') 'wrapper should surface publish-started state.'
-Assert-True ([string]$result.PairedTargetStatus.SourceOutboxState -eq 'publish-started') 'wrapper should attach paired target row.'
+Assert-True ([bool]$result.PrimitiveAccepted) 'strict helper path should reach accepted publish state after watcher import.'
+Assert-True ([string]$result.PrimitiveState -eq 'accepted') 'wrapper should classify helper-driven strict publish as accepted.'
+Assert-True ([string]$result.NextPrimitiveAction -eq 'handoff-confirm') 'accepted strict publish should recommend handoff confirm.'
+Assert-True ([string]$result.Evidence.SourceOutboxState -eq 'imported') 'wrapper should surface imported source-outbox state in evidence.'
+Assert-True ([string]$result.Evidence.Target.SourceOutboxState -eq 'imported') 'wrapper should attach imported target evidence row.'
+Assert-True ([string]$result.SourceOutboxState -eq 'imported') 'wrapper should surface imported source-outbox state.'
+Assert-True ([string]$result.PairedTargetStatus.SourceOutboxState -eq 'imported') 'wrapper should attach imported paired target row.'
+Assert-True ([string]$result.PairedTargetStatus.SourceOutboxNextAction -eq 'handoff-ready') 'wrapper should expose handoff-ready next action after import.'
+Assert-True ([string]$result.PairedTargetStatus.TypedWindowSessionScopeKind -eq 'pair') 'wrapper should carry typed-window scope kind into paired target status.'
+Assert-True ([string]$result.PairedTargetStatus.TypedWindowSessionScopeId -eq 'pair01') 'wrapper should carry typed-window scope id into paired target status.'
+Assert-True ([string]$result.PairedTargetStatus.TypedWindowSessionRouteKey -eq 'pair:pair01:target01') 'wrapper should carry typed-window route key into paired target status.'
 Assert-True ([string]$result.PairedStatusSnapshot.PairTest.ExecutionPathMode -eq 'typed-window') 'wrapper should attach paired status snapshot.'
+Assert-True ([int]$result.PairedStatusSnapshot.Counts.FailureLineCount -eq 0) 'publish primitive import-only watcher pass should not leave handoff failure lines.'
 
 Write-Host ('confirm paired exchange publish primitive ok: runRoot=' + $runRoot)

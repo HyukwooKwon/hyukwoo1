@@ -166,6 +166,7 @@ Assert-True ([string]$result.FinalState -eq 'manual_attention_required') 'helper
 Assert-True ([bool]$result.ManualAttentionRequired) 'manual attention flag should be true.'
 Assert-True ([string]$result.RetryReason -eq 'user_active_hold') 'retry reason should preserve router failure category.'
 Assert-True ([int]$result.AttemptCount -eq 2) 'helper should exhaust two attempts.'
+Assert-True ([string]$result.AcceptanceProofGrade -eq 'manual-attention') 'manual attention result should be graded explicitly.'
 
 $seedSendStatusPath = Join-Path $runRoot '.state\seed-send-status.json'
 $seedSendStatus = Get-Content -LiteralPath $seedSendStatusPath -Raw -Encoding UTF8 | ConvertFrom-Json
@@ -173,6 +174,7 @@ $targetStatus = @($seedSendStatus.Targets | Where-Object { [string]$_.TargetId -
 Assert-True ([string]$targetStatus.FinalState -eq 'manual_attention_required') 'persisted seed-send status should record manual attention state.'
 Assert-True ([bool]$targetStatus.ManualAttentionRequired) 'persisted seed-send status should set manual attention flag.'
 Assert-True ([string]$targetStatus.RetryReason -eq 'user_active_hold') 'persisted seed-send status should preserve retry reason.'
+Assert-True ([string]$targetStatus.AcceptanceProofGrade -eq 'manual-attention') 'persisted seed-send status should record manual attention proof grade.'
 
 $watcherResult = & $powershellPath '-NoProfile' '-ExecutionPolicy' 'Bypass' '-File' (Join-Path $root 'tests\Watch-PairedExchange.ps1') `
     '-ConfigPath' $configPath `

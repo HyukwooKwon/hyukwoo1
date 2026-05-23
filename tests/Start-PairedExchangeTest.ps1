@@ -531,11 +531,15 @@ function Resolve-TargetSeedContext {
     }
     $resolvedWorkRepoRoot = Resolve-OptionalLiteralPath -PathValue $workRepoRootCandidate
 
-    $reviewInputCandidate = if (Test-NonEmptyString $ExplicitSeedReviewInputPath) {
+    $hasExplicitReviewInputPath = (Test-NonEmptyString $ExplicitSeedReviewInputPath)
+    $reviewInputCandidate = if ($hasExplicitReviewInputPath) {
         $ExplicitSeedReviewInputPath
     }
     else {
         [string](Get-ConfigValue -Object $PairPolicy -Name 'DefaultSeedReviewInputPath' -DefaultValue '')
+    }
+    if ((-not $hasExplicitReviewInputPath) -and (Test-NonEmptyString $reviewInputCandidate) -and (-not (Test-Path -LiteralPath $reviewInputCandidate -PathType Leaf))) {
+        $reviewInputCandidate = ''
     }
     $seedReviewSearchRoot = if (-not (Test-NonEmptyString $reviewInputCandidate) -and (Test-NonEmptyString $resolvedWorkRepoRoot)) {
         Join-Path $resolvedWorkRepoRoot ([string](Get-ConfigValue -Object $PairPolicy -Name 'DefaultSeedReviewInputSearchRelativePath' -DefaultValue ([string]$PairTest.DefaultSeedReviewInputSearchRelativePath)))
@@ -1262,6 +1266,19 @@ $coordinatorWorkRepoRoot = if ($externalRunRootPairs.Count -gt 0) {
 }
 else {
     ''
+}
+$coordinatorRunRootRequiresValidation = (
+    ($externalRunRootPairs.Count -gt 0) -and
+    (Test-NonEmptyString $RunRoot) -and
+    (Test-NonEmptyString $coordinatorWorkRepoRoot)
+)
+if ($coordinatorRunRootRequiresValidation) {
+    Assert-RunRootPolicy `
+        -PairTest $pairTest `
+        -PairPolicy $runRootPolicy `
+        -AutomationRoot $root `
+        -RunRoot $RunRoot `
+        -WorkRepoRoot $coordinatorWorkRepoRoot
 }
 $allowedBookkeepingRoots = @(
     @($pairRows | ForEach-Object { [string]$_.PairWorkRepoRoot }) +

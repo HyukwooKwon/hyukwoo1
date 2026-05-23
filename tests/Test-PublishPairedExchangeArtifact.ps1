@@ -140,6 +140,8 @@ $publishBad = Invoke-PowerShellJson -ScriptPath (Join-Path $root 'publish-paired
 Assert-True ($publishBad.ExitCode -ne 0) 'publish helper should fail for forbidden source artifacts.'
 Assert-True (-not [bool]$publishBad.Json.PublishReadyCreated) 'publish helper should not create marker for forbidden source artifacts.'
 Assert-True (@($publishBad.Json.Validation.Issues | ForEach-Object { [string]$_ }) -contains 'summary-source-forbidden-artifact') 'publish helper should report forbidden summary artifact.'
+Assert-True (@($publishBad.Json.ValidationIssues | ForEach-Object { [string]$_ }) -contains 'summary-source-forbidden-artifact') 'publish helper should expose validation issues separately.'
+Assert-True (@($publishBad.Json.Issues | ForEach-Object { [string]$_ }) -contains 'summary-source-forbidden-artifact') 'publish helper top-level issues should surface concrete validation reject reasons.'
 Assert-True (-not (Test-Path -LiteralPath ([string]$target05Request.PublishReadyPath) -PathType Leaf)) 'publish helper should not write publish.ready.json for forbidden source artifacts.'
 
 Write-Host ('publish paired exchange artifact helper ok: runRoot=' + $contractRunRoot)

@@ -144,6 +144,9 @@ Assert-True ([string]$result.TypedWindowExecutionState -eq 'typed-window-submit-
 Assert-True ([int]$result.SubmitRetryCount -eq 0) 'typed-window no-progress path should not increment retry count when retry limit is zero.'
 Assert-True ([string]$result.TypedWindowSessionState -eq 'recovery-needed') 'typed-window no-progress path should mark the session recovery-needed.'
 Assert-True ([string]$result.TypedWindowLastResetReason -eq 'typed-window-submit-unconfirmed') 'typed-window no-progress path should record the reset reason.'
+Assert-True ([string]$result.TypedWindowSessionScopeKind -eq 'pair') 'typed-window no-progress path should preserve pair scope kind.'
+Assert-True ([string]$result.TypedWindowSessionScopeId -eq 'pair01') 'typed-window no-progress path should preserve pair scope id.'
+Assert-True ([string]$result.TypedWindowSessionRouteKey -eq 'pair:pair01:target01') 'typed-window no-progress path should preserve pair route key.'
 
 $seedSendStatusPath = Join-Path $runRoot '.state\seed-send-status.json'
 $seedSendStatus = Get-Content -LiteralPath $seedSendStatusPath -Raw -Encoding UTF8 | ConvertFrom-Json
@@ -154,5 +157,8 @@ Assert-True ([string]$targetStatus.SubmitProbeState -eq 'typed-window-submit-unc
 Assert-True ([string]$targetStatus.TypedWindowExecutionState -eq 'typed-window-submit-unconfirmed') 'persisted seed-send status should record typed-window submit-unconfirmed execution state.'
 Assert-True ([string]$targetStatus.TypedWindowSessionState -eq 'recovery-needed') 'persisted seed-send status should record recovery-needed session state.'
 Assert-True ([string]$targetStatus.TypedWindowLastResetReason -eq 'typed-window-submit-unconfirmed') 'persisted seed-send status should record typed-window reset reason.'
+Assert-True ([string]$targetStatus.TypedWindowSessionScopeKind -eq 'pair') 'persisted seed-send status should record pair scope kind.'
+Assert-True ([string]$targetStatus.TypedWindowSessionScopeId -eq 'pair01') 'persisted seed-send status should record pair scope id.'
+Assert-True ([string]$targetStatus.TypedWindowSessionRouteKey -eq 'pair:pair01:target01') 'persisted seed-send status should record pair route key.'
 
 Write-Host ('send-initial-pair-seed-submit-state ok: runRoot=' + $runRoot)

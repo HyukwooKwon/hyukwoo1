@@ -128,117 +128,7 @@ function New-Utf8NoBomEncoding {
     return [System.Text.UTF8Encoding]::new($false)
 }
 
-function Get-TypedWindowSessionRoot {
-    param([Parameter(Mandatory)]$Config)
-
-    $runtimeRoot = [string](Get-ConfigValue -Object $Config -Name 'RuntimeRoot' -DefaultValue '')
-    if (-not (Test-NonEmptyString $runtimeRoot)) {
-        $runtimeRoot = Join-Path $root 'runtime\bottest-live-visible'
-    }
-
-    $sessionRoot = Join-Path $runtimeRoot 'typed-window-session'
-    Ensure-Directory -Path $sessionRoot
-    return $sessionRoot
-}
-
-function Get-TypedWindowSessionStatePath {
-    param(
-        [Parameter(Mandatory)]$Config,
-        [Parameter(Mandatory)][string]$TargetKey
-    )
-
-    return (Join-Path (Get-TypedWindowSessionRoot -Config $Config) ($TargetKey + '.json'))
-}
-
-function New-TypedWindowSessionState {
-    param(
-        [Parameter(Mandatory)][string]$TargetKey,
-        [string]$State = 'bootstrap-needed',
-        [string]$RunRoot = '',
-        [string]$PairId = '',
-        [string]$ResetReason = ''
-    )
-
-    return [ordered]@{
-        SchemaVersion                   = '1.0.0'
-        TargetId                        = $TargetKey
-        State                           = $State
-        SessionRunRoot                  = $RunRoot
-        SessionPairId                   = $PairId
-        SessionTargetId                 = $TargetKey
-        SessionEpoch                    = 0
-        LastPrepareAt                   = ''
-        LastSubmitAt                    = ''
-        LastProgressAt                  = ''
-        LastConfirmedArtifactAt         = ''
-        LastResetReason                 = $ResetReason
-        ConsecutiveSubmitUnconfirmedCount = 0
-        UpdatedAt                       = (Get-Date).ToString('o')
-    }
-}
-
-function Read-TypedWindowSessionState {
-    param(
-        [Parameter(Mandatory)]$Config,
-        [Parameter(Mandatory)][string]$TargetKey
-    )
-
-    $path = Get-TypedWindowSessionStatePath -Config $Config -TargetKey $TargetKey
-    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
-        return [pscustomobject](New-TypedWindowSessionState -TargetKey $TargetKey)
-    }
-
-    try {
-        $session = Read-JsonObject -Path $path
-        return [pscustomobject]@{
-            SchemaVersion                     = [string](Get-ConfigValue -Object $session -Name 'SchemaVersion' -DefaultValue '1.0.0')
-            TargetId                          = [string](Get-ConfigValue -Object $session -Name 'TargetId' -DefaultValue $TargetKey)
-            State                             = [string](Get-ConfigValue -Object $session -Name 'State' -DefaultValue 'bootstrap-needed')
-            SessionRunRoot                    = [string](Get-ConfigValue -Object $session -Name 'SessionRunRoot' -DefaultValue '')
-            SessionPairId                     = [string](Get-ConfigValue -Object $session -Name 'SessionPairId' -DefaultValue '')
-            SessionTargetId                   = [string](Get-ConfigValue -Object $session -Name 'SessionTargetId' -DefaultValue $TargetKey)
-            SessionEpoch                      = [int](Get-ConfigValue -Object $session -Name 'SessionEpoch' -DefaultValue 0)
-            LastPrepareAt                     = [string](Get-ConfigValue -Object $session -Name 'LastPrepareAt' -DefaultValue '')
-            LastSubmitAt                      = [string](Get-ConfigValue -Object $session -Name 'LastSubmitAt' -DefaultValue '')
-            LastProgressAt                    = [string](Get-ConfigValue -Object $session -Name 'LastProgressAt' -DefaultValue '')
-            LastConfirmedArtifactAt           = [string](Get-ConfigValue -Object $session -Name 'LastConfirmedArtifactAt' -DefaultValue '')
-            LastResetReason                   = [string](Get-ConfigValue -Object $session -Name 'LastResetReason' -DefaultValue '')
-            ConsecutiveSubmitUnconfirmedCount = [int](Get-ConfigValue -Object $session -Name 'ConsecutiveSubmitUnconfirmedCount' -DefaultValue 0)
-            UpdatedAt                         = [string](Get-ConfigValue -Object $session -Name 'UpdatedAt' -DefaultValue '')
-        }
-    }
-    catch {
-        return [pscustomobject](New-TypedWindowSessionState -TargetKey $TargetKey -State 'dirty-session' -ResetReason 'session-parse-failed')
-    }
-}
-
-function Save-TypedWindowSessionState {
-    param(
-        [Parameter(Mandatory)]$Config,
-        [Parameter(Mandatory)][string]$TargetKey,
-        [Parameter(Mandatory)]$Session
-    )
-
-    $path = Get-TypedWindowSessionStatePath -Config $Config -TargetKey $TargetKey
-    $payload = [ordered]@{
-        SchemaVersion                     = '1.0.0'
-        TargetId                          = $TargetKey
-        State                             = [string](Get-ConfigValue -Object $Session -Name 'State' -DefaultValue 'bootstrap-needed')
-        SessionRunRoot                    = [string](Get-ConfigValue -Object $Session -Name 'SessionRunRoot' -DefaultValue '')
-        SessionPairId                     = [string](Get-ConfigValue -Object $Session -Name 'SessionPairId' -DefaultValue '')
-        SessionTargetId                   = [string](Get-ConfigValue -Object $Session -Name 'SessionTargetId' -DefaultValue $TargetKey)
-        SessionEpoch                      = [int](Get-ConfigValue -Object $Session -Name 'SessionEpoch' -DefaultValue 0)
-        LastPrepareAt                     = [string](Get-ConfigValue -Object $Session -Name 'LastPrepareAt' -DefaultValue '')
-        LastSubmitAt                      = [string](Get-ConfigValue -Object $Session -Name 'LastSubmitAt' -DefaultValue '')
-        LastProgressAt                    = [string](Get-ConfigValue -Object $Session -Name 'LastProgressAt' -DefaultValue '')
-        LastConfirmedArtifactAt           = [string](Get-ConfigValue -Object $Session -Name 'LastConfirmedArtifactAt' -DefaultValue '')
-        LastResetReason                   = [string](Get-ConfigValue -Object $Session -Name 'LastResetReason' -DefaultValue '')
-        ConsecutiveSubmitUnconfirmedCount = [int](Get-ConfigValue -Object $Session -Name 'ConsecutiveSubmitUnconfirmedCount' -DefaultValue 0)
-        UpdatedAt                         = (Get-Date).ToString('o')
-    }
-
-    $payload | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $path -Encoding UTF8
-}
+. (Join-Path $PSScriptRoot 'lib\TypedWindowSessionState.ps1')
 
 function Set-TypedWindowSessionFields {
     param(
@@ -329,6 +219,64 @@ function Read-RetryPendingMetadata {
     catch {
         return $null
     }
+}
+
+function Get-RetryMetadataDebugLogPath {
+    param($Metadata)
+
+    if ($null -eq $Metadata) {
+        return ''
+    }
+
+    $debugLogPath = [string](Get-ConfigValue -Object $Metadata -Name 'DebugLogPath' -DefaultValue '')
+    if (Test-NonEmptyString $debugLogPath) {
+        return $debugLogPath
+    }
+
+    $message = [string](Get-ConfigValue -Object $Metadata -Name 'FailureMessage' -DefaultValue '')
+    if ($message -match 'debugLog=(.+)$') {
+        return ([string]$Matches[1]).Trim()
+    }
+
+    return ''
+}
+
+function Resolve-AcceptanceProofGrade {
+    param(
+        [AllowEmptyString()][string]$FinalState = '',
+        [bool]$SubmitConfirmed = $false,
+        [bool]$OutboxPublished = $false,
+        [bool]$ManualAttentionRequired = $false,
+        [bool]$FocusLostObserved = $false,
+        [AllowEmptyString()][string]$FocusLostRecoveryMode = ''
+    )
+
+    if ($ManualAttentionRequired -or $FinalState -eq 'manual_attention_required') {
+        return 'manual-attention'
+    }
+
+    if ($FinalState -in @('failed', 'ignored', 'timeout', 'submit-unconfirmed', 'worker-not-ready', 'dispatch-accepted-stale', 'dispatch-running-stale-no-heartbeat')) {
+        return 'failed'
+    }
+
+    $successObserved = (
+        $OutboxPublished -or
+        $SubmitConfirmed -or
+        ($FinalState -in @('publish-detected', 'publish-detected-late', 'processed', 'completed'))
+    )
+    if ($successObserved -and $FocusLostObserved) {
+        if ($FocusLostRecoveryMode -eq 'manual-retry') {
+            return 'recovered-manual-retry'
+        }
+
+        return 'recovered-auto-retry'
+    }
+
+    if ($successObserved) {
+        return 'clean'
+    }
+
+    return 'pending'
 }
 
 function Remove-RetryPendingMetadata {
@@ -464,6 +412,10 @@ function Set-SeedSendStatusEntry {
         [Parameter(Mandatory)][AllowEmptyString()][string]$ProcessedAt,
         [Parameter(Mandatory)][AllowEmptyString()][string]$FailedPath,
         [Parameter(Mandatory)][AllowEmptyString()][string]$FailedAt,
+        [AllowEmptyString()][string]$IgnoredPath = '',
+        [AllowEmptyString()][string]$IgnoredAt = '',
+        [AllowEmptyString()][string]$IgnoredReason = '',
+        [AllowEmptyString()][string]$IgnoredReasonDetail = '',
         [Parameter(Mandatory)][AllowEmptyString()][string]$RetryPendingPath,
         [Parameter(Mandatory)][AllowEmptyString()][string]$RetryPendingAt,
         [Parameter(Mandatory)][bool]$OutboxPublished,
@@ -476,7 +428,18 @@ function Set-SeedSendStatusEntry {
         [int]$SubmitRetryCount = 0,
         [AllowEmptyString()][string]$SubmitConfirmationSignal = '',
         [AllowEmptyString()][string]$TypedWindowSessionState = '',
-        [AllowEmptyString()][string]$TypedWindowLastResetReason = ''
+        [AllowEmptyString()][string]$TypedWindowLastResetReason = '',
+        [AllowEmptyString()][string]$TypedWindowSessionScopeKind = '',
+        [AllowEmptyString()][string]$TypedWindowSessionScopeId = '',
+        [AllowEmptyString()][string]$TypedWindowSessionRouteKey = '',
+        [bool]$FocusLostObserved = $false,
+        [int]$FocusLostCount = 0,
+        [AllowEmptyString()][string]$FocusLostPolicy = '',
+        [AllowEmptyString()][string]$FocusLostRecoveryMode = '',
+        [AllowEmptyString()][string]$FirstFocusLostAt = '',
+        [AllowEmptyString()][string]$LastFocusLostAt = '',
+        [AllowEmptyString()][string]$FocusLostDebugLogPath = '',
+        [AllowEmptyString()][string]$AcceptanceProofGrade = ''
     )
 
     $State[$TargetKey] = [pscustomobject]@{
@@ -507,6 +470,10 @@ function Set-SeedSendStatusEntry {
         ProcessedAt = $ProcessedAt
         FailedPath = $FailedPath
         FailedAt = $FailedAt
+        IgnoredPath = $IgnoredPath
+        IgnoredAt = $IgnoredAt
+        IgnoredReason = $IgnoredReason
+        IgnoredReasonDetail = $IgnoredReasonDetail
         RetryPendingPath = $RetryPendingPath
         RetryPendingAt = $RetryPendingAt
         OutboxPublished = $OutboxPublished
@@ -520,6 +487,17 @@ function Set-SeedSendStatusEntry {
         SubmitConfirmationSignal = $SubmitConfirmationSignal
         TypedWindowSessionState = $TypedWindowSessionState
         TypedWindowLastResetReason = $TypedWindowLastResetReason
+        TypedWindowSessionScopeKind = $TypedWindowSessionScopeKind
+        TypedWindowSessionScopeId = $TypedWindowSessionScopeId
+        TypedWindowSessionRouteKey = $TypedWindowSessionRouteKey
+        FocusLostObserved = [bool]$FocusLostObserved
+        FocusLostCount = [int]$FocusLostCount
+        FocusLostPolicy = $FocusLostPolicy
+        FocusLostRecoveryMode = $FocusLostRecoveryMode
+        FirstFocusLostAt = $FirstFocusLostAt
+        LastFocusLostAt = $LastFocusLostAt
+        FocusLostDebugLogPath = $FocusLostDebugLogPath
+        AcceptanceProofGrade = $AcceptanceProofGrade
     }
 }
 
@@ -585,12 +563,29 @@ function Find-ArchivedMessage {
     return $items[0]
 }
 
+function Read-ReadyArchiveMetadata {
+    param([Parameter(Mandatory)][string]$ArchivedReadyPath)
+
+    $metadataPath = ($ArchivedReadyPath + '.archive.json')
+    if (-not (Test-Path -LiteralPath $metadataPath -PathType Leaf)) {
+        return $null
+    }
+
+    try {
+        return (Read-JsonObject -Path $metadataPath)
+    }
+    catch {
+        return $null
+    }
+}
+
 function Wait-ForMessageTransition {
     param(
         [Parameter(Mandatory)][string]$BaseName,
         [Parameter(Mandatory)][string]$InboxRoot,
         [Parameter(Mandatory)][string]$ProcessedRoot,
         [Parameter(Mandatory)][string]$FailedRoot,
+        [AllowEmptyString()][string]$IgnoredRoot = '',
         [Parameter(Mandatory)][string]$RetryPendingRoot,
         [Parameter(Mandatory)][int]$TimeoutSeconds
     )
@@ -610,6 +605,20 @@ function Wait-ForMessageTransition {
             return [pscustomobject]@{
                 State = 'failed'
                 Path  = $failed.FullName
+            }
+        }
+
+        if (Test-NonEmptyString $IgnoredRoot) {
+            $ignored = Find-ArchivedMessage -Root $IgnoredRoot -BaseName $BaseName
+            if ($null -ne $ignored) {
+                $archiveMetadata = Read-ReadyArchiveMetadata -ArchivedReadyPath $ignored.FullName
+                return [pscustomobject]@{
+                    State = 'ignored'
+                    Path  = $ignored.FullName
+                    ReasonCode = if ($null -ne $archiveMetadata) { [string](Get-ConfigValue -Object $archiveMetadata -Name 'ArchiveReasonCode' -DefaultValue '') } else { '' }
+                    ReasonDetail = if ($null -ne $archiveMetadata) { [string](Get-ConfigValue -Object $archiveMetadata -Name 'ArchiveReasonDetail' -DefaultValue '') } else { '' }
+                    MetadataPath = ($ignored.FullName + '.archive.json')
+                }
             }
         }
 
@@ -1037,12 +1046,24 @@ function Resolve-TypedWindowPrepareRequirement {
         return [pscustomobject]@{ Required = $true; Reason = 'runroot-changed' }
     }
 
+    if ([string](Get-ConfigValue -Object $Session -Name 'SessionScopeKind' -DefaultValue '') -ne 'pair') {
+        return [pscustomobject]@{ Required = $true; Reason = 'pair-changed' }
+    }
+
     if ([string](Get-ConfigValue -Object $Session -Name 'SessionPairId' -DefaultValue '') -ne $PairId) {
         return [pscustomobject]@{ Required = $true; Reason = 'pair-changed' }
     }
 
     if ([string](Get-ConfigValue -Object $Session -Name 'SessionTargetId' -DefaultValue '') -ne $TargetKey) {
         return [pscustomobject]@{ Required = $true; Reason = 'target-changed' }
+    }
+
+    if ([string](Get-ConfigValue -Object $Session -Name 'SessionScopeId' -DefaultValue '') -ne $PairId) {
+        return [pscustomobject]@{ Required = $true; Reason = 'pair-changed' }
+    }
+
+    if ([string](Get-ConfigValue -Object $Session -Name 'SessionRouteKey' -DefaultValue '') -ne ('pair:{0}:{1}' -f $PairId, $TargetKey)) {
+        return [pscustomobject]@{ Required = $true; Reason = 'route-changed' }
     }
 
     return [pscustomobject]@{ Required = $false; Reason = 'reuse-session' }
@@ -1057,7 +1078,7 @@ function Invoke-TypedWindowPrepareIfNeeded {
         [bool]$AllowInlinePrepare = $true
     )
 
-    $session = Read-TypedWindowSessionState -Config $Config -TargetKey $TargetKey
+    $session = Read-TypedWindowSessionState -Config $Config -TargetKey $TargetKey -DefaultPairIdValue $PairId
     $requirement = Resolve-TypedWindowPrepareRequirement -Session $session -RunRoot $RunRoot -PairId $PairId -TargetKey $TargetKey
     if (-not [bool]$requirement.Required) {
         return [pscustomobject]@{
@@ -1094,6 +1115,9 @@ function Invoke-TypedWindowPrepareIfNeeded {
     $session = Set-TypedWindowSessionFields -Session $session -State 'active-run'
     $session.SessionRunRoot = $RunRoot
     $session.SessionPairId = $PairId
+    $session.SessionScopeKind = 'pair'
+    $session.SessionScopeId = $PairId
+    $session.SessionRouteKey = ('pair:{0}:{1}' -f $PairId, $TargetKey)
     $session.SessionTargetId = $TargetKey
     $session.SessionEpoch = [int](Get-ConfigValue -Object $session -Name 'SessionEpoch' -DefaultValue 0) + 1
     $session.LastPrepareAt = (Get-Date).ToString('o')
@@ -1547,6 +1571,13 @@ $minUserIdleBeforeSendMs = [int](Get-ConfigValue -Object $config -Name 'MinUserI
 $inboxRoot = [string]$targetConfig[0].Folder
 $processedRoot = [string]$config.ProcessedRoot
 $failedRoot = [string]$config.FailedRoot
+$ignoredRoot = [string](Get-ConfigValue -Object $config -Name 'IgnoredRoot' -DefaultValue '')
+if (-not (Test-NonEmptyString $ignoredRoot)) {
+    $configInboxRoot = [string](Get-ConfigValue -Object $config -Name 'InboxRoot' -DefaultValue '')
+    $laneName = if (Test-NonEmptyString $configInboxRoot) { Split-Path -Leaf $configInboxRoot } else { 'inbox' }
+    $configRoot = [string](Get-ConfigValue -Object $config -Name 'Root' -DefaultValue $resolvedRunRoot)
+    $ignoredRoot = Join-Path (Join-Path $configRoot 'ignored') $laneName
+}
 $retryPendingRoot = [string]$config.RetryPendingRoot
 $stateRoot = Join-Path $resolvedRunRoot '.state'
 $seedSendStatusPath = Join-Path $stateRoot 'seed-send-status.json'
@@ -1572,6 +1603,10 @@ $manualAttentionRequired = $false
 $processedAt = ''
 $failedAt = ''
 $retryPendingAt = ''
+$ignoredPath = ''
+$ignoredAt = ''
+$ignoredReason = ''
+$ignoredReasonDetail = ''
 $workerCommandId = ''
 $workerDispatchPath = ''
 $typedWindowExecutionState = ''
@@ -1581,7 +1616,18 @@ $submitRetryCount = 0
 $submitConfirmationSignal = ''
 $typedWindowSessionState = ''
 $typedWindowLastResetReason = ''
+$typedWindowSessionScopeKind = ''
+$typedWindowSessionScopeId = ''
+$typedWindowSessionRouteKey = ''
 $typedWindowSession = $null
+$focusLostObserved = $false
+$focusLostCount = 0
+$focusLostPolicy = 'retry-then-manual'
+$focusLostRecoveryMode = 'none'
+$firstFocusLostAt = ''
+$lastFocusLostAt = ''
+$focusLostDebugLogPath = ''
+$acceptanceProofGrade = 'pending'
 $resendSeedReadyFile = $false
 
 for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
@@ -1607,8 +1653,12 @@ for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
             -TargetKey $targetKey `
             -AllowInlinePrepare:(-not $DisallowInlineTypedWindowPrepare)
         $typedWindowSession = $prepareResult.Session
-        $typedWindowSessionState = [string](Get-ConfigValue -Object $typedWindowSession -Name 'State' -DefaultValue '')
-        $typedWindowLastResetReason = [string](Get-ConfigValue -Object $typedWindowSession -Name 'LastResetReason' -DefaultValue '')
+        $typedWindowSessionInfo = Get-TypedWindowSessionInfo -Session $typedWindowSession -DefaultTargetKey $targetKey
+        $typedWindowSessionState = [string]$typedWindowSessionInfo.State
+        $typedWindowLastResetReason = [string]$typedWindowSessionInfo.LastResetReason
+        $typedWindowSessionScopeKind = [string]$typedWindowSessionInfo.ScopeKind
+        $typedWindowSessionScopeId = [string]$typedWindowSessionInfo.ScopeId
+        $typedWindowSessionRouteKey = [string]$typedWindowSessionInfo.RouteKey
         if ([bool](Get-ConfigValue -Object $prepareResult -Name 'PrepareBlocked' -DefaultValue $false)) {
             $typedWindowExecutionState = 'typed-window-inline-prepare-blocked'
             $submitProbeState = 'typed-window-inline-prepare-blocked'
@@ -1626,8 +1676,12 @@ for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
             $typedWindowSession.LastResetReason = 'typed-window-inline-prepare-blocked'
             $typedWindowSession.ConsecutiveSubmitUnconfirmedCount = [int](Get-ConfigValue -Object $typedWindowSession -Name 'ConsecutiveSubmitUnconfirmedCount' -DefaultValue 0) + 1
             Save-TypedWindowSessionState -Config $config -TargetKey $targetKey -Session $typedWindowSession
-            $typedWindowSessionState = [string](Get-ConfigValue -Object $typedWindowSession -Name 'State' -DefaultValue '')
-            $typedWindowLastResetReason = [string](Get-ConfigValue -Object $typedWindowSession -Name 'LastResetReason' -DefaultValue '')
+            $typedWindowSessionInfo = Get-TypedWindowSessionInfo -Session $typedWindowSession -DefaultTargetKey $targetKey
+            $typedWindowSessionState = [string]$typedWindowSessionInfo.State
+            $typedWindowLastResetReason = [string]$typedWindowSessionInfo.LastResetReason
+            $typedWindowSessionScopeKind = [string]$typedWindowSessionInfo.ScopeKind
+            $typedWindowSessionScopeId = [string]$typedWindowSessionInfo.ScopeId
+            $typedWindowSessionRouteKey = [string]$typedWindowSessionInfo.RouteKey
 
             Set-SeedSendStatusEntry -State $seedSendState `
                 -TargetKey $targetKey `
@@ -1669,7 +1723,10 @@ for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
                 -SubmitRetryCount $submitRetryCount `
                 -SubmitConfirmationSignal $submitConfirmationSignal `
                 -TypedWindowSessionState $typedWindowSessionState `
-                -TypedWindowLastResetReason $typedWindowLastResetReason
+                -TypedWindowLastResetReason $typedWindowLastResetReason `
+                -TypedWindowSessionScopeKind $typedWindowSessionScopeKind `
+                -TypedWindowSessionScopeId $typedWindowSessionScopeId `
+                -TypedWindowSessionRouteKey $typedWindowSessionRouteKey
             Save-SeedSendStatusState -Path $seedSendStatusPath -RunRoot $resolvedRunRoot -State $seedSendState
             break
         }
@@ -1698,8 +1755,12 @@ for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
                 $typedWindowSession.ConsecutiveSubmitUnconfirmedCount = [int](Get-ConfigValue -Object $typedWindowSession -Name 'ConsecutiveSubmitUnconfirmedCount' -DefaultValue 0) + 1
             }
             Save-TypedWindowSessionState -Config $config -TargetKey $targetKey -Session $typedWindowSession
-            $typedWindowSessionState = [string](Get-ConfigValue -Object $typedWindowSession -Name 'State' -DefaultValue '')
-            $typedWindowLastResetReason = [string](Get-ConfigValue -Object $typedWindowSession -Name 'LastResetReason' -DefaultValue '')
+            $typedWindowSessionInfo = Get-TypedWindowSessionInfo -Session $typedWindowSession -DefaultTargetKey $targetKey
+            $typedWindowSessionState = [string]$typedWindowSessionInfo.State
+            $typedWindowLastResetReason = [string]$typedWindowSessionInfo.LastResetReason
+            $typedWindowSessionScopeKind = [string]$typedWindowSessionInfo.ScopeKind
+            $typedWindowSessionScopeId = [string]$typedWindowSessionInfo.ScopeId
+            $typedWindowSessionRouteKey = [string]$typedWindowSessionInfo.RouteKey
 
             Set-SeedSendStatusEntry -State $seedSendState `
                 -TargetKey $targetKey `
@@ -1741,7 +1802,10 @@ for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
                 -SubmitRetryCount $submitRetryCount `
                 -SubmitConfirmationSignal ([string]$prepareFailure.FailureSummary) `
                 -TypedWindowSessionState $typedWindowSessionState `
-                -TypedWindowLastResetReason $typedWindowLastResetReason
+                -TypedWindowLastResetReason $typedWindowLastResetReason `
+                -TypedWindowSessionScopeKind $typedWindowSessionScopeKind `
+                -TypedWindowSessionScopeId $typedWindowSessionScopeId `
+                -TypedWindowSessionRouteKey $typedWindowSessionRouteKey
             Save-SeedSendStatusState -Path $seedSendStatusPath -RunRoot $resolvedRunRoot -State $seedSendState
             break
         }
@@ -1802,11 +1866,18 @@ for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
         $typedWindowSession = Set-TypedWindowSessionFields -Session $typedWindowSession -State 'active-run'
         $typedWindowSession.SessionRunRoot = $resolvedRunRoot
         $typedWindowSession.SessionPairId = $pairId
+        $typedWindowSession.SessionScopeKind = 'pair'
+        $typedWindowSession.SessionScopeId = $pairId
+        $typedWindowSession.SessionRouteKey = ('pair:{0}:{1}' -f $pairId, $targetKey)
         $typedWindowSession.SessionTargetId = $targetKey
         $typedWindowSession.LastSubmitAt = $attemptedAt
         Save-TypedWindowSessionState -Config $config -TargetKey $targetKey -Session $typedWindowSession
-        $typedWindowSessionState = [string](Get-ConfigValue -Object $typedWindowSession -Name 'State' -DefaultValue '')
-        $typedWindowLastResetReason = [string](Get-ConfigValue -Object $typedWindowSession -Name 'LastResetReason' -DefaultValue '')
+        $typedWindowSessionInfo = Get-TypedWindowSessionInfo -Session $typedWindowSession -DefaultTargetKey $targetKey
+        $typedWindowSessionState = [string]$typedWindowSessionInfo.State
+        $typedWindowLastResetReason = [string]$typedWindowSessionInfo.LastResetReason
+        $typedWindowSessionScopeKind = [string]$typedWindowSessionInfo.ScopeKind
+        $typedWindowSessionScopeId = [string]$typedWindowSessionInfo.ScopeId
+        $typedWindowSessionRouteKey = [string]$typedWindowSessionInfo.RouteKey
     }
 
     if ($visibleWorkerEnabled) {
@@ -1833,6 +1904,7 @@ for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
             -InboxRoot $inboxRoot `
             -ProcessedRoot $processedRoot `
             -FailedRoot $failedRoot `
+            -IgnoredRoot $ignoredRoot `
             -RetryPendingRoot $retryPendingRoot `
             -TimeoutSeconds $WaitForRouterSeconds
     }
@@ -1900,8 +1972,12 @@ for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
                         $typedWindowSession = Set-TypedWindowSessionFields -Session $typedWindowSession -State $(if ($signalStrength -eq 'strong') { 'running-confirmed' } else { 'active-run' })
                         $typedWindowSession.LastProgressAt = (Get-Date).ToString('o')
                         Save-TypedWindowSessionState -Config $config -TargetKey $targetKey -Session $typedWindowSession
-                        $typedWindowSessionState = [string](Get-ConfigValue -Object $typedWindowSession -Name 'State' -DefaultValue '')
-                        $typedWindowLastResetReason = [string](Get-ConfigValue -Object $typedWindowSession -Name 'LastResetReason' -DefaultValue '')
+                        $typedWindowSessionInfo = Get-TypedWindowSessionInfo -Session $typedWindowSession -DefaultTargetKey $targetKey
+                        $typedWindowSessionState = [string]$typedWindowSessionInfo.State
+                        $typedWindowLastResetReason = [string]$typedWindowSessionInfo.LastResetReason
+                        $typedWindowSessionScopeKind = [string]$typedWindowSessionInfo.ScopeKind
+                        $typedWindowSessionScopeId = [string]$typedWindowSessionInfo.ScopeId
+                        $typedWindowSessionRouteKey = [string]$typedWindowSessionInfo.RouteKey
                     }
                     else {
                         $canRetryTypedWindowSubmit = ($attempt -lt $MaxAttempts -and $submitRetryCount -lt $typedWindowSubmitRetryLimit)
@@ -1918,8 +1994,12 @@ for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
                             $typedWindowSession.LastResetReason = 'typed-window-submit-unconfirmed'
                             $typedWindowSession.ConsecutiveSubmitUnconfirmedCount = [int](Get-ConfigValue -Object $typedWindowSession -Name 'ConsecutiveSubmitUnconfirmedCount' -DefaultValue 0) + 1
                             Save-TypedWindowSessionState -Config $config -TargetKey $targetKey -Session $typedWindowSession
-                            $typedWindowSessionState = [string](Get-ConfigValue -Object $typedWindowSession -Name 'State' -DefaultValue '')
-                            $typedWindowLastResetReason = [string](Get-ConfigValue -Object $typedWindowSession -Name 'LastResetReason' -DefaultValue '')
+                            $typedWindowSessionInfo = Get-TypedWindowSessionInfo -Session $typedWindowSession -DefaultTargetKey $targetKey
+                            $typedWindowSessionState = [string]$typedWindowSessionInfo.State
+                            $typedWindowLastResetReason = [string]$typedWindowSessionInfo.LastResetReason
+                            $typedWindowSessionScopeKind = [string]$typedWindowSessionInfo.ScopeKind
+                            $typedWindowSessionScopeId = [string]$typedWindowSessionInfo.ScopeId
+                            $typedWindowSessionRouteKey = [string]$typedWindowSessionInfo.RouteKey
                             $backoffMs = Get-RetryBackoffMilliseconds -AttemptNumber $attempt -BackoffScheduleMs $RetryBackoffMs -FallbackDelaySeconds $DelaySeconds
                             $nextRetryAt = (Get-Date).AddMilliseconds($backoffMs).ToString('o')
                             $resendSeedReadyFile = $true
@@ -1963,7 +2043,10 @@ for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
                                 -SubmitRetryCount $submitRetryCount `
                                 -SubmitConfirmationSignal $submitConfirmationSignal `
                                 -TypedWindowSessionState $typedWindowSessionState `
-                                -TypedWindowLastResetReason $typedWindowLastResetReason
+                                -TypedWindowLastResetReason $typedWindowLastResetReason `
+                                -TypedWindowSessionScopeKind $typedWindowSessionScopeKind `
+                                -TypedWindowSessionScopeId $typedWindowSessionScopeId `
+                                -TypedWindowSessionRouteKey $typedWindowSessionRouteKey
                             Save-SeedSendStatusState -Path $seedSendStatusPath -RunRoot $resolvedRunRoot -State $seedSendState
                             Start-Sleep -Milliseconds $backoffMs
                             $retryScheduled = $true
@@ -1981,8 +2064,12 @@ for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
                         $typedWindowSession.LastResetReason = 'typed-window-submit-unconfirmed'
                         $typedWindowSession.ConsecutiveSubmitUnconfirmedCount = [int](Get-ConfigValue -Object $typedWindowSession -Name 'ConsecutiveSubmitUnconfirmedCount' -DefaultValue 0) + 1
                         Save-TypedWindowSessionState -Config $config -TargetKey $targetKey -Session $typedWindowSession
-                        $typedWindowSessionState = [string](Get-ConfigValue -Object $typedWindowSession -Name 'State' -DefaultValue '')
-                        $typedWindowLastResetReason = [string](Get-ConfigValue -Object $typedWindowSession -Name 'LastResetReason' -DefaultValue '')
+                        $typedWindowSessionInfo = Get-TypedWindowSessionInfo -Session $typedWindowSession -DefaultTargetKey $targetKey
+                        $typedWindowSessionState = [string]$typedWindowSessionInfo.State
+                        $typedWindowLastResetReason = [string]$typedWindowSessionInfo.LastResetReason
+                        $typedWindowSessionScopeKind = [string]$typedWindowSessionInfo.ScopeKind
+                        $typedWindowSessionScopeId = [string]$typedWindowSessionInfo.ScopeId
+                        $typedWindowSessionRouteKey = [string]$typedWindowSessionInfo.RouteKey
                         break
                     }
                 }
@@ -2000,8 +2087,12 @@ for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
                         $typedWindowSession.LastConfirmedArtifactAt = (Get-Date).ToString('o')
                         $typedWindowSession.ConsecutiveSubmitUnconfirmedCount = 0
                         Save-TypedWindowSessionState -Config $config -TargetKey $targetKey -Session $typedWindowSession
-                        $typedWindowSessionState = [string](Get-ConfigValue -Object $typedWindowSession -Name 'State' -DefaultValue '')
-                        $typedWindowLastResetReason = [string](Get-ConfigValue -Object $typedWindowSession -Name 'LastResetReason' -DefaultValue '')
+                        $typedWindowSessionInfo = Get-TypedWindowSessionInfo -Session $typedWindowSession -DefaultTargetKey $targetKey
+                        $typedWindowSessionState = [string]$typedWindowSessionInfo.State
+                        $typedWindowLastResetReason = [string]$typedWindowSessionInfo.LastResetReason
+                        $typedWindowSessionScopeKind = [string]$typedWindowSessionInfo.ScopeKind
+                        $typedWindowSessionScopeId = [string]$typedWindowSessionInfo.ScopeId
+                        $typedWindowSessionRouteKey = [string]$typedWindowSessionInfo.RouteKey
                     }
                 }
                 elseif ($WaitForPublishSeconds -gt 0) {
@@ -2014,8 +2105,12 @@ for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
                         $typedWindowSession = Set-TypedWindowSessionFields -Session $typedWindowSession -State 'dirty-session'
                         $typedWindowSession.LastResetReason = 'no-artifact-after-submit'
                         Save-TypedWindowSessionState -Config $config -TargetKey $targetKey -Session $typedWindowSession
-                        $typedWindowSessionState = [string](Get-ConfigValue -Object $typedWindowSession -Name 'State' -DefaultValue '')
-                        $typedWindowLastResetReason = [string](Get-ConfigValue -Object $typedWindowSession -Name 'LastResetReason' -DefaultValue '')
+                        $typedWindowSessionInfo = Get-TypedWindowSessionInfo -Session $typedWindowSession -DefaultTargetKey $targetKey
+                        $typedWindowSessionState = [string]$typedWindowSessionInfo.State
+                        $typedWindowLastResetReason = [string]$typedWindowSessionInfo.LastResetReason
+                        $typedWindowSessionScopeKind = [string]$typedWindowSessionInfo.ScopeKind
+                        $typedWindowSessionScopeId = [string]$typedWindowSessionInfo.ScopeId
+                        $typedWindowSessionRouteKey = [string]$typedWindowSessionInfo.RouteKey
                         $finalState = 'processed'
                     }
                     elseif (-not $visibleWorkerEnabled -and $typedWindowExecutionState -eq 'typed-window-running-confirmed') {
@@ -2033,6 +2128,21 @@ for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
                 if (Test-Path -LiteralPath $failedPath -PathType Leaf) {
                     $failedAt = (Get-Item -LiteralPath $failedPath -ErrorAction Stop).LastWriteTime.ToString('o')
                 }
+                break
+            }
+            'ignored' {
+                $finalState = 'ignored'
+                $ignoredPath = [string]$waitResult.Path
+                if (Test-Path -LiteralPath $ignoredPath -PathType Leaf) {
+                    $ignoredAt = (Get-Item -LiteralPath $ignoredPath -ErrorAction Stop).LastWriteTime.ToString('o')
+                }
+                $ignoredReason = [string](Get-ConfigValue -Object $waitResult -Name 'ReasonCode' -DefaultValue '')
+                $ignoredReasonDetail = [string](Get-ConfigValue -Object $waitResult -Name 'ReasonDetail' -DefaultValue '')
+                if (-not (Test-NonEmptyString $ignoredReason)) {
+                    $ignoredReason = 'router-ignored'
+                }
+                $retryReason = $ignoredReason
+                $manualAttentionRequired = $true
                 break
             }
             'retry-pending' {
@@ -2053,10 +2163,31 @@ for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
             else {
                 $retryReason = 'router-retry-pending'
             }
+            if ($retryReason -eq 'focus_lost') {
+                $focusLostObserved = $true
+                $focusLostCount++
+                $focusLostAt = if (Test-NonEmptyString $retryPendingAt) { $retryPendingAt } else { (Get-Date).ToString('o') }
+                if (-not (Test-NonEmptyString $firstFocusLostAt)) {
+                    $firstFocusLostAt = $focusLostAt
+                }
+                $lastFocusLostAt = $focusLostAt
+                $metadataDebugLogPath = Get-RetryMetadataDebugLogPath -Metadata $retryMetadata
+                if (Test-NonEmptyString $metadataDebugLogPath) {
+                    $focusLostDebugLogPath = $metadataDebugLogPath
+                }
+                $focusLostRecoveryMode = if ($attempt -lt $MaxAttempts) { 'auto-retry' } else { 'manual-attention' }
+            }
             if ($attempt -lt $MaxAttempts) {
                 $finalState = 'retry-pending'
                 $backoffMs = Get-RetryBackoffMilliseconds -AttemptNumber $attempt -BackoffScheduleMs $RetryBackoffMs -FallbackDelaySeconds $DelaySeconds
                 $nextRetryAt = (Get-Date).AddMilliseconds($backoffMs).ToString('o')
+                $acceptanceProofGrade = Resolve-AcceptanceProofGrade `
+                    -FinalState $finalState `
+                    -SubmitConfirmed $false `
+                    -OutboxPublished $false `
+                    -ManualAttentionRequired $false `
+                    -FocusLostObserved $focusLostObserved `
+                    -FocusLostRecoveryMode $focusLostRecoveryMode
                 Set-SeedSendStatusEntry -State $seedSendState `
                     -TargetKey $targetKey `
                     -UpdatedAt (Get-Date).ToString('o') `
@@ -2097,7 +2228,18 @@ for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
                     -SubmitRetryCount $submitRetryCount `
                     -SubmitConfirmationSignal $submitConfirmationSignal `
                     -TypedWindowSessionState $typedWindowSessionState `
-                    -TypedWindowLastResetReason $typedWindowLastResetReason
+                    -TypedWindowLastResetReason $typedWindowLastResetReason `
+                    -TypedWindowSessionScopeKind $typedWindowSessionScopeKind `
+                    -TypedWindowSessionScopeId $typedWindowSessionScopeId `
+                    -TypedWindowSessionRouteKey $typedWindowSessionRouteKey `
+                    -FocusLostObserved $focusLostObserved `
+                    -FocusLostCount $focusLostCount `
+                    -FocusLostPolicy $focusLostPolicy `
+                    -FocusLostRecoveryMode $focusLostRecoveryMode `
+                    -FirstFocusLostAt $firstFocusLostAt `
+                    -LastFocusLostAt $lastFocusLostAt `
+                    -FocusLostDebugLogPath $focusLostDebugLogPath `
+                    -AcceptanceProofGrade $acceptanceProofGrade
                 Save-SeedSendStatusState -Path $seedSendStatusPath -RunRoot $resolvedRunRoot -State $seedSendState
                 Start-Sleep -Milliseconds $backoffMs
                 $retryScheduled = $true
@@ -2124,7 +2266,7 @@ for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
 $routerDispatchState = if ($visibleWorkerEnabled) {
     if (@($attemptResults).Count -gt 0) { [string]$attemptResults[-1].TransitionState } else { '' }
 } else {
-    if (Test-NonEmptyString $processedPath) { 'processed' } else { '' }
+    if (@($attemptResults).Count -gt 0) { [string]$attemptResults[-1].TransitionState } else { '' }
 }
 $submitState = ''
 $submitConfirmed = $false
@@ -2172,6 +2314,10 @@ elseif ($finalState -eq 'submit-unconfirmed') {
     else {
         $submitReason = if ($visibleWorkerEnabled) { 'no-outbox-publish-after-visible-worker' } else { 'no-outbox-publish-within-wait-window' }
     }
+}
+elseif ($finalState -eq 'ignored') {
+    $submitState = 'failed'
+    $submitReason = if (Test-NonEmptyString $ignoredReason) { $ignoredReason } else { 'router-ignored' }
 }
 elseif ($finalState -in @('timeout', 'worker-not-ready', 'dispatch-accepted-stale', 'dispatch-running-stale-no-heartbeat')) {
     $submitState = 'unconfirmed'
@@ -2250,10 +2396,13 @@ elseif ($null -ne $typedWindowSession -or -not $visibleWorkerEnabled) {
         $typedWindowSession.LastResetReason = 'typed-window-inline-prepare-blocked'
         $typedWindowSession.ConsecutiveSubmitUnconfirmedCount = [int](Get-ConfigValue -Object $typedWindowSession -Name 'ConsecutiveSubmitUnconfirmedCount' -DefaultValue 0) + 1
     }
-    elseif ($finalState -in @('failed', 'manual_attention_required')) {
+    elseif ($finalState -in @('failed', 'manual_attention_required', 'ignored')) {
         $typedWindowSession = Set-TypedWindowSessionFields -Session $typedWindowSession -State 'dirty-session'
         if ($typedWindowExecutionState -eq 'typed-window-visible-contract-failed') {
             $typedWindowSession.LastResetReason = 'focus-steal-before-submit'
+        }
+        elseif ($finalState -eq 'ignored') {
+            $typedWindowSession.LastResetReason = if (Test-NonEmptyString $ignoredReason) { $ignoredReason } else { 'router-ignored' }
         }
         else {
             $typedWindowSession.LastResetReason = if ($finalState -eq 'failed') { 'typed-window-failed' } else { 'typed-window-manual-attention' }
@@ -2261,11 +2410,22 @@ elseif ($null -ne $typedWindowSession -or -not $visibleWorkerEnabled) {
     }
 
     Save-TypedWindowSessionState -Config $config -TargetKey $targetKey -Session $typedWindowSession
-    $typedWindowSessionState = [string](Get-ConfigValue -Object $typedWindowSession -Name 'State' -DefaultValue '')
-    $typedWindowLastResetReason = [string](Get-ConfigValue -Object $typedWindowSession -Name 'LastResetReason' -DefaultValue '')
+    $typedWindowSessionInfo = Get-TypedWindowSessionInfo -Session $typedWindowSession -DefaultTargetKey $targetKey
+    $typedWindowSessionState = [string]$typedWindowSessionInfo.State
+    $typedWindowLastResetReason = [string]$typedWindowSessionInfo.LastResetReason
+    $typedWindowSessionScopeKind = [string]$typedWindowSessionInfo.ScopeKind
+    $typedWindowSessionScopeId = [string]$typedWindowSessionInfo.ScopeId
+    $typedWindowSessionRouteKey = [string]$typedWindowSessionInfo.RouteKey
 }
 $lastReadyPath = if (@($attemptResults).Count -gt 0) { [string]$attemptResults[-1].ReadyPath } else { '' }
 $lastReadyBaseName = if (@($attemptResults).Count -gt 0) { [string]$attemptResults[-1].ReadyBaseName } else { '' }
+$acceptanceProofGrade = Resolve-AcceptanceProofGrade `
+    -FinalState $finalState `
+    -SubmitConfirmed $submitConfirmed `
+    -OutboxPublished $outboxPublished `
+    -ManualAttentionRequired $manualAttentionRequired `
+    -FocusLostObserved $focusLostObserved `
+    -FocusLostRecoveryMode $focusLostRecoveryMode
 
 $result = [pscustomobject]@{
     RunRoot = $resolvedRunRoot
@@ -2285,6 +2445,17 @@ $result = [pscustomobject]@{
     SubmitConfirmationSignal = $submitConfirmationSignal
     TypedWindowSessionState = $typedWindowSessionState
     TypedWindowLastResetReason = $typedWindowLastResetReason
+    TypedWindowSessionScopeKind = $typedWindowSessionScopeKind
+    TypedWindowSessionScopeId = $typedWindowSessionScopeId
+    TypedWindowSessionRouteKey = $typedWindowSessionRouteKey
+    FocusLostObserved = [bool]$focusLostObserved
+    FocusLostCount = [int]$focusLostCount
+    FocusLostPolicy = $focusLostPolicy
+    FocusLostRecoveryMode = $focusLostRecoveryMode
+    FirstFocusLostAt = $firstFocusLostAt
+    LastFocusLostAt = $lastFocusLostAt
+    FocusLostDebugLogPath = $focusLostDebugLogPath
+    AcceptanceProofGrade = $acceptanceProofGrade
     TargetId = $targetKey
     FinalState = $finalState
     RouterDispatchState = $routerDispatchState
@@ -2301,6 +2472,10 @@ $result = [pscustomobject]@{
     BackoffMs = $backoffMs
     ProcessedPath = $processedPath
     FailedPath = $failedPath
+    IgnoredPath = $ignoredPath
+    IgnoredAt = $ignoredAt
+    IgnoredReason = $ignoredReason
+    IgnoredReasonDetail = $ignoredReasonDetail
     RetryPendingPath = $retryPendingPath
     SourceOutboxPath = [string]$targetRow.SourceOutboxPath
     SourceSummaryPath = [string]$targetRow.SourceSummaryPath
@@ -2341,6 +2516,10 @@ Set-SeedSendStatusEntry -State $seedSendState `
     -ProcessedAt $processedAt `
     -FailedPath $failedPath `
     -FailedAt $failedAt `
+    -IgnoredPath $ignoredPath `
+    -IgnoredAt $ignoredAt `
+    -IgnoredReason $ignoredReason `
+    -IgnoredReasonDetail $ignoredReasonDetail `
     -RetryPendingPath $retryPendingPath `
     -RetryPendingAt $retryPendingAt `
     -OutboxPublished ([bool]$result.OutboxPublished) `
@@ -2353,7 +2532,18 @@ Set-SeedSendStatusEntry -State $seedSendState `
     -SubmitRetryCount $submitRetryCount `
     -SubmitConfirmationSignal $submitConfirmationSignal `
     -TypedWindowSessionState $typedWindowSessionState `
-    -TypedWindowLastResetReason $typedWindowLastResetReason
+    -TypedWindowLastResetReason $typedWindowLastResetReason `
+    -TypedWindowSessionScopeKind $typedWindowSessionScopeKind `
+    -TypedWindowSessionScopeId $typedWindowSessionScopeId `
+    -TypedWindowSessionRouteKey $typedWindowSessionRouteKey `
+    -FocusLostObserved $focusLostObserved `
+    -FocusLostCount $focusLostCount `
+    -FocusLostPolicy $focusLostPolicy `
+    -FocusLostRecoveryMode $focusLostRecoveryMode `
+    -FirstFocusLostAt $firstFocusLostAt `
+    -LastFocusLostAt $lastFocusLostAt `
+    -FocusLostDebugLogPath $focusLostDebugLogPath `
+    -AcceptanceProofGrade $acceptanceProofGrade
 Save-SeedSendStatusState -Path $seedSendStatusPath -RunRoot $resolvedRunRoot -State $seedSendState
 
 if ($AsJson) {

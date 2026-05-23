@@ -46,12 +46,18 @@ function Write-RetryPendingMetadata {
         return
     }
 
+    $debugLogPath = ''
+    if ($FailureMessage -match 'debugLog=(.+)$') {
+        $debugLogPath = ([string]$Matches[1]).Trim()
+    }
+
     $metadataPath = ($RetryPath + '.meta.json')
     $payload = [ordered]@{
         SchemaVersion = '1.0.0'
         RetryPath = $RetryPath
         FailureCategory = $FailureCategory
         FailureMessage = $FailureMessage
+        DebugLogPath = $debugLogPath
         TargetId = $TargetId
         OriginalPath = $OriginalPath
         Attempt = $Attempt

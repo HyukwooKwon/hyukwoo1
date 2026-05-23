@@ -20,37 +20,24 @@ $externalFixtureRoot = 'C:\dev\python\_relay-test-fixtures'
 $tmpRoot = Join-Path $externalFixtureRoot 'Test-StartPairedExchangeExternalContractPaths'
 $workRepoRoot = Join-Path $tmpRoot 'work-repo'
 $reviewRoot = Join-Path $workRepoRoot 'reviewfile'
-$configPath = Join-Path $tmpRoot 'settings.external-contract.psd1'
 $reviewInputPath = Join-Path $reviewRoot 'seed-input.zip'
-$externalInboxRoot = Join-Path $workRepoRoot '.relay-bookkeeping\bottest-live-visible\inbox'
-$externalProcessedRoot = Join-Path $workRepoRoot '.relay-bookkeeping\bottest-live-visible\processed'
-$externalRuntimeRoot = Join-Path $workRepoRoot '.relay-bookkeeping\bottest-live-visible\runtime'
-$externalLogsRoot = Join-Path $workRepoRoot '.relay-bookkeeping\bottest-live-visible\logs'
 
 New-Item -ItemType Directory -Path $reviewRoot -Force | Out-Null
 Set-Content -LiteralPath $reviewInputPath -Value 'seed-input' -Encoding UTF8
 
 $baseConfigPath = Join-Path $root 'config\settings.bottest-live-visible.psd1'
-$baseConfigText = Get-Content -LiteralPath $baseConfigPath -Raw -Encoding UTF8
-$escapedWorkRepoRoot = $workRepoRoot.Replace("'", "''")
-$escapedReviewInputPath = $reviewInputPath.Replace("'", "''")
-$escapedInboxRoot = $externalInboxRoot.Replace("'", "''")
-$escapedProcessedRoot = $externalProcessedRoot.Replace("'", "''")
-$escapedRuntimeRoot = $externalRuntimeRoot.Replace("'", "''")
-$escapedLogsRoot = $externalLogsRoot.Replace("'", "''")
-$configText = $baseConfigText `
-    -replace "DefaultSeedWorkRepoRoot = '.*?'", ("DefaultSeedWorkRepoRoot = '" + $escapedWorkRepoRoot + "'") `
-    -replace "DefaultSeedReviewInputPath = '.*?'", ("DefaultSeedReviewInputPath = '" + $escapedReviewInputPath + "'") `
-    -replace "ExternalWorkRepoContractRelativeRoot = '.*?'", "ExternalWorkRepoContractRelativeRoot = '.relay-contract\\external-contract-test'" `
-    -replace "InboxRoot = '.*?'", ("InboxRoot = '" + $escapedInboxRoot + "'") `
-    -replace "ProcessedRoot = '.*?'", ("ProcessedRoot = '" + $escapedProcessedRoot + "'") `
-    -replace "RuntimeRoot = '.*?'", ("RuntimeRoot = '" + $escapedRuntimeRoot + "'") `
-    -replace "LogsRoot = '.*?'", ("LogsRoot = '" + $escapedLogsRoot + "'")
-Set-Content -LiteralPath $configPath -Value $configText -Encoding UTF8
+$generated = & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Write-ExternalizedRelayConfig.ps1') `
+    -BaseConfigPath $baseConfigPath `
+    -WorkRepoRoot $workRepoRoot `
+    -ReviewInputPath $reviewInputPath `
+    -PairId 'pair01' `
+    -ExternalWorkRepoContractRelativeRoot '.relay-contract\external-contract-test' `
+    -AsJson | ConvertFrom-Json
+$resolvedConfigPath = [string]$generated.OutputConfigPath
 
 $startOutput = @(
     & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Start-PairedExchangeTest.ps1') `
-        -ConfigPath $configPath `
+        -ConfigPath $resolvedConfigPath `
         -IncludePairId pair01 `
         -SeedTargetId target01 2>&1
 )
@@ -65,7 +52,7 @@ $target01 = @($manifest.Targets | Where-Object { [string]$_.TargetId -eq 'target
 $target05 = @($manifest.Targets | Where-Object { [string]$_.TargetId -eq 'target05' } | Select-Object -First 1)[0]
 
 $expectedContractBase = Join-Path $workRepoRoot '.relay-contract\external-contract-test'
-$expectedRunRootBase = Join-Path $workRepoRoot '.relay-runs\bottest-live-visible'
+$expectedRunRootBase = [string]$generated.PairRunRootBase
 $expectedTarget01ContractRoot = Join-Path $expectedContractBase (Join-Path (Split-Path -Leaf $runRoot) 'pair01\target01')
 $expectedTarget05ContractRoot = Join-Path $expectedContractBase (Join-Path (Split-Path -Leaf $runRoot) 'pair01\target05')
 $expectedTarget01Outbox = Join-Path $expectedTarget01ContractRoot 'source-outbox'

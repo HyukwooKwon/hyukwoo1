@@ -23,5 +23,6 @@ Assert-True ($scriptText.Contains("RequireUserVisibleCellExecution")) 'acceptanc
 Assert-True ($scriptText.Contains("shared real test policy requires typed-window execution in the user-visible cells.")) 'acceptance script should hard fail when shared real-test policy is violated.'
 Assert-True ($scriptText.Contains("launcher\Check-TargetWindowVisibility.ps1")) 'typed-window preflight should invoke check-target-window-visibility.'
 Assert-True ($scriptText.Contains("typed-window-preflight")) 'typed-window preflight stage should be recorded.'
+Assert-True ($scriptText.Contains("ActiveWindowSummary")) 'typed-window preflight should preserve the active window snapshot summary.'
 
 Write-Host 'run-live-visible-pair-acceptance typed-window policy wiring ok'

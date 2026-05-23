@@ -21,7 +21,6 @@ $tmpRoot = Join-Path $externalFixtureRoot 'Test-SeedContextDefaults'
 $workRepoRoot = Join-Path $tmpRoot 'work-repo'
 $reviewRoot = Join-Path $workRepoRoot 'reviewfile'
 $runRoot = Join-Path $workRepoRoot ('.relay-runs\bottest-live-visible\run_' + (Get-Date -Format 'yyyyMMdd_HHmmss_fff'))
-$configPath = Join-Path $tmpRoot 'settings.test-seed-defaults.psd1'
 
 New-Item -ItemType Directory -Path $reviewRoot -Force | Out-Null
 
@@ -31,28 +30,26 @@ Set-Content -LiteralPath $olderZip -Value 'older' -Encoding UTF8
 Start-Sleep -Milliseconds 50
 Set-Content -LiteralPath $latestZip -Value 'latest' -Encoding UTF8
 
-$baseConfigPath = Join-Path $root 'config\settings.bottest-live-visible.psd1'
-$baseConfigText = Get-Content -LiteralPath $baseConfigPath -Raw -Encoding UTF8
-$escapedWorkRepoRoot = $workRepoRoot.Replace("'", "''")
-$configText = $baseConfigText `
-    -replace "DefaultSeedWorkRepoRoot = '.*?'", ("DefaultSeedWorkRepoRoot = '" + $escapedWorkRepoRoot + "'") `
-    -replace "DefaultSeedReviewInputPath = '.*?'", "DefaultSeedReviewInputPath = ''" `
-    -replace "DefaultSeedReviewInputSearchRelativePath = '.*?'", "DefaultSeedReviewInputSearchRelativePath = 'reviewfile'" `
-    -replace "DefaultSeedReviewInputFilter = '.*?'", "DefaultSeedReviewInputFilter = '*.zip'"
-Set-Content -LiteralPath $configPath -Value $configText -Encoding UTF8
+$generatedPayload = & (Join-Path $root 'tests\Write-ExternalizedRelayConfig.ps1') `
+    -BaseConfigPath (Join-Path $root 'config\settings.bottest-live-visible.psd1') `
+    -WorkRepoRoot $workRepoRoot `
+    -PairId pair01 `
+    -ReviewInputPath '' `
+    -AsJson | ConvertFrom-Json
+$resolvedConfigPath = [string]$generatedPayload.OutputConfigPath
 
 & (Join-Path $root 'tests\Start-PairedExchangeTest.ps1') `
-    -ConfigPath $configPath `
+    -ConfigPath $resolvedConfigPath `
     -RunRoot $runRoot `
     -IncludePairId pair01 `
     -SeedTargetId target01 | Out-Null
 
-$requestPath = Join-Path $runRoot 'pair01\target01\request.json'
-$messagePath = Join-Path $runRoot 'messages\target01.txt'
 $manifestPath = Join-Path $runRoot 'manifest.json'
-$request = Get-Content -LiteralPath $requestPath -Raw -Encoding UTF8 | ConvertFrom-Json
 $manifest = Get-Content -LiteralPath $manifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
 $manifestTarget = @($manifest.Targets | Where-Object { [string]$_.TargetId -eq 'target01' } | Select-Object -First 1)[0]
+$requestPath = [string]$manifestTarget.RequestPath
+$messagePath = [string]$manifestTarget.MessagePath
+$request = Get-Content -LiteralPath $requestPath -Raw -Encoding UTF8 | ConvertFrom-Json
 $messageText = Get-Content -LiteralPath $messagePath -Raw -Encoding UTF8
 
 Assert-True ([string]$request.WorkRepoRoot -eq $workRepoRoot) 'default seed WorkRepoRoot should be resolved from PairTest config.'
@@ -62,7 +59,8 @@ Assert-True ([int]$request.ReviewInputCandidateCount -eq 2) 'request should reco
 Assert-True ([string]$request.ReviewInputSearchRoot -eq $reviewRoot) 'request should record selection search root.'
 Assert-True ([string]$manifestTarget.ReviewInputSelectionMode -eq 'auto-latest-candidate') 'manifest target row should record selection mode.'
 Assert-True ([int]$manifestTarget.ReviewInputCandidateCount -eq 2) 'manifest target row should record candidate count.'
-Assert-True ($messageText.Contains("WorkRepoRoot: $workRepoRoot")) 'seed message should include default WorkRepoRoot.'
-Assert-True ($messageText.Contains("ReviewInputPath: $latestZip")) 'seed message should include default ReviewInputPath.'
+Assert-True ($messageText.Contains("프로젝트 작업 repo: $workRepoRoot")) 'seed message should include default WorkRepoRoot.'
+Assert-True ($messageText.Contains('먼저 확인할 파일:')) 'seed message should include review input guidance block.'
+Assert-True ($messageText.Contains($latestZip)) 'seed message should include default ReviewInputPath.'
 
 Write-Host ('seed context defaults ok: runRoot=' + $runRoot)

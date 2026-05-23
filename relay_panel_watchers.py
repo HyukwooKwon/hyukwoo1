@@ -14,6 +14,8 @@ from relay_panel_services import CommandService
 
 DEFAULT_WATCHER_MAX_FORWARD_COUNT = 2
 DEFAULT_WATCHER_RUN_DURATION_SEC = 900
+START_MODE_CURRENT_RUN = "current_run"
+START_MODE_NEW_RUN = "new_run"
 WATCHER_CONTROL_FILE_NAME = "watcher-control.json"
 WATCHER_STATUS_FILE_NAME = "watcher-status.json"
 PENDING_STOP_STALE_AFTER_SEC = 15.0
@@ -28,6 +30,15 @@ class WatcherStartRequest:
     max_forward_count: int = DEFAULT_WATCHER_MAX_FORWARD_COUNT
     run_duration_sec: int = DEFAULT_WATCHER_RUN_DURATION_SEC
     pair_max_roundtrip_count: int = 0
+    pair_roundtrip_limit_map: dict[str, int] = field(default_factory=dict)
+    start_mode: str = START_MODE_CURRENT_RUN
+
+
+@dataclass(frozen=True)
+class WatcherStartRequestReview:
+    allowed: bool
+    message: str = ""
+    warning: str = ""
 
 
 @dataclass(frozen=True)
@@ -152,6 +163,110 @@ class WatcherService:
         if not hints:
             return prefix
         return "{0} {1}".format(prefix, " / ".join(hints))
+
+    @staticmethod
+    def _pair_rows(paired_status: dict | None) -> list[dict]:
+        rows: list[dict] = []
+        for item in ((paired_status or {}).get("Pairs", []) or []):
+            if isinstance(item, dict):
+                rows.append(item)
+        return rows
+
+    @classmethod
+    def _pause_disallowed_pair_ids(cls, paired_status: dict | None) -> list[str]:
+        pair_ids: list[str] = []
+        for row in cls._pair_rows(paired_status):
+            if bool(row.get("PolicyPauseAllowed", True)):
+                continue
+            pair_id = str(row.get("PairId", "") or "").strip()
+            if pair_id:
+                pair_ids.append(pair_id)
+        return pair_ids
+
+    @staticmethod
+    def _normalized_pair_roundtrip_limit_map(limit_map: object) -> dict[str, int]:
+        normalized: dict[str, int] = {}
+        if not isinstance(limit_map, dict):
+            return normalized
+        for raw_pair_id, raw_limit in limit_map.items():
+            pair_id = str(raw_pair_id or "").strip()
+            if not pair_id:
+                continue
+            try:
+                limit = int(raw_limit or 0)
+            except (TypeError, ValueError):
+                limit = 0
+            if limit < 0:
+                limit = 0
+            normalized[pair_id] = limit
+        return normalized
+
+    @staticmethod
+    def _format_pair_roundtrip_limit_map(limit_map: dict[str, int]) -> str:
+        if not limit_map:
+            return ""
+        parts = [f"{pair_id}:{int(limit_map[pair_id])}" for pair_id in sorted(limit_map)]
+        return ", ".join(parts)
+
+    def review_start_request(self, request: WatcherStartRequest) -> WatcherStartRequestReview:
+        if request.pair_max_roundtrip_count <= 0:
+            return WatcherStartRequestReview(allowed=True)
+        warnings: list[str] = []
+        pair_limit_map = self._normalized_pair_roundtrip_limit_map(request.pair_roundtrip_limit_map)
+        if len(pair_limit_map) > 1:
+            distinct_limits = {int(limit) for limit in pair_limit_map.values()}
+            if len(distinct_limits) > 1:
+                return WatcherStartRequestReview(
+                    allowed=False,
+                    message=(
+                        "Global Pair Roundtrip Override={0} 는 선택된 pair 정책 왕복 제한이 서로 다를 때 사용할 수 없습니다. "
+                        "현재 pair policy는 {1} 입니다. override를 0으로 두고 pair 카드 Roundtrip 값을 사용하세요."
+                    ).format(
+                        request.pair_max_roundtrip_count,
+                        self._format_pair_roundtrip_limit_map(pair_limit_map),
+                    ),
+                )
+            warnings.append(
+                "주의: Global Pair Roundtrip Override={0} 는 선택된 모든 pair에 동일하게 적용됩니다. "
+                "현재 pair policy={1}".format(
+                    request.pair_max_roundtrip_count,
+                    self._format_pair_roundtrip_limit_map(pair_limit_map),
+                )
+            )
+        if request.max_forward_count <= 0:
+            warnings.append("왕복 제한 모드: MaxForwardCount=0이라 pair별 왕복 제한이 먼저 적용됩니다.")
+        else:
+            minimum_forward_count = request.pair_max_roundtrip_count * 2
+            if request.max_forward_count < minimum_forward_count:
+                return WatcherStartRequestReview(
+                    allowed=False,
+                    message=(
+                        "PairMaxRoundtripCount={0} 와 MaxForwardCount={1} 조합은 충돌합니다. "
+                        "MaxForwardCount는 watcher 전체 forward 합계 기준이며 단일 pair도 최소 {2} forward가 필요합니다. "
+                        "MaxForwardCount를 0으로 두거나 {2} 이상으로 늘리세요."
+                    ).format(
+                        request.pair_max_roundtrip_count,
+                        request.max_forward_count,
+                        minimum_forward_count,
+                    ),
+                )
+            warnings.append(
+                (
+                    "주의: MaxForwardCount={0} 는 watcher 전체 forward 합계 기준이라 "
+                    "여러 pair run에서는 pair 왕복 제한보다 먼저 멈출 수 있습니다."
+                ).format(request.max_forward_count)
+            )
+        if request.run_duration_sec > 0:
+            warnings.append(
+                (
+                    "주의: RunDurationSec={0}초 제한이 있어 pair별 왕복 {1}회 전에 "
+                    "run-duration-reached로 멈출 수 있습니다. 엄격한 왕복 제한 모드라면 RunDurationSec=0을 권장합니다."
+                ).format(request.run_duration_sec, request.pair_max_roundtrip_count)
+            )
+        return WatcherStartRequestReview(
+            allowed=True,
+            warning=" ".join(part for part in warnings if part),
+        )
 
     def get_runtime_status(self, paired_status: dict | None, run_root: str) -> WatcherRuntimeStatus:
         watcher = ((paired_status or {}).get("Watcher", {}) or {})
@@ -329,8 +444,8 @@ class WatcherService:
             allowed=True,
             run_root=run_root,
             state=status.state,
-            message="현재 watch 시작을 요청할 수 있습니다.",
-            recommended_action="watch 시작",
+            message="현재 Run 시작을 요청할 수 있습니다.",
+            recommended_action="현재 Run 시작",
         )
 
     def get_stop_eligibility(self, paired_status: dict | None, run_root: str) -> WatcherStopEligibility:
@@ -390,16 +505,20 @@ class WatcherService:
                 run_root=run_root,
                 state=status.state,
                 reason_codes=["pending_forward_exists"],
-                message="다음 전달 가능 대상이 남아 있어 watch 정지를 차단합니다.",
+                message=(
+                    "지금은 전달 가능한 산출물이 남아 있어 watcher 종료를 막았습니다. "
+                    "이어서 계속할 목적이면 watch 일시중지를 사용하세요. "
+                    "완전 종료하려면 먼저 전달 가능 target을 처리하거나 정리해야 합니다."
+                ),
             )
         warning_codes: list[str] = []
         if int(counts.get("FailureLineCount", 0) or 0) > 0:
             warning_codes.append("recent_failure_present")
         if int(counts.get("NoZipCount", 0) or 0) > 0:
             warning_codes.append("incomplete_artifacts_present")
-        message = "현재 watch 정지를 요청할 수 있습니다."
+        message = "현재 watcher 종료 요청을 진행할 수 있습니다."
         if warning_codes:
-            message = "watch 정지 전 확인이 필요한 상태가 있습니다."
+            message = "watcher 종료 전 확인이 필요한 상태가 있습니다."
         return WatcherStopEligibility(
             allowed=True,
             run_root=run_root,
@@ -463,6 +582,21 @@ class WatcherService:
                 state=status.state,
                 reason_codes=["watcher_not_running"],
                 message="현재 RunRoot 기준 watcher가 실행 중이 아닙니다.",
+            )
+        disallowed_pairs = self._pause_disallowed_pair_ids(paired_status)
+        if disallowed_pairs:
+            pair_summary = ", ".join(disallowed_pairs[:4])
+            if len(disallowed_pairs) > 4:
+                pair_summary += " 외 ..."
+            return WatcherStopEligibility(
+                allowed=False,
+                run_root=run_root,
+                state=status.state,
+                reason_codes=["pause_policy_disabled"],
+                message=(
+                    "현재 watcher에는 pause가 금지된 pair가 포함되어 있어 watch pause 제어를 막았습니다. "
+                    "대상 pair: {0}"
+                ).format(pair_summary),
             )
         return WatcherStopEligibility(
             allowed=True,
@@ -541,17 +675,17 @@ class WatcherService:
             "resume": "resume_requested",
         }
         success_message_map = {
-            "stop": "watch 정지 요청 파일을 기록했습니다. 상태가 stopped로 바뀌는지 확인이 필요합니다.",
+            "stop": "watcher 종료 요청 파일을 기록했습니다. 일시중지가 아니라 완전 종료 흐름이며 상태가 stopped로 바뀌는지 확인이 필요합니다.",
             "pause": "watch pause 요청 파일을 기록했습니다. 상태가 paused로 바뀌는지 확인이 필요합니다.",
             "resume": "watch resume 요청 파일을 기록했습니다. 상태가 running으로 복귀하는지 확인이 필요합니다.",
         }
         already_message_map = {
-            "stop": "이미 watch 정지 요청이 진행 중입니다.",
+            "stop": "이미 watcher 종료 요청이 진행 중입니다.",
             "pause": "이미 watch pause 요청이 진행 중입니다.",
             "resume": "이미 watch resume 요청이 진행 중입니다.",
         }
         file_exists_message_map = {
-            "stop": "이미 watch 정지 요청 파일이 존재합니다.",
+            "stop": "이미 watcher 종료 요청 파일이 존재합니다.",
             "pause": "이미 watch pause 요청 파일이 존재합니다.",
             "resume": "이미 watch resume 요청 파일이 존재합니다.",
         }
@@ -756,6 +890,16 @@ class WatcherService:
                 message="RunRoot가 비어 있어 watch를 시작할 수 없습니다.",
                 reason_codes=["runroot_missing"],
             )
+        request_review = self.review_start_request(request)
+        if not request_review.allowed:
+            return WatcherControlResult(
+                ok=False,
+                action="start",
+                run_root=request.run_root,
+                state="stopped",
+                message=request_review.message or "Run 시작 옵션이 현재 watcher 계약과 충돌합니다.",
+                reason_codes=["watcher_start_option_conflict"],
+            )
         command = self.build_start_command(command_service, request)
         command_service.spawn_detached(command)
         return WatcherControlResult(
@@ -763,7 +907,7 @@ class WatcherService:
             action="start",
             run_root=request.run_root,
             state="starting",
-            message="watch 시작 명령을 별도 프로세스로 요청했습니다.",
+            message="watcher 시작 명령을 별도 프로세스로 요청했습니다.",
             command_text=" ".join(command),
             warning_codes=["verify_running_required"],
         )
@@ -815,6 +959,118 @@ class WatcherService:
             message="watch stopped + control cleared + request ack 상태를 제한 시간 안에 확인하지 못했습니다.",
             request_id=request_id,
             reason_codes=reason_codes,
+        )
+
+    def _wait_for_acknowledged_state(
+        self,
+        status_loader: StatusLoader,
+        run_root: str,
+        *,
+        request_id: str = "",
+        expected_state: str,
+        expected_action: str,
+        expected_results: set[str],
+        timeout_sec: float,
+        poll_interval_sec: float,
+        success_action: str,
+        success_message: str,
+        timeout_action: str,
+        timeout_message: str,
+        timeout_reason_code: str,
+    ) -> WatcherControlResult:
+        deadline = time.monotonic() + timeout_sec
+        last_error = ""
+        last_status = WatcherRuntimeStatus(run_root=run_root, state="unknown")
+        while time.monotonic() <= deadline:
+            paired_status, error = status_loader(run_root)
+            last_error = error or last_error
+            last_status = self.get_runtime_status(paired_status, run_root)
+            ack_ok = (not request_id) or (
+                last_status.last_handled_request_id == request_id
+                and last_status.last_handled_action == expected_action
+                and last_status.last_handled_result in expected_results
+            )
+            control_cleared = not last_status.control_exists and not last_status.control_pending_action
+            if last_status.state == expected_state and control_cleared and ack_ok:
+                return WatcherControlResult(
+                    ok=True,
+                    action=success_action,
+                    run_root=run_root,
+                    state=expected_state,
+                    message=success_message,
+                    request_id=request_id,
+                )
+            time.sleep(max(0.0, poll_interval_sec))
+        reason_codes = [timeout_reason_code]
+        if last_error:
+            reason_codes.append("paired_status_error")
+        ack_ok = (not request_id) or (
+            last_status.last_handled_request_id == request_id
+            and last_status.last_handled_action == expected_action
+            and last_status.last_handled_result in expected_results
+        )
+        if not ack_ok:
+            reason_codes.append("request_ack_missing")
+        if last_status.control_exists or last_status.control_pending_action:
+            reason_codes.append("control_not_cleared")
+        return WatcherControlResult(
+            ok=False,
+            action=timeout_action,
+            run_root=run_root,
+            state=last_status.state,
+            message=timeout_message,
+            request_id=request_id,
+            reason_codes=reason_codes,
+        )
+
+    def wait_for_paused(
+        self,
+        status_loader: StatusLoader,
+        run_root: str,
+        *,
+        request_id: str = "",
+        timeout_sec: float = 15.0,
+        poll_interval_sec: float = 1.0,
+    ) -> WatcherControlResult:
+        return self._wait_for_acknowledged_state(
+            status_loader,
+            run_root,
+            request_id=request_id,
+            expected_state="paused",
+            expected_action="pause",
+            expected_results={"paused", "already-paused"},
+            timeout_sec=timeout_sec,
+            poll_interval_sec=poll_interval_sec,
+            success_action="wait_for_paused",
+            success_message="watch pause 요청과 request ack를 확인했습니다.",
+            timeout_action="wait_for_paused",
+            timeout_message="watch paused + control cleared + request ack 상태를 제한 시간 안에 확인하지 못했습니다.",
+            timeout_reason_code="pause_timeout",
+        )
+
+    def wait_for_resumed(
+        self,
+        status_loader: StatusLoader,
+        run_root: str,
+        *,
+        request_id: str = "",
+        timeout_sec: float = 15.0,
+        poll_interval_sec: float = 1.0,
+    ) -> WatcherControlResult:
+        return self._wait_for_acknowledged_state(
+            status_loader,
+            run_root,
+            request_id=request_id,
+            expected_state="running",
+            expected_action="resume",
+            expected_results={"resumed", "already-running"},
+            timeout_sec=timeout_sec,
+            poll_interval_sec=poll_interval_sec,
+            success_action="wait_for_resumed",
+            success_message="watch resume 요청과 request ack를 확인했습니다.",
+            timeout_action="wait_for_resumed",
+            timeout_message="watch running + control cleared + request ack 상태를 제한 시간 안에 확인하지 못했습니다.",
+            timeout_reason_code="resume_timeout",
         )
 
     def wait_for_running(
@@ -878,6 +1134,16 @@ class WatcherService:
         running_timeout_sec: float = 15.0,
         poll_interval_sec: float = 1.0,
     ) -> WatcherControlResult:
+        request_review = self.review_start_request(request)
+        if not request_review.allowed:
+            return WatcherControlResult(
+                ok=False,
+                action="restart",
+                run_root=request.run_root,
+                state=self.get_runtime_status(paired_status, request.run_root).state,
+                message=request_review.message or "watch 재시작 옵션이 현재 watcher 계약과 충돌합니다.",
+                reason_codes=["watcher_start_option_conflict"],
+            )
         stop_result = self.request_stop(paired_status, request.run_root, requested_by=requested_by)
         if not stop_result.ok:
             return WatcherControlResult(

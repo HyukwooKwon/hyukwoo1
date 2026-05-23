@@ -149,6 +149,10 @@ Assert-True ([string]$result.TypedWindowExecutionState -eq 'typed-window-submit-
 Assert-True (@($result.Attempts).Count -eq 2) 'typed-window helper should record both processed attempts.'
 Assert-True ([string]$result.TypedWindowSessionState -eq 'recovery-needed') 'typed-window helper should mark the session recovery-needed after retry exhaustion.'
 Assert-True ([string]$result.TypedWindowLastResetReason -eq 'typed-window-submit-unconfirmed') 'typed-window helper should record the reset reason after retry exhaustion.'
+Assert-True ([string]$result.TypedWindowSessionScopeKind -eq 'pair') 'typed-window helper should preserve pair scope kind after retry exhaustion.'
+Assert-True ([string]$result.TypedWindowSessionScopeId -eq 'pair01') 'typed-window helper should preserve pair scope id after retry exhaustion.'
+Assert-True ([string]$result.TypedWindowSessionRouteKey -eq 'pair:pair01:target01') 'typed-window helper should preserve pair route key after retry exhaustion.'
+Assert-True ([string]$result.AcceptanceProofGrade -eq 'failed') 'submit-unconfirmed retry exhaustion should be graded as failed.'
 
 $seedSendStatusPath = Join-Path $runRoot '.state\seed-send-status.json'
 $seedSendStatus = Get-Content -LiteralPath $seedSendStatusPath -Raw -Encoding UTF8 | ConvertFrom-Json
@@ -160,5 +164,9 @@ Assert-True ([string]$targetStatus.SubmitProbeState -eq 'typed-window-submit-unc
 Assert-True ([string]$targetStatus.TypedWindowExecutionState -eq 'typed-window-submit-unconfirmed') 'persisted typed-window seed-send status should record submit-unconfirmed execution state.'
 Assert-True ([string]$targetStatus.TypedWindowSessionState -eq 'recovery-needed') 'persisted typed-window seed-send status should record recovery-needed session state.'
 Assert-True ([string]$targetStatus.TypedWindowLastResetReason -eq 'typed-window-submit-unconfirmed') 'persisted typed-window seed-send status should record reset reason.'
+Assert-True ([string]$targetStatus.TypedWindowSessionScopeKind -eq 'pair') 'persisted typed-window seed-send status should record pair scope kind.'
+Assert-True ([string]$targetStatus.TypedWindowSessionScopeId -eq 'pair01') 'persisted typed-window seed-send status should record pair scope id.'
+Assert-True ([string]$targetStatus.TypedWindowSessionRouteKey -eq 'pair:pair01:target01') 'persisted typed-window seed-send status should record pair route key.'
+Assert-True ([string]$targetStatus.AcceptanceProofGrade -eq 'failed') 'persisted typed-window seed-send status should record failed proof grade.'
 
 Write-Host ('send-initial-pair-seed typed-window retry ok: runRoot=' + $runRoot)

@@ -16,6 +16,7 @@ function Assert-True {
 }
 
 $root = Split-Path -Parent $PSScriptRoot
+. (Join-Path $root 'tests\lib\ConfigMutationHelpers.ps1')
 $externalFixtureRoot = 'C:\dev\python\_relay-test-fixtures'
 $tmpRoot = Join-Path $externalFixtureRoot 'Test-StartPairedExchangeSameRepoPairIsolation'
 $sharedRepoRoot = Join-Path $tmpRoot 'shared-work-repo'
@@ -23,11 +24,6 @@ $reviewRoot = Join-Path $sharedRepoRoot 'reviewfile'
 $reviewInputPath = Join-Path $reviewRoot 'seed-input.zip'
 $configPath = Join-Path $tmpRoot 'settings.same-repo.psd1'
 $explicitRunRoot = Join-Path $sharedRepoRoot '.relay-runs\bottest-live-visible\run_same_repo_pair_test'
-$bookkeepingRoot = Join-Path $sharedRepoRoot '.relay-bookkeeping\bottest-live-visible'
-$inboxRoot = Join-Path $bookkeepingRoot 'inbox'
-$processedRoot = Join-Path $bookkeepingRoot 'processed'
-$runtimeRoot = Join-Path $bookkeepingRoot 'runtime'
-$logsRoot = Join-Path $bookkeepingRoot 'logs'
 
 if (Test-Path -LiteralPath $tmpRoot) {
     Remove-Item -LiteralPath $tmpRoot -Recurse -Force
@@ -36,26 +32,16 @@ New-Item -ItemType Directory -Path $reviewRoot -Force | Out-Null
 Set-Content -LiteralPath $reviewInputPath -Value 'seed-input' -Encoding UTF8
 
 $baseConfigPath = Join-Path $root 'config\settings.bottest-live-visible.psd1'
-$baseConfigText = Get-Content -LiteralPath $baseConfigPath -Raw -Encoding UTF8
-$escapedSharedRepoRoot = $sharedRepoRoot.Replace("'", "''")
-$escapedReviewInputPath = $reviewInputPath.Replace("'", "''")
-$escapedInboxRoot = $inboxRoot.Replace("'", "''")
-$escapedProcessedRoot = $processedRoot.Replace("'", "''")
-$escapedRuntimeRoot = $runtimeRoot.Replace("'", "''")
-$escapedLogsRoot = $logsRoot.Replace("'", "''")
-$configText = $baseConfigText `
-    -replace "DefaultSeedWorkRepoRoot = '.*?'", ("DefaultSeedWorkRepoRoot = '" + $escapedSharedRepoRoot + "'") `
-    -replace "DefaultSeedReviewInputPath = '.*?'", ("DefaultSeedReviewInputPath = '" + $escapedReviewInputPath + "'") `
-    -replace "ExternalWorkRepoContractRelativeRoot = '.*?'", "ExternalWorkRepoContractRelativeRoot = '.relay-contract\\external-same-repo-test'" `
-    -replace "InboxRoot = '.*?'", ("InboxRoot = '" + $escapedInboxRoot + "'") `
-    -replace "ProcessedRoot = '.*?'", ("ProcessedRoot = '" + $escapedProcessedRoot + "'") `
-    -replace "RuntimeRoot = '.*?'", ("RuntimeRoot = '" + $escapedRuntimeRoot + "'") `
-    -replace "LogsRoot = '.*?'", ("LogsRoot = '" + $escapedLogsRoot + "'")
-$configText = [regex]::Replace(
-    $configText,
-    "(?s)(pair02\s*=\s*@\{\s*.*?DefaultSeedTargetId\s*=\s*'target02'\s*)",
-    ('$1' + "                DefaultSeedWorkRepoRoot = '" + $escapedSharedRepoRoot + "'`r`n")
-)
+$generated = & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Write-ExternalizedRelayConfig.ps1') `
+    -BaseConfigPath $baseConfigPath `
+    -WorkRepoRoot $sharedRepoRoot `
+    -ReviewInputPath $reviewInputPath `
+    -ExternalWorkRepoContractRelativeRoot '.relay-contract\external-same-repo-test' `
+    -AsJson | ConvertFrom-Json
+$generatedConfigPath = [string]$generated.OutputConfigPath
+$configText = Get-Content -LiteralPath $generatedConfigPath -Raw -Encoding UTF8
+$configText = Set-QuotedPairPolicyAssignment -Text $configText -PairId 'pair01' -Name 'DefaultSeedWorkRepoRoot' -Value $sharedRepoRoot
+$configText = Set-QuotedPairPolicyAssignment -Text $configText -PairId 'pair02' -Name 'DefaultSeedWorkRepoRoot' -Value $sharedRepoRoot
 Set-Content -LiteralPath $configPath -Value $configText -Encoding UTF8
 
 @(

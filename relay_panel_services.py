@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -29,12 +30,20 @@ SCRIPT_ARGUMENT_POLICY = {
     "check-target-window-visibility.ps1": {"config": True, "json_stdout_on_error": True},
     "tests/Confirm-PairedExchangeHandoffPrimitive.ps1": {"config": True, "run_root": True, "pair": True, "target": True},
     "tests/Confirm-PairedExchangePublishPrimitive.ps1": {"config": True, "run_root": True, "pair": True, "target": True},
+    "tests/Request-TargetAutoloopControl.ps1": {"config": True, "run_root": True},
+    "tests/Show-TargetAutoloopSeedComposer.ps1": {"config": True, "run_root": True, "target": True},
+    "tests/Show-TargetAutoloopRouteMatrix.ps1": {"config": True, "run_root": True},
+    "tests/Show-TargetAutoloopRouteProofDoctor.ps1": {"config": True, "run_root": True},
+    "tests/Start-TargetAutoloopRun.ps1": {"config": True, "run_root": True},
+    "tests/Start-TargetAutoloopWatcher.ps1": {"config": True, "run_root": True},
+    "tests/Watch-TargetAutoloop.ps1": {"config": True, "run_root": True},
     "disable-pair.ps1": {"config": True, "pair": True},
     "enable-pair.ps1": {"config": True, "pair": True},
     "export-config-json.ps1": {"config": True},
     "import-paired-exchange-artifact.ps1": {"config": True, "run_root": True, "target": True},
     "tests/Invoke-PairedExchangeOneShotSubmit.ps1": {"config": True, "run_root": True, "pair": True, "target": True},
     "refresh-binding-profile-from-existing.ps1": {"config": True, "json_stdout_on_error": True},
+    "router/Restart-RouterForConfig.ps1": {"config": True},
     "router.ps1": {"config": True},
     "show-effective-config.ps1": {"config": True, "run_root": True, "pair": True, "target": True},
     "show-paired-exchange-status.ps1": {"config": True, "run_root": True},
@@ -115,12 +124,32 @@ def build_command(
     return command
 
 
+def _background_process_kwargs() -> dict[str, object]:
+    kwargs: dict[str, object] = {}
+    create_no_window = int(getattr(subprocess, "CREATE_NO_WINDOW", 0) or 0)
+    if create_no_window:
+        kwargs["creationflags"] = create_no_window
+    startupinfo_factory = getattr(subprocess, "STARTUPINFO", None)
+    startf_use_showwindow = int(getattr(subprocess, "STARTF_USESHOWWINDOW", 0) or 0)
+    sw_hide = int(getattr(subprocess, "SW_HIDE", 0) or 0)
+    if os.name == "nt" and startupinfo_factory is not None and startf_use_showwindow:
+        try:
+            startupinfo = startupinfo_factory()
+            startupinfo.dwFlags |= startf_use_showwindow
+            startupinfo.wShowWindow = sw_hide
+            kwargs["startupinfo"] = startupinfo
+        except Exception:
+            pass
+    return kwargs
+
+
 def run_command(command: list[str]) -> subprocess.CompletedProcess[str]:
     completed = subprocess.run(
         command,
         cwd=ROOT,
         capture_output=True,
         text=True,
+        **_background_process_kwargs(),
     )
     if completed.returncode != 0:
         detail = completed.stderr.strip() or completed.stdout.strip() or f"exit={completed.returncode}"
@@ -202,7 +231,7 @@ class CommandService:
 
     def spawn_detached(self, command: list[str]) -> None:
         self.reap_detached_processes()
-        process = subprocess.Popen(command, cwd=ROOT)
+        process = subprocess.Popen(command, cwd=ROOT, **_background_process_kwargs())
         self._detached_processes.append(process)
 
     def reap_detached_processes(self, *, wait_timeout_sec: float = 0.0) -> None:

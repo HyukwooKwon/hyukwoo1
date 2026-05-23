@@ -125,6 +125,9 @@ Assert-True ([string]$result.TypedWindowExecutionState -eq 'typed-window-inline-
 Assert-True ([string]$result.SubmitProbeState -eq 'typed-window-inline-prepare-blocked') 'inline prepare guard should record typed-window-inline-prepare-blocked probe state.'
 Assert-True ([string]$result.TypedWindowSessionState -eq 'recovery-needed') 'inline prepare guard should keep the session in recovery-needed state.'
 Assert-True ([string]$result.TypedWindowLastResetReason -eq 'typed-window-inline-prepare-blocked') 'inline prepare guard should record the reset reason.'
+Assert-True ([string]$result.TypedWindowSessionScopeKind -eq 'pair') 'inline prepare guard should preserve pair scope kind in the result.'
+Assert-True ([string]$result.TypedWindowSessionScopeId -eq 'pair01') 'inline prepare guard should preserve pair scope id in the result.'
+Assert-True ([string]$result.TypedWindowSessionRouteKey -eq 'pair:pair01:target01') 'inline prepare guard should preserve the canonical pair route key in the result.'
 Assert-True ([string]$result.SubmitConfirmationSignal -like '*dirty-session*') 'inline prepare guard should expose the blocked prepare reason.'
 
 $seedSendStatusPath = Join-Path $runRoot '.state\seed-send-status.json'
@@ -132,5 +135,8 @@ $seedSendStatus = Get-Content -LiteralPath $seedSendStatusPath -Raw -Encoding UT
 $targetStatus = @($seedSendStatus.Targets | Where-Object { [string]$_.TargetId -eq 'target01' } | Select-Object -First 1)[0]
 Assert-True ([string]$targetStatus.FinalState -eq 'manual_attention_required') 'persisted status should record manual attention required.'
 Assert-True ([string]$targetStatus.SubmitReason -eq 'typed-window-inline-prepare-blocked') 'persisted status should record inline prepare blocked reason.'
+Assert-True ([string]$targetStatus.TypedWindowSessionScopeKind -eq 'pair') 'persisted status should record pair scope kind.'
+Assert-True ([string]$targetStatus.TypedWindowSessionScopeId -eq 'pair01') 'persisted status should record pair scope id.'
+Assert-True ([string]$targetStatus.TypedWindowSessionRouteKey -eq 'pair:pair01:target01') 'persisted status should record the canonical pair route key.'
 
 Write-Host ('send-initial-pair-seed-inline-prepare-blocked ok: runRoot=' + $runRoot)

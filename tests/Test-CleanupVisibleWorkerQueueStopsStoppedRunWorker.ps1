@@ -58,8 +58,23 @@ $configText = @"
             WindowTitle = 'CleanupStoppedRun05'
             FixedSuffix = `$null
         }
+        @{
+            Id = 'target06'
+            Folder = '$($testRoot.Replace("'", "''"))\inbox\target06'
+            EnterCount = `$null
+            WindowTitle = 'CleanupStoppedRun06'
+            FixedSuffix = `$null
+        }
     )
     PairTest = @{
+        PairDefinitions = @(
+            @{
+                PairId = 'pair01'
+                TopTargetId = 'target05'
+                BottomTargetId = 'target06'
+                SeedTargetId = 'target05'
+            }
+        )
         VisibleWorker = @{
             Enabled = `$true
             QueueRoot = '$($(Join-Path $runtimeRoot 'visible-worker\queue').Replace("'", "''"))'

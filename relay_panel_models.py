@@ -70,6 +70,47 @@ class IssueModel:
 
 
 @dataclass
+class HomeExecutionContextModel:
+    badge_text: str
+    badge_background: str = "#6B7280"
+    badge_foreground: str = "#FFFFFF"
+    summary: str = ""
+    detail: str = ""
+    warning: str = ""
+    apply_enabled: bool = False
+    run_root_open_enabled: bool = False
+    clear_enabled: bool = False
+
+
+@dataclass
+class PrimaryActionRecommendation:
+    title: str
+    action_key: str
+    button_label: str
+    detail: str = ""
+    command_text: str = ""
+    read_only: bool = False
+    enabled: bool = True
+
+
+@dataclass(frozen=True)
+class StartRunPreview:
+    mode: str
+    allowed: bool
+    run_root: str
+    pair_id: str
+    target_ids: tuple[str, ...] = ()
+    current_forwarded_count: int | None = None
+    current_roundtrip_count: int | None = None
+    roundtrip_limit: int | None = None
+    will_prepare_runroot: bool = False
+    will_prepare_typed_window: bool = False
+    blocked_reason: str = ""
+    warning: str = ""
+    detail: str = ""
+
+
+@dataclass
 class PairSummaryModel:
     pair_id: str
     targets: str

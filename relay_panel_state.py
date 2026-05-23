@@ -4,6 +4,10 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 
+from relay_panel_acceptance_receipt import (
+    format_acceptance_relay_issue_detail_parts,
+    load_acceptance_receipt_summary_from_path,
+)
 from relay_panel_models import (
     ActionModel,
     DashboardRawBundle,
@@ -17,6 +21,11 @@ from relay_panel_models import (
 
 
 class DashboardAggregator:
+    BINDING_PROFILE_ERROR_MESSAGES = {
+        "json-parse-failed": "JSON 파싱 실패",
+        "read-failed": "파일 읽기 실패",
+        "unsupported-schema": "지원하지 않는 schema",
+    }
     PAIR_PHASE_CANONICAL = {
         "seed-running": "seed-running",
         "partner-running": "partner-running",
@@ -102,22 +111,40 @@ class DashboardAggregator:
     @classmethod
     def _binding_window_count(cls, relay_status: dict) -> int:
         runtime = relay_status.get("Runtime", {}) if relay_status else {}
+        if not isinstance(runtime, dict):
+            runtime = {}
         scoped_count = runtime.get("BindingScopedTargetCount", runtime.get("BindingScopedWindowCount"))
         if isinstance(scoped_count, int):
             return max(0, scoped_count)
 
         lane = relay_status.get("Lane", {}) if relay_status else {}
+        if not isinstance(lane, dict):
+            lane = {}
         binding_path = lane.get("BindingProfilePath", "") or ""
         if not binding_path:
             return 0
 
         try:
             payload = json.loads(Path(binding_path).read_text(encoding="utf-8"))
-        except Exception:
+        except FileNotFoundError:
+            lane["BindingProfileExists"] = False
+            lane.pop("BindingProfileParseError", None)
+            return 0
+        except json.JSONDecodeError:
+            lane["BindingProfileParseError"] = "json-parse-failed"
+            return 0
+        except OSError:
+            lane["BindingProfileParseError"] = "read-failed"
             return 0
 
-        windows = payload.get("windows", [])
+        lane["BindingProfileExists"] = True
+        lane.pop("BindingProfileParseError", None)
+
+        windows = payload.get("windows")
         if not isinstance(windows, list):
+            windows = payload.get("bindings", [])
+        if not isinstance(windows, list):
+            lane["BindingProfileParseError"] = "unsupported-schema"
             return 0
 
         active_target_ids = set(cls._string_list(runtime.get("ActiveTargetIds", [])))
@@ -138,6 +165,13 @@ class DashboardAggregator:
         if scoped_target_ids:
             return len(scoped_target_ids)
         return fallback_count
+
+    @classmethod
+    def _binding_profile_error_message(cls, error_code: str) -> str:
+        normalized = str(error_code or "").strip()
+        if not normalized:
+            return "binding profile 해석 실패"
+        return cls.BINDING_PROFILE_ERROR_MESSAGES.get(normalized, normalized)
 
     @classmethod
     def _run_root_timing_detail(cls, *, run_context: dict, hints: dict) -> str:
@@ -248,52 +282,15 @@ class DashboardAggregator:
     def _load_acceptance_receipt_summary(paired_status: dict | None) -> dict[str, str]:
         receipt = ((paired_status or {}).get("AcceptanceReceipt", {}) or {})
         path = str(receipt.get("Path", "") or "").strip()
-        payload: dict[str, object] = {}
         parse_error = str(receipt.get("ParseError", "") or "").strip()
-        if path:
-            try:
-                loaded = json.loads(Path(path).read_text(encoding="utf-8"))
-            except Exception as exc:
-                if not parse_error:
-                    parse_error = str(exc)
-            else:
-                if isinstance(loaded, dict):
-                    payload = loaded
-
-        outcome = payload.get("Outcome", {}) if isinstance(payload.get("Outcome", {}), dict) else {}
-        phase_history = payload.get("PhaseHistory", [])
-        if not isinstance(phase_history, list):
-            phase_history = []
-        history_tail_entries: list[str] = []
-        for entry in phase_history[-4:]:
-            if not isinstance(entry, dict):
-                continue
-            stage = str(entry.get("Stage", "") or "")
-            state = str(entry.get("AcceptanceState", "") or "")
-            if stage and state:
-                history_tail_entries.append(f"{stage}:{state}")
-            elif stage:
-                history_tail_entries.append(stage)
-            elif state:
-                history_tail_entries.append(state)
-        return {
-            "Path": path,
-            "ParseError": parse_error,
-            "Exists": "true" if bool(receipt.get("Exists", False) or payload) else "false",
-            "LastWriteAt": str(receipt.get("LastWriteAt", "") or ""),
-            "LastUpdatedAt": str(payload.get("LastUpdatedAt", "") or ""),
-            "GeneratedAt": str(payload.get("GeneratedAt", "") or ""),
-            "Stage": str(payload.get("Stage", "") or ""),
-            "AcceptanceState": str(outcome.get("AcceptanceState", "") or receipt.get("AcceptanceState", "") or ""),
-            "AcceptanceReason": str(outcome.get("AcceptanceReason", "") or receipt.get("AcceptanceReason", "") or ""),
-            "BlockedBy": str(payload.get("BlockedBy", "") or ""),
-            "BlockedTargetId": str(payload.get("BlockedTargetId", "") or ""),
-            "BlockedRunRoot": str(payload.get("BlockedRunRoot", "") or ""),
-            "BlockedPath": str(payload.get("BlockedPath", "") or ""),
-            "BlockedDetail": str(payload.get("BlockedDetail", "") or ""),
-            "PhaseHistoryCount": str(len(phase_history)),
-            "PhaseHistoryTail": " -> ".join(history_tail_entries),
-        }
+        return load_acceptance_receipt_summary_from_path(
+            path,
+            exists=bool(receipt.get("Exists", False)),
+            parse_error=parse_error,
+            last_write_at=str(receipt.get("LastWriteAt", "") or ""),
+            fallback_acceptance_state=str(receipt.get("AcceptanceState", "") or ""),
+            fallback_acceptance_reason=str(receipt.get("AcceptanceReason", "") or ""),
+        )
 
     @staticmethod
     def _map_next_action(command_text: str) -> ActionModel:
@@ -405,11 +402,12 @@ class DashboardAggregator:
         binding_scope_label = "현재 세션" if anchor_raw else "binding profile"
         window_count_label = "{0}개 창".format(expected_targets)
         if reason == "binding_parse_error":
-            stage_detail = "binding profile parse error"
+            error_message = cls._binding_profile_error_message(binding_parse_error)
+            stage_detail = "binding profile error ({0})".format(error_message)
             workflow_label = "창 준비 안 됨"
-            workflow_detail = "binding profile을 해석하지 못해 현재 세션 창 준비 상태를 신뢰할 수 없습니다."
+            workflow_detail = "binding profile {0}로 현재 세션 창 준비 상태를 신뢰할 수 없습니다.".format(error_message)
             issue_title = "binding profile 오류"
-            issue_detail = "binding profile parse error로 현재 세션 창 준비 상태를 판단할 수 없습니다."
+            issue_detail = "binding profile {0}로 현재 세션 창 준비 상태를 판단할 수 없습니다.".format(error_message)
         elif reason == "binding_missing":
             stage_detail = "{0} binding 0/{1}".format(binding_scope_label, expected_targets)
             workflow_label = "현재 세션 창 준비 필요"
@@ -436,7 +434,9 @@ class DashboardAggregator:
             issue_detail = ""
 
         if reason == "binding_parse_error":
-            attach_wait_detail = "붙이기 비활성: binding profile parse error로 현재 세션 창 준비 상태를 신뢰할 수 없습니다."
+            attach_wait_detail = "붙이기 비활성: binding profile {0}로 현재 세션 창 준비 상태를 신뢰할 수 없습니다.".format(
+                cls._binding_profile_error_message(binding_parse_error)
+            )
         elif reason == "binding_missing":
             attach_wait_detail = "붙이기 비활성: 현재 세션 기준 binding profile이 없습니다. {0} 준비가 필요합니다.".format(window_count_label)
         elif reason == "binding_incomplete":
@@ -909,6 +909,7 @@ class DashboardAggregator:
                         str(acceptance_receipt.get("LastUpdatedAt", "") or acceptance_receipt.get("LastWriteAt", "") or "")
                     )
                 )
+            detail_parts.extend(format_acceptance_relay_issue_detail_parts(acceptance_receipt))
             acceptance_detail = " / ".join(detail_parts) if detail_parts else "receipt 존재"
         cards = [
             StatusCardModel(
@@ -1155,6 +1156,7 @@ class DashboardAggregator:
                     detail_parts.append(blocked_detail)
                 if history_tail:
                     detail_parts.append(history_tail)
+                detail_parts.extend(format_acceptance_relay_issue_detail_parts(acceptance_receipt))
                 add_issue(
                     72,
                     "Visible preflight 차단",
@@ -1171,10 +1173,14 @@ class DashboardAggregator:
                     "active visible acceptance",
                 )
             elif acceptance_state == "error":
+                error_detail_parts: list[str] = []
+                if acceptance_reason:
+                    error_detail_parts.append(acceptance_reason)
+                error_detail_parts.extend(format_acceptance_relay_issue_detail_parts(acceptance_receipt))
                 add_issue(
                     74,
                     "Visible acceptance 실패",
-                    acceptance_reason or "live acceptance receipt가 error 상태입니다.",
+                    " / ".join(error_detail_parts) if error_detail_parts else "live acceptance receipt가 error 상태입니다.",
                     "visible_active_acceptance",
                     "active visible acceptance",
                 )
@@ -1195,12 +1201,12 @@ class DashboardAggregator:
                     add_issue(
                         100,
                         "watcher 정상 제한 종료",
-                        "forward 한도에 도달해 정지했습니다. 계속 진행하려면 watch를 다시 시작하세요.",
-                        "start_watcher",
-                        "watch 다시 시작",
+                        "현재 Run은 정상 제한 종료 상태입니다. 계속 진행하려면 새 Run을 준비해 다시 시작하세요.",
+                        "start_new_watcher_run",
+                        "새 Run 시작",
                     )
                 else:
-                    add_issue(100, "watcher 중지", "현재 run root 기준 watcher가 실행 중이 아닙니다.", "start_watcher", "watch 시작")
+                    add_issue(100, "watcher 중지", "현재 run root 기준 watcher가 실행 중이 아닙니다.", "start_current_watcher_run", "현재 Run 시작")
             elif watcher_status in ("stop_requested", "stopping", "starting"):
                 add_issue(110, "watch 제어 진행 중", "watcher 상태 전이를 확인하는 중입니다.", "run_paired_status", "Pair 상태 보기")
 

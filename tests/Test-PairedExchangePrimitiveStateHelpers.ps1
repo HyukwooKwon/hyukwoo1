@@ -61,6 +61,12 @@ Assert-True (
 Assert-True (
     Test-PairedRoundtripDetected -SeedRow $publishStartedRow -PartnerRow $forwardedRow -ForwardedCount 1 -UseVisibleWorker
 ) 'partner forwarded state should count as roundtrip for visible-worker.'
+Assert-True (
+    -not (Test-PairedRoundtripDetected -SeedRow $publishStartedRow -PartnerRow $forwardedRow -ForwardedCount 1 -SeedReadyCount 2 -RoundtripBaselineSeedInboxCount 1)
+) 'non-visible typed-window roundtrip should not be confirmed from seed inbox growth alone.'
+Assert-True (
+    Test-PairedRoundtripDetected -SeedRow $publishStartedRow -PartnerRow $forwardedRow -ForwardedCount 2 -SeedReadyCount 2 -RoundtripBaselineSeedInboxCount 1
+) 'non-visible typed-window roundtrip should require both forwarded states.'
 
 $evidence = New-PairedPrimitiveEvidence -TargetRow $publishStartedRow -PartnerRow $partnerActiveRow -Extra @{
     DemoFlag = $true
@@ -79,6 +85,8 @@ Assert-True ([string]$failure.AcceptanceReason -eq 'submit-unconfirmed') 'failur
 $success = Get-PairedAcceptanceSuccessOutcome -Roundtrip -UseVisibleWorker
 Assert-True ([string]$success.AcceptanceState -eq 'roundtrip-confirmed') 'success helper should surface roundtrip-confirmed state.'
 Assert-True ([string]$success.AcceptanceReason -eq 'forwarded-state-roundtrip-detected') 'success helper should surface visible-worker roundtrip reason.'
+$typedWindowSuccess = Get-PairedAcceptanceSuccessOutcome -Roundtrip
+Assert-True ([string]$typedWindowSuccess.AcceptanceReason -eq 'forwarded-state-roundtrip-detected') 'typed-window roundtrip reason should match forwarded-state proof.'
 
 $timeout = Get-PairedAcceptanceTimeoutOutcome -FirstHandoffConfirmed:$true -UseVisibleWorker -WatcherStopSuffix '; watcher=test'
 Assert-True ([string]$timeout.AcceptanceState -eq 'roundtrip-timeout') 'timeout helper should surface roundtrip-timeout state.'

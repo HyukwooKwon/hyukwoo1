@@ -27,6 +27,7 @@ function Set-LastWriteTimeUtc {
 
 $root = Split-Path -Parent $PSScriptRoot
 $sourcePath = Join-Path $root 'show-paired-run-summary.ps1'
+$sourceOutboxHelperPath = Join-Path $root 'tests\lib\PairedSourceOutboxPaths.ps1'
 
 $tempRoot = Join-Path ([System.IO.Path]::GetTempPath()) ('show-paired-run-summary-guards-' + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $tempRoot -Force | Out-Null
@@ -35,6 +36,9 @@ try {
     $scriptCopyPath = Join-Path $tempRoot 'show-paired-run-summary.ps1'
     $stubStatusPath = Join-Path $tempRoot 'show-paired-exchange-status.ps1'
     Copy-Item -LiteralPath $sourcePath -Destination $scriptCopyPath -Force
+    $helperCopyPath = Join-Path $tempRoot 'tests\lib\PairedSourceOutboxPaths.ps1'
+    New-Item -ItemType Directory -Path (Split-Path -Parent $helperCopyPath) -Force | Out-Null
+    Copy-Item -LiteralPath $sourceOutboxHelperPath -Destination $helperCopyPath -Force
 
     $nowUtc = (Get-Date).ToUniversalTime()
     $oldUtc = $nowUtc.AddMinutes(-11)
@@ -362,7 +366,12 @@ param(
             (Join-Path $focusContractRootPair02 'target06\source-outbox\review.zip'),
             (Join-Path $focusContractRootPair02 'target06\source-outbox\publish.ready.json')
         )) {
-        'ready' | Set-Content -LiteralPath $artifactPath -Encoding UTF8
+        if ($artifactPath -like '*.json') {
+            '{"PublishedAt":"' + $nowIso + '","PublishSequence":1,"AttemptId":"attempt-ready"}' | Set-Content -LiteralPath $artifactPath -Encoding UTF8
+        }
+        else {
+            'ready' | Set-Content -LiteralPath $artifactPath -Encoding UTF8
+        }
     }
 
     $focusManifest = [pscustomobject]@{

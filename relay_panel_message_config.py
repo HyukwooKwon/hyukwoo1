@@ -25,14 +25,14 @@ DEFAULT_SLOT_ORDER = [
 ]
 
 SCOPED_SLOT_LABELS = {
-    "global-prefix": "글로벌 Prefix",
+    "global-prefix": "PAIR 공통 Prefix",
     "pair-extra": "Pair Extra",
     "role-extra": "Role Extra",
     "target-extra": "Target Extra",
     "one-time-prefix": "One-time Prefix",
     "body": "Body",
     "one-time-suffix": "One-time Suffix",
-    "global-suffix": "글로벌 Suffix",
+    "global-suffix": "PAIR 공통 Suffix",
 }
 
 CONFIG_BACKUP_RETENTION_COUNT = 20
@@ -155,6 +155,164 @@ class MessageConfigService:
             raise ValueError("PairTest.PairPolicies section is not editable")
         return policies
 
+    def _target_autoloop(self, document: dict[str, Any]) -> dict[str, Any]:
+        node = document.setdefault("TargetAutoloop", {})
+        if not isinstance(node, dict):
+            raise ValueError("TargetAutoloop section is not editable")
+        return node
+
+    def _target_autoloop_targets(self, document: dict[str, Any]) -> list[dict[str, Any]]:
+        section = self._target_autoloop(document)
+        targets = section.setdefault("Targets", [])
+        if not isinstance(targets, list):
+            raise ValueError("TargetAutoloop.Targets section is not editable")
+        return [item for item in targets if isinstance(item, dict)]
+
+    def _target_autoloop_target_node(self, document: dict[str, Any], target_id: str, *, create: bool = False) -> dict[str, Any] | None:
+        normalized_target_id = str(target_id or "").strip()
+        if not normalized_target_id:
+            raise ValueError("target_id is required")
+        targets = self._target_autoloop_targets(document)
+        node = next(
+            (item for item in targets if str(item.get("TargetId", "") or "").strip() == normalized_target_id),
+            None,
+        )
+        if node is None and create:
+            node = {"TargetId": normalized_target_id}
+            self._target_autoloop(document).setdefault("Targets", []).append(node)
+        return node
+
+    def target_autoloop_target_ids(self, document: dict[str, Any]) -> list[str]:
+        ordered: list[str] = []
+        seen: set[str] = set()
+        for item in self._target_autoloop_targets(document):
+            target_id = str(item.get("TargetId", "") or "").strip()
+            if target_id and target_id not in seen:
+                seen.add(target_id)
+                ordered.append(target_id)
+        for target_id in self.target_ids(document):
+            normalized = str(target_id or "").strip()
+            if normalized and normalized not in seen:
+                seen.add(normalized)
+                ordered.append(normalized)
+        return ordered
+
+    def effective_target_autoloop_target(self, document: dict[str, Any], target_id: str) -> dict[str, Any]:
+        normalized_target_id = str(target_id or "").strip()
+        if not normalized_target_id:
+            raise ValueError("target_id is required")
+        section = self._target_autoloop(document)
+        run_mode = str(section.get("RunMode", "target-inbox-submit") or "").strip() or "target-inbox-submit"
+        default_enabled = bool(section.get("Enabled", False))
+        default_max_cycle_count = int(section.get("DefaultMaxCycleCount", 0) or 0)
+        default_trigger_kinds = ["input-file", "publish-ready"] if run_mode == "target-autoloop" else ["input-file"]
+        target_row = self._target_autoloop_target_node(document, normalized_target_id)
+        global_target = self.target_map(document).get(normalized_target_id, {})
+        resolved_trigger_kinds = list(target_row.get("TriggerKinds", default_trigger_kinds) if isinstance(target_row, dict) else default_trigger_kinds)
+        normalized_trigger_kinds: list[str] = []
+        for item in resolved_trigger_kinds:
+            trigger_kind = str(item or "").strip()
+            if trigger_kind and trigger_kind not in normalized_trigger_kinds:
+                normalized_trigger_kinds.append(trigger_kind)
+        if not normalized_trigger_kinds:
+            normalized_trigger_kinds = list(default_trigger_kinds)
+        return {
+            "TargetId": normalized_target_id,
+            "Enabled": bool((target_row or {}).get("Enabled", default_enabled)),
+            "TriggerKinds": normalized_trigger_kinds,
+            "MaxCycleCount": int((target_row or {}).get("MaxCycleCount", default_max_cycle_count) or 0),
+            "RunMode": run_mode,
+            "WindowTitle": str(global_target.get("WindowTitle", "") or "").strip(),
+            "GlobalFolder": str(global_target.get("Folder", "") or "").strip(),
+            "WorkRepoRoot": self.get_target_autoloop_work_repo_root(document, normalized_target_id),
+            "FixedSuffix": self.get_target_autoloop_fixed_suffix(document, normalized_target_id),
+            "FixedSuffixMode": self.get_target_autoloop_fixed_suffix_mode(document, normalized_target_id),
+            "EffectiveFixedSuffix": self.get_effective_target_autoloop_fixed_suffix(document, normalized_target_id),
+        }
+
+    def set_target_autoloop_target_values(
+        self,
+        document: dict[str, Any],
+        target_id: str,
+        *,
+        enabled: bool,
+        trigger_kinds: list[str],
+        max_cycle_count: int,
+        work_repo_root: str | None = None,
+    ) -> dict[str, Any]:
+        normalized_target_id = str(target_id or "").strip()
+        if not normalized_target_id:
+            raise ValueError("target_id is required")
+        node = self._target_autoloop_target_node(document, normalized_target_id, create=True)
+        if node is None:
+            raise ValueError(f"Unknown target: {normalized_target_id}")
+        node["Enabled"] = bool(enabled)
+        node["TriggerKinds"] = [str(item).strip() for item in trigger_kinds if str(item).strip()]
+        node["MaxCycleCount"] = int(max_cycle_count)
+        if work_repo_root is not None:
+            stripped_work_repo_root = str(work_repo_root or "").strip()
+            if stripped_work_repo_root:
+                node["WorkRepoRoot"] = stripped_work_repo_root
+            else:
+                node.pop("WorkRepoRoot", None)
+        return node
+
+    def get_target_autoloop_work_repo_root(self, document: dict[str, Any], target_id: str) -> str:
+        node = self._target_autoloop_target_node(document, target_id)
+        if node is None:
+            return ""
+        return str(node.get("WorkRepoRoot", "") or "").strip()
+
+    def set_target_autoloop_work_repo_root(self, document: dict[str, Any], target_id: str, value: str) -> dict[str, Any]:
+        node = self._target_autoloop_target_node(document, target_id, create=True)
+        if node is None:
+            raise ValueError(f"Unknown target: {target_id}")
+        stripped_value = str(value or "").strip()
+        if stripped_value:
+            node["WorkRepoRoot"] = stripped_value
+        else:
+            node.pop("WorkRepoRoot", None)
+        return node
+
+    def get_target_autoloop_fixed_suffix_mode(self, document: dict[str, Any], target_id: str) -> str:
+        node = self._target_autoloop_target_node(document, target_id)
+        if node is None or "FixedSuffix" not in node:
+            return "inherit-shared"
+        value = str(node.get("FixedSuffix", "") or "").strip()
+        return "autoloop-only" if value else "none"
+
+    def get_target_autoloop_fixed_suffix(self, document: dict[str, Any], target_id: str) -> str:
+        node = self._target_autoloop_target_node(document, target_id)
+        if node is None or "FixedSuffix" not in node:
+            return ""
+        return str(node.get("FixedSuffix", "") or "")
+
+    def get_effective_target_autoloop_fixed_suffix(self, document: dict[str, Any], target_id: str) -> str:
+        mode = self.get_target_autoloop_fixed_suffix_mode(document, target_id)
+        if mode == "inherit-shared":
+            shared_target_suffix = self.get_target_fixed_suffix(document, target_id)
+            return shared_target_suffix or self.get_default_fixed_suffix(document)
+        if mode == "autoloop-only":
+            return self.get_target_autoloop_fixed_suffix(document, target_id)
+        return ""
+
+    def set_target_autoloop_fixed_suffix(
+        self,
+        document: dict[str, Any],
+        target_id: str,
+        value: str,
+        *,
+        inherit_shared: bool,
+    ) -> dict[str, Any]:
+        node = self._target_autoloop_target_node(document, target_id, create=True)
+        if node is None:
+            raise ValueError(f"Unknown target: {target_id}")
+        if inherit_shared:
+            node.pop("FixedSuffix", None)
+        else:
+            node["FixedSuffix"] = str(value or "").strip()
+        return node
+
     def pair_policy(self, document: dict[str, Any], pair_id: str) -> dict[str, Any]:
         normalized_pair_id = str(pair_id or "").strip()
         if not normalized_pair_id:
@@ -218,6 +376,20 @@ class MessageConfigService:
                     "RequireExternalRunRoot",
                     pair_test.get("RequireExternalRunRoot", False),
                 )
+            ),
+            "DefaultWatcherMaxForwardCount": int(
+                pair_policy.get(
+                    "DefaultWatcherMaxForwardCount",
+                    pair_test.get("DefaultWatcherMaxForwardCount", 0),
+                )
+                or 0
+            ),
+            "DefaultWatcherRunDurationSec": int(
+                pair_policy.get(
+                    "DefaultWatcherRunDurationSec",
+                    pair_test.get("DefaultWatcherRunDurationSec", 900),
+                )
+                or 0
             ),
             "DefaultPairMaxRoundtripCount": int(
                 pair_policy.get(
@@ -487,7 +659,7 @@ class MessageConfigService:
                     "change_type": "target_fixed_suffix",
                     "scope_kind": "target-fixed-suffix",
                     "scope_id": target_id,
-                    "label": f"Target 고정문구:{target_id}",
+                    "label": f"공유 Target 고정문구:{target_id}",
                     "before_count": 1 if self.get_target_fixed_suffix(original_document, target_id) else 0,
                     "after_count": 1 if self.get_target_fixed_suffix(edited_document, target_id) else 0,
                 }
@@ -783,6 +955,25 @@ class MessageConfigService:
                 pair_id=pair_id,
                 target_id=target_id,
                 extra=["-Mode", mode, "-AsJson"],
+            )
+            return self.command_service.run_json(command)
+
+    def render_target_autoloop_route_matrix(
+        self,
+        document: dict[str, Any],
+        *,
+        config_path: str,
+        run_root: str = "",
+    ) -> dict[str, Any]:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_config_path = Path(temp_dir) / Path(config_path).name
+            serialized = self.serialize_psd1(document).replace("\n", "\r\n")
+            temp_config_path.write_text(serialized, encoding="utf-8")
+            command = self.command_service.build_script_command(
+                "tests/Show-TargetAutoloopRouteMatrix.ps1",
+                config_path=str(temp_config_path),
+                run_root=run_root,
+                extra=["-AsJson"],
             )
             return self.command_service.run_json(command)
 

@@ -107,13 +107,69 @@ function Write-ControlRequest {
     }
 }
 
+function Ensure-MinimalSeedReviewZip {
+    param([Parameter(Mandatory)][string]$ZipPath)
+
+    if (Test-Path -LiteralPath $ZipPath -PathType Leaf) {
+        return
+    }
+
+    $parent = Split-Path -Parent $ZipPath
+    if (-not [string]::IsNullOrWhiteSpace($parent) -and -not (Test-Path -LiteralPath $parent -PathType Container)) {
+        New-Item -ItemType Directory -Path $parent -Force | Out-Null
+    }
+
+    Add-Type -AssemblyName System.IO.Compression
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $fileStream = [System.IO.File]::Open($ZipPath, [System.IO.FileMode]::Create, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+    try {
+        $archive = [System.IO.Compression.ZipArchive]::new($fileStream, [System.IO.Compression.ZipArchiveMode]::Create, $false)
+        try {
+            $entry = $archive.CreateEntry('seed-review.txt')
+            $writer = [System.IO.StreamWriter]::new($entry.Open(), [System.Text.UTF8Encoding]::new($false))
+            try {
+                $writer.WriteLine('watcher pause/resume contract fixture')
+            }
+            finally {
+                $writer.Dispose()
+            }
+        }
+        finally {
+            $archive.Dispose()
+        }
+    }
+    finally {
+        $fileStream.Dispose()
+    }
+}
+
 $root = Split-Path -Parent $PSScriptRoot
 if ([string]::IsNullOrWhiteSpace($ConfigPath)) {
     $ConfigPath = Join-Path $root 'config\settings.bottest-live-visible.psd1'
 }
 
-$resolvedConfigPath = (Resolve-Path -LiteralPath $ConfigPath).Path
+$resolvedBaseConfigPath = (Resolve-Path -LiteralPath $ConfigPath).Path
+$generatedConfigPayload = & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Write-PairExternalizedRelayConfigs.ps1') `
+    -BaseConfigPath $resolvedBaseConfigPath `
+    -PairId pair01 `
+    -AsJson | ConvertFrom-Json
+$resolvedConfigPath = [string]@($generatedConfigPayload.GeneratedConfigs | Select-Object -First 1)[0].OutputConfigPath
 $config = Import-PowerShellDataFile -Path $resolvedConfigPath
+$pairPolicy = $null
+if ($null -ne $config.PairTest -and $null -ne $config.PairTest.PairPolicies) {
+    $pairPolicy = $config.PairTest.PairPolicies['pair01']
+}
+$seedReviewInputPath = ''
+if ($null -ne $pairPolicy -and -not [string]::IsNullOrWhiteSpace([string]$pairPolicy.DefaultSeedReviewInputPath)) {
+    $seedReviewInputPath = [string]$pairPolicy.DefaultSeedReviewInputPath
+}
+elseif (-not [string]::IsNullOrWhiteSpace([string]$config.PairTest.DefaultSeedReviewInputPath)) {
+    $seedReviewInputPath = [string]$config.PairTest.DefaultSeedReviewInputPath
+}
+else {
+    $seedReviewInputPath = Join-Path ([string]@($generatedConfigPayload.GeneratedConfigs | Select-Object -First 1)[0].WorkRepoRoot) 'reviewfile\seed_review_input_latest.zip'
+}
+Ensure-MinimalSeedReviewZip -ZipPath $seedReviewInputPath
 $pairRunRootBase = [string]$config.PairTest.RunRootBase
 $contractRunRoot = Join-Path $pairRunRootBase ('run_contract_watcher_pause_resume_' + (Get-Date -Format 'yyyyMMdd_HHmmss_fff'))
 

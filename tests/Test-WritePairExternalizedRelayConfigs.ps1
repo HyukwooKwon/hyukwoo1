@@ -83,6 +83,12 @@ Assert-True ([string]$pair02[0].WorkRepoRoot -eq $repoB) 'pair02 should use repo
 Assert-True ([string]$pair01[0].BookkeepingRoot -ne [string]$pair02[0].BookkeepingRoot) 'pair-scoped bookkeeping roots should differ.'
 Assert-True (Test-Path -LiteralPath ([string]$pair01[0].OutputConfigPath) -PathType Leaf) 'pair01 config file should exist.'
 Assert-True (Test-Path -LiteralPath ([string]$pair02[0].OutputConfigPath) -PathType Leaf) 'pair02 config file should exist.'
+$pair01Config = Import-PowerShellDataFile -Path ([string]$pair01[0].OutputConfigPath)
+$pair02Config = Import-PowerShellDataFile -Path ([string]$pair02[0].OutputConfigPath)
+Assert-True ([string]$pair01Config.PairTest.PairPolicies.pair01.DefaultSeedWorkRepoRoot -eq $repoA) 'pair01 config should keep pair01 repo root in pair policy.'
+Assert-True ([string]$pair02Config.PairTest.PairPolicies.pair02.DefaultSeedWorkRepoRoot -eq $repoB) 'pair02 config should keep pair02 repo root in pair policy.'
+Assert-True ([string]$pair01Config.PairTest.PairPolicies.pair01.DefaultSeedReviewInputPath -eq (Join-Path $repoA 'reviewfile\seed_review_input_latest.zip')) 'pair01 config should keep pair01 review input path in pair policy.'
+Assert-True ([string]$pair02Config.PairTest.PairPolicies.pair02.DefaultSeedReviewInputPath -eq (Join-Path $repoB 'reviewfile\seed_review_input_latest.zip')) 'pair02 config should keep pair02 review input path in pair policy.'
 
 $singlePairResult = & (Join-Path $root 'tests\Write-PairExternalizedRelayConfigs.ps1') `
     -BaseConfigPath $configPath `
