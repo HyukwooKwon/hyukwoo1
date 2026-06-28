@@ -16,6 +16,9 @@ param(
     [int]$WaitForFirstHandoffSeconds = 180,
     [int]$WaitForRoundtripSeconds = 180,
     [int]$SeedWaitForPublishSeconds = 180,
+    [int]$SeedPublishLateGraceSeconds = 45,
+    [int]$SourceOutboxImportOnlyCloseoutSeconds = 90,
+    [int]$SourceOutboxCloseoutWatcherStopWaitSeconds = 60,
     [switch]$ReuseExistingRunRoot,
     [switch]$ForceFreshRouter,
     [switch]$KeepWatcherRunning,
@@ -60,7 +63,7 @@ function Get-WindowLaunchEvidence {
 }
 
 function Resolve-PowerShellExecutable {
-    foreach ($name in @('pwsh.exe', 'powershell.exe')) {
+    foreach ($name in @('pwsh.exe', 'pwsh')) {
         $command = Get-Command -Name $name -ErrorAction SilentlyContinue | Select-Object -First 1
         if ($null -eq $command) {
             continue
@@ -75,7 +78,7 @@ function Resolve-PowerShellExecutable {
         return [string]$name
     }
 
-    throw 'pwsh.exe 또는 powershell.exe를 찾지 못했습니다.'
+    throw 'pwsh (PowerShell 7+)를 찾지 못했습니다.'
 }
 
 function Test-ProcessAlive {
@@ -329,6 +332,77 @@ function Test-MutexHeld {
     }
 }
 
+function Get-RuntimeMapLauncherSessionIds {
+    param([Parameter(Mandatory)][string]$RuntimeMapPath)
+
+    if (-not (Test-NonEmptyString $RuntimeMapPath) -or -not (Test-Path -LiteralPath $RuntimeMapPath -PathType Leaf)) {
+        return @()
+    }
+
+    $items = Read-JsonObject -Path $RuntimeMapPath
+    if ($null -eq $items) {
+        return @()
+    }
+
+    if (-not ($items -is [System.Array])) {
+        $items = ,$items
+    }
+
+    return @(
+        $items |
+            ForEach-Object { [string](Get-ConfigValue -Object $_ -Name 'LauncherSessionId' -DefaultValue '') } |
+            Where-Object { Test-NonEmptyString $_ } |
+            Sort-Object -Unique
+    )
+}
+
+function Get-RouterRuntimeSessionRestartDecision {
+    param(
+        [Parameter(Mandatory)][string]$RouterMutexName,
+        [Parameter(Mandatory)][string]$RouterStatePath,
+        [Parameter(Mandatory)][string]$RuntimeMapPath
+    )
+
+    $routerRunning = Test-MutexHeld -Name $RouterMutexName
+    $runtimeSessionIds = @(Get-RuntimeMapLauncherSessionIds -RuntimeMapPath $RuntimeMapPath)
+    $routerState = Read-JsonObject -Path $RouterStatePath
+    $routerSessionId = if ($null -ne $routerState) { [string](Get-ConfigValue -Object $routerState -Name 'LauncherSessionId' -DefaultValue '') } else { '' }
+    $runtimeSessionId = if ($runtimeSessionIds.Count -eq 1) { [string]$runtimeSessionIds[0] } else { '' }
+    $restartRequired = (
+        $routerRunning -and
+        (Test-NonEmptyString $routerSessionId) -and
+        (Test-NonEmptyString $runtimeSessionId) -and
+        $routerSessionId.Trim() -ne $runtimeSessionId.Trim()
+    )
+
+    $reason = if ($restartRequired) {
+        ('launcher-session-mismatch: router={0} runtime={1}' -f $routerSessionId, $runtimeSessionId)
+    }
+    elseif (-not $routerRunning) {
+        'router-not-running'
+    }
+    elseif (-not (Test-NonEmptyString $routerSessionId)) {
+        'router-session-missing'
+    }
+    elseif ($runtimeSessionIds.Count -ne 1) {
+        ('runtime-session-count={0}' -f $runtimeSessionIds.Count)
+    }
+    else {
+        'session-match'
+    }
+
+    return [pscustomobject]@{
+        RestartRequired         = [bool]$restartRequired
+        Reason                  = $reason
+        RouterRunning           = [bool]$routerRunning
+        RouterLauncherSessionId = $routerSessionId
+        RuntimeLauncherSessionId = $runtimeSessionId
+        RuntimeLauncherSessionIds = @($runtimeSessionIds)
+        RouterStatePath         = $RouterStatePath
+        RuntimeMapPath          = $RuntimeMapPath
+    }
+}
+
 function Get-MatchingRouterProcesses {
     param(
         [Parameter(Mandatory)][string]$Root,
@@ -376,6 +450,8 @@ function Restart-RouterForAcceptance {
         [Parameter(Mandatory)][string]$RouterMutexName,
         [Parameter(Mandatory)][string]$StdoutLogPath,
         [Parameter(Mandatory)][string]$StderrLogPath,
+        [string]$RestartMode = 'inline-acceptance',
+        [string]$RestartReason = '',
         [int]$WaitForReleaseSeconds = 15
     )
 
@@ -428,7 +504,8 @@ function Restart-RouterForAcceptance {
         StdoutLogPath = $StdoutLogPath
         StderrLogPath = $StderrLogPath
         MutexHeld = $false
-        RestartMode = 'inline-acceptance'
+        RestartMode = $RestartMode
+        RestartReason = $RestartReason
     }
 }
 
@@ -563,6 +640,100 @@ function Resolve-LateVisibleWorkerSeedResult {
     return $SeedResult
 }
 
+function Test-PublishPrimitiveLateGraceCandidate {
+    param($PublishPrimitive)
+
+    if ($null -eq $PublishPrimitive) {
+        return $false
+    }
+    if ([bool](Get-ResultPropertyValue -Object $PublishPrimitive -Name 'PrimitiveSuccess' -DefaultValue $false)) {
+        return $false
+    }
+
+    $activityStates = @('publish-started', 'seed-send-processed')
+    $sourceOutboxState = [string](Get-ResultPropertyValue -Object $PublishPrimitive -Name 'SourceOutboxState' -DefaultValue '')
+    if ($sourceOutboxState -in $activityStates) {
+        return $true
+    }
+
+    $primitiveReason = [string](Get-ResultPropertyValue -Object $PublishPrimitive -Name 'PrimitiveReason' -DefaultValue '')
+    if ($primitiveReason -match '(^|/)publish-started($|/)') {
+        return $true
+    }
+
+    foreach ($row in @((Get-ResultPropertyValue -Object $PublishPrimitive -Name 'PairedTargetStatus' -DefaultValue $null))) {
+        if ($null -eq $row) {
+            continue
+        }
+
+        $rowState = [string](Get-ResultPropertyValue -Object $row -Name 'SourceOutboxState' -DefaultValue '')
+        if ($rowState -in $activityStates) {
+            return $true
+        }
+    }
+
+    return $false
+}
+
+function Set-PublishPrimitiveLateGraceMetadata {
+    param(
+        $PublishPrimitive,
+        [Parameter(Mandatory)][bool]$Waited,
+        [Parameter(Mandatory)][bool]$TimedOut,
+        [Parameter(Mandatory)][int]$ElapsedSeconds
+    )
+
+    if ($null -eq $PublishPrimitive) {
+        return
+    }
+
+    Add-Member -InputObject $PublishPrimitive -NotePropertyName 'LateGraceWaited' -NotePropertyValue $Waited -Force
+    Add-Member -InputObject $PublishPrimitive -NotePropertyName 'LateGraceTimedOut' -NotePropertyValue $TimedOut -Force
+    Add-Member -InputObject $PublishPrimitive -NotePropertyName 'LateGraceElapsedSeconds' -NotePropertyValue $ElapsedSeconds -Force
+}
+
+function Wait-ForPublishPrimitiveLateGrace {
+    param(
+        [Parameter(Mandatory)][string]$Root,
+        [Parameter(Mandatory)][string]$ResolvedConfigPath,
+        [Parameter(Mandatory)][string]$RunRoot,
+        [Parameter(Mandatory)][string]$PairId,
+        [Parameter(Mandatory)][string]$TargetId,
+        $InitialPublishPrimitive,
+        [int]$GraceSeconds = 45
+    )
+
+    $current = $InitialPublishPrimitive
+    if ($GraceSeconds -le 0 -or -not (Test-PublishPrimitiveLateGraceCandidate -PublishPrimitive $current)) {
+        Set-PublishPrimitiveLateGraceMetadata -PublishPrimitive $current -Waited:$false -TimedOut:$false -ElapsedSeconds 0
+        return $current
+    }
+
+    $startedAt = Get-Date
+    $deadline = $startedAt.AddSeconds([math]::Max(1, $GraceSeconds))
+    while ((Get-Date) -lt $deadline) {
+        Start-Sleep -Milliseconds 1000
+
+        $current = Invoke-JsonRelayScript -ScriptPath (Join-Path $Root 'tests\Confirm-PairedExchangePublishPrimitive.ps1') -Parameters @{
+            ConfigPath = $ResolvedConfigPath
+            RunRoot = $RunRoot
+            PairId = $PairId
+            TargetId = $TargetId
+            AsJson = $true
+        }
+
+        $elapsedSeconds = [int][math]::Max(1, [math]::Round(((Get-Date) - $startedAt).TotalSeconds))
+        if ([bool](Get-ResultPropertyValue -Object $current -Name 'PrimitiveSuccess' -DefaultValue $false)) {
+            Set-PublishPrimitiveLateGraceMetadata -PublishPrimitive $current -Waited:$true -TimedOut:$false -ElapsedSeconds $elapsedSeconds
+            return $current
+        }
+    }
+
+    $finalElapsedSeconds = [int][math]::Max(1, [math]::Round(((Get-Date) - $startedAt).TotalSeconds))
+    Set-PublishPrimitiveLateGraceMetadata -PublishPrimitive $current -Waited:$true -TimedOut:$true -ElapsedSeconds $finalElapsedSeconds
+    return $current
+}
+
 function Get-ResultPropertyValue {
     param(
         $Object,
@@ -646,6 +817,15 @@ function Test-VisibleWorkerTargetProgress {
     }
 
     return $false
+}
+
+function Test-LiveAcceptanceTargetProgress {
+    param(
+        [Parameter(Mandatory)]$Row,
+        [Parameter(Mandatory)]$PairTest
+    )
+
+    return (Test-VisibleWorkerTargetProgress -Row $Row -PairTest $PairTest)
 }
 
 function Invoke-ShowPairedStatus {
@@ -1008,6 +1188,23 @@ function Get-VisibleWorkerWatcherDurationPlan {
     }
 }
 
+function Resolve-AcceptanceWatcherMaxForwardCount {
+    param(
+        [Parameter(Mandatory)][int]$ConfiguredMaxForwardCount,
+        [Parameter(Mandatory)][int]$TargetForwardedStateCount,
+        [Parameter(Mandatory)][bool]$KeepRunning
+    )
+
+    if ($ConfiguredMaxForwardCount -gt 0) {
+        return $ConfiguredMaxForwardCount
+    }
+    if ($KeepRunning) {
+        return 0
+    }
+
+    return [math]::Max(1, $TargetForwardedStateCount)
+}
+
 function Get-CloseoutStatus {
     param(
         $Status = $null,
@@ -1133,6 +1330,155 @@ function Wait-ForAcceptanceCloseout {
         CompletedAt    = ''
         FailureReason  = if ($watcherStopped) { 'closeout-counts-incomplete' } else { 'closeout-timeout-before-watcher-stop' }
         TimeoutSeconds = $timeoutSeconds
+    }
+}
+
+function Get-SourceOutboxPendingReadySummary {
+    param($Status)
+
+    $rows = @((Get-ResultPropertyValue -Object $Status -Name 'Targets' -DefaultValue @()))
+    $pendingTargets = New-Object System.Collections.Generic.List[string]
+    foreach ($row in $rows) {
+        if ($null -eq $row) {
+            continue
+        }
+
+        if ([bool](Get-ResultPropertyValue -Object $row -Name 'PublishReadyPresent' -DefaultValue $false)) {
+            [void]$pendingTargets.Add(('{0}:{1}' -f `
+                [string](Get-ResultPropertyValue -Object $row -Name 'TargetId' -DefaultValue ''), `
+                [string](Get-ResultPropertyValue -Object $row -Name 'PublishReadyPath' -DefaultValue '')))
+        }
+    }
+
+    $counts = Get-ResultPropertyValue -Object $Status -Name 'Counts' -DefaultValue $null
+    $pendingReadyCount = if ($null -ne $counts) {
+        [int](Get-ResultPropertyValue -Object $counts -Name 'SourceOutboxPendingReadyCount' -DefaultValue $pendingTargets.Count)
+    }
+    else {
+        $pendingTargets.Count
+    }
+
+    return [pscustomobject]@{
+        PendingReadyCount   = $pendingReadyCount
+        PendingReadyTargets = @($pendingTargets)
+    }
+}
+
+function Wait-ForAcceptanceWatcherStoppedAny {
+    param(
+        [Parameter(Mandatory)][string]$Root,
+        [Parameter(Mandatory)][string]$ResolvedConfigPath,
+        [Parameter(Mandatory)][string]$RunRoot,
+        [Parameter(Mandatory)][int]$TimeoutSeconds
+    )
+
+    $deadline = (Get-Date).AddSeconds([math]::Max(1, $TimeoutSeconds))
+    $lastStatus = $null
+    while ((Get-Date) -lt $deadline) {
+        $lastStatus = Invoke-ShowPairedStatus -Root $Root -ResolvedConfigPath $ResolvedConfigPath -RunRoot $RunRoot
+        $watcher = Get-ResultPropertyValue -Object $lastStatus -Name 'Watcher' -DefaultValue $null
+        if ($null -ne $watcher -and [string](Get-ResultPropertyValue -Object $watcher -Name 'Status' -DefaultValue '') -eq 'stopped') {
+            return [pscustomobject]@{
+                Stopped        = $true
+                Status         = $lastStatus
+                CompletedAt    = (Get-Date).ToString('o')
+                FailureReason  = ''
+                TimeoutSeconds = [int]$TimeoutSeconds
+            }
+        }
+
+        Start-Sleep -Milliseconds 500
+    }
+
+    return [pscustomobject]@{
+        Stopped        = $false
+        Status         = $lastStatus
+        CompletedAt    = ''
+        FailureReason  = 'watcher-stop-timeout'
+        TimeoutSeconds = [int]$TimeoutSeconds
+    }
+}
+
+function Invoke-SourceOutboxImportOnlyCloseout {
+    param(
+        [Parameter(Mandatory)][string]$Root,
+        [Parameter(Mandatory)][string]$ResolvedConfigPath,
+        [Parameter(Mandatory)][string]$RunRoot,
+        [Parameter(Mandatory)][int]$PollIntervalMs,
+        [Parameter(Mandatory)][int]$ImportDurationSeconds,
+        [Parameter(Mandatory)][int]$WaitForWatcherStopSeconds
+    )
+
+    $statusBefore = Invoke-ShowPairedStatus -Root $Root -ResolvedConfigPath $ResolvedConfigPath -RunRoot $RunRoot
+    $pendingBefore = Get-SourceOutboxPendingReadySummary -Status $statusBefore
+    $watcherStop = Wait-ForAcceptanceWatcherStoppedAny `
+        -Root $Root `
+        -ResolvedConfigPath $ResolvedConfigPath `
+        -RunRoot $RunRoot `
+        -TimeoutSeconds $WaitForWatcherStopSeconds
+    if (-not [bool]$watcherStop.Stopped) {
+        return [pscustomobject]@{
+            Requested                 = $true
+            Satisfied                 = $false
+            Stage                     = 'watcher-stop-timeout'
+            Reason                    = [string]$watcherStop.FailureReason
+            StartedAt                 = ''
+            CompletedAt               = ''
+            ImportDurationSeconds     = [int]$ImportDurationSeconds
+            WatcherStop               = $watcherStop
+            PendingReadyBeforeCount   = [int]$pendingBefore.PendingReadyCount
+            PendingReadyBeforeTargets = @($pendingBefore.PendingReadyTargets)
+            PendingReadyAfterCount    = [int]$pendingBefore.PendingReadyCount
+            PendingReadyAfterTargets  = @($pendingBefore.PendingReadyTargets)
+            OutputTail                = @()
+            FinalStatus               = $statusBefore
+        }
+    }
+
+    $startedAt = (Get-Date).ToString('o')
+    $output = @()
+    $scriptError = ''
+    try {
+        $output = @(Invoke-ScriptAndCaptureOutput -ScriptPath (Join-Path $Root 'tests\Watch-PairedExchange.ps1') -Parameters @{
+                ConfigPath             = $ResolvedConfigPath
+                RunRoot                = $RunRoot
+                PollIntervalMs         = $PollIntervalMs
+                RunDurationSec         = [math]::Max(1, $ImportDurationSeconds)
+                ImportSourceOutboxOnly = $true
+            })
+    }
+    catch {
+        $scriptError = $_.Exception.Message
+    }
+
+    $statusAfter = Invoke-ShowPairedStatus -Root $Root -ResolvedConfigPath $ResolvedConfigPath -RunRoot $RunRoot
+    $pendingAfter = Get-SourceOutboxPendingReadySummary -Status $statusAfter
+    $satisfied = (-not (Test-NonEmptyString $scriptError)) -and ([int]$pendingAfter.PendingReadyCount -eq 0)
+    $reason = if (Test-NonEmptyString $scriptError) {
+        $scriptError
+    }
+    elseif (-not $satisfied) {
+        'source-outbox-pending-ready-remains'
+    }
+    else {
+        ''
+    }
+
+    return [pscustomobject]@{
+        Requested                 = $true
+        Satisfied                 = $satisfied
+        Stage                     = if ($satisfied) { 'completed' } else { 'failed' }
+        Reason                    = $reason
+        StartedAt                 = $startedAt
+        CompletedAt               = (Get-Date).ToString('o')
+        ImportDurationSeconds     = [int]$ImportDurationSeconds
+        WatcherStop               = $watcherStop
+        PendingReadyBeforeCount   = [int]$pendingBefore.PendingReadyCount
+        PendingReadyBeforeTargets = @($pendingBefore.PendingReadyTargets)
+        PendingReadyAfterCount    = [int]$pendingAfter.PendingReadyCount
+        PendingReadyAfterTargets  = @($pendingAfter.PendingReadyTargets)
+        OutputTail                = @($output | Select-Object -Last 20)
+        FinalStatus               = $statusAfter
     }
 }
 
@@ -2299,7 +2645,7 @@ function Wait-ForLiveAcceptanceOutcome {
                 break
             }
 
-            $seedStillProgressing = $UseVisibleWorker -and (Test-VisibleWorkerTargetProgress -Row $seedRow[0] -PairTest $PairTest)
+            $seedStillProgressing = Test-LiveAcceptanceTargetProgress -Row $seedRow[0] -PairTest $PairTest
             if (($seedSubmitState -eq 'unconfirmed' -or $seedSendState -in $seedFailureStates) -and -not $seedStillProgressing) {
                 $failureOutcome = Get-PairedAcceptanceFailureOutcome -SubmitState $seedSubmitState -ExecutionState $seedSendState -SubmitReason ([string]$seedRow[0].SubmitReason)
                 $acceptanceState = [string]$failureOutcome.AcceptanceState
@@ -2336,7 +2682,7 @@ function Wait-ForLiveAcceptanceOutcome {
                 break
             }
 
-            $partnerStillProgressing = $UseVisibleWorker -and (Test-VisibleWorkerTargetProgress -Row $partnerRow[0] -PairTest $PairTest)
+            $partnerStillProgressing = Test-LiveAcceptanceTargetProgress -Row $partnerRow[0] -PairTest $PairTest
             if (($partnerSubmitState -eq 'unconfirmed' -or $partnerSeedState -in $partnerFailureStates) -and -not $partnerStillProgressing) {
                 $failureOutcome = Get-PairedAcceptanceFailureOutcome -SubmitState $partnerSubmitState -ExecutionState $partnerSeedState -SubmitReason ([string]$partnerRow[0].SubmitReason)
                 $acceptanceState = [string]$failureOutcome.AcceptanceState
@@ -2363,17 +2709,15 @@ function Wait-ForLiveAcceptanceOutcome {
         }
 
         if ((Get-Date) -ge $firstHandoffDeadline) {
-            if ($UseVisibleWorker) {
-                if ((-not $firstHandoffConfirmed) -and $seedStillProgressing) {
-                    $firstHandoffDeadline = (Get-Date).AddSeconds([math]::Max(5, $VisibleWorkerProgressGraceSeconds))
-                    Start-Sleep -Milliseconds 1000
-                    continue
-                }
-                if ($firstHandoffConfirmed -and $partnerStillProgressing) {
-                    $firstHandoffDeadline = (Get-Date).AddSeconds([math]::Max(5, $VisibleWorkerProgressGraceSeconds))
-                    Start-Sleep -Milliseconds 1000
-                    continue
-                }
+            if ((-not $firstHandoffConfirmed) -and $seedStillProgressing) {
+                $firstHandoffDeadline = (Get-Date).AddSeconds([math]::Max(5, $VisibleWorkerProgressGraceSeconds))
+                Start-Sleep -Milliseconds 1000
+                continue
+            }
+            if ($firstHandoffConfirmed -and $partnerStillProgressing) {
+                $firstHandoffDeadline = (Get-Date).AddSeconds([math]::Max(5, $VisibleWorkerProgressGraceSeconds))
+                Start-Sleep -Milliseconds 1000
+                continue
             }
             $timeoutOutcome = Get-PairedAcceptanceTimeoutOutcome -FirstHandoffConfirmed:$firstHandoffConfirmed -UseVisibleWorker:$UseVisibleWorker -WatcherStopSuffix $watcherStopSuffix
             $acceptanceState = [string]$timeoutOutcome.AcceptanceState
@@ -2579,6 +2923,10 @@ $watcherDurationPlan = Get-VisibleWorkerWatcherDurationPlan `
     -WaitForRoundtripSeconds $WaitForRoundtripSeconds `
     -ConfiguredMaxForwardCount $WatcherMaxForwardCount
 $WatcherRunDurationSec = [int]$watcherDurationPlan.EffectiveRunDurationSec
+$effectiveWatcherMaxForwardCount = Resolve-AcceptanceWatcherMaxForwardCount `
+    -ConfiguredMaxForwardCount $WatcherMaxForwardCount `
+    -TargetForwardedStateCount ([int]$watcherDurationPlan.CloseoutForwardedStateCount) `
+    -KeepRunning ([bool]$KeepWatcherRunning)
 
 $contractEvidence = Get-RunContractEvidence -RunRoot $resolvedRunRoot -SeedTargetId $SeedTargetId -PartnerTargetId $partnerTargetId
 
@@ -2590,6 +2938,8 @@ $result = [pscustomobject]@{
     AcceptanceProfile = $acceptanceProfile
     PairId = $PairId
     PairPolicy = $pairPolicy
+    RequestedWatcherMaxForwardCount = [int]$WatcherMaxForwardCount
+    EffectiveWatcherMaxForwardCount = [int]$effectiveWatcherMaxForwardCount
     RunRoot = $resolvedRunRoot
     ReceiptPath = (Join-Path $resolvedRunRoot '.state\live-acceptance-result.json')
     WindowLaunchMode = [string]$windowLaunchEvidence.LaunchMode
@@ -2725,6 +3075,15 @@ $result = [pscustomobject]@{
         Satisfied = $false
         Status = if ($WatcherMaxForwardCount -gt [int]$watcherDurationPlan.AcceptanceForwardedStateCount) { 'pending' } else { 'not-requested' }
     }
+    SourceOutboxCloseout = [pscustomobject]@{
+        Requested = $false
+        Satisfied = $false
+        Stage = 'not-requested'
+        Reason = ''
+        PendingReadyBeforeCount = 0
+        PendingReadyAfterCount = 0
+        ImportDurationSeconds = 0
+    }
     BlockedBy = ''
     BlockedTargetId = ''
     BlockedCommandId = ''
@@ -2791,18 +3150,40 @@ try {
                 -ResolvedConfigPath $resolvedConfigPath `
                 -RouterMutexName $routerMutexName `
                 -StdoutLogPath $routerStdoutLog `
-                -StderrLogPath $routerStderrLog
+                -StderrLogPath $routerStderrLog `
+                -RestartMode 'force-fresh-router' `
+                -RestartReason 'ForceFreshRouter'
         }
-        elseif (-not (Test-MutexHeld -Name $routerMutexName)) {
-            $routerLaunchMode = 'started'
-            $powershellPath = Resolve-PowerShellExecutable
-            $routerArguments = @(
-                '-NoProfile',
-                '-ExecutionPolicy', 'Bypass',
-                '-File', (Join-Path $root 'router\Start-Router.ps1'),
-                '-ConfigPath', $resolvedConfigPath
-            )
-            Start-Process -FilePath $powershellPath -ArgumentList $routerArguments -PassThru -RedirectStandardOutput $routerStdoutLog -RedirectStandardError $routerStderrLog | Out-Null
+        else {
+            $routerSessionDecision = Get-RouterRuntimeSessionRestartDecision `
+                -RouterMutexName $routerMutexName `
+                -RouterStatePath $routerStatePath `
+                -RuntimeMapPath ([string]$config.RuntimeMapPath)
+
+            if ([bool]$routerSessionDecision.RestartRequired) {
+                $result.Stage = 'router-restarting-runtime-session-mismatch'
+                Write-AcceptanceReceipt -RunRoot $resolvedRunRoot -ReceiptPath ([string]$result.ReceiptPath) -Result $result
+                $routerLaunchMode = 'restarted-session-mismatch'
+                $routerRestartResult = Restart-RouterForAcceptance `
+                    -Root $root `
+                    -ResolvedConfigPath $resolvedConfigPath `
+                    -RouterMutexName $routerMutexName `
+                    -StdoutLogPath $routerStdoutLog `
+                    -StderrLogPath $routerStderrLog `
+                    -RestartMode 'runtime-session-mismatch' `
+                    -RestartReason ([string]$routerSessionDecision.Reason)
+            }
+            elseif (-not [bool]$routerSessionDecision.RouterRunning) {
+                $routerLaunchMode = 'started'
+                $powershellPath = Resolve-PowerShellExecutable
+                $routerArguments = @(
+                    '-NoProfile',
+                    '-ExecutionPolicy', 'Bypass',
+                    '-File', (Join-Path $root 'router\Start-Router.ps1'),
+                    '-ConfigPath', $resolvedConfigPath
+                )
+                Start-Process -FilePath $powershellPath -ArgumentList $routerArguments -PassThru -RedirectStandardOutput $routerStdoutLog -RedirectStandardError $routerStderrLog | Out-Null
+            }
         }
 
         $result.Stage = 'router-waiting'
@@ -3051,8 +3432,8 @@ try {
             '-PollIntervalMs', [string]$WatcherPollIntervalMs,
             '-RunDurationSec', [string]$WatcherRunDurationSec
         )
-        if ($WatcherMaxForwardCount -gt 0) {
-            $watchArguments += @('-MaxForwardCount', [string]$WatcherMaxForwardCount)
+        if ($effectiveWatcherMaxForwardCount -gt 0) {
+            $watchArguments += @('-MaxForwardCount', [string]$effectiveWatcherMaxForwardCount)
         }
         if ($WatcherPairMaxRoundtripCount -gt 0) {
             $watchArguments += @('-PairMaxRoundtripCount', [string]$WatcherPairMaxRoundtripCount)
@@ -3115,6 +3496,21 @@ try {
         AsJson = $true
     }
     $result.Primitives.Publish = $publishPrimitive
+    if (-not [bool](Get-ResultPropertyValue -Object $publishPrimitive -Name 'PrimitiveSuccess' -DefaultValue $false) -and
+        (Test-PublishPrimitiveLateGraceCandidate -PublishPrimitive $publishPrimitive)) {
+        $result.Stage = 'publish-late-grace'
+        Write-AcceptanceReceipt -RunRoot $resolvedRunRoot -ReceiptPath ([string]$result.ReceiptPath) -Result $result
+
+        $publishPrimitive = Wait-ForPublishPrimitiveLateGrace `
+            -Root $root `
+            -ResolvedConfigPath $resolvedConfigPath `
+            -RunRoot $resolvedRunRoot `
+            -PairId $PairId `
+            -TargetId $SeedTargetId `
+            -InitialPublishPrimitive $publishPrimitive `
+            -GraceSeconds $SeedPublishLateGraceSeconds
+        $result.Primitives.Publish = $publishPrimitive
+    }
     if (-not [bool]$seedResult.OutboxPublished -and [bool](Get-ResultPropertyValue -Object $publishPrimitive -Name 'PrimitiveSuccess' -DefaultValue $false)) {
         $publishTargetRow = @((Get-ResultPropertyValue -Object $publishPrimitive -Name 'PairedTargetStatus' -DefaultValue $null))
         if (@($publishTargetRow).Length -gt 0) {
@@ -3210,6 +3606,57 @@ try {
         $result.Stage = 'closeout-completed'
         $result.Outcome = $outcome
         Write-AcceptanceReceipt -RunRoot $resolvedRunRoot -ReceiptPath ([string]$result.ReceiptPath) -Result $result
+    }
+
+    if ((-not [bool]$KeepWatcherRunning) -and [int]$effectiveWatcherMaxForwardCount -gt 0 -and [int]$SourceOutboxImportOnlyCloseoutSeconds -gt 0) {
+        $result.Stage = 'source-outbox-closeout-running'
+        Write-AcceptanceReceipt -RunRoot $resolvedRunRoot -ReceiptPath ([string]$result.ReceiptPath) -Result $result
+
+        $sourceOutboxCloseout = Invoke-SourceOutboxImportOnlyCloseout `
+            -Root $root `
+            -ResolvedConfigPath $resolvedConfigPath `
+            -RunRoot $resolvedRunRoot `
+            -PollIntervalMs $WatcherPollIntervalMs `
+            -ImportDurationSeconds $SourceOutboxImportOnlyCloseoutSeconds `
+            -WaitForWatcherStopSeconds $SourceOutboxCloseoutWatcherStopWaitSeconds
+
+        $sourceOutboxFinalStatus = Get-ResultPropertyValue -Object $sourceOutboxCloseout -Name 'FinalStatus' -DefaultValue $null
+        if ($null -ne $sourceOutboxFinalStatus) {
+            $outcome.FinalStatus = $sourceOutboxFinalStatus
+            $watcherStatus = $sourceOutboxFinalStatus
+            $result.Closeout = Get-CloseoutStatus `
+                -Status $sourceOutboxFinalStatus `
+                -AcceptanceForwardedStateCount ([int]$watcherDurationPlan.AcceptanceForwardedStateCount) `
+                -CloseoutForwardedStateCount ([int]$watcherDurationPlan.CloseoutForwardedStateCount)
+        }
+        $result.SourceOutboxCloseout = ($sourceOutboxCloseout | Select-Object -Property * -ExcludeProperty FinalStatus)
+
+        if (-not [bool](Get-ResultPropertyValue -Object $sourceOutboxCloseout -Name 'Satisfied' -DefaultValue $false)) {
+            $sourceOutboxFailureReason = "source-outbox closeout incomplete: reason=$([string](Get-ResultPropertyValue -Object $sourceOutboxCloseout -Name 'Reason' -DefaultValue '')) pendingBefore=$([int](Get-ResultPropertyValue -Object $sourceOutboxCloseout -Name 'PendingReadyBeforeCount' -DefaultValue 0)) pendingAfter=$([int](Get-ResultPropertyValue -Object $sourceOutboxCloseout -Name 'PendingReadyAfterCount' -DefaultValue 0))"
+            $result.Stage = 'source-outbox-closeout-failed'
+            $result.Outcome = [pscustomobject]@{
+                AcceptanceState = 'error'
+                AcceptanceReason = $sourceOutboxFailureReason
+                PreviousOutcome = $outcome
+            }
+            Write-AcceptanceReceipt -RunRoot $resolvedRunRoot -ReceiptPath ([string]$result.ReceiptPath) -Result $result
+            throw $sourceOutboxFailureReason
+        }
+
+        $result.Stage = 'source-outbox-closeout-completed'
+        $result.Outcome = $outcome
+        Write-AcceptanceReceipt -RunRoot $resolvedRunRoot -ReceiptPath ([string]$result.ReceiptPath) -Result $result
+    }
+    else {
+        $result.SourceOutboxCloseout = [pscustomobject]@{
+            Requested = $false
+            Satisfied = $true
+            Stage = 'not-requested'
+            Reason = if ([bool]$KeepWatcherRunning) { 'keep-watcher-running' } elseif ([int]$effectiveWatcherMaxForwardCount -le 0) { 'no-effective-forward-cap' } else { 'disabled' }
+            PendingReadyBeforeCount = 0
+            PendingReadyAfterCount = 0
+            ImportDurationSeconds = 0
+        }
     }
 
     try {

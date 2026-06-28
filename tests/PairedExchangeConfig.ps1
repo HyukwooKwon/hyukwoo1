@@ -656,7 +656,7 @@ function Test-PairedSourceOutboxObservedRow {
     if ($state -in @('publish-started', 'imported', 'imported-archive-pending', 'duplicate-marker-archived', 'duplicate-marker-present', 'forwarded')) {
         return $true
     }
-    if ($latestState -in @('ready-to-forward', 'forwarded', 'duplicate-skipped')) {
+    if ($latestState -in @('ready-to-forward', 'forwarded', 'duplicate-skipped', 'limit-reached')) {
         return $true
     }
     if ((Test-NonEmptyString $publishReadyPath) -and (Test-Path -LiteralPath $publishReadyPath)) {
@@ -745,7 +745,7 @@ function Test-PairedPartnerProgressObserved {
     if ($dispatchState -in @('running', 'failed')) {
         return $true
     }
-    return ($latestState -in @('ready-to-forward', 'forwarded', 'duplicate-skipped'))
+    return ($latestState -in @('ready-to-forward', 'forwarded', 'duplicate-skipped', 'limit-reached'))
 }
 
 function Test-PairedFirstHandoffDetected {

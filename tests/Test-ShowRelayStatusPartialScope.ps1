@@ -31,7 +31,7 @@ function Assert-SetEqual {
 }
 
 $root = Split-Path -Parent $PSScriptRoot
-$powershellPath = (Get-Command -Name 'powershell.exe' -ErrorAction Stop | Select-Object -First 1).Source
+$powershellPath = (Get-Command -Name 'pwsh.exe' -ErrorAction Stop | Select-Object -First 1).Source
 $tmpRoot = Join-Path $root ('_tmp\show-relay-status-partial-scope-' + (Get-Date -Format 'yyyyMMdd_HHmmss_fff'))
 New-Item -ItemType Directory -Path $tmpRoot -Force | Out-Null
 

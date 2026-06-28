@@ -48,7 +48,7 @@ New-Item -ItemType Directory -Path $routerInboxRoot -Force | Out-Null
 }
 "@, (New-Utf8NoBomEncoding))
 
-$startJson = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Start-TargetAutoloopRun.ps1') `
+$startJson = & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Start-TargetAutoloopRun.ps1') `
     -ConfigPath $configPath `
     -RunRoot $runRoot `
     -Targets target01 `
@@ -60,7 +60,7 @@ $target01 = @($manifest.Targets | Where-Object { [string]$_.TargetId -eq 'target
 $inputPath = Join-Path $target01.InboxPendingRoot 'task_001.txt'
 Set-Content -LiteralPath $inputPath -Encoding UTF8 -Value 'input trigger body'
 
-$watchJson = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Watch-TargetAutoloop.ps1') `
+$watchJson = & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Watch-TargetAutoloop.ps1') `
     -ConfigPath $configPath `
     -RunRoot $runRoot `
     -ProcessOnce `
@@ -76,6 +76,13 @@ Assert-True ([string]$command.TargetId -eq 'target01') 'queued command should ta
 Assert-True ([string]$command.TriggerKind -eq 'input-file') 'queued command should record input-file trigger kind.'
 Assert-True ([string]$command.LoopSource -eq 'external-inbox') 'queued command should record external-inbox loop source.'
 Assert-True ($null -eq $command.PSObject.Properties['PartnerTargetId']) 'queued command should not carry PartnerTargetId.'
+$promptText = Get-Content -LiteralPath ([string]$command.PromptSnapshotPath) -Raw -Encoding UTF8
+Assert-True ($promptText.Contains([string]$target01.SourceSummaryPath)) 'watcher should append the manifest summary path to the dispatched prompt.'
+Assert-True ($promptText.Contains([string]$target01.SourceReviewZipPath)) 'watcher should append the manifest review.zip path to the dispatched prompt.'
+Assert-True ($promptText.Contains([string]$target01.PublishReadyPath)) 'watcher should append the manifest publish-ready path to the dispatched prompt.'
+Assert-True (($promptText | Select-String -Pattern ([regex]::Escape([string]$target01.SourceSummaryPath)) -AllMatches).Matches.Count -eq 1) 'watcher should append the summary path exactly once.'
+Assert-True ($promptText.Contains('input trigger body')) 'watcher should keep the operator input body.'
+Assert-True ($promptText.Contains('suffix-01')) 'watcher should append the target fixed suffix.'
 
 $state = Get-Content -LiteralPath $start.StatePath -Raw -Encoding UTF8 | ConvertFrom-Json
 $targetState = $state.Targets.target01

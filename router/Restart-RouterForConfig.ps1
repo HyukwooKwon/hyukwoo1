@@ -28,7 +28,7 @@ function Resolve-FullPath {
 }
 
 function Resolve-PowerShellExecutable {
-    foreach ($name in @('pwsh.exe', 'powershell.exe')) {
+    foreach ($name in @('pwsh.exe', 'pwsh')) {
         $command = Get-Command -Name $name -ErrorAction SilentlyContinue | Select-Object -First 1
         if ($null -eq $command) {
             continue
@@ -43,7 +43,7 @@ function Resolve-PowerShellExecutable {
         return [string]$name
     }
 
-    throw 'pwsh.exe 또는 powershell.exe를 찾지 못했습니다.'
+    throw 'pwsh (PowerShell 7+)를 찾지 못했습니다.'
 }
 
 function Read-JsonObject {
@@ -151,6 +151,33 @@ function Wait-ForRouterStarted {
     throw "router startup timeout: $MutexName"
 }
 
+function Wait-ForRouterStatePid {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][int]$ProcessId,
+        [Parameter(Mandatory)][int]$TimeoutSeconds
+    )
+
+    $deadline = (Get-Date).AddSeconds([math]::Max(1, $TimeoutSeconds))
+    while ((Get-Date) -lt $deadline) {
+        $state = Read-JsonObject -Path $Path
+        if ($null -ne $state) {
+            $statePid = 0
+            if ($null -ne $state.RouterPid) {
+                $statePid = [int]$state.RouterPid
+            }
+            $stateStatus = [string]$state.Status
+            if ($statePid -eq $ProcessId -and $stateStatus -eq 'running') {
+                return $state
+            }
+        }
+
+        Start-Sleep -Milliseconds 250
+    }
+
+    return (Read-JsonObject -Path $Path)
+}
+
 $root = Split-Path -Parent $PSScriptRoot
 if (-not (Test-NonEmptyString $ConfigPath)) {
     $ConfigPath = Join-Path $root 'config\settings.psd1'
@@ -233,10 +260,16 @@ if ($RunDurationMs -gt 0) {
     $argumentList += @('-RunDurationMs', [string]$RunDurationMs)
 }
 
-$startedProcess = Start-Process -FilePath $powershellPath -ArgumentList $argumentList -PassThru -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath
+$startedProcess = Start-Process `
+    -FilePath $powershellPath `
+    -ArgumentList $argumentList `
+    -PassThru `
+    -WindowStyle Hidden `
+    -RedirectStandardOutput $stdoutPath `
+    -RedirectStandardError $stderrPath
 
 Wait-ForRouterStarted -MutexName $routerMutexName -TimeoutSeconds $WaitForStartupSeconds
-$finalRouterState = Read-JsonObject -Path $routerStatePath
+$finalRouterState = Wait-ForRouterStatePid -Path $routerStatePath -ProcessId ([int]$startedProcess.Id) -TimeoutSeconds ([math]::Min(5, [math]::Max(1, $WaitForStartupSeconds)))
 $effectiveRouterPid = 0
 if ($null -ne $finalRouterState -and $null -ne $finalRouterState.RouterPid) {
     $effectiveRouterPid = [int]$finalRouterState.RouterPid

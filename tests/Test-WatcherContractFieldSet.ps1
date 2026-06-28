@@ -34,7 +34,7 @@ $contractRunRoot = Join-Path $pairRunRootBase ('run_contract_watcher_fields_' + 
     -RunRoot $contractRunRoot `
     -IncludePairId pair01 | Out-Null
 
-$status = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Show-PairedExchangeStatus.ps1') -ConfigPath $resolvedConfigPath -RunRoot $contractRunRoot -AsJson | ConvertFrom-Json
+$status = & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Show-PairedExchangeStatus.ps1') -ConfigPath $resolvedConfigPath -RunRoot $contractRunRoot -AsJson | ConvertFrom-Json
 $watcherPropertyNames = @($status.Watcher.PSObject.Properties.Name)
 
 foreach ($fieldName in @($fieldSpec.WatcherBridgeRequiredFields)) {

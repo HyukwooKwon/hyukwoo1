@@ -48,7 +48,7 @@ New-Item -ItemType Directory -Path $routerInboxRoot -Force | Out-Null
 }
 "@, (New-Utf8NoBomEncoding))
 
-$startJson = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Start-TargetAutoloopRun.ps1') `
+$startJson = & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Start-TargetAutoloopRun.ps1') `
     -ConfigPath $configPath `
     -RunRoot $runRoot `
     -Targets target01 `
@@ -65,7 +65,7 @@ if (Test-Path -LiteralPath $target01.SourceReviewZipPath) {
     Remove-Item -LiteralPath $target01.SourceReviewZipPath -Force
 }
 Compress-Archive -LiteralPath $zipNotePath -DestinationPath $target01.SourceReviewZipPath -Force
-$publishJson = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Publish-TargetAutoloopArtifact.ps1') `
+$publishJson = & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Publish-TargetAutoloopArtifact.ps1') `
     -ConfigPath $configPath `
     -RunRoot $runRoot `
     -TargetId target01 `
@@ -76,7 +76,7 @@ $publishJson = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path 
 $publish = $publishJson | ConvertFrom-Json
 Assert-True ([string]$publish.Marker.OutputFingerprint -eq 'dedup-output-001') 'publish helper should keep the provided dedup output fingerprint.'
 
-$firstWatchJson = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Watch-TargetAutoloop.ps1') `
+$firstWatchJson = & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Watch-TargetAutoloop.ps1') `
     -ConfigPath $configPath `
     -RunRoot $runRoot `
     -ProcessOnce `
@@ -84,7 +84,7 @@ $firstWatchJson = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Pa
 $firstWatch = $firstWatchJson | ConvertFrom-Json
 Assert-True ([int]$firstWatch.QueuedCount -eq 1) 'first publish-ready trigger should queue one command.'
 
-$secondWatchJson = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Watch-TargetAutoloop.ps1') `
+$secondWatchJson = & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Watch-TargetAutoloop.ps1') `
     -ConfigPath $configPath `
     -RunRoot $runRoot `
     -ProcessOnce `
@@ -92,6 +92,8 @@ $secondWatchJson = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-P
 $secondWatch = $secondWatchJson | ConvertFrom-Json
 Assert-True ([int]$secondWatch.QueuedCount -eq 0) 'second sweep should not queue a duplicate command.'
 Assert-True ([int]$secondWatch.DuplicateCount -ge 1) 'second sweep should report at least one duplicate trigger.'
+Assert-True (@($secondWatch.DuplicateTargetIds) -contains 'target01') 'second sweep should report the duplicate target id.'
+Assert-True (@($secondWatch.DuplicateFingerprints).Count -ge 1) 'second sweep should report the duplicate trigger fingerprint.'
 
 $queueFiles = @(Get-ChildItem -LiteralPath $target01.QueueQueuedRoot -File -Filter '*.json' | Sort-Object Name)
 Assert-True (@($queueFiles).Count -eq 1) 'duplicate publish-ready sweep should not create another queued command.'

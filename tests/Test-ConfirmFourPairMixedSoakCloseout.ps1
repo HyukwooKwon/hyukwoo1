@@ -144,7 +144,7 @@ $receipt = [pscustomobject]@{
 $receiptPath = Join-Path $stateRoot 'four-pair-soak-receipt.json'
 $receipt | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $receiptPath -Encoding UTF8
 
-$powershellPath = (Get-Command -Name 'powershell.exe' -ErrorAction Stop | Select-Object -First 1).Source
+$powershellPath = (Get-Command -Name 'pwsh.exe' -ErrorAction Stop | Select-Object -First 1).Source
 $passRaw = & $powershellPath `
     -NoProfile `
     -ExecutionPolicy Bypass `

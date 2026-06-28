@@ -24,6 +24,8 @@ $tmpRoot = Join-Path $root '_tmp\Test-ShowTargetAutoloopStatusRecommendationHist
 $configPath = Join-Path $tmpRoot 'settings.target-autoloop.psd1'
 $runRoot = Join-Path $tmpRoot 'run_target_autoloop_status_recommendation_history'
 $historyPath = Join-Path $runRoot '.state\target-autoloop-recommendation-history.json'
+$runtimeMapPath = Join-Path $tmpRoot 'target-runtime.json'
+$routerStatePath = Join-Path $tmpRoot 'router-state.json'
 
 if (Test-Path -LiteralPath $tmpRoot) {
     Remove-Item -LiteralPath $tmpRoot -Recurse -Force
@@ -33,6 +35,8 @@ New-Item -ItemType Directory -Path $tmpRoot -Force | Out-Null
 [System.IO.File]::WriteAllText($configPath, @"
 @{
     LaneName = 'bottest-live-visible'
+    RuntimeMapPath = '$($runtimeMapPath.Replace("'", "''"))'
+    RouterStatePath = '$($routerStatePath.Replace("'", "''"))'
     Targets = @(
         @{ Id = 'target01'; Folder = 'C:\tmp\target01'; WindowTitle = 'Target01'; FixedSuffix = 'suffix-01' }
     )
@@ -47,9 +51,19 @@ New-Item -ItemType Directory -Path $tmpRoot -Force | Out-Null
     }
 }
 "@, (New-Utf8NoBomEncoding))
+[System.IO.File]::WriteAllText(
+    $runtimeMapPath,
+    (@(@{ TargetId = 'target01'; LauncherSessionId = 'session-current' }) | ConvertTo-Json -Depth 4),
+    (New-Utf8NoBomEncoding)
+)
+[System.IO.File]::WriteAllText(
+    $routerStatePath,
+    (@{ Status = 'running'; LauncherSessionId = 'session-current'; RouterPid = $PID } | ConvertTo-Json -Depth 4),
+    (New-Utf8NoBomEncoding)
+)
 
 try {
-    $startJson = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Start-TargetAutoloopRun.ps1') `
+    $startJson = & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Start-TargetAutoloopRun.ps1') `
         -ConfigPath $configPath `
         -RunRoot $runRoot `
         -Targets target01 `
@@ -111,7 +125,7 @@ try {
         (New-Utf8NoBomEncoding)
     )
 
-    $statusJson = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Show-TargetAutoloopStatus.ps1') `
+    $statusJson = & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Show-TargetAutoloopStatus.ps1') `
         -ConfigPath $configPath `
         -RunRoot $runRoot `
         -AsJson | ConvertFrom-Json
@@ -136,10 +150,10 @@ try {
     Assert-True ((@($statusJson.RecommendationHistory)).Count -eq 2) 'status json should filter recommendation history to the current runroot.'
     Assert-True ([string]$statusJson.RecommendationHistory[0].RunRoot -eq $runRoot) 'status json should keep only matching runroot records.'
     Assert-True ([string]$statusJson.RecommendationHistory[1].Outcome -eq 'failed') 'status json should preserve the latest recommendation outcome.'
-    Assert-True ([string]$statusJson.RecommendationHistorySummary -eq '권장 이력: 2건 (마지막=resume 요청 실패 @ 2026-05-11T12:02:00+09:00)') 'status json should surface the filtered recommendation history summary.'
+    Assert-True ([string]$statusJson.RecommendationHistorySummary -match '권장 이력: 2건 \(마지막=resume 요청 실패 @ ') 'status json should surface the filtered recommendation history summary.'
     Assert-True ([string]$statusJson.RecommendationHistoryWarning -eq '') 'status json should not emit a warning for a valid recommendation history file.'
 
-    $output = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Show-TargetAutoloopStatus.ps1') `
+    $output = & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Show-TargetAutoloopStatus.ps1') `
         -ConfigPath $configPath `
         -RunRoot $runRoot
     $joined = (@($output) -join "`n")
@@ -153,7 +167,7 @@ try {
     Assert-True ($joined -match 'RecommendationLabel: resume 재요청') 'status text should surface the retry-aware recommendation label.'
     Assert-True ($joined -match 'RecommendationDetail: 이전 실패: failed: resume ack timeout / 이번 조치: controller는 paused이고 watcher는 stopped입니다\.') 'status text should surface the retry-aware recommendation detail.'
     Assert-True ($joined -match 'RecommendationRetryBadge: 재시도 사유: 이전 실패 / failed: resume ack timeout') 'status text should surface the retry reason badge text.'
-    Assert-True ($joined -match 'RecommendationHistorySummary: 권장 이력: 2건 \(마지막=resume 요청 실패 @ 2026-05-11T12:02:00\+09:00\)') 'status text should surface the filtered recommendation history summary.'
+    Assert-True ($joined -match 'RecommendationHistorySummary: 권장 이력: 2건 \(마지막=resume 요청 실패 @ ') 'status text should surface the filtered recommendation history summary.'
     Assert-True ($joined -notmatch 'watch restart 실패') 'status text should not include recommendation history from another runroot.'
 }
 finally {

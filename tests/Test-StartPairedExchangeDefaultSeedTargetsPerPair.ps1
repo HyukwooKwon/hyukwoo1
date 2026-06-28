@@ -16,9 +16,10 @@ function Assert-True {
 }
 
 $root = Split-Path -Parent $PSScriptRoot
-$tmpRoot = Join-Path $root '_tmp\Test-StartPairedExchangeDefaultSeedTargetsPerPair'
-$runRoot = Join-Path $tmpRoot ('run_' + (Get-Date -Format 'yyyyMMdd_HHmmss_fff'))
 $configPath = Join-Path $root 'config\settings.bottest-live-visible.psd1'
+$config = Import-PowerShellDataFile -Path $configPath
+$runRootBase = [string]$config.PairTest.RunRootBase
+$runRoot = Join-Path $runRootBase ('run_' + (Get-Date -Format 'yyyyMMdd_HHmmss_fff'))
 
 & (Join-Path $root 'tests\Start-PairedExchangeTest.ps1') `
     -ConfigPath $configPath `

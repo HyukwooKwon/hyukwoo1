@@ -29,7 +29,18 @@ $targetConfig = @($config.Targets | Where-Object { [string](Get-ConfigValue -Obj
 if (@($targetConfig).Count -eq 0) {
     throw "target autoloop target config not found: $TargetId"
 }
-$queuePaths = Get-TargetAutoloopQueuePaths -RunRoot $resolvedRunRoot -TargetId $TargetId -Target $targetConfig[0] -Config $config
+$manifestPath = Join-Path $resolvedRunRoot 'manifest.json'
+if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
+    throw "target autoloop manifest not found: $manifestPath"
+}
+$manifest = Read-JsonObject -Path $manifestPath
+$targetRow = @($manifest.Targets | Where-Object { [string]$_.TargetId -eq $TargetId } | Select-Object -First 1)
+if (@($targetRow).Count -eq 0) {
+    throw "target not found in target autoloop manifest: $TargetId"
+}
+
+$queuePaths = Get-TargetAutoloopQueuePaths -RunRoot $resolvedRunRoot -TargetId $TargetId -Target $targetRow[0] -Config $config
+$queuePaths = Use-TargetAutoloopManifestQueuePaths -Paths $queuePaths -ManifestTarget $targetRow[0]
 foreach ($queuePath in @($queuePaths.QueuedRoot, $queuePaths.ProcessingRoot, $queuePaths.CompletedRoot, $queuePaths.FailedRoot)) {
     Ensure-Directory -Path $queuePath
 }
@@ -58,7 +69,7 @@ do {
         -AsJson
     $lastResult = ($raw | ConvertFrom-Json)
     $dispatchState = [string](Get-ConfigValue -Object $lastResult -Name 'State' -DefaultValue '')
-    if ($dispatchState -in @('blocked-by-controller', 'blocked-by-router-session-mismatch')) {
+    if ($dispatchState -in @('blocked-by-controller', 'blocked-by-router-session-mismatch', 'blocked-by-router-session-not-ready')) {
         if ($ProcessOnce) {
             break
         }

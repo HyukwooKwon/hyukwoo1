@@ -175,7 +175,7 @@ $receipt = New-ReviewReceiptObject `
         },
         [pscustomobject]@{
             label       = 'smoke_temp_root'
-            command     = 'powershell -NoProfile -ExecutionPolicy Bypass -File .\tests\Smoke-Test.ps1 -UseTempRoot'
+            command     = 'pwsh -NoProfile -ExecutionPolicy Bypass -File .\tests\Smoke-Test.ps1 -UseTempRoot'
             passed      = $false
             exit_code   = 1
             duration_ms = 450

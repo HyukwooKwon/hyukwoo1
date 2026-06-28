@@ -7,6 +7,7 @@ $root = Split-Path -Parent $PSScriptRoot
 $script:TargetAutoloopSchemaVersion = '1.0.0'
 $script:TargetAutoloopRunModes = @('target-inbox-submit', 'target-autoloop')
 $script:TargetAutoloopTriggerKinds = @('input-file', 'publish-ready')
+$script:TargetAutoloopExternalPathPolicies = @('permissive', 'strict')
 $script:TargetAutoloopPhases = @(
     'disabled',
     'idle',
@@ -88,6 +89,70 @@ function Get-TargetAutoloopRuntimeMapLauncherSessionIds {
     )
 }
 
+function Test-TargetAutoloopProcessAlive {
+    param([int]$ProcessId)
+
+    if ($ProcessId -le 0) {
+        return $false
+    }
+
+    try {
+        $process = Get-Process -Id $ProcessId -ErrorAction SilentlyContinue
+        return ($null -ne $process)
+    }
+    catch {
+        return $false
+    }
+}
+
+function Test-TargetAutoloopRouterMutexHeld {
+    param([AllowEmptyString()][string]$Name)
+
+    if (-not (Test-NonEmptyString $Name)) {
+        return $false
+    }
+
+    $createdNew = $false
+    $mutex = $null
+    try {
+        $mutex = [System.Threading.Mutex]::new($false, $Name, [ref]$createdNew)
+        try {
+            if ($mutex.WaitOne(0)) {
+                $mutex.ReleaseMutex()
+                return $false
+            }
+            return $true
+        }
+        catch [System.Threading.AbandonedMutexException] {
+            return $true
+        }
+    }
+    catch {
+        return $false
+    }
+    finally {
+        if ($null -ne $mutex) {
+            $mutex.Dispose()
+        }
+    }
+}
+
+function Get-TargetAutoloopFileAgeSeconds {
+    param([AllowEmptyString()][string]$Path)
+
+    if (-not (Test-NonEmptyString $Path) -or -not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        return -1
+    }
+
+    try {
+        $item = Get-Item -LiteralPath $Path -ErrorAction Stop
+        return [int][math]::Max(0, [math]::Floor(((Get-Date).ToUniversalTime() - $item.LastWriteTimeUtc).TotalSeconds))
+    }
+    catch {
+        return -1
+    }
+}
+
 function Get-TargetAutoloopRouterSessionState {
     param([Parameter(Mandatory)]$Config)
 
@@ -98,6 +163,19 @@ function Get-TargetAutoloopRouterSessionState {
     $routerStatus = if ($null -ne $routerState) { [string](Get-ConfigValue -Object $routerState -Name 'Status' -DefaultValue '') } else { '' }
     $routerLauncherSessionId = if ($null -ne $routerState) { [string](Get-ConfigValue -Object $routerState -Name 'LauncherSessionId' -DefaultValue '') } else { '' }
     $runtimeLauncherSessionId = if (@($runtimeSessionIds).Count -eq 1) { [string]$runtimeSessionIds[0] } else { '' }
+    $routerPid = if ($null -ne $routerState) { [int](Get-ConfigValue -Object $routerState -Name 'RouterPid' -DefaultValue 0) } else { 0 }
+    $routerPidExists = Test-TargetAutoloopProcessAlive -ProcessId $routerPid
+    $routerMutexName = [string](Get-ConfigValue -Object $Config -Name 'RouterMutexName' -DefaultValue '')
+    if (-not (Test-NonEmptyString $routerMutexName) -and $null -ne $routerState) {
+        $routerMutexName = [string](Get-ConfigValue -Object $routerState -Name 'RouterMutexName' -DefaultValue '')
+    }
+    $routerMutexHeld = if (Test-NonEmptyString $routerMutexName) {
+        Test-TargetAutoloopRouterMutexHeld -Name $routerMutexName
+    }
+    else {
+        $false
+    }
+    $routerStateAgeSeconds = Get-TargetAutoloopFileAgeSeconds -Path $routerStatePath
     $state = 'not-configured'
     if (Test-NonEmptyString $runtimeMapPath -or Test-NonEmptyString $routerStatePath) {
         $state = 'insufficient-data'
@@ -108,13 +186,25 @@ function Get-TargetAutoloopRouterSessionState {
     elseif ((Test-NonEmptyString $routerStatus) -and $routerStatus -ne 'running') {
         $state = 'router-not-running'
     }
+    elseif (
+        $routerStatus -eq 'running' -and
+        (Test-NonEmptyString $runtimeLauncherSessionId) -and
+        (Test-NonEmptyString $routerLauncherSessionId) -and
+        $runtimeLauncherSessionId -ne $routerLauncherSessionId
+    ) {
+        $state = 'mismatch'
+    }
+    elseif ($routerStatus -eq 'running' -and $routerPid -le 0) {
+        $state = 'router-pid-missing'
+    }
+    elseif ($routerStatus -eq 'running' -and -not $routerPidExists) {
+        $state = 'router-pid-not-running'
+    }
+    elseif ($routerStatus -eq 'running' -and (Test-NonEmptyString $routerMutexName) -and -not $routerMutexHeld) {
+        $state = 'router-mutex-not-held'
+    }
     elseif ((Test-NonEmptyString $runtimeLauncherSessionId) -and (Test-NonEmptyString $routerLauncherSessionId)) {
-        if ($runtimeLauncherSessionId -eq $routerLauncherSessionId) {
-            $state = 'ok'
-        }
-        else {
-            $state = 'mismatch'
-        }
+        $state = 'ok'
     }
 
     return [pscustomobject][ordered]@{
@@ -126,9 +216,14 @@ function Get-TargetAutoloopRouterSessionState {
         RuntimeLauncherSessionId = $runtimeLauncherSessionId
         RouterStatePath = $routerStatePath
         RouterStateExists = ((Test-NonEmptyString $routerStatePath) -and (Test-Path -LiteralPath $routerStatePath -PathType Leaf))
+        RouterStateAgeSeconds = $routerStateAgeSeconds
+        RouterStateUpdatedAt = if ($null -ne $routerState) { [string](Get-ConfigValue -Object $routerState -Name 'UpdatedAt' -DefaultValue '') } else { '' }
         RouterStatus = $routerStatus
         RouterLauncherSessionId = $routerLauncherSessionId
-        RouterPid = if ($null -ne $routerState) { [int](Get-ConfigValue -Object $routerState -Name 'RouterPid' -DefaultValue 0) } else { 0 }
+        RouterPid = $routerPid
+        RouterPidExists = $routerPidExists
+        RouterMutexName = $routerMutexName
+        RouterMutexHeld = $routerMutexHeld
     }
 }
 
@@ -139,6 +234,30 @@ function New-TargetAutoloopRouterSessionMismatchMessage {
         'router/runtime LauncherSessionId가 달라 target-autoloop ready 파일이 router에서 ignored 됩니다. ' +
         '공식 8창 재사용/attach 후 router를 현재 세션으로 다시 시작한 뒤 감지를 재시작하세요. ' +
         'router={0} runtime={1} routerState={2} runtimeMap={3}' -f `
+            [string](Get-ConfigValue -Object $RouterSessionState -Name 'RouterLauncherSessionId' -DefaultValue ''), `
+            [string](Get-ConfigValue -Object $RouterSessionState -Name 'RuntimeLauncherSessionId' -DefaultValue ''), `
+            [string](Get-ConfigValue -Object $RouterSessionState -Name 'RouterStatePath' -DefaultValue ''), `
+            [string](Get-ConfigValue -Object $RouterSessionState -Name 'RuntimeMapPath' -DefaultValue '')
+    )
+}
+
+function New-TargetAutoloopRouterSessionNotReadyMessage {
+    param([Parameter(Mandatory)]$RouterSessionState)
+
+    $state = [string](Get-ConfigValue -Object $RouterSessionState -Name 'State' -DefaultValue '')
+    if ([bool](Get-ConfigValue -Object $RouterSessionState -Name 'Mismatch' -DefaultValue $false)) {
+        return (New-TargetAutoloopRouterSessionMismatchMessage -RouterSessionState $RouterSessionState)
+    }
+
+    return (
+        'router/runtime 세션이 target-autoloop ready 파일 소비 조건을 만족하지 않습니다. ' +
+        '공식 8창 재사용/attach 후 router를 현재 세션으로 다시 시작한 뒤 감지를 재시작하세요. ' +
+        'state={0} routerPid={1} pidExists={2} mutex={3} mutexHeld={4} router={5} runtime={6} routerState={7} runtimeMap={8}' -f `
+            $(if (Test-NonEmptyString $state) { $state } else { '-' }), `
+            [int](Get-ConfigValue -Object $RouterSessionState -Name 'RouterPid' -DefaultValue 0), `
+            [bool](Get-ConfigValue -Object $RouterSessionState -Name 'RouterPidExists' -DefaultValue $false), `
+            $(if (Test-NonEmptyString ([string](Get-ConfigValue -Object $RouterSessionState -Name 'RouterMutexName' -DefaultValue ''))) { [string](Get-ConfigValue -Object $RouterSessionState -Name 'RouterMutexName' -DefaultValue '') } else { '-' }), `
+            [bool](Get-ConfigValue -Object $RouterSessionState -Name 'RouterMutexHeld' -DefaultValue $false), `
             [string](Get-ConfigValue -Object $RouterSessionState -Name 'RouterLauncherSessionId' -DefaultValue ''), `
             [string](Get-ConfigValue -Object $RouterSessionState -Name 'RuntimeLauncherSessionId' -DefaultValue ''), `
             [string](Get-ConfigValue -Object $RouterSessionState -Name 'RouterStatePath' -DefaultValue ''), `
@@ -954,6 +1073,7 @@ function Get-TargetAutoloopDefaultSection {
         RequireTargetMetadata      = $true
         AllowRecursiveWatch        = $false
         PollIntervalMs             = 1000
+        ExternalPathPolicy         = 'permissive'
         RunRootBase                = (Join-Path $Root ('pair-test\' + $laneName + '\target-autoloop'))
         StatusRoot                 = (Join-Path $runtimeRoot 'target-autoloop\status')
         QueueRoot                  = (Join-Path $runtimeRoot 'target-autoloop\queue')
@@ -961,6 +1081,31 @@ function Get-TargetAutoloopDefaultSection {
     }
 
     return [pscustomobject]$defaultRoot
+}
+
+function Test-TargetAutoloopStrictExternalPathPolicy {
+    param($Config = $null)
+
+    return ([string](Get-ConfigValue -Object $Config -Name 'ExternalPathPolicy' -DefaultValue '') -eq 'strict')
+}
+
+function Assert-TargetAutoloopExternalPath {
+    param(
+        [AllowEmptyString()][string]$PathValue,
+        [Parameter(Mandatory)][string]$AutomationRoot,
+        [Parameter(Mandatory)][string]$FieldName
+    )
+
+    if (-not (Test-NonEmptyString $PathValue)) {
+        throw ('{0} must be an explicit external path when TargetAutoloop.ExternalPathPolicy=strict.' -f $FieldName)
+    }
+
+    $resolvedPath = [System.IO.Path]::GetFullPath($PathValue)
+    if (Test-PathEqualsOrIsDescendant -Path $resolvedPath -BasePath $AutomationRoot) {
+        throw ('{0} must be outside automation repo. automationRoot={1} path={2}' -f $FieldName, [System.IO.Path]::GetFullPath($AutomationRoot), $resolvedPath)
+    }
+
+    return $resolvedPath
 }
 
 function Resolve-TargetAutoloopConfig {
@@ -985,6 +1130,9 @@ function Resolve-TargetAutoloopConfig {
 
     $runMode = [string](Get-ConfigValue -Object $section -Name 'RunMode' -DefaultValue ([string]$defaults.RunMode))
     Assert-TargetAutoloopEnum -Value $runMode -AllowedValues $script:TargetAutoloopRunModes -FieldName 'TargetAutoloop.RunMode'
+    $externalPathPolicy = [string](Get-ConfigValue -Object $section -Name 'ExternalPathPolicy' -DefaultValue ([string]$defaults.ExternalPathPolicy))
+    Assert-TargetAutoloopEnum -Value $externalPathPolicy -AllowedValues $script:TargetAutoloopExternalPathPolicies -FieldName 'TargetAutoloop.ExternalPathPolicy'
+    $strictExternalPathPolicy = ($externalPathPolicy -eq 'strict')
 
     $mutexScope = [string](Get-ConfigValue -Object $section -Name 'MutexScope' -DefaultValue ([string]$defaults.MutexScope))
     if ($mutexScope -ne 'target') {
@@ -1035,6 +1183,11 @@ function Resolve-TargetAutoloopConfig {
     $runRootBase = Resolve-FullPathFromBase -PathValue ([string](Get-ConfigValue -Object $section -Name 'RunRootBase' -DefaultValue ([string]$defaults.RunRootBase))) -BasePath $Root
     $statusRoot = Resolve-FullPathFromBase -PathValue ([string](Get-ConfigValue -Object $section -Name 'StatusRoot' -DefaultValue ([string]$defaults.StatusRoot))) -BasePath $Root
     $queueRoot = Resolve-FullPathFromBase -PathValue ([string](Get-ConfigValue -Object $section -Name 'QueueRoot' -DefaultValue ([string]$defaults.QueueRoot))) -BasePath $Root
+    if ($strictExternalPathPolicy) {
+        $runRootBase = Assert-TargetAutoloopExternalPath -PathValue $runRootBase -AutomationRoot $Root -FieldName 'TargetAutoloop.RunRootBase'
+        $statusRoot = Assert-TargetAutoloopExternalPath -PathValue $statusRoot -AutomationRoot $Root -FieldName 'TargetAutoloop.StatusRoot'
+        $queueRoot = Assert-TargetAutoloopExternalPath -PathValue $queueRoot -AutomationRoot $Root -FieldName 'TargetAutoloop.QueueRoot'
+    }
 
     $rawTargets = @(Get-ConfigValue -Object $section -Name 'Targets' -DefaultValue @())
     if (@($rawTargets).Count -eq 0 -and @($globalTargets).Count -gt 0) {
@@ -1084,9 +1237,15 @@ function Resolve-TargetAutoloopConfig {
         $workRepoRoot = ''
         if (Test-NonEmptyString $workRepoRootRaw) {
             $workRepoRoot = Resolve-FullPathFromBase -PathValue $workRepoRootRaw -BasePath $Root
-            if (Test-PathEqualsOrIsDescendant -Path $workRepoRoot -BasePath $Root) {
+            if ($strictExternalPathPolicy) {
+                $workRepoRoot = Assert-TargetAutoloopExternalPath -PathValue $workRepoRoot -AutomationRoot $Root -FieldName ('TargetAutoloop.Targets.{0}.WorkRepoRoot' -f $targetId)
+            }
+            elseif (Test-PathEqualsOrIsDescendant -Path $workRepoRoot -BasePath $Root) {
                 throw ('TargetAutoloop.Targets.{0}.WorkRepoRoot must be outside automation repo. automationRoot={1} workRepoRoot={2}' -f $targetId, $Root, $workRepoRoot)
             }
+        }
+        elseif ($strictExternalPathPolicy -and $targetEnabled) {
+            throw ('TargetAutoloop.Targets.{0}.WorkRepoRoot must be an explicit external path when TargetAutoloop.ExternalPathPolicy=strict.' -f $targetId)
         }
         $fixedSuffix = [string](Get-ConfigValue -Object $targetRow -Name 'FixedSuffix' -DefaultValue ([string](Get-ConfigValue -Object $globalTarget -Name 'FixedSuffix' -DefaultValue ([string](Get-ConfigValue -Object $config -Name 'DefaultFixedSuffix' -DefaultValue '')))))
         $targetDelayPolicy = Resolve-TargetAutoloopDispatchDelayPolicy `
@@ -1125,10 +1284,13 @@ function Resolve-TargetAutoloopConfig {
         ConfigPath = $resolvedConfigPath
         LaneName = [string](Get-ConfigValue -Object $config -Name 'LaneName' -DefaultValue 'bottest-live-visible')
         InboxRoot = [string](Get-ConfigValue -Object $config -Name 'InboxRoot' -DefaultValue '')
+        RetryPendingRoot = [string](Get-ConfigValue -Object $config -Name 'RetryPendingRoot' -DefaultValue '')
         RuntimeMapPath = [string](Get-ConfigValue -Object $config -Name 'RuntimeMapPath' -DefaultValue '')
         RouterStatePath = [string](Get-ConfigValue -Object $config -Name 'RouterStatePath' -DefaultValue '')
+        RouterMutexName = [string](Get-ConfigValue -Object $config -Name 'RouterMutexName' -DefaultValue '')
         Enabled = $enabledDefault
         RunMode = $runMode
+        ExternalPathPolicy = $externalPathPolicy
         MutexScope = $mutexScope
         MaxConcurrentTargets = $maxConcurrentTargets
         MaxConcurrentSubmits = $maxConcurrentSubmits
@@ -1182,6 +1344,288 @@ function Resolve-TargetAutoloopRunRoot {
     }
 
     return $latest.FullName
+}
+
+function Get-TargetAutoloopManifestRouteSummary {
+    param(
+        [Parameter(Mandatory)]$Config,
+        [Parameter(Mandatory)][string]$RunRoot,
+        [ValidateSet('Status', 'RouteMatrix', 'ProofDoctor')]
+        [string]$Mode = 'Status'
+    )
+
+    $manifestPath = Join-Path $RunRoot 'manifest.json'
+    $manifestExists = Test-Path -LiteralPath $manifestPath -PathType Leaf
+    $manifestDocument = if ($manifestExists) { Read-JsonObject -Path $manifestPath } else { [pscustomobject]@{} }
+    $manifestRunMode = [string](Get-ConfigValue -Object $manifestDocument -Name 'RunMode' -DefaultValue '')
+    $manifestTargetRows = @(Get-ConfigValue -Object $manifestDocument -Name 'Targets' -DefaultValue @())
+    $manifestTargetMap = @{}
+    $manifestTargetIds = @()
+    $manifestEnabledTargetIds = @()
+    $manifestPublishReadyTargetIds = @()
+    $manifestPublishReadyMissingTargetIds = @()
+    foreach ($manifestTarget in @($manifestTargetRows)) {
+        $manifestTargetId = [string](Get-ConfigValue -Object $manifestTarget -Name 'TargetId' -DefaultValue '')
+        if (-not (Test-NonEmptyString $manifestTargetId)) {
+            continue
+        }
+
+        $manifestTargetMap[$manifestTargetId] = $manifestTarget
+        $manifestTargetIds += $manifestTargetId
+        if (-not [bool](Get-ConfigValue -Object $manifestTarget -Name 'Enabled' -DefaultValue $false)) {
+            continue
+        }
+
+        $manifestEnabledTargetIds += $manifestTargetId
+        $triggerKinds = @(Get-StringArray (Get-ConfigValue -Object $manifestTarget -Name 'TriggerKinds' -DefaultValue @()))
+        if ($triggerKinds -contains 'publish-ready') {
+            $manifestPublishReadyTargetIds += $manifestTargetId
+        }
+        else {
+            $manifestPublishReadyMissingTargetIds += $manifestTargetId
+        }
+    }
+
+    $configTargetIds = @(
+        $Config.Targets |
+            ForEach-Object { [string](Get-ConfigValue -Object $_ -Name 'TargetId' -DefaultValue '') } |
+            Where-Object { Test-NonEmptyString $_ } |
+            Sort-Object
+    )
+    $configEnabledTargetIds = @(
+        $Config.Targets |
+            Where-Object { [bool](Get-ConfigValue -Object $_ -Name 'Enabled' -DefaultValue $false) } |
+            ForEach-Object { [string](Get-ConfigValue -Object $_ -Name 'TargetId' -DefaultValue '') } |
+            Where-Object { Test-NonEmptyString $_ } |
+            Sort-Object
+    )
+    $sortedManifestTargetIds = @($manifestTargetIds | Sort-Object)
+    $sortedManifestEnabledTargetIds = @($manifestEnabledTargetIds | Sort-Object)
+    $sortedManifestPublishReadyTargetIds = @($manifestPublishReadyTargetIds | Sort-Object)
+    $sortedManifestPublishReadyMissingTargetIds = @($manifestPublishReadyMissingTargetIds | Sort-Object)
+
+    $configTargetSet = @{}
+    foreach ($targetId in @($configTargetIds)) {
+        if (Test-NonEmptyString $targetId) {
+            $configTargetSet[$targetId] = $true
+        }
+    }
+    $configEnabledTargetSet = @{}
+    foreach ($targetId in @($configEnabledTargetIds)) {
+        if (Test-NonEmptyString $targetId) {
+            $configEnabledTargetSet[$targetId] = $true
+        }
+    }
+
+    $unknownManifestTargetIds = @($sortedManifestTargetIds | Where-Object { -not $configTargetSet.ContainsKey([string]$_) })
+    $configEnabledTargetIdsInManifestScope = @(
+        $sortedManifestTargetIds |
+            Where-Object { $configEnabledTargetSet.ContainsKey([string]$_) } |
+            Sort-Object
+    )
+
+    $manifestScope = 'none'
+    if (@($sortedManifestTargetIds).Count -gt 0) {
+        if (@($unknownManifestTargetIds).Count -gt 0) {
+            $manifestScope = 'unknown-targets'
+        }
+        elseif (@($sortedManifestTargetIds).Count -lt @($configTargetIds).Count) {
+            $manifestScope = 'selected-targets'
+        }
+        elseif ((@($sortedManifestTargetIds) -join ',') -eq (@($configTargetIds) -join ',')) {
+            $manifestScope = 'all-config-targets'
+        }
+        else {
+            $manifestScope = 'custom-targets'
+        }
+    }
+
+    $routeMatrixMismatchReasons = @()
+    $routeMatrixReasonCodes = @()
+    if (-not $manifestExists) {
+        $routeMatrixMismatchReasons += 'manifest-missing'
+        $routeMatrixReasonCodes += 'manifest-missing'
+    }
+    else {
+        if ((Test-NonEmptyString $manifestRunMode) -and $manifestRunMode -ne 'target-autoloop') {
+            $routeMatrixMismatchReasons += ('run-mode={0}' -f $manifestRunMode)
+            $routeMatrixReasonCodes += 'run-mode-mismatch'
+        }
+        if ((@($configTargetIds) -join ',') -ne (@($sortedManifestTargetIds) -join ',')) {
+            $routeMatrixMismatchReasons += ('target-set-differ config={0} manifest={1}' -f
+                $(if (@($configTargetIds).Count -gt 0) { @($configTargetIds) -join ',' } else { '(none)' }),
+                $(if (@($sortedManifestTargetIds).Count -gt 0) { @($sortedManifestTargetIds) -join ',' } else { '(none)' }))
+            $routeMatrixReasonCodes += 'target-set-differ'
+        }
+        if ((@($configEnabledTargetIds) -join ',') -ne (@($sortedManifestEnabledTargetIds) -join ',')) {
+            $routeMatrixMismatchReasons += ('enabled-targets-differ config={0} manifest={1}' -f
+                $(if (@($configEnabledTargetIds).Count -gt 0) { @($configEnabledTargetIds) -join ',' } else { '(none)' }),
+                $(if (@($sortedManifestEnabledTargetIds).Count -gt 0) { @($sortedManifestEnabledTargetIds) -join ',' } else { '(none)' }))
+            $routeMatrixReasonCodes += 'enabled-targets-differ'
+        }
+        if (@($sortedManifestPublishReadyMissingTargetIds).Count -gt 0) {
+            $routeMatrixMismatchReasons += ('publish-ready-missing={0}' -f (@($sortedManifestPublishReadyMissingTargetIds) -join ','))
+            $routeMatrixReasonCodes += 'publish-ready-missing'
+        }
+    }
+
+    $proofDoctorMismatchReasons = @()
+    $proofDoctorReasonCodes = @()
+    if (-not $manifestExists) {
+        $proofDoctorMismatchReasons += 'manifest-missing'
+        $proofDoctorReasonCodes += 'manifest-missing'
+    }
+    else {
+        if ((Test-NonEmptyString $manifestRunMode) -and $manifestRunMode -ne 'target-autoloop') {
+            $proofDoctorMismatchReasons += ('run-mode={0}' -f $manifestRunMode)
+            $proofDoctorReasonCodes += 'run-mode-mismatch'
+        }
+        if (@($sortedManifestTargetIds).Count -eq 0 -and @($configEnabledTargetIds).Count -gt 0) {
+            $proofDoctorMismatchReasons += 'manifest-targets-empty'
+            $proofDoctorReasonCodes += 'manifest-targets-empty'
+        }
+        if (@($unknownManifestTargetIds).Count -gt 0) {
+            $proofDoctorMismatchReasons += ('unknown-manifest-targets={0}' -f (@($unknownManifestTargetIds) -join ','))
+            $proofDoctorReasonCodes += 'unknown-manifest-targets'
+        }
+        if ((@($configEnabledTargetIdsInManifestScope) -join ',') -ne (@($sortedManifestEnabledTargetIds) -join ',')) {
+            $proofDoctorMismatchReasons += ('enabled-targets-differ config-scope={0} manifest={1}' -f
+                $(if (@($configEnabledTargetIdsInManifestScope).Count -gt 0) { @($configEnabledTargetIdsInManifestScope) -join ',' } else { '(none)' }),
+                $(if (@($sortedManifestEnabledTargetIds).Count -gt 0) { @($sortedManifestEnabledTargetIds) -join ',' } else { '(none)' }))
+            $proofDoctorReasonCodes += 'enabled-targets-differ'
+        }
+        if (@($sortedManifestPublishReadyMissingTargetIds).Count -gt 0) {
+            $proofDoctorMismatchReasons += ('publish-ready-missing={0}' -f (@($sortedManifestPublishReadyMissingTargetIds) -join ','))
+            $proofDoctorReasonCodes += 'publish-ready-missing'
+        }
+    }
+
+    $selectedReasons = if ($Mode -eq 'ProofDoctor') { @($proofDoctorMismatchReasons) } elseif ($Mode -eq 'RouteMatrix') { @($routeMatrixMismatchReasons) } else { @() }
+    $selectedReasonCodes = if ($Mode -eq 'ProofDoctor') { @($proofDoctorReasonCodes) } elseif ($Mode -eq 'RouteMatrix') { @($routeMatrixReasonCodes) } else { @() }
+    $manifestMismatch = @($selectedReasons).Count -gt 0
+    $operationalRecommendation = if ($Mode -eq 'ProofDoctor' -and $manifestMismatch -and @($sortedManifestEnabledTargetIds).Count -eq 0 -and @($configEnabledTargetIds).Count -gt 0) {
+        '새 RunRoot 준비 후 감지 시작'
+    }
+    elseif ($Mode -eq 'ProofDoctor' -and $manifestMismatch -and @($sortedManifestPublishReadyMissingTargetIds).Count -gt 0) {
+        'publish-ready 켜고 새 RunRoot 준비'
+    }
+    elseif ($Mode -eq 'ProofDoctor' -and $manifestMismatch) {
+        '현재 RunRoot manifest와 config가 다릅니다. 새 RunRoot 준비 후 감지 시작을 권장합니다.'
+    }
+    else {
+        ''
+    }
+
+    return [pscustomobject][ordered]@{
+        Mode = [string]$Mode
+        RunRoot = [string]$RunRoot
+        ManifestPath = [string]$manifestPath
+        ManifestExists = [bool]$manifestExists
+        ManifestDocument = $manifestDocument
+        ManifestRunMode = [string]$manifestRunMode
+        ManifestTargetRows = @($manifestTargetRows)
+        ManifestTargetMap = $manifestTargetMap
+        ManifestTargetIds = @($manifestTargetIds)
+        ManifestEnabledTargetIds = @($manifestEnabledTargetIds)
+        ManifestPublishReadyTargetIds = @($manifestPublishReadyTargetIds)
+        ManifestPublishReadyMissingTargetIds = @($manifestPublishReadyMissingTargetIds)
+        SortedManifestTargetIds = @($sortedManifestTargetIds)
+        SortedManifestEnabledTargetIds = @($sortedManifestEnabledTargetIds)
+        SortedManifestPublishReadyTargetIds = @($sortedManifestPublishReadyTargetIds)
+        SortedManifestPublishReadyMissingTargetIds = @($sortedManifestPublishReadyMissingTargetIds)
+        ConfigTargetIds = @($configTargetIds)
+        ConfigEnabledTargetIds = @($configEnabledTargetIds)
+        ConfigEnabledTargetIdsInManifestScope = @($configEnabledTargetIdsInManifestScope)
+        UnknownManifestTargetIds = @($unknownManifestTargetIds)
+        ManifestScope = [string]$manifestScope
+        RouteMatrixMismatch = @($routeMatrixMismatchReasons).Count -gt 0
+        RouteMatrixMismatchReasons = @($routeMatrixMismatchReasons)
+        RouteMatrixMismatchReason = $(if (@($routeMatrixMismatchReasons).Count -gt 0) { @($routeMatrixMismatchReasons) -join '; ' } else { '' })
+        RouteMatrixReasonCodes = @($routeMatrixReasonCodes)
+        ProofDoctorMismatch = @($proofDoctorMismatchReasons).Count -gt 0
+        ProofDoctorMismatchReasons = @($proofDoctorMismatchReasons)
+        ProofDoctorMismatchReason = $(if (@($proofDoctorMismatchReasons).Count -gt 0) { @($proofDoctorMismatchReasons) -join '; ' } else { '' })
+        ProofDoctorReasonCodes = @($proofDoctorReasonCodes)
+        ManifestMismatch = [bool]$manifestMismatch
+        ManifestMismatchReasons = @($selectedReasons)
+        ManifestMismatchReason = $(if ($manifestMismatch) { @($selectedReasons) -join '; ' } else { '' })
+        ReasonCodes = @($selectedReasonCodes)
+        BlockingReasonCodes = @($selectedReasonCodes)
+        OperationalRecommendation = [string]$operationalRecommendation
+    }
+}
+
+function Get-TargetAutoloopManifestRouteTextLines {
+    param(
+        [Parameter(Mandatory)]$Payload,
+        [switch]$IncludeScope,
+        [switch]$IncludeOperationalRecommendation
+    )
+
+    $manifestTargetIds = @(Get-ConfigValue -Object $Payload -Name 'ManifestTargetIds' -DefaultValue @())
+    $manifestEnabledTargetIds = @(Get-ConfigValue -Object $Payload -Name 'ManifestEnabledTargetIds' -DefaultValue @())
+    $manifestRunMode = [string](Get-ConfigValue -Object $Payload -Name 'ManifestRunMode' -DefaultValue '')
+    $manifestMismatchReason = [string](Get-ConfigValue -Object $Payload -Name 'ManifestMismatchReason' -DefaultValue '')
+    $lines = @(
+        ('Manifest: exists={0} runMode={1} targets={2} enabled={3} mismatch={4} reason={5}' -f
+            [bool](Get-ConfigValue -Object $Payload -Name 'ManifestExists' -DefaultValue $false),
+            $(if (Test-NonEmptyString $manifestRunMode) { $manifestRunMode } else { '(none)' }),
+            $(if (@($manifestTargetIds).Count -gt 0) { @($manifestTargetIds) -join ',' } else { '(none)' }),
+            $(if (@($manifestEnabledTargetIds).Count -gt 0) { @($manifestEnabledTargetIds) -join ',' } else { '(none)' }),
+            [bool](Get-ConfigValue -Object $Payload -Name 'ManifestMismatch' -DefaultValue $false),
+            $(if (Test-NonEmptyString $manifestMismatchReason) { $manifestMismatchReason } else { '(none)' }))
+    )
+
+    if ([bool]$IncludeScope) {
+        $manifestScope = [string](Get-ConfigValue -Object $Payload -Name 'ManifestScope' -DefaultValue '')
+        $lines += ('ManifestScope: ' + $(if (Test-NonEmptyString $manifestScope) { $manifestScope } else { '(none)' }))
+    }
+
+    if ([bool]$IncludeOperationalRecommendation) {
+        $operationalRecommendation = [string](Get-ConfigValue -Object $Payload -Name 'OperationalRecommendation' -DefaultValue '')
+        $lines += ('OperationalRecommendation: ' + $(if (Test-NonEmptyString $operationalRecommendation) { $operationalRecommendation } else { '(none)' }))
+    }
+
+    return @($lines)
+}
+
+function Get-TargetAutoloopRouteRowManifestTextLine {
+    param(
+        [Parameter(Mandatory)]$Row,
+        [string]$Indent = '  '
+    )
+
+    return ('{0}manifest: inManifest={1} manifestEnabled={2}' -f
+        $Indent,
+        [bool](Get-ConfigValue -Object $Row -Name 'InManifest' -DefaultValue $false),
+        [bool](Get-ConfigValue -Object $Row -Name 'ManifestEnabled' -DefaultValue $false))
+}
+
+function Get-TargetAutoloopDeliveryTextLines {
+    param(
+        [Parameter(Mandatory)]$Row,
+        [string]$Indent = '  '
+    )
+
+    $lines = @()
+    $deliverySummary = [string](Get-ConfigValue -Object $Row -Name 'DeliverySummary' -DefaultValue '')
+    if (Test-NonEmptyString $deliverySummary) {
+        $lines += ('{0}delivery: {1}' -f $Indent, $deliverySummary)
+    }
+
+    $deliveryNextAction = [string](Get-ConfigValue -Object $Row -Name 'DeliveryNextAction' -DefaultValue '')
+    if (Test-NonEmptyString $deliveryNextAction) {
+        $deliveryNextActionLabel = [string](Get-ConfigValue -Object $Row -Name 'DeliveryNextActionLabel' -DefaultValue '')
+        $deliveryNextText = if (Test-NonEmptyString $deliveryNextActionLabel) {
+            $deliveryNextActionLabel + ' - ' + $deliveryNextAction
+        }
+        else {
+            $deliveryNextAction
+        }
+        $lines += ('{0}deliveryNext: {1}' -f $Indent, $deliveryNextText)
+    }
+
+    return @($lines)
 }
 
 function Get-TargetAutoloopStatePaths {
@@ -1265,6 +1709,138 @@ function Get-TargetAutoloopQueuePaths {
         FailedRoot = Join-Path $queueRoot 'failed'
         PayloadRoot = Join-Path $queueRoot 'payloads'
     }
+}
+
+function Set-TargetAutoloopPathValue {
+    param(
+        [Parameter(Mandatory)]$Object,
+        [Parameter(Mandatory)][string]$Name,
+        [AllowEmptyString()][string]$Value
+    )
+
+    if ($null -ne $Object.PSObject.Properties[$Name]) {
+        $Object.$Name = [string]$Value
+        return
+    }
+
+    $Object | Add-Member -NotePropertyName $Name -NotePropertyValue ([string]$Value)
+}
+
+function Test-TargetAutoloopObjectPropertyExists {
+    param(
+        $Object,
+        [Parameter(Mandatory)][string]$Name
+    )
+
+    if ($null -eq $Object) {
+        return $false
+    }
+    if ($Object -is [hashtable]) {
+        return $Object.ContainsKey($Name)
+    }
+    if ($Object -is [System.Collections.IDictionary]) {
+        return $Object.Contains($Name)
+    }
+
+    return ($null -ne $Object.PSObject.Properties[$Name])
+}
+
+function Use-TargetAutoloopManifestTargetPaths {
+    param(
+        [Parameter(Mandatory)]$Paths,
+        $ManifestTarget = $null
+    )
+
+    if ($null -eq $ManifestTarget) {
+        return $Paths
+    }
+
+    foreach ($mapping in @(
+            @{ Property = 'CoordinatorRunRoot'; Field = 'CoordinatorRunRoot' },
+            @{ Property = 'TargetRunRoot'; Field = 'TargetRunRoot' },
+            @{ Property = 'WorkRepoRoot'; Field = 'WorkRepoRoot' },
+            @{ Property = 'TargetRoot'; Field = 'TargetRoot' },
+            @{ Property = 'InboxRoot'; Field = 'InboxRoot' },
+            @{ Property = 'InboxPendingRoot'; Field = 'InboxPendingRoot' },
+            @{ Property = 'InboxClaimedRoot'; Field = 'InboxClaimedRoot' },
+            @{ Property = 'InboxProcessedRoot'; Field = 'InboxProcessedRoot' },
+            @{ Property = 'InboxFailedRoot'; Field = 'InboxFailedRoot' },
+            @{ Property = 'WorkRoot'; Field = 'WorkRoot' },
+            @{ Property = 'CurrentRequestPath'; Field = 'CurrentRequestPath' },
+            @{ Property = 'LastPromptPath'; Field = 'LastPromptPath' },
+            @{ Property = 'SourceOutboxRoot'; Field = 'SourceOutboxPath' },
+            @{ Property = 'SourceSummaryPath'; Field = 'SourceSummaryPath' },
+            @{ Property = 'SourceReviewZipPath'; Field = 'SourceReviewZipPath' },
+            @{ Property = 'PublishReadyPath'; Field = 'PublishReadyPath' },
+            @{ Property = 'ReceiptsRoot'; Field = 'ReceiptsRoot' }
+        )) {
+        if (-not (Test-TargetAutoloopObjectPropertyExists -Object $ManifestTarget -Name ([string]$mapping.Field))) {
+            continue
+        }
+
+        Set-TargetAutoloopPathValue `
+            -Object $Paths `
+            -Name ([string]$mapping.Property) `
+            -Value ([string](Get-ConfigValue -Object $ManifestTarget -Name ([string]$mapping.Field) -DefaultValue ''))
+    }
+
+    if (
+        (-not (Test-TargetAutoloopObjectPropertyExists -Object $ManifestTarget -Name 'TargetRoot')) -and
+        (Test-TargetAutoloopObjectPropertyExists -Object $ManifestTarget -Name 'TargetRunRoot')
+    ) {
+        $manifestTargetRunRoot = [string](Get-ConfigValue -Object $ManifestTarget -Name 'TargetRunRoot' -DefaultValue '')
+        $manifestTargetId = [string](Get-ConfigValue -Object $ManifestTarget -Name 'TargetId' -DefaultValue '')
+        if ((Test-NonEmptyString $manifestTargetRunRoot) -and (Test-NonEmptyString $manifestTargetId)) {
+            Set-TargetAutoloopPathValue `
+                -Object $Paths `
+                -Name 'TargetRoot' `
+                -Value (Join-Path (Join-Path $manifestTargetRunRoot 'targets') $manifestTargetId)
+        }
+    }
+
+    if ($null -ne $Paths.PSObject.Properties['UsesWorkRepoRoot']) {
+        $Paths.UsesWorkRepoRoot = Test-NonEmptyString ([string](Get-ConfigValue -Object $Paths -Name 'WorkRepoRoot' -DefaultValue ''))
+    }
+
+    return $Paths
+}
+
+function Use-TargetAutoloopManifestQueuePaths {
+    param(
+        [Parameter(Mandatory)]$Paths,
+        $ManifestTarget = $null
+    )
+
+    if ($null -eq $ManifestTarget) {
+        return $Paths
+    }
+
+    foreach ($mapping in @(
+            @{ Property = 'CoordinatorRunRoot'; Field = 'CoordinatorRunRoot' },
+            @{ Property = 'TargetRunRoot'; Field = 'TargetRunRoot' },
+            @{ Property = 'WorkRepoRoot'; Field = 'WorkRepoRoot' },
+            @{ Property = 'QueueRoot'; Field = 'QueueRoot' },
+            @{ Property = 'QueuedRoot'; Field = 'QueueQueuedRoot' },
+            @{ Property = 'ProcessingRoot'; Field = 'QueueProcessingRoot' },
+            @{ Property = 'CompletedRoot'; Field = 'QueueCompletedRoot' },
+            @{ Property = 'FailedRoot'; Field = 'QueueFailedRoot' },
+            @{ Property = 'PayloadRoot'; Field = 'QueuePayloadRoot' }
+        )) {
+        if (-not (Test-TargetAutoloopObjectPropertyExists -Object $ManifestTarget -Name ([string]$mapping.Field))) {
+            continue
+        }
+
+        Set-TargetAutoloopPathValue `
+            -Object $Paths `
+            -Name ([string]$mapping.Property) `
+            -Value ([string](Get-ConfigValue -Object $ManifestTarget -Name ([string]$mapping.Field) -DefaultValue ''))
+    }
+
+    if ($null -ne $Paths.PSObject.Properties['UsesWorkRepoRoot']) {
+        $Paths.UsesWorkRepoRoot = Test-NonEmptyString ([string](Get-ConfigValue -Object $Paths -Name 'WorkRepoRoot' -DefaultValue ''))
+    }
+
+    return $Paths
 }
 
 function Get-TargetAutoloopTargetPaths {
@@ -1968,6 +2544,221 @@ function Test-TargetAutoloopPublishReadyValid {
     }
 
     return $true
+}
+
+function Get-TargetAutoloopContractRouteBadge {
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$State)
+
+    switch ($State) {
+        'ready' { return 'ROUTE READY' }
+        'partial' { return 'ROUTE CHECK' }
+        'invalid' { return 'ROUTE CHECK' }
+        default { return 'ROUTE EMPTY' }
+    }
+}
+
+function Get-TargetAutoloopContractSnapshotCore {
+    param(
+        [Parameter(Mandatory)]$Paths,
+        [Parameter(Mandatory)][string]$TargetId,
+        [Parameter(Mandatory)]$SummaryState,
+        [Parameter(Mandatory)]$ReviewZipState,
+        [Parameter(Mandatory)]$PublishReadyState
+    )
+
+    $publishValid = $false
+    try {
+        $publishValid = Test-TargetAutoloopPublishReadyValid -Paths $Paths -ExpectedTargetId $TargetId
+    }
+    catch {
+        $publishValid = $false
+    }
+
+    $publishReadyExists = [bool](Get-ConfigValue -Object $PublishReadyState -Name 'Exists' -DefaultValue $false)
+    $summaryExists = [bool](Get-ConfigValue -Object $SummaryState -Name 'Exists' -DefaultValue $false)
+    $reviewZipExists = [bool](Get-ConfigValue -Object $ReviewZipState -Name 'Exists' -DefaultValue $false)
+    $publishMarker = $null
+    if ($publishReadyExists) {
+        try {
+            $publishMarker = Read-JsonObject -Path ([string]$Paths.PublishReadyPath)
+        }
+        catch {
+            $publishMarker = $null
+        }
+    }
+
+    $contractState = 'missing'
+    $reason = 'no-contract-files'
+    if ($publishValid) {
+        $contractState = 'ready'
+        $reason = 'publish-ready-valid'
+    }
+    elseif ($publishReadyExists) {
+        $contractState = 'invalid'
+        $reason = 'publish-ready-invalid'
+    }
+    elseif ($summaryExists -or $reviewZipExists) {
+        $contractState = 'partial'
+        if ($summaryExists -and $reviewZipExists) {
+            $reason = 'summary-review-without-marker'
+        }
+        elseif ($summaryExists) {
+            $reason = 'summary-only'
+        }
+        else {
+            $reason = 'review-only'
+        }
+    }
+
+    return [pscustomobject]@{
+        State = $contractState
+        Reason = $reason
+        RouteBadge = (Get-TargetAutoloopContractRouteBadge -State $contractState)
+        PublishReadyValid = [bool]$publishValid
+        SummaryExists = [bool]$summaryExists
+        ReviewZipExists = [bool]$reviewZipExists
+        PublishReadyExists = [bool]$publishReadyExists
+        OutputFingerprint = [string](Get-ConfigValue -Object $publishMarker -Name 'OutputFingerprint' -DefaultValue '')
+        PublishedAt = [string](Get-ConfigValue -Object $publishMarker -Name 'PublishedAt' -DefaultValue '')
+    }
+}
+
+function Get-TargetAutoloopContractFileExists {
+    param(
+        $Contract,
+        [Parameter(Mandatory)][string]$FlatName,
+        [Parameter(Mandatory)][string]$NestedName
+    )
+
+    if ([bool](Get-ConfigValue -Object $Contract -Name $FlatName -DefaultValue $false)) {
+        return $true
+    }
+
+    $nested = Get-ConfigValue -Object $Contract -Name $NestedName -DefaultValue $null
+    return [bool](Get-ConfigValue -Object $nested -Name 'Exists' -DefaultValue $false)
+}
+
+function Get-TargetAutoloopDeliverySnapshot {
+    param(
+        [Parameter(Mandatory)]$Contract,
+        $StateRecord = $null,
+        $StatusRow = $null,
+        $RouterSessionState = $null,
+        [switch]$UseRouterSessionFallback
+    )
+
+    $publishReadyExists = Get-TargetAutoloopContractFileExists -Contract $Contract -FlatName 'PublishReadyExists' -NestedName 'PublishReady'
+    $summaryExists = Get-TargetAutoloopContractFileExists -Contract $Contract -FlatName 'SummaryExists' -NestedName 'Summary'
+    $reviewZipExists = Get-TargetAutoloopContractFileExists -Contract $Contract -FlatName 'ReviewZipExists' -NestedName 'ReviewZip'
+    $artifactState = if ([bool](Get-ConfigValue -Object $Contract -Name 'PublishReadyValid' -DefaultValue $false)) {
+        'created'
+    }
+    elseif ($publishReadyExists) {
+        'invalid-marker'
+    }
+    elseif ($summaryExists -or $reviewZipExists) {
+        'partial'
+    }
+    else {
+        'missing'
+    }
+
+    $markerFingerprint = [string](Get-ConfigValue -Object $Contract -Name 'OutputFingerprint' -DefaultValue '')
+    $lastHandledOutputFingerprint = [string](Get-ConfigValue -Object $StateRecord -Name 'LastHandledOutputFingerprint' -DefaultValue ([string](Get-ConfigValue -Object $StatusRow -Name 'LastHandledOutputFingerprint' -DefaultValue '')))
+    $watcherAccepted = (Test-NonEmptyString $markerFingerprint) -and ($markerFingerprint -eq $lastHandledOutputFingerprint)
+    $watcherState = if ($artifactState -ne 'created') {
+        'waiting-artifact'
+    }
+    elseif ($watcherAccepted) {
+        'accepted-current-marker'
+    }
+    else {
+        'not-yet-accepted-current-marker'
+    }
+
+    $lastDispatchState = [string](Get-ConfigValue -Object $StateRecord -Name 'LastDispatchState' -DefaultValue ([string](Get-ConfigValue -Object $StatusRow -Name 'LastDispatchState' -DefaultValue '')))
+    $lastRouterReadyPath = [string](Get-ConfigValue -Object $StateRecord -Name 'LastRouterReadyPath' -DefaultValue ([string](Get-ConfigValue -Object $StatusRow -Name 'LastRouterReadyPath' -DefaultValue '')))
+    $pendingDispatchEligibleAt = [string](Get-ConfigValue -Object $StateRecord -Name 'PendingDispatchEligibleAt' -DefaultValue ([string](Get-ConfigValue -Object $StatusRow -Name 'PendingDispatchEligibleAt' -DefaultValue '')))
+    $pendingDispatchDelaySeconds = [int](Get-ConfigValue -Object $StateRecord -Name 'PendingDispatchDelaySeconds' -DefaultValue ([int](Get-ConfigValue -Object $StatusRow -Name 'PendingDispatchDelaySeconds' -DefaultValue 0)))
+    $routerStateName = [string](Get-ConfigValue -Object $RouterSessionState -Name 'State' -DefaultValue '')
+    $routerDelivered = $lastDispatchState -eq 'router-ready-file-created'
+    $routerStage = if ($routerDelivered) {
+        'ready-file-created'
+    }
+    elseif ($lastDispatchState -eq 'dispatch-delay-waiting') {
+        'dispatch-delay-waiting'
+    }
+    elseif ([bool]$UseRouterSessionFallback -and $lastDispatchState -in @('router-session-not-ready', 'router-session-mismatch')) {
+        $lastDispatchState
+    }
+    elseif (Test-NonEmptyString $lastDispatchState) {
+        if ([bool]$UseRouterSessionFallback) { 'dispatch-' + $lastDispatchState } else { $lastDispatchState }
+    }
+    elseif ([bool]$UseRouterSessionFallback -and (Test-NonEmptyString $routerStateName) -and $routerStateName -ne 'ok') {
+        'router-' + $routerStateName
+    }
+    else {
+        'not-delivered'
+    }
+
+    $nextActionCode = ''
+    $nextActionLabel = ''
+    $nextAction = if ($artifactState -eq 'missing') {
+        $nextActionCode = 'create-artifacts'
+        $nextActionLabel = '산출물 생성 필요'
+        'summary.txt와 review.zip을 만든 뒤 publish helper로 publish.ready.json을 생성해야 합니다.'
+    }
+    elseif ($artifactState -eq 'partial') {
+        $nextActionCode = 'complete-artifacts'
+        $nextActionLabel = '누락 산출물 보완'
+        'summary.txt/review.zip/publish.ready.json 중 누락된 산출물을 채운 뒤 publish helper를 다시 실행해야 합니다.'
+    }
+    elseif ($artifactState -eq 'invalid-marker') {
+        $nextActionCode = 'regenerate-marker'
+        $nextActionLabel = 'marker 재생성'
+        'publish.ready.json marker가 strict contract 검증을 통과하지 못했습니다. helper로 marker를 다시 생성해야 합니다.'
+    }
+    elseif ($watcherState -eq 'not-yet-accepted-current-marker') {
+        $nextActionCode = 'wait-or-restart-watcher'
+        $nextActionLabel = 'watcher accepted 확인'
+        'publish.ready.json은 생성됐지만 watcher accepted가 아직 없습니다. 감지기 running 상태, RunRoot, target 상태를 먼저 확인하세요.'
+    }
+    elseif ($lastDispatchState -eq 'dispatch-delay-waiting') {
+        $nextActionCode = 'wait-dispatch-delay'
+        $nextActionLabel = 'dispatch delay 확인'
+        ('watcher는 marker를 accepted 처리했고 publish-ready dispatch delay 대기 중입니다. delaySeconds={0}, eligibleAt={1}' -f $pendingDispatchDelaySeconds, $(if (Test-NonEmptyString $pendingDispatchEligibleAt) { $pendingDispatchEligibleAt } else { '-' }))
+    }
+    elseif ($lastDispatchState -ne 'router-ready-file-created') {
+        $nextActionCode = 'check-router-delivery'
+        $nextActionLabel = 'router 전달 확인'
+        if ([bool]$UseRouterSessionFallback) {
+            ('watcher는 marker를 accepted 처리했지만 router 전달이 끝나지 않았습니다. router/runtime 세션과 ready 파일 소비 상태를 확인하세요. router={0}' -f $routerStage)
+        }
+        else {
+            ('watcher는 marker를 accepted 처리했지만 router 전달이 끝나지 않았습니다. dispatch={0}' -f $routerStage)
+        }
+    }
+    else {
+        $nextActionCode = 'check-cell-processing'
+        $nextActionLabel = '셀창 처리 확인'
+        'router ready 파일이 생성됐습니다. 이후 셀창 처리/processed 상태와 다음 target queue 상태를 확인하세요.'
+    }
+
+    return [pscustomobject]@{
+        Artifact = $artifactState
+        Watcher = $watcherState
+        Router = $routerStage
+        CurrentMarkerFingerprint = $markerFingerprint
+        LastHandledOutputFingerprint = $lastHandledOutputFingerprint
+        LastDispatchState = $lastDispatchState
+        LastRouterReadyPath = $lastRouterReadyPath
+        PendingDispatchEligibleAt = $pendingDispatchEligibleAt
+        PendingDispatchDelaySeconds = $pendingDispatchDelaySeconds
+        Summary = ('artifact={0} / watcher={1} / router={2}' -f $artifactState, $watcherState, $routerStage)
+        NextAction = $nextAction
+        NextActionCode = $nextActionCode
+        NextActionLabel = $nextActionLabel
+    }
 }
 
 function Get-TargetAutoloopInputTriggerFingerprint {

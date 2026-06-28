@@ -47,7 +47,7 @@ $configText = @"
 "@
 $configText | Set-Content -LiteralPath $configPath -Encoding UTF8
 
-$startJson = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Start-TargetAutoloopRun.ps1') `
+$startJson = & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Start-TargetAutoloopRun.ps1') `
     -ConfigPath $configPath `
     -RunRoot $runRoot `
     -Targets target01 `
@@ -104,11 +104,11 @@ $start = $startJson | ConvertFrom-Json
     )
 } | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $stateRoot 'live-acceptance-result.json') -Encoding UTF8
 
-$statusJson = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Show-TargetAutoloopStatus.ps1') `
+$statusJson = & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Show-TargetAutoloopStatus.ps1') `
     -ConfigPath $configPath `
     -RunRoot $runRoot `
     -AsJson | ConvertFrom-Json
-$statusText = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Show-TargetAutoloopStatus.ps1') `
+$statusText = & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Show-TargetAutoloopStatus.ps1') `
     -ConfigPath $configPath `
     -RunRoot $runRoot
 

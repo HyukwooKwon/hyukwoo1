@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Callable
 
 from relay_panel_models import AppContext
 from relay_panel_refresh_controller import RuntimeRefreshResult
@@ -50,6 +51,7 @@ class ReuseWindowsRequest:
     config_path: str
     reuse_anchor_utc: str
     pairs_mode: bool = False
+    progress: Callable[[str], None] | None = None
 
 
 @dataclass(frozen=True)
@@ -60,6 +62,7 @@ class ReuseWindowsResult:
     reuse_anchor_utc: str
     window_reuse_mode: str
     wrapper_path: str
+    reuse_timing_steps: tuple[dict[str, object], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -69,6 +72,7 @@ class RunRootPrepareRequest:
     requested_run_root: str
     summary_fallback_run_root: str
     prepare_config_path: str = ""
+    progress: Callable[[str], None] | None = None
 
 
 @dataclass(frozen=True)
@@ -89,6 +93,7 @@ class PrepareAllRequest:
     launch_windows_needed: bool
     attach_windows_needed: bool
     prepare_config_path: str = ""
+    progress: Callable[[str], None] | None = None
 
 
 @dataclass(frozen=True)
@@ -108,6 +113,37 @@ class PanelRuntimeWorkflowService:
         self.command_service = command_service
         self.status_service = status_service
         self.refresh_controller = refresh_controller
+
+    @staticmethod
+    def _report_progress(progress: Callable[[str], None] | None, message: str) -> None:
+        if not callable(progress):
+            return
+        try:
+            progress(message)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _run_timed_workflow_step(steps: list[dict[str, object]], label: str, callback):
+        started_at = time.monotonic()
+        try:
+            return callback()
+        finally:
+            steps.append(
+                {
+                    "label": str(label or "step").strip() or "step",
+                    "elapsed_seconds": max(0.0, time.monotonic() - started_at),
+                }
+            )
+
+    def _invalidate_visibility_cache(self) -> None:
+        invalidate = getattr(self.status_service, "invalidate_visibility_cache", None)
+        if not callable(invalidate):
+            return
+        try:
+            invalidate()
+        except Exception:
+            pass
 
     def _resolve_prepared_run_root_from_effective_config(
         self,
@@ -142,10 +178,16 @@ class PanelRuntimeWorkflowService:
         refresh_extra = ["-AsJson"]
         if request.pairs_mode:
             refresh_extra += ["-ReuseMode", "Pairs"]
-        reuse_payload = self.status_service.run_json_script(
-            "refresh-binding-profile-from-existing.ps1",
-            request.context,
-            extra=refresh_extra,
+        timing_steps: list[dict[str, object]] = []
+        self._report_progress(request.progress, "1/3 binding refresh 중")
+        reuse_payload = self._run_timed_workflow_step(
+            timing_steps,
+            "binding refresh",
+            lambda: self.status_service.run_json_script(
+                "refresh-binding-profile-from-existing.ps1",
+                request.context,
+                extra=refresh_extra,
+            ),
         )
         if not reuse_payload.get("Success", False):
             raise PowerShellError(
@@ -155,12 +197,23 @@ class PanelRuntimeWorkflowService:
                 stderr="",
             )
 
+        self._report_progress(request.progress, "2/3 attach 재실행 중")
         attach_command = self.command_service.build_script_command(
             "attach-targets-from-bindings.ps1",
             config_path=request.config_path,
         )
-        attach_completed = self.command_service.run(attach_command)
-        runtime_result = self.refresh_controller.refresh_runtime(request.context)
+        attach_completed = self._run_timed_workflow_step(
+            timing_steps,
+            "attach bindings",
+            lambda: self.command_service.run(attach_command),
+        )
+        self._report_progress(request.progress, "3/3 visibility 확인 중")
+        self._invalidate_visibility_cache()
+        runtime_result = self._run_timed_workflow_step(
+            timing_steps,
+            "runtime refresh",
+            lambda: self.refresh_controller.refresh_runtime(request.context),
+        )
         return ReuseWindowsResult(
             reuse_payload=reuse_payload,
             attach_output=attach_completed.stdout.strip() or "binding attach 완료",
@@ -168,6 +221,7 @@ class PanelRuntimeWorkflowService:
             reuse_anchor_utc=request.reuse_anchor_utc,
             window_reuse_mode="attach-only",
             wrapper_path="",
+            reuse_timing_steps=tuple(timing_steps),
         )
 
     def load_run_root_summary_text(self, *, run_root: str, config_path: str) -> str:
@@ -190,6 +244,7 @@ class PanelRuntimeWorkflowService:
 
     def prepare_run_root(self, request: RunRootPrepareRequest) -> RunRootPrepareResult:
         resolved_config_path = str(request.prepare_config_path or request.config_path or "").strip()
+        self._report_progress(request.progress, "1/2 RunRoot manifest 준비 중")
         command = self.command_service.build_script_command(
             "tests/Start-PairedExchangeTest.ps1",
             config_path=resolved_config_path,
@@ -209,6 +264,7 @@ class PanelRuntimeWorkflowService:
             request.requested_run_root,
             request.summary_fallback_run_root,
         )
+        self._report_progress(request.progress, "2/2 RunRoot 요약 읽는 중")
         return RunRootPrepareResult(
             output=output,
             prepared_run_root=prepared_run_root,
@@ -227,11 +283,13 @@ class PanelRuntimeWorkflowService:
         if request.launch_windows_needed:
             if not request.wrapper_path:
                 raise PowerShellError("LauncherWrapperPath를 찾지 못했습니다.")
+            self._report_progress(request.progress, "1/4 공식 창 기동 중")
             window_launch_anchor_utc = datetime.now(timezone.utc).isoformat()
             completed = self.command_service.run(self.command_service.build_python_command(request.wrapper_path))
             launcher_output = completed.stdout.strip() or "visible launcher 실행 완료"
 
         if launcher_output or request.attach_windows_needed:
+            self._report_progress(request.progress, "2/4 attach 재실행 중")
             attach_command = self.command_service.build_script_command(
                 "attach-targets-from-bindings.ps1",
                 config_path=request.config_path,
@@ -239,7 +297,10 @@ class PanelRuntimeWorkflowService:
             completed = self.command_service.run(attach_command)
             attach_output = completed.stdout.strip() or "binding attach 완료"
 
+        self._report_progress(request.progress, "3/4 visibility 확인 중")
+        self._invalidate_visibility_cache()
         runtime_result = self.refresh_controller.refresh_runtime(request.context)
+        self._report_progress(request.progress, "4/4 RunRoot 준비 중")
         run_root_result = self.prepare_run_root(
             RunRootPrepareRequest(
                 config_path=request.config_path,
@@ -247,6 +308,7 @@ class PanelRuntimeWorkflowService:
                 requested_run_root=request.explicit_run_root,
                 summary_fallback_run_root=request.context.run_root,
                 prepare_config_path=request.prepare_config_path,
+                progress=request.progress,
             )
         )
         return PrepareAllResult(

@@ -18,6 +18,7 @@ class DashboardRawBundle:
     visibility_status: dict
     paired_status: dict | None = None
     paired_status_error: str = ""
+    refresh_timing_steps: list[dict[str, object]] = field(default_factory=list)
 
 
 @dataclass

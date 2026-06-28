@@ -148,7 +148,8 @@ function Get-TargetAutoloopSeedComposerQueueState {
         [Parameter(Mandatory)][AllowEmptyString()][string]$TaskText,
         [Parameter(Mandatory)]$InputPathState,
         [Parameter(Mandatory)][bool]$RunRootExists,
-        [Parameter(Mandatory)][string]$RunRootMode
+        [Parameter(Mandatory)][string]$RunRootMode,
+        [Parameter(Mandatory)]$OperationalNotice
     )
 
     if (-not $Enabled) {
@@ -164,6 +165,15 @@ function Get-TargetAutoloopSeedComposerQueueState {
             Allowed = $false
             BlockedReason = '실제 RunRoot가 아직 준비되지 않았습니다. target-autoloop run을 먼저 시작하세요.'
             Summary = 'queue: blocked / runroot-not-ready'
+        }
+    }
+
+    if ([bool](Get-ConfigValue -Object $OperationalNotice -Name 'BlocksQueue' -DefaultValue $false)) {
+        $summary = [string](Get-ConfigValue -Object $OperationalNotice -Name 'Summary' -DefaultValue '')
+        return [pscustomobject]@{
+            Allowed = $false
+            BlockedReason = if (Test-NonEmptyString $summary) { $summary } else { '현재 target 상태에서는 queue 등록을 진행할 수 없습니다.' }
+            Summary = ('queue: blocked / {0}' -f [string](Get-ConfigValue -Object $OperationalNotice -Name 'ReasonCode' -DefaultValue 'operational-blocked'))
         }
     }
 
@@ -192,6 +202,61 @@ function Get-TargetAutoloopSeedComposerQueueState {
         Allowed = $true
         BlockedReason = ''
         Summary = 'queue: ready / input-file trigger로 watcher가 다음 sweep에서 처리합니다.'
+    }
+}
+
+function Get-TargetAutoloopSeedComposerOperationalNotice {
+    param(
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Phase,
+        [Parameter(Mandatory)][int]$CycleCount,
+        [Parameter(Mandatory)][int]$MaxCycleCount,
+        [Parameter(Mandatory)][bool]$PublishReadyTriggerEnabled,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$RouterSessionState,
+        [Parameter(Mandatory)][bool]$RouterSessionMismatch,
+        [Parameter(Mandatory)][int]$RouterPid,
+        [Parameter(Mandatory)][bool]$RouterPidExists,
+        [Parameter(Mandatory)][bool]$RouterMutexHeld
+    )
+
+    $phaseValue = [string]$Phase
+    $limitReached = ($phaseValue -eq 'limit-reached') -or ($MaxCycleCount -gt 0 -and $CycleCount -ge $MaxCycleCount)
+    if ($limitReached) {
+        return [pscustomobject]@{
+            State = 'blocked'
+            ReasonCode = 'max-cycle-reached'
+            BlocksQueue = $true
+            Summary = ('진행 중지: target이 MaxCycleCount에 도달했습니다. cycle={0}/{1}, phase={2}. 같은 RunRoot에 publish.ready.json을 다시 만들어도 다음 action은 생성되지 않습니다. 새 RunRoot를 준비하거나 MaxCycleCount를 늘린 뒤 다시 시작하세요.' -f $CycleCount, $MaxCycleCount, $(if (Test-NonEmptyString $phaseValue) { $phaseValue } else { '-' }))
+        }
+    }
+
+    if (-not $PublishReadyTriggerEnabled) {
+        return [pscustomobject]@{
+            State = 'blocked'
+            ReasonCode = 'publish-ready-trigger-disabled'
+            BlocksQueue = $true
+            Summary = '주의: 이 target은 TriggerKinds에 publish-ready가 없어 산출물 생성 후 다음 action으로 이어지지 않습니다. target 설정에서 publish-ready를 켜고 새 RunRoot를 준비하세요.'
+        }
+    }
+
+    $routerStateValue = [string]$RouterSessionState
+    $routerNotReady = $RouterSessionMismatch -or (
+        (Test-NonEmptyString $routerStateValue) -and
+        $routerStateValue -ne 'ok'
+    )
+    if ($routerNotReady) {
+        return [pscustomobject]@{
+            State = 'warning'
+            ReasonCode = 'router-session-not-ready'
+            BlocksQueue = $false
+            Summary = ('주의: router/runtime 세션이 ready 파일 소비 조건을 만족하지 않습니다. state={0}, routerPid={1}, pidExists={2}, mutexHeld={3}. 공식 8창 attach 후 router를 현재 세션으로 다시 시작해야 다음 action이 실제 셀창으로 전달됩니다.' -f $(if (Test-NonEmptyString $routerStateValue) { $routerStateValue } else { '-' }), $RouterPid, $RouterPidExists, $RouterMutexHeld)
+        }
+    }
+
+    return [pscustomobject]@{
+        State = 'ready'
+        ReasonCode = 'none'
+        BlocksQueue = $false
+        Summary = ''
     }
 }
 
@@ -236,53 +301,149 @@ function Get-TargetAutoloopSeedComposerContractSnapshot {
     $summaryState = Get-TargetAutoloopSeedComposerPathState -Path ([string]$Paths.SourceSummaryPath)
     $reviewState = Get-TargetAutoloopSeedComposerPathState -Path ([string]$Paths.SourceReviewZipPath)
     $publishState = Get-TargetAutoloopSeedComposerPathState -Path ([string]$Paths.PublishReadyPath)
+    $core = Get-TargetAutoloopContractSnapshotCore -Paths $Paths -TargetId $TargetId -SummaryState $summaryState -ReviewZipState $reviewState -PublishReadyState $publishState
 
-    $publishValid = $false
-    try {
-        $publishValid = Test-TargetAutoloopPublishReadyValid -Paths $Paths -ExpectedTargetId $TargetId
+    return [pscustomobject]@{
+        State = [string]$core.State
+        Reason = [string]$core.Reason
+        RouteBadge = [string]$core.RouteBadge
+        PublishReadyValid = [bool]$core.PublishReadyValid
+        SummaryExists = [bool]$core.SummaryExists
+        ReviewZipExists = [bool]$core.ReviewZipExists
+        PublishReadyExists = [bool]$core.PublishReadyExists
+        OutputFingerprint = [string]$core.OutputFingerprint
+        PublishedAt = [string]$core.PublishedAt
     }
-    catch {
-        $publishValid = $false
+}
+
+function New-TargetAutoloopSeedComposerPathSnapshot {
+    param([Parameter(Mandatory)]$Paths)
+
+    return [pscustomobject]@{
+        WorkRepoRoot = [string](Get-ConfigValue -Object $Paths -Name 'WorkRepoRoot' -DefaultValue '')
+        TargetRunRoot = [string](Get-ConfigValue -Object $Paths -Name 'TargetRunRoot' -DefaultValue '')
+        SourceOutboxPath = [string](Get-ConfigValue -Object $Paths -Name 'SourceOutboxRoot' -DefaultValue '')
+        SourceSummaryPath = [string](Get-ConfigValue -Object $Paths -Name 'SourceSummaryPath' -DefaultValue '')
+        SourceReviewZipPath = [string](Get-ConfigValue -Object $Paths -Name 'SourceReviewZipPath' -DefaultValue '')
+        PublishReadyPath = [string](Get-ConfigValue -Object $Paths -Name 'PublishReadyPath' -DefaultValue '')
+    }
+}
+
+function Test-TargetAutoloopSeedComposerSamePath {
+    param(
+        [AllowEmptyString()][string]$Left,
+        [AllowEmptyString()][string]$Right
+    )
+
+    return ((Get-NormalizedFullPath -Path $Left) -eq (Get-NormalizedFullPath -Path $Right))
+}
+
+function Get-TargetAutoloopSeedComposerContractPathProof {
+    param(
+        [Parameter(Mandatory)]$ComputedPaths,
+        [Parameter(Mandatory)]$ResolvedPaths,
+        [object]$ManifestTarget,
+        [string]$ManifestPath = ''
+    )
+
+    $fields = @(
+        @{ Name = 'WorkRepoRoot'; ManifestField = 'WorkRepoRoot'; ComputedField = 'WorkRepoRoot'; ResolvedField = 'WorkRepoRoot' },
+        @{ Name = 'TargetRunRoot'; ManifestField = 'TargetRunRoot'; ComputedField = 'TargetRunRoot'; ResolvedField = 'TargetRunRoot' },
+        @{ Name = 'SourceOutboxPath'; ManifestField = 'SourceOutboxPath'; ComputedField = 'SourceOutboxPath'; ResolvedField = 'SourceOutboxPath' },
+        @{ Name = 'SourceSummaryPath'; ManifestField = 'SourceSummaryPath'; ComputedField = 'SourceSummaryPath'; ResolvedField = 'SourceSummaryPath' },
+        @{ Name = 'SourceReviewZipPath'; ManifestField = 'SourceReviewZipPath'; ComputedField = 'SourceReviewZipPath'; ResolvedField = 'SourceReviewZipPath' },
+        @{ Name = 'PublishReadyPath'; ManifestField = 'PublishReadyPath'; ComputedField = 'PublishReadyPath'; ResolvedField = 'PublishReadyPath' }
+    )
+
+    $computedMismatchFields = New-Object System.Collections.Generic.List[string]
+    $resolvedMismatchFields = New-Object System.Collections.Generic.List[string]
+    $fieldRows = New-Object System.Collections.Generic.List[object]
+    $hasManifestTarget = ($null -ne $ManifestTarget)
+    foreach ($field in @($fields)) {
+        $manifestValue = if ($hasManifestTarget) { [string](Get-ConfigValue -Object $ManifestTarget -Name ([string]$field.ManifestField) -DefaultValue '') } else { '' }
+        $computedValue = [string](Get-ConfigValue -Object $ComputedPaths -Name ([string]$field.ComputedField) -DefaultValue '')
+        $resolvedValue = [string](Get-ConfigValue -Object $ResolvedPaths -Name ([string]$field.ResolvedField) -DefaultValue '')
+        $computedMatches = if ($hasManifestTarget) { Test-TargetAutoloopSeedComposerSamePath -Left $computedValue -Right $manifestValue } else { $true }
+        $resolvedMatches = if ($hasManifestTarget) { Test-TargetAutoloopSeedComposerSamePath -Left $resolvedValue -Right $manifestValue } else { $true }
+        if (-not $computedMatches) {
+            $computedMismatchFields.Add([string]$field.Name) | Out-Null
+        }
+        if (-not $resolvedMatches) {
+            $resolvedMismatchFields.Add([string]$field.Name) | Out-Null
+        }
+
+        $fieldRows.Add([pscustomobject]@{
+                Name = [string]$field.Name
+                ManifestPath = $manifestValue
+                ComputedPath = $computedValue
+                ResolvedPath = $resolvedValue
+                ComputedMatchesManifest = [bool]$computedMatches
+                ResolvedMatchesManifest = [bool]$resolvedMatches
+            }) | Out-Null
     }
 
-    $contractState = 'missing'
-    $reason = 'no-contract-files'
-    if ($publishValid) {
-        $contractState = 'ready'
-        $reason = 'publish-ready-valid'
+    $strictPathSource = if ($hasManifestTarget) { 'manifest' } else { 'computed' }
+    $computedMatchesManifest = (@($computedMismatchFields).Count -eq 0)
+    $resolvedMatchesManifest = (@($resolvedMismatchFields).Count -eq 0)
+    $summary = if (-not $hasManifestTarget) {
+        'strict path source=computed / manifest target row 없음'
     }
-    elseif ($publishState.Exists) {
-        $contractState = 'invalid'
-        $reason = 'publish-ready-invalid'
+    elseif (-not $resolvedMatchesManifest) {
+        ('strict path source=manifest / resolved mismatch={0}' -f (@($resolvedMismatchFields) -join ','))
     }
-    elseif ($summaryState.Exists -or $reviewState.Exists) {
-        $contractState = 'partial'
-        if ($summaryState.Exists -and $reviewState.Exists) {
-            $reason = 'summary-review-without-marker'
-        }
-        elseif ($summaryState.Exists) {
-            $reason = 'summary-only'
-        }
-        else {
-            $reason = 'review-only'
+    elseif (-not $computedMatchesManifest) {
+        ('strict path source=manifest / config drift override active={0}' -f (@($computedMismatchFields) -join ','))
+    }
+    else {
+        'strict path source=manifest / copied paths match manifest'
+    }
+    $resolvedMismatchArray = $resolvedMismatchFields.ToArray()
+    $computedMismatchArray = $computedMismatchFields.ToArray()
+    $fieldRowArray = $fieldRows.ToArray()
+    $configDriftDetected = [bool]($hasManifestTarget -and (-not [bool]$computedMatchesManifest))
+
+    return [pscustomobject]@{
+        StrictPathSource = $strictPathSource
+        ManifestPath = [string]$ManifestPath
+        ManifestTargetPresent = [bool]$hasManifestTarget
+        ComputedPathsMatchManifest = [bool]$computedMatchesManifest
+        ResolvedPathsMatchManifest = [bool]$resolvedMatchesManifest
+        ConfigDriftDetected = $configDriftDetected
+        ResolvedMismatchFields = @($resolvedMismatchArray)
+        ComputedMismatchFields = @($computedMismatchArray)
+        Fields = @($fieldRowArray)
+        Summary = $summary
+    }
+}
+
+function Get-TargetAutoloopSeedComposerRepoNotice {
+    param(
+        [Parameter(Mandatory)]$Paths,
+        [Parameter(Mandatory)][string]$AutomationRoot
+    )
+
+    $workRepoRoot = [string](Get-ConfigValue -Object $Paths -Name 'WorkRepoRoot' -DefaultValue '')
+    if (-not (Test-NonEmptyString $workRepoRoot)) {
+        return [pscustomobject]@{
+            State = 'coordinator-runroot'
+            Summary = '산출물 contract는 공통 RunRoot 기준입니다.'
         }
     }
 
-    $routeBadge = switch ($contractState) {
-        'ready' { 'ROUTE READY' }
-        'partial' { 'ROUTE CHECK' }
-        'invalid' { 'ROUTE CHECK' }
-        default { 'ROUTE EMPTY' }
+    $resolvedWorkRepoRoot = [System.IO.Path]::GetFullPath($workRepoRoot)
+    $resolvedAutomationRoot = [System.IO.Path]::GetFullPath($AutomationRoot)
+    $insideAutomationRepo = Test-PathEqualsOrIsDescendant -Path $resolvedWorkRepoRoot -BasePath $resolvedAutomationRoot
+    $state = if ($insideAutomationRepo) { 'automation-repo-contract' } else { 'external-workrepo-contract' }
+    $summary = if ($insideAutomationRepo) {
+        ('주의: WorkRepoRoot가 automation repo 아래입니다. shared visible strict 기준에 맞지 않습니다. workRepoRoot={0}' -f $resolvedWorkRepoRoot)
+    }
+    else {
+        ('산출물은 automation repo가 아니라 WorkRepoRoot 아래 target runroot에 생성됩니다. workRepoRoot={0} targetRunRoot={1}' -f $resolvedWorkRepoRoot, [string]$Paths.TargetRunRoot)
     }
 
     return [pscustomobject]@{
-        State = $contractState
-        Reason = $reason
-        RouteBadge = $routeBadge
-        PublishReadyValid = [bool]$publishValid
-        SummaryExists = [bool]$summaryState.Exists
-        ReviewZipExists = [bool]$reviewState.Exists
-        PublishReadyExists = [bool]$publishState.Exists
+        State = $state
+        Summary = $summary
     }
 }
 
@@ -333,7 +494,7 @@ function Get-TargetAutoloopSeedComposerPublishHelperCommand {
     )
 
     return (
-        "powershell -NoProfile -ExecutionPolicy Bypass -File {0} -ConfigPath {1} -RunRoot {2} -TargetId {3} -Overwrite" -f
+        "pwsh -NoProfile -ExecutionPolicy Bypass -File {0} -ConfigPath {1} -RunRoot {2} -TargetId {3} -Overwrite" -f
         (Quote-PowerShellLiteral $ScriptPath),
         (Quote-PowerShellLiteral $ConfigPath),
         (Quote-PowerShellLiteral $RunRoot),
@@ -354,12 +515,20 @@ function New-TargetAutoloopSeedComposerTexts {
         [Parameter(Mandatory)][AllowEmptyString()][string]$InputWarning,
         [Parameter(Mandatory)][string]$InputRecommendationLabel,
         [Parameter(Mandatory)][AllowEmptyString()][string]$InputRecommendationDetail,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$OperationalNotice,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$DeliverySummary,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$DeliveryAction,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$DeliveryActionLabel,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$RepoNotice,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$ContractPathProofSummary,
         [Parameter(Mandatory)][string]$RuntimeSummary,
         [Parameter(Mandatory)][AllowEmptyString()][string]$FixedSuffix,
         [Parameter(Mandatory)][string]$Phase,
         [Parameter(Mandatory)][int]$CycleCount,
         [Parameter(Mandatory)][int]$MaxCycleCount,
         [Parameter(Mandatory)]$Contract,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$WorkRepoRoot,
+        [Parameter(Mandatory)][string]$TargetRunRoot,
         [Parameter(Mandatory)][string]$SourceSummaryPath,
         [Parameter(Mandatory)][string]$SourceReviewZipPath,
         [Parameter(Mandatory)][string]$PublishReadyPath,
@@ -372,6 +541,9 @@ function New-TargetAutoloopSeedComposerTexts {
 
     $manualLines = @()
     $queueLines = @()
+    if (Test-NonEmptyString $FixedSuffix) {
+        $manualLines += @('[고정문구 / 항상 포함]', $FixedSuffix.Trim(), '')
+    }
     if (Test-NonEmptyString $TaskText) {
         $manualLines += @('[작업 내용]', $TaskText.Trim(), '')
         $queueLines += @('[작업 내용]', $TaskText.Trim(), '')
@@ -379,9 +551,6 @@ function New-TargetAutoloopSeedComposerTexts {
     if (Test-NonEmptyString $ReferenceInputPath) {
         $manualLines += @('[먼저 확인할 입력 파일]', $ReferenceInputPath, '')
         $queueLines += @('[먼저 확인할 입력 파일]', $ReferenceInputPath, '')
-    }
-    if (Test-NonEmptyString $FixedSuffix) {
-        $manualLines += @('[고정문구 / 항상 포함]', $FixedSuffix.Trim(), '')
     }
     $manualLines += @(
         '[생성해야 할 파일]',
@@ -398,20 +567,6 @@ function New-TargetAutoloopSeedComposerTexts {
         '- 위 target 계약 경로 외 다른 위치에 최종 산출물을 두지 마세요.',
         '- 순서는 summary.txt -> review.zip -> publish helper 입니다.'
     )
-    $queueLines += @(
-        '[생성해야 할 파일]',
-        ('1. summary.txt -> ' + $SourceSummaryPath),
-        ('2. review.zip -> ' + $SourceReviewZipPath),
-        '',
-        '[마지막 단계]',
-        ('3. publish helper 실행 -> ' + $PublishHelperCommand),
-        ('4. helper output marker -> ' + $PublishReadyPath),
-        '',
-        '[규칙]',
-        '- summary.txt와 review.zip을 먼저 준비하세요.',
-        '- publish.ready.json은 직접 만들지 말고 마지막에 helper로만 생성하세요.',
-        '- fixed suffix는 watcher가 자동으로 뒤에 붙입니다.'
-    )
     $manualStartText = ($manualLines -join "`n").Trim()
     $queuePromptText = ($queueLines -join "`n").Trim()
     $contractText = @(
@@ -422,8 +577,13 @@ function New-TargetAutoloopSeedComposerTexts {
         ('- route badge: ' + [string]$Contract.RouteBadge),
         ('- contract state: ' + [string]$Contract.State),
         ('- contract reason: ' + [string]$Contract.Reason),
+        ('- strict path proof: ' + $ContractPathProofSummary),
+        ('- delivery: ' + $DeliverySummary),
+        ('- delivery next: ' + $(if (Test-NonEmptyString $DeliveryActionLabel) { $DeliveryActionLabel + ' - ' + $DeliveryAction } else { $DeliveryAction })),
         ('- cycle: ' + $CycleCount + '/' + $MaxCycleCount),
         ('- phase: ' + $Phase),
+        ('- work repo: ' + $(if (Test-NonEmptyString $WorkRepoRoot) { $WorkRepoRoot } else { '(공통 RunRoot 사용)' })),
+        ('- target runroot: ' + $TargetRunRoot),
         ('- target root: ' + $TargetRoot),
         ('- source outbox: ' + $SourceOutboxPath),
         ('- queue root: ' + $QueueRoot),
@@ -465,6 +625,10 @@ function New-TargetAutoloopSeedComposerTexts {
         ('target=' + $TargetId + ' / route=' + [string]$Contract.RouteBadge + ' / contract=' + [string]$Contract.State + ' / cycle=' + $CycleCount + '/' + $MaxCycleCount + ' / phase=' + $Phase + ' / input=' + $InputBadge + ' / inputReason=' + $InputCheckReason),
         $InputSummary,
         $RuntimeSummary,
+        $(if (Test-NonEmptyString $DeliverySummary) { '[진행 단계] ' + $DeliverySummary } else { '' }),
+        $(if (Test-NonEmptyString $DeliveryAction) { '[다음 확인] ' + $(if (Test-NonEmptyString $DeliveryActionLabel) { $DeliveryActionLabel + ' - ' + $DeliveryAction } else { $DeliveryAction }) } else { '' }),
+        $(if (Test-NonEmptyString $RepoNotice) { '[Repo 확인] ' + $RepoNotice } else { '' }),
+        $(if (Test-NonEmptyString $OperationalNotice) { '[시작 가능 여부] ' + $OperationalNotice } else { '' }),
         $(if (Test-NonEmptyString $InputWarning) { '[입력 파일 확인 필요] ' + $InputWarning } else { '' }),
         $(if (Test-NonEmptyString $InputRecommendationLabel) { '[권장 입력 조치] ' + $InputRecommendationLabel + $(if (Test-NonEmptyString $InputRecommendationDetail) { ' - ' + $InputRecommendationDetail } else { '' }) } else { '' }),
         '',
@@ -523,7 +687,26 @@ if (@($selectedTargetRows).Count -lt 1) {
 }
 $selectedTarget = $selectedTargetRows[0]
 $paths = Get-TargetAutoloopTargetPaths -RunRoot $resolvedRunRoot -TargetId $selectedTargetId -Target $selectedTarget -Config $config
-$queuePaths = Get-TargetAutoloopQueuePaths -RunRoot $resolvedRunRoot -TargetId $selectedTargetId -Target $selectedTarget -Config $config
+$computedPathSnapshot = New-TargetAutoloopSeedComposerPathSnapshot -Paths $paths
+$manifestPath = Join-Path $resolvedRunRoot 'manifest.json'
+$manifestDocument = if (Test-Path -LiteralPath $manifestPath -PathType Leaf) { Read-JsonObject -Path $manifestPath } else { [pscustomobject]@{} }
+$manifestTargetRows = @(Get-ConfigValue -Object $manifestDocument -Name 'Targets' -DefaultValue @() | Where-Object { [string](Get-ConfigValue -Object $_ -Name 'TargetId' -DefaultValue '') -eq $selectedTargetId } | Select-Object -First 1)
+$manifestTarget = if (@($manifestTargetRows).Count -gt 0) { $manifestTargetRows[0] } else { $null }
+if ($null -ne $manifestTarget) {
+    $paths = Use-TargetAutoloopManifestTargetPaths -Paths $paths -ManifestTarget $manifestTarget
+}
+$resolvedPathSnapshot = New-TargetAutoloopSeedComposerPathSnapshot -Paths $paths
+$contractPathProof = Get-TargetAutoloopSeedComposerContractPathProof `
+    -ComputedPaths $computedPathSnapshot `
+    -ResolvedPaths $resolvedPathSnapshot `
+    -ManifestTarget $manifestTarget `
+    -ManifestPath $manifestPath
+
+$queuePathTarget = if ($null -ne $manifestTarget) { $manifestTarget } else { $selectedTarget }
+$queuePaths = Get-TargetAutoloopQueuePaths -RunRoot $resolvedRunRoot -TargetId $selectedTargetId -Target $queuePathTarget -Config $config
+if ($null -ne $manifestTarget) {
+    $queuePaths = Use-TargetAutoloopManifestQueuePaths -Paths $queuePaths -ManifestTarget $manifestTarget
+}
 $statePaths = Get-TargetAutoloopStatePaths -RunRoot $resolvedRunRoot -Config $config
 $stateDocument = if (Test-Path -LiteralPath $statePaths.StatePath -PathType Leaf) { Read-JsonObject -Path $statePaths.StatePath } else { [pscustomobject]@{} }
 $statusDocument = if (Test-Path -LiteralPath $statePaths.StatusPath -PathType Leaf) { Read-JsonObject -Path $statePaths.StatusPath } else { [pscustomobject]@{} }
@@ -533,6 +716,7 @@ $statusRowRows = @($statusRows | Where-Object { [string](Get-ConfigValue -Object
 $statusRow = if (@($statusRowRows).Count -gt 0) { $statusRowRows[0] } else { $null }
 $stateRecord = if ($stateTargetMap.Contains($selectedTargetId)) { $stateTargetMap[$selectedTargetId] } else { $null }
 $contract = Get-TargetAutoloopSeedComposerContractSnapshot -Paths $paths -TargetId $selectedTargetId
+$repoNotice = Get-TargetAutoloopSeedComposerRepoNotice -Paths $paths -AutomationRoot $root
 $proofReceipt = Get-TargetAutoloopProofReceiptSummary `
     -SmokeReceiptPath $statePaths.SmokeReceiptPath `
     -AcceptanceReceiptPath $statePaths.AcceptanceReceiptPath `
@@ -547,12 +731,31 @@ $selectedTriggerKinds = @(Get-StringArray (Get-ConfigValue -Object $selectedTarg
 $publishReadyTriggerEnabled = (@($selectedTriggerKinds) -contains 'publish-ready')
 $inputPathState = Get-TargetAutoloopSeedComposerInputPathState -ReferenceInputPath ([string]$ReferenceInputPath) -AutomationRoot $root
 $inputRecommendation = Get-TargetAutoloopSeedComposerInputRecommendation -InputPathState $inputPathState
+$routerSessionState = Get-TargetAutoloopRouterSessionState -Config $config
+$routerSessionMismatch = [bool](Get-ConfigValue -Object $routerSessionState -Name 'Mismatch' -DefaultValue $false)
+$deliverySnapshot = Get-TargetAutoloopDeliverySnapshot `
+    -Contract $contract `
+    -StateRecord $stateRecord `
+    -StatusRow $statusRow `
+    -RouterSessionState $routerSessionState `
+    -UseRouterSessionFallback
+$operationalNotice = Get-TargetAutoloopSeedComposerOperationalNotice `
+    -Phase $phase `
+    -CycleCount $cycleCount `
+    -MaxCycleCount $maxCycleCount `
+    -PublishReadyTriggerEnabled ([bool]$publishReadyTriggerEnabled) `
+    -RouterSessionState ([string](Get-ConfigValue -Object $routerSessionState -Name 'State' -DefaultValue '')) `
+    -RouterSessionMismatch:$routerSessionMismatch `
+    -RouterPid ([int](Get-ConfigValue -Object $routerSessionState -Name 'RouterPid' -DefaultValue 0)) `
+    -RouterPidExists ([bool](Get-ConfigValue -Object $routerSessionState -Name 'RouterPidExists' -DefaultValue $false)) `
+    -RouterMutexHeld ([bool](Get-ConfigValue -Object $routerSessionState -Name 'RouterMutexHeld' -DefaultValue $false))
 $queueState = Get-TargetAutoloopSeedComposerQueueState `
     -Enabled ([bool](Get-ConfigValue -Object $selectedTarget -Name 'Enabled' -DefaultValue $false)) `
     -TaskText ([string]$TaskText) `
     -InputPathState $inputPathState `
     -RunRootExists ([bool]$runContext.RunRootExists) `
-    -RunRootMode ([string]$runContext.RunRootMode)
+    -RunRootMode ([string]$runContext.RunRootMode) `
+    -OperationalNotice $operationalNotice
 $runtimeState = Get-TargetAutoloopSeedComposerRuntimeState -Paths $paths -QueuePaths $queuePaths
 $publishHelperScriptPath = Join-Path $root 'tests\Publish-TargetAutoloopArtifact.ps1'
 $publishHelperCommand = Get-TargetAutoloopSeedComposerPublishHelperCommand `
@@ -572,12 +775,20 @@ $texts = New-TargetAutoloopSeedComposerTexts `
     -InputWarning ([string]$inputPathState.Warning) `
     -InputRecommendationLabel ([string]$inputRecommendation.Label) `
     -InputRecommendationDetail ([string]$inputRecommendation.Detail) `
+    -OperationalNotice ([string](Get-ConfigValue -Object $operationalNotice -Name 'Summary' -DefaultValue '')) `
+    -DeliverySummary ([string](Get-ConfigValue -Object $deliverySnapshot -Name 'Summary' -DefaultValue '')) `
+    -DeliveryAction ([string](Get-ConfigValue -Object $deliverySnapshot -Name 'NextAction' -DefaultValue '')) `
+    -DeliveryActionLabel ([string](Get-ConfigValue -Object $deliverySnapshot -Name 'NextActionLabel' -DefaultValue '')) `
+    -RepoNotice ([string](Get-ConfigValue -Object $repoNotice -Name 'Summary' -DefaultValue '')) `
+    -ContractPathProofSummary ([string](Get-ConfigValue -Object $contractPathProof -Name 'Summary' -DefaultValue '')) `
     -RuntimeSummary ([string]$runtimeState.Summary) `
     -FixedSuffix $fixedSuffix `
     -Phase $phase `
     -CycleCount $cycleCount `
     -MaxCycleCount $maxCycleCount `
     -Contract $contract `
+    -WorkRepoRoot ([string]$paths.WorkRepoRoot) `
+    -TargetRunRoot ([string]$paths.TargetRunRoot) `
     -SourceSummaryPath ([string]$paths.SourceSummaryPath) `
     -SourceReviewZipPath ([string]$paths.SourceReviewZipPath) `
     -PublishReadyPath ([string]$paths.PublishReadyPath) `
@@ -587,11 +798,23 @@ $texts = New-TargetAutoloopSeedComposerTexts `
     -PublishHelperCommand $publishHelperCommand `
     -CloseoutSummary ([string](Get-ConfigValue -Object $proofCloseout -Name 'Summary' -DefaultValue ''))
 
-$readiness = if (-not (Test-NonEmptyString ([string]$TaskText))) {
+$readiness = if ([string](Get-ConfigValue -Object $operationalNotice -Name 'State' -DefaultValue '') -in @('blocked', 'warning')) {
+    [string](Get-ConfigValue -Object $operationalNotice -Name 'Summary' -DefaultValue '')
+}
+elseif ([string](Get-ConfigValue -Object $deliverySnapshot -Name 'Watcher' -DefaultValue '') -eq 'not-yet-accepted-current-marker') {
+    'publish.ready.json은 생성됐지만 watcher가 현재 marker를 아직 accepted 처리하지 않았습니다. 감지기 sweep/RunRoot/target 상태를 먼저 확인하세요. ' + [string](Get-ConfigValue -Object $deliverySnapshot -Name 'Summary' -DefaultValue '')
+}
+elseif (
+    [string](Get-ConfigValue -Object $deliverySnapshot -Name 'Watcher' -DefaultValue '') -eq 'accepted-current-marker' -and
+    [string](Get-ConfigValue -Object $deliverySnapshot -Name 'Router' -DefaultValue '') -ne 'ready-file-created'
+) {
+    'watcher는 현재 marker를 accepted 처리했지만 router 전달이 완료되지 않았습니다. router/runtime 세션과 ready 파일 소비 상태를 확인하세요. ' + [string](Get-ConfigValue -Object $deliverySnapshot -Name 'Summary' -DefaultValue '')
+}
+elseif (-not (Test-NonEmptyString ([string]$TaskText))) {
     '작업 설명이 비어 있습니다. 경로만 자동 주입한 시작문을 복사할 수 있지만 작업 설명을 채우는 편이 안전합니다.'
 }
 elseif ([string]$contract.RouteBadge -eq 'ROUTE READY') {
-    '현재 contract가 이미 ready 상태입니다. 기존 summary/review/publish 산출물을 확인한 뒤 overwrite 여부를 판단하세요.'
+    '현재 contract 파일은 ready입니다. 단, 실제 진행 여부는 artifact/watcher/router 3단계 상태를 같이 확인하세요. ' + [string](Get-ConfigValue -Object $deliverySnapshot -Name 'Summary' -DefaultValue '')
 }
 elseif (-not $publishReadyTriggerEnabled) {
     '주의: 이 target은 TriggerKinds에 publish-ready가 없어 산출물 생성 후 다음 동작으로 이어지지 않습니다. 8 Cell Autoloop target 설정에서 publish-ready를 켜고 저장하세요.'
@@ -627,10 +850,28 @@ $payload = [ordered]@{
     MaxCycleCount = $maxCycleCount
     RouteBadge = [string]$contract.RouteBadge
     Contract = $contract
+    ContractPathProof = $contractPathProof
+    ContractPathProofSummary = [string](Get-ConfigValue -Object $contractPathProof -Name 'Summary' -DefaultValue '')
     ProofReceipt = $proofReceipt
     ProofCloseout = $proofCloseout
+    Delivery = $deliverySnapshot
+    DeliverySummary = [string](Get-ConfigValue -Object $deliverySnapshot -Name 'Summary' -DefaultValue '')
+    DeliveryNextAction = [string](Get-ConfigValue -Object $deliverySnapshot -Name 'NextAction' -DefaultValue '')
+    DeliveryNextActionCode = [string](Get-ConfigValue -Object $deliverySnapshot -Name 'NextActionCode' -DefaultValue '')
+    DeliveryNextActionLabel = [string](Get-ConfigValue -Object $deliverySnapshot -Name 'NextActionLabel' -DefaultValue '')
+    RepoNotice = $repoNotice
+    RepoNoticeSummary = [string](Get-ConfigValue -Object $repoNotice -Name 'Summary' -DefaultValue '')
     TargetBanner = ('붙여넣기 대상: 8 Cell Autoloop / ' + $selectedTargetId)
     Readiness = $readiness
+    OperationalState = [string](Get-ConfigValue -Object $operationalNotice -Name 'State' -DefaultValue 'ready')
+    OperationalReason = [string](Get-ConfigValue -Object $operationalNotice -Name 'ReasonCode' -DefaultValue 'none')
+    OperationalBlocksQueue = [bool](Get-ConfigValue -Object $operationalNotice -Name 'BlocksQueue' -DefaultValue $false)
+    OperationalNotice = [string](Get-ConfigValue -Object $operationalNotice -Name 'Summary' -DefaultValue '')
+    RouterSessionState = [string](Get-ConfigValue -Object $routerSessionState -Name 'State' -DefaultValue '')
+    RouterSessionMismatch = [bool]$routerSessionMismatch
+    RouterPid = [int](Get-ConfigValue -Object $routerSessionState -Name 'RouterPid' -DefaultValue 0)
+    RouterPidExists = [bool](Get-ConfigValue -Object $routerSessionState -Name 'RouterPidExists' -DefaultValue $false)
+    RouterMutexHeld = [bool](Get-ConfigValue -Object $routerSessionState -Name 'RouterMutexHeld' -DefaultValue $false)
     TaskText = [string]$TaskText
     InputPath = [string]$inputPathState.ResolvedPath
     InputPathState = $inputPathState
@@ -646,6 +887,8 @@ $payload = [ordered]@{
     QueueSummary = [string]$queueState.Summary
     QueuePromptText = [string]$texts.QueuePromptText
     ResolvedOutputPaths = [ordered]@{
+        PathSource = [string](Get-ConfigValue -Object $contractPathProof -Name 'StrictPathSource' -DefaultValue 'computed')
+        ManifestPath = [string]$manifestPath
         WorkRepoRoot = [string]$paths.WorkRepoRoot
         TargetRunRoot = [string]$paths.TargetRunRoot
         TargetRoot = [string]$paths.TargetRoot

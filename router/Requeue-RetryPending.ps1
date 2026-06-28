@@ -48,9 +48,14 @@ foreach ($file in $files) {
     $destinationPath = Join-Path $destinationFolder $destinationName
     $metadataPath = ($file.FullName + '.meta.json')
     $destinationMetadataPath = ($destinationPath + '.meta.json')
+    $deliveryMetadataPath = ($file.FullName + '.delivery.json')
+    $destinationDeliveryMetadataPath = ($destinationPath + '.delivery.json')
     Move-Item -LiteralPath $file.FullName -Destination $destinationPath -Force
     if (Test-Path -LiteralPath $metadataPath -PathType Leaf) {
         Move-Item -LiteralPath $metadataPath -Destination $destinationMetadataPath -Force
+    }
+    if (Test-Path -LiteralPath $deliveryMetadataPath -PathType Leaf) {
+        Move-Item -LiteralPath $deliveryMetadataPath -Destination $destinationDeliveryMetadataPath -Force
     }
     Write-Host "requeued: $destinationPath"
 }

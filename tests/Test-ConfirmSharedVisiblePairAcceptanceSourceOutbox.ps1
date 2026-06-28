@@ -16,6 +16,8 @@ function Assert-True {
 }
 
 $root = Split-Path -Parent $PSScriptRoot
+. (Join-Path $root 'tests\PairedExchangeConfig.ps1')
+
 $sourcePath = Join-Path $root 'tests\Confirm-SharedVisiblePairAcceptance.ps1'
 $scriptAst = [System.Management.Automation.Language.Parser]::ParseFile($sourcePath, [ref]$null, [ref]$null)
 
@@ -60,7 +62,15 @@ $waitingRow = [pscustomobject]@{
 Assert-True (-not (Test-SourceOutboxAcceptedRow -Row $waitingRow)) 'waiting row should not count as accepted.'
 Assert-True (-not (Test-SourceOutboxTransitionReadyRow -Row $waitingRow)) 'waiting row should not count as transition-ready.'
 
-$summary = Get-SourceOutboxCloseoutSummary -Rows @($importedRow, $duplicateForwardedRow, $waitingRow)
+$limitReachedRow = [pscustomobject]@{
+    SourceOutboxState = 'duplicate-marker-archived'
+    SourceOutboxNextAction = 'limit-reached'
+    LatestState = 'limit-reached'
+}
+Assert-True (-not (Test-SourceOutboxAcceptedRow -Row $limitReachedRow)) 'limit-reached row should not count as accepted.'
+Assert-True (-not (Test-SourceOutboxTransitionReadyRow -Row $limitReachedRow)) 'limit-reached row should not count as transition-ready.'
+
+$summary = Get-SourceOutboxCloseoutSummary -Rows @($importedRow, $duplicateForwardedRow, $waitingRow, $limitReachedRow)
 Assert-True ([int]$summary.AcceptedCount -eq 2) 'closeout summary should count two accepted rows.'
 Assert-True ([int]$summary.TransitionReadyCount -eq 2) 'closeout summary should count two transition-ready rows.'
 

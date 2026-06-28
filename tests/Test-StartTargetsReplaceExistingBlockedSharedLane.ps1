@@ -45,7 +45,7 @@ $configText = @"
     RuntimeRoot = '$($runtimeRoot.Replace("'", "''"))'
     LogsRoot = '$($logsRoot.Replace("'", "''"))'
     RuntimeMapPath = '$($(Join-Path $runtimeRoot 'target-runtime.json').Replace("'", "''"))'
-    ShellPath = 'powershell.exe'
+    ShellPath = 'pwsh.exe'
     Targets = @()
 }
 "@

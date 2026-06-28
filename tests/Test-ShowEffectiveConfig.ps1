@@ -24,6 +24,17 @@ function Assert-True {
     }
 }
 
+function Resolve-PwshExecutable {
+    foreach ($name in @('pwsh.exe', 'pwsh')) {
+        $command = Get-Command -Name $name -ErrorAction SilentlyContinue
+        if ($null -ne $command) {
+            return [string]($command | Select-Object -First 1).Source
+        }
+    }
+
+    throw 'pwsh (PowerShell 7+) is required for show-effective-config tests.'
+}
+
 function Invoke-ShowEffectiveConfig {
     param(
         [Parameter(Mandatory)][string]$Root,
@@ -54,7 +65,7 @@ function Invoke-ShowEffectiveConfig {
         $arguments += @('-TargetId', $TargetId)
     }
 
-    $powershellPath = (Get-Command -Name 'powershell.exe' -ErrorAction Stop | Select-Object -First 1).Source
+    $powershellPath = Resolve-PwshExecutable
     $result = & $powershellPath @arguments
     if ($LASTEXITCODE -ne 0) {
         throw ("show-effective-config failed: " + (($result | Out-String).Trim()))
@@ -70,7 +81,8 @@ if ([string]::IsNullOrWhiteSpace($ConfigPath)) {
 $baseConfigPath = (Resolve-Path -LiteralPath $ConfigPath).Path
 $tempWorkRepoRoot = Join-Path 'C:\dev\python\_relay-test-fixtures\Test-ShowEffectiveConfig' ('workrepo_' + (Get-Date -Format 'yyyyMMdd_HHmmss_fff'))
 New-Item -ItemType Directory -Path $tempWorkRepoRoot -Force | Out-Null
-$externalizedResult = & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Write-ExternalizedRelayConfig.ps1') `
+$pwshPath = Resolve-PwshExecutable
+$externalizedResult = & $pwshPath -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Write-ExternalizedRelayConfig.ps1') `
     -BaseConfigPath $baseConfigPath `
     -WorkRepoRoot $tempWorkRepoRoot `
     -BootstrapBindingProfile `
@@ -88,10 +100,13 @@ $previewOnlyRunRoot = Join-Path $root ('_tmp\show-effective-config\requested_no_
 $latestPreviewRunRoot = Join-Path $pairRunRootBase ('run_preview_only_show_effective_' + (Get-Date -Format 'yyyyMMdd_HHmmss_fff'))
 New-Item -ItemType Directory -Path $previewOnlyRunRoot -Force | Out-Null
 
-& (Join-Path $root 'tests\Start-PairedExchangeTest.ps1') `
+$startResult = & $pwshPath -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Start-PairedExchangeTest.ps1') `
     -ConfigPath $resolvedConfigPath `
     -RunRoot $contractRunRoot `
-    -IncludePairId pair01 | Out-Null
+    -IncludePairId pair01 2>&1
+if ($LASTEXITCODE -ne 0) {
+    throw ("Start-PairedExchangeTest.ps1 failed: " + (($startResult | Out-String).Trim()))
+}
 
 $requestedPreview = Invoke-ShowEffectiveConfig `
     -Root $root `

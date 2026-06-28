@@ -63,8 +63,23 @@ if ($null -eq $target) {
     throw "target-autoloop target not found: $TargetId"
 }
 
+$manifestPath = Join-Path $resolvedRunRoot 'manifest.json'
+if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
+    throw "target autoloop manifest not found: $manifestPath"
+}
+$manifest = Read-JsonObject -Path $manifestPath
+$manifestTargetRows = @(Get-ConfigValue -Object $manifest -Name 'Targets' -DefaultValue @() |
+    Where-Object { [string](Get-ConfigValue -Object $_ -Name 'TargetId' -DefaultValue '') -eq $TargetId } |
+    Select-Object -First 1)
+if (@($manifestTargetRows).Count -eq 0) {
+    throw "target not found in target autoloop manifest: $TargetId"
+}
+$manifestTarget = $manifestTargetRows[0]
+
 $paths = Get-TargetAutoloopTargetPaths -RunRoot $resolvedRunRoot -TargetId $TargetId -Target $target -Config $config
-$queuePaths = Get-TargetAutoloopQueuePaths -RunRoot $resolvedRunRoot -TargetId $TargetId -Target $target -Config $config
+$paths = Use-TargetAutoloopManifestTargetPaths -Paths $paths -ManifestTarget $manifestTarget
+$queuePaths = Get-TargetAutoloopQueuePaths -RunRoot $resolvedRunRoot -TargetId $TargetId -Target $manifestTarget -Config $config
+$queuePaths = Use-TargetAutoloopManifestQueuePaths -Paths $queuePaths -ManifestTarget $manifestTarget
 Ensure-TargetAutoloopTargetDirectories -Paths $paths
 Ensure-Directory -Path ([string]$paths.InboxPendingRoot)
 
@@ -93,6 +108,8 @@ $result = [pscustomobject]@{
     SchemaVersion = $script:TargetAutoloopSchemaVersion
     ConfigPath = $resolvedConfigPath
     RunRoot = $resolvedRunRoot
+    ManifestPath = $manifestPath
+    PathSource = 'manifest'
     WorkRepoRoot = [string]$paths.WorkRepoRoot
     TargetRunRoot = [string]$paths.TargetRunRoot
     TargetId = $TargetId

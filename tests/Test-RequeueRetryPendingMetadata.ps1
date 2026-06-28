@@ -47,12 +47,19 @@ $configText = @"
 
 $retryFile = Join-Path $retryPendingRoot 'target01__20260414_000000_000__message_sample.ready.txt'
 $retryMeta = ($retryFile + '.meta.json')
+$retryDeliveryMeta = ($retryFile + '.delivery.json')
 [System.IO.File]::WriteAllText($retryFile, 'sample', (New-Utf8NoBomEncoding))
 ([ordered]@{
     SchemaVersion = '1.0.0'
     FailureCategory = 'user_active_hold'
     FailureMessage = 'AHK exit code: 43'
 } | ConvertTo-Json -Depth 4) | Set-Content -LiteralPath $retryMeta -Encoding UTF8
+([ordered]@{
+    SchemaVersion = '1.0.0'
+    Kind = 'relay-ready'
+    TargetId = 'target01'
+    LauncherSessionId = 'test-session'
+} | ConvertTo-Json -Depth 4) | Set-Content -LiteralPath $retryDeliveryMeta -Encoding UTF8
 
 $output = & (Join-Path $root 'router\Requeue-RetryPending.ps1') -ConfigPath $configPath -TargetId target01 2>&1
 
@@ -61,9 +68,14 @@ Assert-True ($requeuedFiles.Count -eq 1) 'requeue should move the retry file int
 
 $requeuedMeta = ($requeuedFiles[0].FullName + '.meta.json')
 Assert-True (Test-Path -LiteralPath $requeuedMeta -PathType Leaf) 'requeue should move metadata sidecar with the retry file.'
+$requeuedDeliveryMeta = ($requeuedFiles[0].FullName + '.delivery.json')
+Assert-True (Test-Path -LiteralPath $requeuedDeliveryMeta -PathType Leaf) 'requeue should move delivery metadata sidecar with the retry file.'
 
 $metadata = Get-Content -LiteralPath $requeuedMeta -Raw -Encoding UTF8 | ConvertFrom-Json
 Assert-True ([string]$metadata.FailureCategory -eq 'user_active_hold') 'requeued metadata should preserve failure category.'
+$deliveryMetadata = Get-Content -LiteralPath $requeuedDeliveryMeta -Raw -Encoding UTF8 | ConvertFrom-Json
+Assert-True ([string]$deliveryMetadata.LauncherSessionId -eq 'test-session') 'requeued delivery metadata should preserve launcher session.'
 Assert-True (-not (Test-Path -LiteralPath $retryMeta -PathType Leaf)) 'original retry metadata should be removed from retry-pending root.'
+Assert-True (-not (Test-Path -LiteralPath $retryDeliveryMeta -PathType Leaf)) 'original retry delivery metadata should be removed from retry-pending root.'
 
 Write-Host ('requeue-retry-pending-metadata ok: inbox=' + $targetInbox)

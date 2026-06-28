@@ -20,7 +20,7 @@ function New-Utf8NoBomEncoding {
 }
 
 function Resolve-PowerShellExecutable {
-    foreach ($name in @('pwsh.exe', 'powershell.exe')) {
+    foreach ($name in @('pwsh.exe', 'pwsh')) {
         $command = Get-Command -Name $name -ErrorAction SilentlyContinue | Select-Object -First 1
         if ($null -eq $command) {
             continue
@@ -36,7 +36,7 @@ function Resolve-PowerShellExecutable {
         return [string]$name
     }
 
-    throw 'pwsh.exe 또는 powershell.exe를 찾지 못했습니다.'
+    throw 'pwsh (PowerShell 7+)를 찾지 못했습니다.'
 }
 
 function Wait-ForWorkerStatus {
@@ -70,10 +70,26 @@ New-Item -ItemType Directory -Path $testRoot -Force | Out-Null
 $workerQueueRoot = Join-Path $testRoot 'queue'
 $workerStatusRoot = Join-Path $testRoot 'status'
 $workerLogRoot = Join-Path $testRoot 'logs'
+$targetFolder = Join-Path $testRoot 'inbox\target01'
+$pairedTargetFolder = Join-Path $testRoot 'inbox\target05'
 $configPath = Join-Path $testRoot 'settings.bootstrap-worker.psd1'
+New-Item -ItemType Directory -Path $targetFolder -Force | Out-Null
+New-Item -ItemType Directory -Path $pairedTargetFolder -Force | Out-Null
 $configText = @"
 @{
+    Targets = @(
+        @{ Id = 'target01'; Folder = '$($targetFolder.Replace("'", "''"))'; WindowTitle = 'VisibleWorkerBootstrapTest-target01' }
+        @{ Id = 'target05'; Folder = '$($pairedTargetFolder.Replace("'", "''"))'; WindowTitle = 'VisibleWorkerBootstrapTest-target05' }
+    )
     PairTest = @{
+        PairDefinitions = @(
+            @{
+                PairId = 'pair01'
+                TopTargetId = 'target01'
+                BottomTargetId = 'target05'
+                SeedTargetId = 'target01'
+            }
+        )
         VisibleWorker = @{
             Enabled = `$true
             QueueRoot = '$($workerQueueRoot.Replace("'", "''"))'

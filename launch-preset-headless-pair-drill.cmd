@@ -18,12 +18,13 @@ if not exist "%SCRIPT%" (
 )
 
 where pwsh.exe >nul 2>nul
-if "%ERRORLEVEL%"=="0" (
-  pwsh.exe -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT%" -PairId "%PAIR_ID%"
-) else (
-  powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT%" -PairId "%PAIR_ID%"
+if not "%ERRORLEVEL%"=="0" (
+  echo pwsh.exe PowerShell 7+ is required.
+  pause
+  exit /b 1
 )
 
+pwsh.exe -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT%" -PairId "%PAIR_ID%"
 set "EXITCODE=%ERRORLEVEL%"
 if not "%EXITCODE%"=="0" (
   pause

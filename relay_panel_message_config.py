@@ -3,6 +3,7 @@ from __future__ import annotations
 import difflib
 import hashlib
 import json
+import re
 import shutil
 import tempfile
 from copy import deepcopy
@@ -36,6 +37,8 @@ SCOPED_SLOT_LABELS = {
 }
 
 CONFIG_BACKUP_RETENTION_COUNT = 20
+MAX_CONFIG_TEXT_VALUE_CHARS = 200_000
+MAX_CONFIG_TEXT_VALUE_NEWLINES = 5_000
 
 
 class MessageConfigService:
@@ -922,8 +925,10 @@ class MessageConfigService:
 
     def save_document(self, config_path: str, document: dict[str, Any]) -> Path:
         backup_path = self._write_backup(config_path, suffix="pre-save")
-        serialized = self.serialize_psd1(document).replace("\n", "\r\n")
-        Path(config_path).write_text(serialized, encoding="utf-8")
+        working_document = self._document_for_serialization(document)
+        self._validate_document_text_size(working_document)
+        serialized = self.serialize_psd1(working_document)
+        Path(config_path).write_text(serialized, encoding="utf-8", newline="\n")
         return backup_path
 
     def rollback_last_backup(self, config_path: str) -> Path:
@@ -946,8 +951,10 @@ class MessageConfigService:
     ) -> dict[str, Any]:
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_config_path = Path(temp_dir) / Path(config_path).name
-            serialized = self.serialize_psd1(document).replace("\n", "\r\n")
-            temp_config_path.write_text(serialized, encoding="utf-8")
+            working_document = self._document_for_serialization(document)
+            self._validate_document_text_size(working_document)
+            serialized = self.serialize_psd1(working_document)
+            temp_config_path.write_text(serialized, encoding="utf-8", newline="\n")
             command = self.command_service.build_script_command(
                 "show-effective-config.ps1",
                 config_path=str(temp_config_path),
@@ -967,8 +974,10 @@ class MessageConfigService:
     ) -> dict[str, Any]:
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_config_path = Path(temp_dir) / Path(config_path).name
-            serialized = self.serialize_psd1(document).replace("\n", "\r\n")
-            temp_config_path.write_text(serialized, encoding="utf-8")
+            working_document = self._document_for_serialization(document)
+            self._validate_document_text_size(working_document)
+            serialized = self.serialize_psd1(working_document)
+            temp_config_path.write_text(serialized, encoding="utf-8", newline="\n")
             command = self.command_service.build_script_command(
                 "tests/Show-TargetAutoloopRouteMatrix.ps1",
                 config_path=str(temp_config_path),
@@ -978,13 +987,75 @@ class MessageConfigService:
             return self.command_service.run_json(command)
 
     def serialize_psd1(self, document: dict[str, Any]) -> str:
+        if isinstance(document, dict):
+            document = self._document_for_serialization(document)
         return self._serialize_value(document, indent=0)
 
     def _serialize_key(self, key: str) -> str:
         return key if key.replace("_", "").isalnum() else self._serialize_scalar(str(key))
 
+    @staticmethod
+    def _normalize_multiline_text(value: str) -> str:
+        return str(value or "").replace("\r\n", "\n").replace("\r", "\n")
+
+    @staticmethod
+    def _collapse_excessive_blank_lines(value: str, *, strip: bool = False) -> str:
+        collapsed = re.sub(r"\n{4,}", "\n\n", MessageConfigService._normalize_multiline_text(value))
+        return collapsed.strip() if strip else collapsed
+
+    def _sanitize_document_before_serialization(self, document: dict[str, Any]) -> None:
+        pair_test = document.get("PairTest", {})
+        if isinstance(pair_test, dict) and "SmokeSeedTaskText" in pair_test:
+            pair_test["SmokeSeedTaskText"] = self._collapse_excessive_blank_lines(
+                str(pair_test.get("SmokeSeedTaskText", "") or ""),
+                strip=True,
+            )
+
+    def _document_for_serialization(self, document: dict[str, Any]) -> dict[str, Any]:
+        working_document = self.clone_document(document)
+        self._sanitize_document_before_serialization(working_document)
+        return working_document
+
+    def _iter_document_text_values(self, value: Any, *, path: str = "$") -> list[tuple[str, str]]:
+        if isinstance(value, str):
+            return [(path, value)]
+        if isinstance(value, list):
+            rows: list[tuple[str, str]] = []
+            for index, item in enumerate(value):
+                rows.extend(self._iter_document_text_values(item, path=f"{path}[{index}]"))
+            return rows
+        if isinstance(value, dict):
+            rows: list[tuple[str, str]] = []
+            for key, item in value.items():
+                rows.extend(self._iter_document_text_values(item, path=f"{path}.{key}"))
+            return rows
+        return []
+
+    def _validate_document_text_size(self, document: dict[str, Any]) -> None:
+        oversized: list[str] = []
+        for path, value in self._iter_document_text_values(document):
+            text = self._normalize_multiline_text(value)
+            if len(text) > MAX_CONFIG_TEXT_VALUE_CHARS:
+                oversized.append(f"{path}: {len(text)} chars")
+                continue
+            newline_count = text.count("\n")
+            if newline_count > MAX_CONFIG_TEXT_VALUE_NEWLINES:
+                oversized.append(f"{path}: {newline_count} newlines")
+        if oversized:
+            limit_detail = (
+                f"maxChars={MAX_CONFIG_TEXT_VALUE_CHARS}, "
+                f"maxNewlines={MAX_CONFIG_TEXT_VALUE_NEWLINES}"
+            )
+            raise ValueError(
+                "Config text value is too large; refusing to save to prevent startup slowdown. "
+                + limit_detail
+                + " / "
+                + "; ".join(oversized[:5])
+            )
+
     def _serialize_scalar(self, value: str) -> str:
-        return "'" + value.replace("'", "''") + "'"
+        normalized = self._normalize_multiline_text(str(value))
+        return "'" + normalized.replace("'", "''") + "'"
 
     def _serialize_value(self, value: Any, *, indent: int) -> str:
         prefix = " " * indent

@@ -24,6 +24,17 @@ function Assert-True {
     }
 }
 
+function Resolve-PwshExecutable {
+    foreach ($name in @('pwsh.exe', 'pwsh')) {
+        $command = Get-Command -Name $name -ErrorAction SilentlyContinue
+        if ($null -ne $command) {
+            return [string]($command | Select-Object -First 1).Source
+        }
+    }
+
+    throw 'pwsh (PowerShell 7+) is required for render-pair-message tests.'
+}
+
 function Invoke-RenderPairMessage {
     param(
         [Parameter(Mandatory)][string]$Root,
@@ -49,7 +60,7 @@ function Invoke-RenderPairMessage {
         '-AsJson'
     )
 
-    $powershellPath = (Get-Command -Name 'powershell.exe' -ErrorAction Stop | Select-Object -First 1).Source
+    $powershellPath = Resolve-PwshExecutable
     $result = & $powershellPath @arguments
     if ($LASTEXITCODE -ne 0) {
         throw ("render-pair-message failed: " + (($result | Out-String).Trim()))
@@ -65,7 +76,7 @@ function Invoke-ScriptJson {
         [Parameter(Mandatory)][string[]]$Arguments
     )
 
-    $powershellPath = (Get-Command -Name 'powershell.exe' -ErrorAction Stop | Select-Object -First 1).Source
+    $powershellPath = Resolve-PwshExecutable
     $result = & $powershellPath '-NoProfile' '-ExecutionPolicy' 'Bypass' '-File' (Join-Path $Root $ScriptName) @Arguments
     if ($LASTEXITCODE -ne 0) {
         throw (($result | Out-String).Trim())
@@ -107,10 +118,14 @@ try {
         '-AsJson'
     )
 
-    & (Join-Path $root 'tests\Start-PairedExchangeTest.ps1') `
+    $pwshPath = Resolve-PwshExecutable
+    $startResult = & $pwshPath -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Start-PairedExchangeTest.ps1') `
         -ConfigPath $resolvedConfigPath `
         -RunRoot $contractRunRoot `
-        -IncludePairId pair01 | Out-Null
+        -IncludePairId pair01 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        throw ("Start-PairedExchangeTest.ps1 failed: " + (($startResult | Out-String).Trim()))
+    }
 
     $both = Invoke-RenderPairMessage `
         -Root $root `
@@ -150,7 +165,9 @@ try {
 
     Assert-True (@($initial.Messages).Count -eq 1) 'Expected one initial output.'
     Assert-True ([string]$initial.Messages[0].MessageType -eq 'initial') 'Expected initial message type.'
-    Assert-True ((Get-Content -LiteralPath (Join-Path $initialOnlyOutputRoot 'initial.rendered.txt') -Raw -Encoding UTF8) -match 'paired exchange 테스트용 창') 'Expected Korean initial rendered text.'
+    $initialRenderedText = Get-Content -LiteralPath (Join-Path $initialOnlyOutputRoot 'initial.rendered.txt') -Raw -Encoding UTF8
+    Assert-True ($initialRenderedText.Contains('[자동 경로 안내]')) 'Expected Korean path guidance in initial rendered text.'
+    Assert-True ($initialRenderedText.Contains('현재 대상: target05')) 'Expected target-specific dynamic body in initial rendered text.'
 
     Write-Host ('render-pair-message contract ok: runRoot=' + $contractRunRoot)
 }

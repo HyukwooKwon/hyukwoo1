@@ -88,7 +88,7 @@ function ConvertTo-CommandArgumentList {
 }
 
 function Resolve-PowerShellExecutable {
-    $candidates = @('pwsh.exe', 'powershell.exe')
+    $candidates = @('pwsh.exe', 'pwsh')
     foreach ($name in $candidates) {
         $command = Get-Command -Name $name -ErrorAction SilentlyContinue | Select-Object -First 1
         if ($null -ne $command) {
@@ -102,7 +102,7 @@ function Resolve-PowerShellExecutable {
         }
     }
 
-    throw 'pwsh.exe 또는 powershell.exe를 찾지 못했습니다.'
+    throw 'pwsh (PowerShell 7+)를 찾지 못했습니다.'
 }
 
 function Invoke-ScriptAndCaptureOutput {
@@ -393,9 +393,9 @@ $result = [pscustomobject]@{
     PairMaxRoundtripCount = $PairMaxRoundtripCount
     RunDurationSec    = $RunDurationSec
     Commands          = [pscustomobject]@{
-        Start  = Format-CommandLine -Parts (@('powershell', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $startScriptPath, '-ConfigPath', $resolvedConfigPath, '-IncludePairId') + @($selectedPairIds) + @('-InitialTargetId') + @($resolvedInitialTargetIds) + @('-SendInitialMessages', '-UseHeadlessDispatch', '-AllowHeadlessDispatchInTypedWindowLane') + $(if (Test-NonEmptyString $RunRoot) { @('-RunRoot', (Resolve-FullPathFromCurrentLocation -PathValue $RunRoot)) } else { @() }))
+        Start  = Format-CommandLine -Parts (@('pwsh', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $startScriptPath, '-ConfigPath', $resolvedConfigPath, '-IncludePairId') + @($selectedPairIds) + @('-InitialTargetId') + @($resolvedInitialTargetIds) + @('-SendInitialMessages', '-UseHeadlessDispatch', '-AllowHeadlessDispatchInTypedWindowLane') + $(if (Test-NonEmptyString $RunRoot) { @('-RunRoot', (Resolve-FullPathFromCurrentLocation -PathValue $RunRoot)) } else { @() }))
         Watch  = Format-CommandLine -Parts @('pwsh', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $watchScriptPath, '-ConfigPath', $resolvedConfigPath, '-RunRoot', $resolvedRunRoot, '-UseHeadlessDispatch', '-AllowHeadlessDispatchInTypedWindowLane', '-PairMaxRoundtripCount', [string]$PairMaxRoundtripCount, '-RunDurationSec', [string]$RunDurationSec)
-        Status = Format-CommandLine -Parts @('powershell', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $statusScriptPath, '-ConfigPath', $resolvedConfigPath, '-RunRoot', $resolvedRunRoot, '-AsJson')
+        Status = Format-CommandLine -Parts @('pwsh', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $statusScriptPath, '-ConfigPath', $resolvedConfigPath, '-RunRoot', $resolvedRunRoot, '-AsJson')
     }
     StartOutput       = @($startOutput)
     WatchOutput       = @($watchOutput)

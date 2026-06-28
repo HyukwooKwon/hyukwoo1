@@ -40,6 +40,8 @@ $baseMutex = [string]$baseConfig.RouterMutexName
 $externalMutex = [string]$externalConfig.RouterMutexName
 
 Assert-True (Test-Path -LiteralPath $outputConfigPath -PathType Leaf) 'externalized config should be written.'
+$outputBytes = [System.IO.File]::ReadAllBytes($outputConfigPath)
+Assert-True (($outputBytes.Length -ge 3) -and ($outputBytes[0] -eq 0xEF) -and ($outputBytes[1] -eq 0xBB) -and ($outputBytes[2] -eq 0xBF)) 'externalized config should be UTF-8 BOM encoded for Windows PowerShell data-file import.'
 Assert-True (-not [string]::IsNullOrWhiteSpace($externalMutex)) 'externalized config should contain RouterMutexName.'
 Assert-True ($externalMutex -ne $baseMutex) 'externalized config must use a different router mutex from the automation/base config.'
 Assert-True ($externalMutex -match '_ext_') 'externalized router mutex should carry an externalized suffix.'

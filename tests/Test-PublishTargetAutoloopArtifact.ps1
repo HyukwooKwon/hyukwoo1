@@ -48,7 +48,7 @@ New-Item -ItemType Directory -Path $routerInboxRoot -Force | Out-Null
 }
 "@, (New-Utf8NoBomEncoding))
 
-$startJson = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Start-TargetAutoloopRun.ps1') `
+$startJson = & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Start-TargetAutoloopRun.ps1') `
     -ConfigPath $configPath `
     -RunRoot $runRoot `
     -Targets target01 `
@@ -60,7 +60,7 @@ $target01 = @($manifest.Targets | Where-Object { [string]$_.TargetId -eq 'target
 
 $inputPath = Join-Path $target01.InboxPendingRoot 'seed_001.txt'
 Set-Content -LiteralPath $inputPath -Encoding UTF8 -Value 'publish helper seed body'
-$watchJson = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Watch-TargetAutoloop.ps1') `
+$watchJson = & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Watch-TargetAutoloop.ps1') `
     -ConfigPath $configPath `
     -RunRoot $runRoot `
     -ProcessOnce `
@@ -76,7 +76,7 @@ if (Test-Path -LiteralPath $target01.SourceReviewZipPath) {
 }
 Compress-Archive -LiteralPath $zipNotePath -DestinationPath $target01.SourceReviewZipPath -Force
 
-$publishJson = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Publish-TargetAutoloopArtifact.ps1') `
+$publishJson = & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Publish-TargetAutoloopArtifact.ps1') `
     -ConfigPath $configPath `
     -RunRoot $runRoot `
     -TargetId target01 `

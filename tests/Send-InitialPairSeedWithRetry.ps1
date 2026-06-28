@@ -933,7 +933,7 @@ function Invoke-TypedWindowAhkPayload {
     $submitRetryIntervalMs = [math]::Max(0, [int](Get-ConfigValue -Object $Config -Name 'SubmitRetryIntervalMs' -DefaultValue 1800))
     $sendTimeoutMs = [math]::Max(1000, [int](Get-ConfigValue -Object $Config -Name 'SendTimeoutMs' -DefaultValue 5000))
     $requireActiveBeforeEnter = [bool](Get-ConfigValue -Object $Config -Name 'RequireActiveBeforeEnter' -DefaultValue $true)
-    $resolverShellPath = [string](Get-ConfigValue -Object $Config -Name 'ResolverShellPath' -DefaultValue 'powershell.exe')
+    $resolverShellPath = [string](Get-ConfigValue -Object $Config -Name 'ResolverShellPath' -DefaultValue 'pwsh.exe')
     $visibleBeaconEnabled = [bool](Get-ConfigValue -Object $Config -Name 'VisibleExecutionBeaconEnabled' -DefaultValue $false)
     $visiblePreHoldMs = [math]::Max(0, [int](Get-ConfigValue -Object $Config -Name 'VisibleExecutionPreHoldMs' -DefaultValue 0))
     $visiblePostHoldMs = [math]::Max(0, [int](Get-ConfigValue -Object $Config -Name 'VisibleExecutionPostHoldMs' -DefaultValue 0))

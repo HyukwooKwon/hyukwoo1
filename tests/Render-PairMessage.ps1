@@ -16,6 +16,17 @@ $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 . (Join-Path $PSScriptRoot 'PairedExchangeConfig.ps1')
 
+function Resolve-PwshExecutable {
+    foreach ($name in @('pwsh.exe', 'pwsh')) {
+        $command = Get-Command -Name $name -ErrorAction SilentlyContinue
+        if ($null -ne $command) {
+            return [string]($command | Select-Object -First 1).Source
+        }
+    }
+
+    throw 'pwsh (PowerShell 7+) is required for render-pair-message.'
+}
+
 function Write-Utf8NoBomFile {
     param(
         [Parameter(Mandatory)][string]$Path,
@@ -55,7 +66,7 @@ function Invoke-ShowEffectiveConfigJson {
         $arguments += @('-RunRoot', $RequestedRunRoot)
     }
 
-    $powershellPath = (Get-Command -Name 'powershell.exe' -ErrorAction Stop | Select-Object -First 1).Source
+    $powershellPath = Resolve-PwshExecutable
     $jsonText = & $powershellPath @arguments
     if ($LASTEXITCODE -ne 0) {
         $detail = (($jsonText | Out-String).Trim())

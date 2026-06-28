@@ -78,3 +78,5 @@ pwsh -NoProfile -ExecutionPolicy Bypass -File .\visible\Cleanup-VisibleWorkerQue
   -Apply `
   -AsJson
 ```
+
+Pass multiple targets as one comma-separated `-TargetId` value. Do not use a space-separated form such as `-TargetId target01 target02`; PowerShell binds the second token as another positional argument before the script can normalize it.

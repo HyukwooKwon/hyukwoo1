@@ -22,7 +22,7 @@ function New-Utf8NoBomEncoding {
 }
 
 function Resolve-PowerShellExecutable {
-    foreach ($name in @('pwsh.exe', 'powershell.exe')) {
+    foreach ($name in @('pwsh.exe', 'pwsh')) {
         $command = Get-Command -Name $name -ErrorAction SilentlyContinue | Select-Object -First 1
         if ($null -eq $command) {
             continue
@@ -36,7 +36,7 @@ function Resolve-PowerShellExecutable {
         return [string]$name
     }
 
-    throw 'pwsh.exe 또는 powershell.exe를 찾지 못했습니다.'
+    throw 'pwsh (PowerShell 7+)를 찾지 못했습니다.'
 }
 
 function Invoke-PowerShellJson {
@@ -196,7 +196,7 @@ $fakeCodexPath = Join-Path $staleRunRoot 'fake-codex.cmd'
 $fakeCodexContent = @'
 @echo off
 more >nul
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$request = Get-Content -LiteralPath 'request.json' -Raw -Encoding UTF8 | ConvertFrom-Json; $summaryPath = if ([string]::IsNullOrWhiteSpace([string]$request.SummaryPath)) { Join-Path (Get-Location) 'summary.txt' } else { [string]$request.SummaryPath }; $parent = Split-Path -Parent $summaryPath; if ($parent -and -not (Test-Path -LiteralPath $parent)) { New-Item -ItemType Directory -Path $parent -Force | Out-Null }; [System.IO.File]::WriteAllText($summaryPath, 'fresh summary from fake codex', [System.Text.UTF8Encoding]::new($false))"
+pwsh -NoProfile -ExecutionPolicy Bypass -Command "$request = Get-Content -LiteralPath 'request.json' -Raw -Encoding UTF8 | ConvertFrom-Json; $summaryPath = if ([string]::IsNullOrWhiteSpace([string]$request.SummaryPath)) { Join-Path (Get-Location) 'summary.txt' } else { [string]$request.SummaryPath }; $parent = Split-Path -Parent $summaryPath; if ($parent -and -not (Test-Path -LiteralPath $parent)) { New-Item -ItemType Directory -Path $parent -Force | Out-Null }; [System.IO.File]::WriteAllText($summaryPath, 'fresh summary from fake codex', [System.Text.UTF8Encoding]::new($false))"
 exit /b 0
 '@
 [System.IO.File]::WriteAllText($fakeCodexPath, $fakeCodexContent, (New-Utf8NoBomEncoding))
@@ -254,7 +254,7 @@ $sourceOutboxFakeCodexPath = Join-Path $sourceOutboxRunRoot 'fake-codex-source-o
 $sourceOutboxFakeCodexContent = @'
 @echo off
 more >nul
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$request = Get-Content -LiteralPath 'request.json' -Raw -Encoding UTF8 | ConvertFrom-Json; $summaryPath = [string]$request.SourceSummaryPath; $reviewZipPath = [string]$request.SourceReviewZipPath; $publishReadyPath = [string]$request.PublishReadyPath; $outboxPath = Split-Path -Parent $summaryPath; if ($outboxPath -and -not (Test-Path -LiteralPath $outboxPath)) { New-Item -ItemType Directory -Path $outboxPath -Force | Out-Null }; [System.IO.File]::WriteAllText($summaryPath, 'fresh source-outbox summary', [System.Text.UTF8Encoding]::new($false)); $notePath = Join-Path $outboxPath 'source-outbox-note.txt'; [System.IO.File]::WriteAllText($notePath, 'fresh source-outbox zip payload', [System.Text.UTF8Encoding]::new($false)); Compress-Archive -LiteralPath $notePath -DestinationPath $reviewZipPath -Force; $summaryItem = Get-Item -LiteralPath $summaryPath -ErrorAction Stop; $zipItem = Get-Item -LiteralPath $reviewZipPath -ErrorAction Stop; $publishedAt = (Get-Date).ToString('o'); $payload = [ordered]@{ SchemaVersion = '1.0.0'; PairId = [string]$request.PairId; TargetId = [string]$request.TargetId; SummaryPath = $summaryPath; ReviewZipPath = $reviewZipPath; PublishedAt = $publishedAt; SummarySizeBytes = [int64]$summaryItem.Length; ReviewZipSizeBytes = [int64]$zipItem.Length; PublishedBy = 'publish-paired-exchange-artifact.ps1'; ValidationPassed = $true; ValidationCompletedAt = $publishedAt }; $payload | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $publishReadyPath -Encoding UTF8"
+pwsh -NoProfile -ExecutionPolicy Bypass -Command "$request = Get-Content -LiteralPath 'request.json' -Raw -Encoding UTF8 | ConvertFrom-Json; $summaryPath = [string]$request.SourceSummaryPath; $reviewZipPath = [string]$request.SourceReviewZipPath; $publishReadyPath = [string]$request.PublishReadyPath; $outboxPath = Split-Path -Parent $summaryPath; if ($outboxPath -and -not (Test-Path -LiteralPath $outboxPath)) { New-Item -ItemType Directory -Path $outboxPath -Force | Out-Null }; [System.IO.File]::WriteAllText($summaryPath, 'fresh source-outbox summary', [System.Text.UTF8Encoding]::new($false)); $notePath = Join-Path $outboxPath 'source-outbox-note.txt'; [System.IO.File]::WriteAllText($notePath, 'fresh source-outbox zip payload', [System.Text.UTF8Encoding]::new($false)); Compress-Archive -LiteralPath $notePath -DestinationPath $reviewZipPath -Force; $summaryItem = Get-Item -LiteralPath $summaryPath -ErrorAction Stop; $zipItem = Get-Item -LiteralPath $reviewZipPath -ErrorAction Stop; $publishedAt = (Get-Date).ToString('o'); $payload = [ordered]@{ SchemaVersion = '1.0.0'; PairId = [string]$request.PairId; TargetId = [string]$request.TargetId; SummaryPath = $summaryPath; ReviewZipPath = $reviewZipPath; PublishedAt = $publishedAt; SummarySizeBytes = [int64]$summaryItem.Length; ReviewZipSizeBytes = [int64]$zipItem.Length; PublishedBy = 'publish-paired-exchange-artifact.ps1'; ValidationPassed = $true; ValidationCompletedAt = $publishedAt }; $payload | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $publishReadyPath -Encoding UTF8"
 exit /b 0
 '@
 [System.IO.File]::WriteAllText($sourceOutboxFakeCodexPath, $sourceOutboxFakeCodexContent, (New-Utf8NoBomEncoding))

@@ -52,7 +52,7 @@ foreach ($path in @($expectedTarget01Inbox, $mismatchTarget01Inbox)) {
 }
 "@, (New-Utf8NoBomEncoding))
 
-$startJson = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Start-TargetAutoloopRun.ps1') `
+$startJson = & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Start-TargetAutoloopRun.ps1') `
     -ConfigPath $configPath `
     -RunRoot $runRoot `
     -Targets target01 `

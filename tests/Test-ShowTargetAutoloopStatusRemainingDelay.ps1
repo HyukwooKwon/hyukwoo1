@@ -46,7 +46,7 @@ New-Item -ItemType Directory -Path $tmpRoot -Force | Out-Null
 }
 "@, (New-Utf8NoBomEncoding))
 
-$startJson = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Start-TargetAutoloopRun.ps1') `
+$startJson = & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Start-TargetAutoloopRun.ps1') `
     -ConfigPath $configPath `
     -RunRoot $runRoot `
     -Targets target01 `
@@ -84,7 +84,7 @@ $status.Targets[0].PendingDispatchEligibleAt = $targetState.PendingDispatchEligi
 $status.LastUpdatedAt = (Get-Date).ToString('o')
 $status | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $start.StatusPath -Encoding UTF8
 
-$statusJson = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Show-TargetAutoloopStatus.ps1') `
+$statusJson = & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Show-TargetAutoloopStatus.ps1') `
     -ConfigPath $configPath `
     -RunRoot $runRoot `
     -AsJson | ConvertFrom-Json
@@ -96,7 +96,7 @@ Assert-True ([string]$delaySummary.DelayRange -eq '15-30s') 'status json should 
 $actualDueAt = ([datetimeoffset]$delaySummary.DueAt).ToString('o')
 Assert-True ($actualDueAt -eq [string]$targetState.PendingDispatchEligibleAt) 'status json should surface due timestamp.'
 
-$output = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Show-TargetAutoloopStatus.ps1') `
+$output = & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Show-TargetAutoloopStatus.ps1') `
     -ConfigPath $configPath `
     -RunRoot $runRoot
 

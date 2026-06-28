@@ -67,6 +67,7 @@ $configText = @"
     PairTest = @{
         RunRootBase = '$($testRoot.Replace("'", "''"))'
         ExecutionPathMode = 'typed-window'
+        SeedOutboxStartTimeoutSeconds = 600
     }
 }
 "@
@@ -113,6 +114,7 @@ $statusRaw = & (Join-Path $root 'tests\Show-PairedExchangeStatus.ps1') `
 $status = $statusRaw | ConvertFrom-Json
 $targetRow = @($status.Targets | Where-Object { [string]$_.TargetId -eq 'target01' } | Select-Object -First 1)[0]
 
+Assert-True ([int]$status.PairTest.SeedOutboxStartTimeoutSeconds -eq 600) 'paired status should surface the configured seed outbox timeout.'
 Assert-True ($null -ne $targetRow) 'paired status should include target01 row.'
 Assert-True ([string]$targetRow.TypedWindowSessionState -eq 'recovery-needed') 'paired status should surface typed-window session state.'
 Assert-True ([string]$targetRow.TypedWindowSessionScopeKind -eq 'pair') 'paired status should surface typed-window session scope kind.'

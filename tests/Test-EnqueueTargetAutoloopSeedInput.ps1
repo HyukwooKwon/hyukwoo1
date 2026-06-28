@@ -49,7 +49,7 @@ New-Item -ItemType Directory -Path $referenceInputRoot -Force | Out-Null
 }
 "@, (New-Object System.Text.UTF8Encoding($false)))
 
-$startJson = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Start-TargetAutoloopRun.ps1') `
+$startJson = & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Start-TargetAutoloopRun.ps1') `
     -ConfigPath $configPath `
     -RunRoot $runRoot `
     -Targets target01 `
@@ -58,7 +58,7 @@ $start = $startJson | ConvertFrom-Json
 $manifest = Get-Content -LiteralPath $start.ManifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
 $target01 = @($manifest.Targets | Where-Object { [string]$_.TargetId -eq 'target01' } | Select-Object -First 1)[0]
 
-$queueJson = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Enqueue-TargetAutoloopSeedInput.ps1') `
+$queueJson = & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Enqueue-TargetAutoloopSeedInput.ps1') `
     -ConfigPath $configPath `
     -RunRoot $runRoot `
     -TargetId target01 `

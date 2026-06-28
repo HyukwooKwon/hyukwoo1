@@ -48,7 +48,7 @@ New-Item -ItemType Directory -Path $routerInboxRoot -Force | Out-Null
 }
 "@, (New-Utf8NoBomEncoding))
 
-$startJson = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Start-TargetAutoloopRun.ps1') `
+$startJson = & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Start-TargetAutoloopRun.ps1') `
     -ConfigPath $configPath `
     -RunRoot $runRoot `
     -Targets target01 `
@@ -65,7 +65,7 @@ if (Test-Path -LiteralPath $target01.SourceReviewZipPath) {
     Remove-Item -LiteralPath $target01.SourceReviewZipPath -Force
 }
 Compress-Archive -LiteralPath $zipNotePath -DestinationPath $target01.SourceReviewZipPath -Force
-$null = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Publish-TargetAutoloopArtifact.ps1') `
+$null = & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Publish-TargetAutoloopArtifact.ps1') `
     -ConfigPath $configPath `
     -RunRoot $runRoot `
     -TargetId target01 `
@@ -84,7 +84,7 @@ $state.Targets.target01.LastTriggerKind = 'publish-ready'
 $state.LastUpdatedAt = (Get-Date).ToString('o')
 $state | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $start.StatePath -Encoding UTF8
 
-$watchJson = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Watch-TargetAutoloop.ps1') `
+$watchJson = & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Watch-TargetAutoloop.ps1') `
     -ConfigPath $configPath `
     -RunRoot $runRoot `
     -ProcessOnce `
@@ -108,7 +108,7 @@ $control = Get-Content -LiteralPath $start.ControlPath -Raw -Encoding UTF8 | Con
 Assert-True ([string]$control.State -eq 'stopped') 'control document should become stopped after cycle limit closeout.'
 Assert-True ([string]$control.Action -eq '') 'cycle limit closeout should not leave a pending control action.'
 
-$statusJson = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Show-TargetAutoloopStatus.ps1') `
+$statusJson = & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Show-TargetAutoloopStatus.ps1') `
     -ConfigPath $configPath `
     -RunRoot $runRoot `
     -AsJson | ConvertFrom-Json
@@ -117,7 +117,7 @@ Assert-True ([string]$statusJson.WatcherStopReason -eq 'all-targets-limit-reache
 Assert-True ([int]$statusJson.Counts.LimitReachedTargets -eq 1) 'status json should count limit-reached targets.'
 Assert-True ([string]$statusJson.Targets[0].Phase -eq 'limit-reached') 'status json should surface limit-reached phase.'
 
-$output = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Show-TargetAutoloopStatus.ps1') `
+$output = & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Show-TargetAutoloopStatus.ps1') `
     -ConfigPath $configPath `
     -RunRoot $runRoot
 $joined = (@($output) -join "`n")

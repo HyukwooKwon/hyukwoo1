@@ -177,6 +177,22 @@ Assert-True (Test-Path -LiteralPath $invalidCommandPath -PathType Leaf) 'dry-run
 Assert-True (Test-Path -LiteralPath $missingFieldCommandPath -PathType Leaf) 'dry-run should not move missing-field command.'
 Assert-True (Test-Path -LiteralPath $staleProcessingPath -PathType Leaf) 'dry-run should not move stale processing command.'
 
+$multiTargetRaw = & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'visible\Cleanup-VisibleWorkerQueue.ps1') `
+    -ConfigPath $configPath `
+    -TargetId target01,target02 `
+    -KeepRunRoot $sameRunRoot `
+    -StaleAgeSeconds 60 `
+    -AsJson
+if ($LASTEXITCODE -ne 0) {
+    throw ('cleanup comma target dry-run failed: ' + (($multiTargetRaw | Out-String).Trim()))
+}
+
+$multiTarget = $multiTargetRaw | ConvertFrom-Json
+$multiTargetIds = @($multiTarget.Targets | ForEach-Object { [string]$_.TargetId })
+Assert-True ([int]$multiTarget.Summary.TargetCount -eq 2) 'cleanup should split comma-separated target ids into two targets.'
+Assert-True ('target01' -in $multiTargetIds) 'cleanup comma target list should include target01.'
+Assert-True ('target02' -in $multiTargetIds) 'cleanup comma target list should include target02.'
+
 $applyRaw = & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'visible\Cleanup-VisibleWorkerQueue.ps1') `
     -ConfigPath $configPath `
     -TargetId target01 `

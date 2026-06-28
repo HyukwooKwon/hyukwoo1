@@ -23,6 +23,34 @@ function New-Utf8NoBomEncoding {
     return [System.Text.UTF8Encoding]::new($false)
 }
 
+function Resolve-PowerShellExecutable {
+    $hostPath = ''
+    foreach ($hostName in @('pwsh.exe', 'pwsh')) {
+        $hostCommand = Get-Command -Name $hostName -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($null -eq $hostCommand) {
+            continue
+        }
+
+        if (Test-NonEmptyString ([string]$hostCommand.Source)) {
+            $hostPath = [string]$hostCommand.Source
+            break
+        }
+        if (Test-NonEmptyString ([string]$hostCommand.Path)) {
+            $hostPath = [string]$hostCommand.Path
+            break
+        }
+
+        $hostPath = $hostName
+        break
+    }
+
+    if (-not (Test-NonEmptyString $hostPath)) {
+        throw 'pwsh (PowerShell 7+)를 찾지 못했습니다.'
+    }
+
+    return $hostPath
+}
+
 function Ensure-Directory {
     param([Parameter(Mandatory)][string]$Path)
 
@@ -851,7 +879,7 @@ function Invoke-SourceOutboxMarkerRepair {
         }
     }
 
-    $powershellPath = if ($PSVersionTable.PSVersion.Major -ge 6) { 'pwsh' } else { 'powershell' }
+    $powershellPath = Resolve-PowerShellExecutable
     $repairScriptPath = Join-Path $Root 'tests\Publish-PairedExchangeArtifact.ps1'
     $repairSourceContext = ('exec-auto-repair:' + $Reason)
     $result = & $powershellPath `
@@ -1038,32 +1066,8 @@ function Resolve-LaunchCommand {
     }
 
     if ($extension -ieq '.ps1') {
-        $hostPath = ''
-        foreach ($hostName in @('pwsh.exe', 'powershell.exe')) {
-            $hostCommand = Get-Command -Name $hostName -ErrorAction SilentlyContinue | Select-Object -First 1
-            if ($null -eq $hostCommand) {
-                continue
-            }
-
-            if (Test-NonEmptyString ([string]$hostCommand.Source)) {
-                $hostPath = [string]$hostCommand.Source
-                break
-            }
-            if (Test-NonEmptyString ([string]$hostCommand.Path)) {
-                $hostPath = [string]$hostCommand.Path
-                break
-            }
-
-            $hostPath = $hostName
-            break
-        }
-
-        if (-not (Test-NonEmptyString $hostPath)) {
-            throw 'pwsh.exe 또는 powershell.exe를 찾지 못했습니다.'
-        }
-
         return [pscustomobject]@{
-            FilePath  = $hostPath
+            FilePath  = (Resolve-PowerShellExecutable)
             Arguments = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $resolvedPath) + $Arguments
             Resolved  = $resolvedPath
         }

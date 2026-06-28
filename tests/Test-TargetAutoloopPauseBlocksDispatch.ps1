@@ -48,7 +48,7 @@ New-Item -ItemType Directory -Path $routerInboxRoot -Force | Out-Null
 }
 "@, (New-Utf8NoBomEncoding))
 
-$startJson = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Start-TargetAutoloopRun.ps1') `
+$startJson = & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Start-TargetAutoloopRun.ps1') `
     -ConfigPath $configPath `
     -RunRoot $runRoot `
     -Targets target01 `
@@ -61,7 +61,7 @@ $target01 = @($manifest.Targets | Where-Object { [string]$_.TargetId -eq 'target
 $inputPath = Join-Path $target01.InboxPendingRoot 'task_pause_dispatch_001.txt'
 Set-Content -LiteralPath $inputPath -Encoding UTF8 -Value 'pause should block queued dispatch until resume'
 
-$watchQueueJson = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Watch-TargetAutoloop.ps1') `
+$watchQueueJson = & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Watch-TargetAutoloop.ps1') `
     -ConfigPath $configPath `
     -RunRoot $runRoot `
     -ProcessOnce `
@@ -72,7 +72,7 @@ Assert-True ([int]$watchQueue.QueuedCount -eq 1) 'input trigger should queue one
 $queuedFilesBeforePause = @(Get-ChildItem -LiteralPath $target01.QueueQueuedRoot -File -Filter '*.json' | Sort-Object Name)
 Assert-True (@($queuedFilesBeforePause).Count -eq 1) 'queued command should exist before pause acknowledgement.'
 
-$pauseRequest = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Request-TargetAutoloopControl.ps1') `
+$pauseRequest = & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Request-TargetAutoloopControl.ps1') `
     -ConfigPath $configPath `
     -RunRoot $runRoot `
     -Action pause `
@@ -81,19 +81,19 @@ $pauseRequest = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path
 Assert-True ([bool]$pauseRequest.Ok) 'pause request should succeed.'
 Assert-True (([string]$pauseRequest.RequestId).Length -gt 0) 'pause request should allocate request id.'
 
-$null = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Watch-TargetAutoloop.ps1') `
+$null = & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Watch-TargetAutoloop.ps1') `
     -ConfigPath $configPath `
     -RunRoot $runRoot `
     -ProcessOnce `
     -AsJson
 
-$pausedStatus = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Show-TargetAutoloopStatus.ps1') `
+$pausedStatus = & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Show-TargetAutoloopStatus.ps1') `
     -ConfigPath $configPath `
     -RunRoot $runRoot `
     -AsJson | ConvertFrom-Json
 Assert-True ([string]$pausedStatus.ControllerState -eq 'paused') 'controller state should be paused before dispatch worker runs.'
 
-$blockedWorkerJson = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'visible\Start-TargetAutoloopWorker.ps1') `
+$blockedWorkerJson = & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'visible\Start-TargetAutoloopWorker.ps1') `
     -ConfigPath $configPath `
     -RunRoot $runRoot `
     -TargetId target01 `
@@ -112,7 +112,7 @@ Assert-True (@($queuedFilesWhilePaused).Count -eq 1) 'queued command should rema
 Assert-True (@($processingFilesWhilePaused).Count -eq 0) 'processing archive should stay empty while paused.'
 Assert-True (@($completedFilesWhilePaused).Count -eq 0) 'completed archive should stay empty while paused.'
 
-$resumeRequest = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Request-TargetAutoloopControl.ps1') `
+$resumeRequest = & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Request-TargetAutoloopControl.ps1') `
     -ConfigPath $configPath `
     -RunRoot $runRoot `
     -Action resume `
@@ -121,19 +121,19 @@ $resumeRequest = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Pat
 Assert-True ([bool]$resumeRequest.Ok) 'resume request should succeed.'
 Assert-True (([string]$resumeRequest.RequestId).Length -gt 0) 'resume request should allocate request id.'
 
-$null = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Watch-TargetAutoloop.ps1') `
+$null = & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Watch-TargetAutoloop.ps1') `
     -ConfigPath $configPath `
     -RunRoot $runRoot `
     -ProcessOnce `
     -AsJson
 
-$resumedStatus = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Show-TargetAutoloopStatus.ps1') `
+$resumedStatus = & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Show-TargetAutoloopStatus.ps1') `
     -ConfigPath $configPath `
     -RunRoot $runRoot `
     -AsJson | ConvertFrom-Json
 Assert-True ([string]$resumedStatus.ControllerState -eq 'running') 'controller state should return to running after resume acknowledgement.'
 
-$resumedWorkerJson = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'visible\Start-TargetAutoloopWorker.ps1') `
+$resumedWorkerJson = & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'visible\Start-TargetAutoloopWorker.ps1') `
     -ConfigPath $configPath `
     -RunRoot $runRoot `
     -TargetId target01 `

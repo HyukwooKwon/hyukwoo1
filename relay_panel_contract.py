@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime
 from functools import lru_cache
 from pathlib import Path
@@ -35,6 +36,7 @@ def _is_iso_timestamp(value: object) -> bool:
     candidate = value.strip()
     if not candidate:
         return False
+    candidate = re.sub(r"(\.\d{6})\d+(?=Z$|[+-]\d{2}:\d{2}$|$)", r"\1", candidate)
     if candidate.endswith("Z"):
         candidate = candidate[:-1] + "+00:00"
     try:

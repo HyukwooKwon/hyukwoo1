@@ -39,7 +39,7 @@ foreach ($path in @($expectedTarget01Inbox, $mismatchTarget01Inbox)) {
     InboxRoot = '$($expectedInboxRoot.Replace("'", "''"))'
     AhkExePath = 'C:\Program Files\AutoHotkey\v2\AutoHotkey64.exe'
     AhkScriptPath = 'C:\dev\python\hyukwoo\hyukwoo1\sender\SendToWindow.ahk'
-    ResolverShellPath = 'powershell.exe'
+    ResolverShellPath = 'pwsh.exe'
     RuntimeMapPath = 'C:\dev\python\hyukwoo\hyukwoo1\runtime\bottest-live-visible\target-runtime.json'
     Targets = @(
         @{ Id = 'target01'; Folder = '$($mismatchTarget01Inbox.Replace("'", "''"))'; WindowTitle = 'Target01'; FixedSuffix = 'suffix-mismatch' }
@@ -56,7 +56,7 @@ foreach ($path in @($expectedTarget01Inbox, $mismatchTarget01Inbox)) {
 }
 "@, (New-Utf8NoBomEncoding))
 
-$startJson = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Start-TargetAutoloopRun.ps1') `
+$startJson = & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Start-TargetAutoloopRun.ps1') `
     -ConfigPath $configPath `
     -RunRoot $runRoot `
     -Targets target01 `

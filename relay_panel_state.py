@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -780,7 +781,28 @@ class DashboardAggregator:
             return workflow
         return workflow
 
-    def build_panel_state(self, *, bundle: DashboardRawBundle, selected_pair: str) -> PanelStateModel:
+    def build_panel_state(
+        self,
+        *,
+        bundle: DashboardRawBundle,
+        selected_pair: str,
+        timing_steps: list[dict[str, object]] | None = None,
+    ) -> PanelStateModel:
+        timing_started_at = time.monotonic() if timing_steps is not None else 0.0
+
+        def mark_timing_step(label: str) -> None:
+            nonlocal timing_started_at
+            if timing_steps is None:
+                return
+            now = time.monotonic()
+            timing_steps.append(
+                {
+                    "label": label,
+                    "elapsed_seconds": max(0.0, now - timing_started_at),
+                }
+            )
+            timing_started_at = now
+
         effective_data = bundle.effective_data
         relay_status = bundle.relay_status
         visibility_status = bundle.visibility_status
@@ -826,6 +848,7 @@ class DashboardAggregator:
         partial_reuse = bool(runtime_scope.get("PartialReuse", False))
         active_pair_ids = self._string_list(runtime_scope.get("ActivePairIds", []))
         pair_in_scope = (not partial_reuse) or (not selected_pair) or (selected_pair in active_pair_ids)
+        mark_timing_step("readiness inputs")
 
         workflow = self._compute_workflow_state(
             launch_status=launch_status,
@@ -911,6 +934,8 @@ class DashboardAggregator:
                 )
             detail_parts.extend(format_acceptance_relay_issue_detail_parts(acceptance_receipt))
             acceptance_detail = " / ".join(detail_parts) if detail_parts else "receipt 존재"
+        mark_timing_step("workflow and receipt")
+
         cards = [
             StatusCardModel(
                 key="windows",
@@ -981,6 +1006,7 @@ class DashboardAggregator:
                 detail=acceptance_detail,
             ),
         ]
+        mark_timing_step("cards build")
 
         stages = [
             StageModel(
@@ -1029,6 +1055,7 @@ class DashboardAggregator:
                 enabled=pair_stage_ready and pair_in_scope,
             ),
         ]
+        mark_timing_step("stages build")
 
         next_actions = [self._map_next_action(command_text) for command_text in workflow.next_actions[:4]]
         prioritized_issues: list[tuple[int, IssueModel]] = []
@@ -1209,6 +1236,7 @@ class DashboardAggregator:
                     add_issue(100, "watcher 중지", "현재 run root 기준 watcher가 실행 중이 아닙니다.", "start_current_watcher_run", "현재 Run 시작")
             elif watcher_status in ("stop_requested", "stopping", "starting"):
                 add_issue(110, "watch 제어 진행 중", "watcher 상태 전이를 확인하는 중입니다.", "run_paired_status", "Pair 상태 보기")
+        mark_timing_step("actions/issues build")
 
         pair_target_map = self._pair_target_map(paired_status)
         pair_status_map = self._pair_status_map(paired_status)
@@ -1322,6 +1350,7 @@ class DashboardAggregator:
                     next_action=next_action,
                 )
             )
+        mark_timing_step("pair summaries build")
 
         return PanelStateModel(
             workflow=workflow,

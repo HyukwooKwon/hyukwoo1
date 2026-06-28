@@ -1,10 +1,11 @@
-[CmdletBinding()]
+[CmdletBinding(PositionalBinding = $false)]
 param(
     [string]$ConfigPath,
     [string]$RunRoot,
     [ValidateSet('target-inbox-submit', 'target-autoloop')][string]$RunMode = '',
     [string[]]$Targets = @(),
-    [switch]$AsJson
+    [switch]$AsJson,
+    [Parameter(ValueFromRemainingArguments = $true)][string[]]$RemainingTargets = @()
 )
 
 Set-StrictMode -Version Latest
@@ -38,10 +39,13 @@ if (Test-NonEmptyString $RunMode) {
     }
 }
 
+$rawTargetArgs = @($Targets) + @($RemainingTargets)
 $selectedTargets = @(
-    $Targets |
+    $rawTargetArgs |
         Where-Object { Test-NonEmptyString $_ } |
-        ForEach-Object { [string]$_ } |
+        ForEach-Object { ([string]$_ -split ',') } |
+        ForEach-Object { ([string]$_).Trim() } |
+        Where-Object { Test-NonEmptyString $_ } |
         Sort-Object -Unique
 )
 if (@($selectedTargets).Count -eq 0) {
@@ -49,6 +53,26 @@ if (@($selectedTargets).Count -eq 0) {
 }
 if (@($selectedTargets).Count -eq 0) {
     throw 'no target-autoloop targets were selected. configure TargetAutoloop.Targets.Enabled or pass -Targets.'
+}
+
+$configuredTargetIds = @()
+foreach ($target in @($config.Targets)) {
+    $configuredTargetId = ''
+    if ($target -is [System.Collections.IDictionary]) {
+        $configuredTargetId = [string]$target['TargetId']
+    }
+    else {
+        $configuredTargetId = [string]$target.TargetId
+    }
+    if (Test-NonEmptyString $configuredTargetId) {
+        $configuredTargetIds += $configuredTargetId
+    }
+}
+$configuredTargetIds = @($configuredTargetIds | Sort-Object -Unique)
+foreach ($targetId in @($selectedTargets)) {
+    if ($targetId -notin @($configuredTargetIds)) {
+        throw ("selected target was not found in TargetAutoloop.Targets: {0}" -f $targetId)
+    }
 }
 
 $selectedSet = @{}
@@ -73,6 +97,15 @@ else {
     Ensure-Directory -Path ([string]$config.RunRootBase)
     $runLeaf = 'run_{0}' -f (Get-Date -Format 'yyyyMMdd_HHmmss_fff')
     Join-Path ([string]$config.RunRootBase) $runLeaf
+}
+
+if (Test-TargetAutoloopStrictExternalPathPolicy -Config $config) {
+    [void](Assert-TargetAutoloopExternalPath -PathValue $resolvedRunRoot -AutomationRoot $root -FieldName 'TargetAutoloop.RunRoot')
+    $runRootBase = [string]$config.RunRootBase
+    $runRootOutsideBase = (Test-NonEmptyString $runRootBase) -and -not (Test-PathEqualsOrIsDescendant -Path $resolvedRunRoot -BasePath $runRootBase)
+    if ($runRootOutsideBase) {
+        throw ('TargetAutoloop.RunRoot must stay under TargetAutoloop.RunRootBase when TargetAutoloop.ExternalPathPolicy=strict. runRoot={0} runRootBase={1}' -f $resolvedRunRoot, [string]$config.RunRootBase)
+    }
 }
 
 Ensure-Directory -Path $resolvedRunRoot
@@ -116,6 +149,7 @@ foreach ($target in @($config.Targets | Where-Object { $selectedSet.ContainsKey(
             WorkRepoRoot = [string]$paths.WorkRepoRoot
             TargetRunRoot = [string]$paths.TargetRunRoot
             CoordinatorRunRoot = [string]$paths.CoordinatorRunRoot
+            TargetRoot = [string]$paths.TargetRoot
             CooldownSeconds = [int]$target.CooldownSeconds
             PublishReadyDispatchDelayMode = [string]$target.PublishReadyDispatchDelayMode
             PublishReadyDispatchDelaySeconds = [int]$target.PublishReadyDispatchDelaySeconds
@@ -145,6 +179,17 @@ foreach ($target in @($config.Targets | Where-Object { $selectedSet.ContainsKey(
             QueueFailedRoot = [string]$queuePaths.FailedRoot
             QueuePayloadRoot = [string]$queuePaths.PayloadRoot
         }) | Out-Null
+}
+
+if ($manifestTargets.Count -ne @($selectedTargets).Count) {
+    $manifestTargetIds = @($manifestTargets.ToArray() | ForEach-Object { [string]$_.TargetId } | Sort-Object -Unique)
+    $missingTargetIds = @($selectedTargets | Where-Object { $_ -notin @($manifestTargetIds) })
+    throw (
+        'target-autoloop manifest target count mismatch: selected={0} manifest={1} missing={2}' -f
+        (@($selectedTargets) -join ','),
+        (@($manifestTargetIds) -join ','),
+        (@($missingTargetIds) -join ',')
+    )
 }
 
 $stateDocument = New-TargetAutoloopStateDocument -Config $config -RunRoot $resolvedRunRoot -SelectedTargetIds @($selectedTargets)
@@ -180,6 +225,7 @@ $manifest = [ordered]@{
         RequireExplicitContractPath = [bool]$config.RequireExplicitContractPath
         RequireTargetMetadata = [bool]$config.RequireTargetMetadata
         AllowRecursiveWatch = [bool]$config.AllowRecursiveWatch
+        ExternalPathPolicy = [string]$config.ExternalPathPolicy
         PollIntervalMs = [int]$config.PollIntervalMs
     }
     StatePaths = [ordered]@{

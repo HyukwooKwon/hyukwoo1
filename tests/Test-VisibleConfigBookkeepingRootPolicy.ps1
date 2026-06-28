@@ -38,6 +38,7 @@ $workRepoRoot = [string]$generated.WorkRepoRoot
 $config = Import-PowerShellDataFile -Path $resolvedConfigPath
 $pairTest = Resolve-PairTestConfig -Root $root -ConfigPath $resolvedConfigPath
 $pairPolicy = Get-PairPolicyForPair -PairTest $pairTest -PairId 'pair01'
+Assert-True ([int]$pairTest.SeedOutboxStartTimeoutSeconds -ge 300) 'typed-window shared visible handoff timeout should allow slow visible-cell publish.'
 
 $evidence = @(Get-BookkeepingResidualRootsEvidence -Config $config -BasePath $root)
 $evidenceNames = @($evidence | ForEach-Object { [string]$_.Name })

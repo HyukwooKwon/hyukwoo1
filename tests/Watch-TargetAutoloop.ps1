@@ -160,33 +160,103 @@ function Compose-InputPromptText {
     return ((@($blocks) | Where-Object { Test-NonEmptyString $_ }) -join "`r`n`r`n")
 }
 
+function Quote-TargetAutoloopPowerShellLiteral {
+    param([AllowEmptyString()][string]$Value)
+
+    return ("'" + [string]($Value -replace "'", "''") + "'")
+}
+
+function Get-TargetAutoloopPublishHelperCommand {
+    param(
+        [AllowEmptyString()][string]$ScriptPath,
+        [AllowEmptyString()][string]$ConfigPath,
+        [AllowEmptyString()][string]$RunRoot,
+        [Parameter(Mandatory)][string]$TargetId
+    )
+
+    if (
+        -not (Test-NonEmptyString $ScriptPath) -or
+        -not (Test-NonEmptyString $ConfigPath) -or
+        -not (Test-NonEmptyString $RunRoot)
+    ) {
+        return ''
+    }
+
+    return (
+        "pwsh -NoProfile -ExecutionPolicy Bypass -File {0} -ConfigPath {1} -RunRoot {2} -TargetId {3} -Overwrite" -f
+        (Quote-TargetAutoloopPowerShellLiteral -Value $ScriptPath),
+        (Quote-TargetAutoloopPowerShellLiteral -Value $ConfigPath),
+        (Quote-TargetAutoloopPowerShellLiteral -Value $RunRoot),
+        (Quote-TargetAutoloopPowerShellLiteral -Value $TargetId)
+    )
+}
+
 function Compose-PublishReadyPromptText {
     param(
         [Parameter(Mandatory)][string]$TargetId,
         [Parameter(Mandatory)][string]$RunMode,
         [Parameter(Mandatory)]$Paths,
         [Parameter(Mandatory)]$Marker,
-        [string]$EffectiveFixedSuffix = ''
+        [string]$EffectiveFixedSuffix = '',
+        [AllowEmptyString()][string]$ConfigPath = '',
+        [AllowEmptyString()][string]$RunRoot = '',
+        [AllowEmptyString()][string]$PublishHelperPath = ''
     )
 
-    $blocks = @(
-        ('Target trigger mode: ' + $RunMode),
-        ('TargetId: ' + $TargetId),
-        '같은 target에서 직전 산출물을 이어받아 다음 턴을 준비하세요.',
-        ('WorkRepoRoot: ' + $(if (Test-NonEmptyString ([string](Get-ConfigValue -Object $Paths -Name 'WorkRepoRoot' -DefaultValue ''))) { [string]$Paths.WorkRepoRoot } else { '(공통 RunRoot 사용)' })),
-        ('TargetRunRoot: ' + [string]$Paths.TargetRunRoot),
-        ('summary.txt: ' + [string]$Paths.SourceSummaryPath),
-        ('review.zip: ' + [string]$Paths.SourceReviewZipPath),
-        ('publish.ready.json: ' + [string]$Paths.PublishReadyPath),
-        ('CycleId: ' + [string](Get-ConfigValue -Object $Marker -Name 'CycleId' -DefaultValue '')),
-        ('ParentCycleId: ' + [string](Get-ConfigValue -Object $Marker -Name 'ParentCycleId' -DefaultValue '')),
-        ('OutputFingerprint: ' + [string](Get-ConfigValue -Object $Marker -Name 'OutputFingerprint' -DefaultValue '')),
-        ('PublishedBy: ' + [string](Get-ConfigValue -Object $Marker -Name 'PublishedBy' -DefaultValue '')),
-        ('PublishedAt: ' + [string](Get-ConfigValue -Object $Marker -Name 'PublishedAt' -DefaultValue ''))
-    )
-    if (Test-NonEmptyString $EffectiveFixedSuffix) {
-        $blocks += $EffectiveFixedSuffix.Trim()
+    $publishHelperCommand = Get-TargetAutoloopPublishHelperCommand `
+        -ScriptPath $PublishHelperPath `
+        -ConfigPath $ConfigPath `
+        -RunRoot $RunRoot `
+        -TargetId $TargetId
+    $workRepoRootText = if (Test-NonEmptyString ([string](Get-ConfigValue -Object $Paths -Name 'WorkRepoRoot' -DefaultValue ''))) {
+        [string]$Paths.WorkRepoRoot
     }
+    else {
+        '(공통 RunRoot 사용)'
+    }
+
+    $blocks = New-Object System.Collections.Generic.List[string]
+    if (Test-NonEmptyString $EffectiveFixedSuffix) {
+        $blocks.Add(("[고정문구 / 항상 포함]`r`n" + $EffectiveFixedSuffix.Trim())) | Out-Null
+    }
+    $blocks.Add("[작업 내용]`r`n같은 target에서 직전 산출물을 이어받아 다음 턴을 준비하세요.") | Out-Null
+    $blocks.Add((
+        @(
+            '[생성해야 할 파일]',
+            ('1. summary.txt -> ' + [string]$Paths.SourceSummaryPath),
+            ('2. review.zip -> ' + [string]$Paths.SourceReviewZipPath)
+        ) -join "`r`n"
+    )) | Out-Null
+    $blocks.Add((
+        @(
+            '[마지막 단계]',
+            ('3. publish helper 실행 -> ' + $(if (Test-NonEmptyString $publishHelperCommand) { $publishHelperCommand } else { '(계산 불가)' })),
+            ('4. helper output marker -> ' + [string]$Paths.PublishReadyPath)
+        ) -join "`r`n"
+    )) | Out-Null
+    $blocks.Add((
+        @(
+            '[규칙]',
+            '- summary.txt 와 review.zip 을 먼저 준비하세요.',
+            '- publish.ready.json 은 직접 만들지 말고 마지막에 helper 로만 생성하세요.',
+            '- 위 target 계약 경로 외 다른 위치에 최종 산출물을 두지 마세요.',
+            '- 순서는 summary.txt -> review.zip -> publish helper 입니다.'
+        ) -join "`r`n"
+    )) | Out-Null
+    $blocks.Add((
+        @(
+            '[현재 턴 메타]',
+            ('Target trigger mode: ' + $RunMode),
+            ('TargetId: ' + $TargetId),
+            ('WorkRepoRoot: ' + $workRepoRootText),
+            ('TargetRunRoot: ' + [string]$Paths.TargetRunRoot),
+            ('CycleId: ' + [string](Get-ConfigValue -Object $Marker -Name 'CycleId' -DefaultValue '')),
+            ('ParentCycleId: ' + [string](Get-ConfigValue -Object $Marker -Name 'ParentCycleId' -DefaultValue '')),
+            ('OutputFingerprint: ' + [string](Get-ConfigValue -Object $Marker -Name 'OutputFingerprint' -DefaultValue '')),
+            ('PublishedBy: ' + [string](Get-ConfigValue -Object $Marker -Name 'PublishedBy' -DefaultValue '')),
+            ('PublishedAt: ' + [string](Get-ConfigValue -Object $Marker -Name 'PublishedAt' -DefaultValue ''))
+        ) -join "`r`n"
+    )) | Out-Null
 
     return ((@($blocks) | Where-Object { Test-NonEmptyString $_ }) -join "`r`n`r`n")
 }
@@ -252,8 +322,8 @@ function Write-TargetFailureReceipt {
 function Try-ParseTargetAutoloopDateTimeOffset {
     param([string]$Value)
 
-    $null = $parsed = [datetimeoffset]::MinValue
-    if (Test-NonEmptyString $Value -and [datetimeoffset]::TryParse($Value, [ref]$parsed)) {
+    [datetimeoffset]$parsed = [datetimeoffset]::MinValue
+    if ((Test-NonEmptyString $Value) -and [datetimeoffset]::TryParse($Value, [ref]$parsed)) {
         return $parsed
     }
 
@@ -434,12 +504,12 @@ function Resolve-TargetAutoloopPublishReadyEligibleAt {
     )
 
     $publishedAtValue = [datetimeoffset]::Now
-    if (Test-NonEmptyString $PublishReadyPath -and (Test-Path -LiteralPath $PublishReadyPath -PathType Leaf)) {
+    if ((Test-NonEmptyString $PublishReadyPath) -and (Test-Path -LiteralPath $PublishReadyPath -PathType Leaf)) {
         $publishedAtValue = [datetimeoffset](Get-Item -LiteralPath $PublishReadyPath -ErrorAction Stop).LastWriteTime
     }
     else {
-        $null = $parsedPublishedAt = [datetimeoffset]::MinValue
-        if (Test-NonEmptyString $PublishedAt -and [datetimeoffset]::TryParse($PublishedAt, [ref]$parsedPublishedAt)) {
+        [datetimeoffset]$parsedPublishedAt = [datetimeoffset]::MinValue
+        if ((Test-NonEmptyString $PublishedAt) -and [datetimeoffset]::TryParse($PublishedAt, [ref]$parsedPublishedAt)) {
             $publishedAtValue = $parsedPublishedAt
         }
     }
@@ -513,7 +583,15 @@ function Invoke-TargetAutoloopSweep {
             $stateMap[$targetId].NextAction = 'stopped'
         }
         Set-TargetAutoloopTargetStateMap -TargetStateMap $stateMap -StateDocument $StateDocument
-        return [pscustomobject]@{ QueuedCount = 0; DuplicateCount = 0; FailedCount = 0; StateChanged = $true }
+        return [pscustomobject]@{
+            QueuedCount = 0
+            DuplicateCount = 0
+            FailedCount = 0
+            StateChanged = $true
+            QueuedTargetIds = @()
+            DuplicateTargetIds = @()
+            DuplicateFingerprints = @()
+        }
     }
 
     $maxTargetsThisSweep = if ([int]$Config.MaxConcurrentTargets -gt 0) { [int]$Config.MaxConcurrentTargets } else { [math]::Max(1, @($Manifest.Targets).Count) }
@@ -523,6 +601,8 @@ function Invoke-TargetAutoloopSweep {
     $failedCount = 0
     $stateChanged = $false
     $queuedTargetIds = New-Object System.Collections.Generic.List[string]
+    $duplicateTargetIds = New-Object System.Collections.Generic.List[string]
+    $duplicateFingerprints = New-Object System.Collections.Generic.List[string]
 
     $candidateTargets = @(
         $Manifest.Targets |
@@ -581,6 +661,7 @@ function Invoke-TargetAutoloopSweep {
         }
 
         $paths = Get-TargetAutoloopTargetPaths -RunRoot $ResolvedRunRoot -TargetId $targetId -Target $target -Config $Config
+        $paths = Use-TargetAutoloopManifestTargetPaths -Paths $paths -ManifestTarget $target
         Ensure-TargetAutoloopTargetDirectories -Paths $paths
         $triggerKinds = @(Get-StringArray (Get-ConfigValue -Object $entry -Name 'TriggerKinds' -DefaultValue @()))
         $fixedSuffix = [string](Get-ConfigValue -Object $target -Name 'FixedSuffix' -DefaultValue '')
@@ -604,6 +685,12 @@ function Invoke-TargetAutoloopSweep {
                     $publishFingerprint = Get-TargetAutoloopPublishReadyFingerprint -Paths $paths -ExpectedTargetId $targetId
                     if ([string](Get-ConfigValue -Object $entry -Name 'LastTriggerFingerprint' -DefaultValue '') -eq $publishFingerprint) {
                         $duplicateCount += 1
+                        if ((Test-NonEmptyString $targetId) -and -not $duplicateTargetIds.Contains($targetId)) {
+                            $duplicateTargetIds.Add($targetId) | Out-Null
+                        }
+                        if ((Test-NonEmptyString $publishFingerprint) -and -not $duplicateFingerprints.Contains($publishFingerprint)) {
+                            $duplicateFingerprints.Add($publishFingerprint) | Out-Null
+                        }
                         Append-TargetAutoloopEvent -Path $StatePaths.EventsPath -EventType 'duplicate-trigger-skipped' -TargetId $targetId -TriggerKind 'publish-ready' -TriggerFingerprint $publishFingerprint
                     }
                     else {
@@ -679,7 +766,15 @@ function Invoke-TargetAutoloopSweep {
 
                         $cycleId = $currentCycleCount + 1
                         $parentCycleId = [int](Get-ConfigValue -Object $entry -Name 'LastCycleId' -DefaultValue 0)
-                        $promptText = Compose-PublishReadyPromptText -TargetId $targetId -RunMode ([string]$Config.RunMode) -Paths $paths -Marker $marker -EffectiveFixedSuffix $fixedSuffix
+                        $promptText = Compose-PublishReadyPromptText `
+                            -TargetId $targetId `
+                            -RunMode ([string]$Config.RunMode) `
+                            -Paths $paths `
+                            -Marker $marker `
+                            -EffectiveFixedSuffix $fixedSuffix `
+                            -ConfigPath ([string]$Config.ConfigPath) `
+                            -RunRoot $ResolvedRunRoot `
+                            -PublishHelperPath (Join-Path $root 'tests\Publish-TargetAutoloopArtifact.ps1')
                         $request = [ordered]@{
                             SchemaVersion = $script:TargetAutoloopSchemaVersion
                             RunMode = [string]$Config.RunMode
@@ -852,6 +947,12 @@ function Invoke-TargetAutoloopSweep {
                     $inputFingerprint = Get-TargetAutoloopInputTriggerFingerprint -Path $pendingFilePath
                     if ([string](Get-ConfigValue -Object $entry -Name 'LastTriggerFingerprint' -DefaultValue '') -eq $inputFingerprint) {
                         $duplicateCount += 1
+                        if ((Test-NonEmptyString $targetId) -and -not $duplicateTargetIds.Contains($targetId)) {
+                            $duplicateTargetIds.Add($targetId) | Out-Null
+                        }
+                        if ((Test-NonEmptyString $inputFingerprint) -and -not $duplicateFingerprints.Contains($inputFingerprint)) {
+                            $duplicateFingerprints.Add($inputFingerprint) | Out-Null
+                        }
                         Append-TargetAutoloopEvent -Path $StatePaths.EventsPath -EventType 'duplicate-trigger-skipped' -TargetId $targetId -TriggerKind 'input-file' -TriggerFingerprint $inputFingerprint
                         continue
                     }
@@ -959,7 +1060,7 @@ function Invoke-TargetAutoloopSweep {
                     $entry.LastFailureReason = $_.Exception.Message
                     $entry.NextAction = 'open-receipt'
                     $receiptInputPath = ''
-                    if (Test-NonEmptyString $claimedPath -and (Test-Path -LiteralPath $claimedPath -PathType Leaf)) {
+                    if ((Test-NonEmptyString $claimedPath) -and (Test-Path -LiteralPath $claimedPath -PathType Leaf)) {
                         try {
                             $receiptInputPath = Move-FileToDirectory -Path $claimedPath -DestinationDirectory ([string]$paths.InboxFailedRoot)
                         }
@@ -970,7 +1071,7 @@ function Invoke-TargetAutoloopSweep {
                     elseif (Test-NonEmptyString $processedPath) {
                         $receiptInputPath = $processedPath
                     }
-                    elseif (Test-NonEmptyString $pendingFilePath -and (Test-Path -LiteralPath $pendingFilePath -PathType Leaf)) {
+                    elseif ((Test-NonEmptyString $pendingFilePath) -and (Test-Path -LiteralPath $pendingFilePath -PathType Leaf)) {
                         $receiptInputPath = $pendingFilePath
                     }
                     if (Test-NonEmptyString $claimedPath) {
@@ -1016,6 +1117,8 @@ function Invoke-TargetAutoloopSweep {
         FailedCount = $failedCount
         StateChanged = $stateChanged
         QueuedTargetIds = $queuedTargetIds.ToArray()
+        DuplicateTargetIds = $duplicateTargetIds.ToArray()
+        DuplicateFingerprints = $duplicateFingerprints.ToArray()
     }
 }
 
@@ -1089,6 +1192,8 @@ $aggregateQueued = 0
 $aggregateDuplicates = 0
 $aggregateFailed = 0
 $aggregateDispatched = 0
+$aggregateDuplicateTargetIds = New-Object System.Collections.Generic.List[string]
+$aggregateDuplicateFingerprints = New-Object System.Collections.Generic.List[string]
 $iterationCount = 0
 try {
     $watcherMutex = Acquire-TargetAutoloopWatcherMutex -Name $watcherMutexName
@@ -1128,6 +1233,8 @@ try {
                 FailedCount = 0
                 StateChanged = [bool]$controlActionResult.StateChanged
                 QueuedTargetIds = @()
+                DuplicateTargetIds = @()
+                DuplicateFingerprints = @()
             }
         }
         else {
@@ -1143,6 +1250,16 @@ try {
         $aggregateQueued += [int]$sweepResult.QueuedCount
         $aggregateDuplicates += [int]$sweepResult.DuplicateCount
         $aggregateFailed += [int]$sweepResult.FailedCount
+        foreach ($duplicateTargetId in @(Get-StringArray (Get-ConfigValue -Object $sweepResult -Name 'DuplicateTargetIds' -DefaultValue @()))) {
+            if ((Test-NonEmptyString $duplicateTargetId) -and -not $aggregateDuplicateTargetIds.Contains($duplicateTargetId)) {
+                $aggregateDuplicateTargetIds.Add($duplicateTargetId) | Out-Null
+            }
+        }
+        foreach ($duplicateFingerprint in @(Get-StringArray (Get-ConfigValue -Object $sweepResult -Name 'DuplicateFingerprints' -DefaultValue @()))) {
+            if ((Test-NonEmptyString $duplicateFingerprint) -and -not $aggregateDuplicateFingerprints.Contains($duplicateFingerprint)) {
+                $aggregateDuplicateFingerprints.Add($duplicateFingerprint) | Out-Null
+            }
+        }
         $autoStopReason = ''
         if (Test-TargetAutoloopAllSelectedTargetsLimitReached -StateDocument $stateDocument -SelectedTargetIds @($selectedTargets)) {
             $stateDocument.State = 'stopped'
@@ -1265,6 +1382,8 @@ $result = [pscustomobject][ordered]@{
     IterationCount = $iterationCount
     QueuedCount = $aggregateQueued
     DuplicateCount = $aggregateDuplicates
+    DuplicateTargetIds = $aggregateDuplicateTargetIds.ToArray()
+    DuplicateFingerprints = $aggregateDuplicateFingerprints.ToArray()
     FailedCount = $aggregateFailed
     DispatchedCount = $aggregateDispatched
     StatePath = [string]$statePaths.StatePath

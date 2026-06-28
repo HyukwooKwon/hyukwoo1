@@ -72,8 +72,8 @@ function Quote-PowerShellLiteral {
 function Try-ParseTargetAutoloopStatusDateTime {
     param([string]$Value)
 
-    $null = $parsed = [datetimeoffset]::MinValue
-    if (Test-NonEmptyString $Value -and [datetimeoffset]::TryParse($Value, [ref]$parsed)) {
+    [datetimeoffset]$parsed = [datetimeoffset]::MinValue
+    if ((Test-NonEmptyString $Value) -and [datetimeoffset]::TryParse($Value, [ref]$parsed)) {
         return $parsed
     }
 
@@ -101,6 +101,109 @@ function Test-TargetAutoloopWatcherFresh {
     }
 
     return (($timestamp - [datetimeoffset]::Now).TotalSeconds -ge (-1 * [math]::Max(5, $StaleAfterSeconds)))
+}
+
+function New-TargetAutoloopAlreadyRunningPayload {
+    param(
+        [Parameter(Mandatory)]$Config,
+        [Parameter(Mandatory)][string]$ResolvedRunRoot,
+        [Parameter(Mandatory)]$StatePaths,
+        $ControlDocument = $null,
+        $StatusDocument = $null,
+        [string]$WatcherMutexName = '',
+        [string[]]$ReasonCodes = @('watcher_already_active'),
+        [string]$Message = '',
+        [bool]$ActiveConfirmed = $true
+    )
+
+    $currentWatcherState = [string](Get-ConfigValue -Object $StatusDocument -Name 'WatcherState' -DefaultValue '')
+    if (-not (Test-NonEmptyString $Message)) {
+        $Message = ('target-autoloop watcher가 이미 active 상태입니다: {0}' -f $currentWatcherState)
+    }
+
+    return [ordered]@{
+        SchemaVersion = $script:TargetAutoloopSchemaVersion
+        Ok = $ActiveConfirmed
+        RunMode = [string]$Config.RunMode
+        RunRoot = $ResolvedRunRoot
+        Result = 'already-running'
+        Message = $Message
+        ReasonCodes = @($ReasonCodes)
+        Idempotent = $true
+        ActiveConfirmed = $ActiveConfirmed
+        WatcherMutexHeld = (@($ReasonCodes) -contains 'watcher_mutex_held')
+        ControllerState = [string](Get-ConfigValue -Object $ControlDocument -Name 'State' -DefaultValue '')
+        WatcherState = $currentWatcherState
+        HeartbeatAt = [string](Get-ConfigValue -Object $StatusDocument -Name 'HeartbeatAt' -DefaultValue '')
+        ProcessStartedAt = [string](Get-ConfigValue -Object $StatusDocument -Name 'ProcessStartedAt' -DefaultValue '')
+        WatcherMutexName = $WatcherMutexName
+        StatusPath = [string]$StatePaths.StatusPath
+        ControlPath = [string]$StatePaths.ControlPath
+    }
+}
+
+function Test-TargetAutoloopWatcherMutexHeld {
+    param([Parameter(Mandatory)][string]$Name)
+
+    $createdNew = $false
+    $mutex = [System.Threading.Mutex]::new($false, $Name, [ref]$createdNew)
+    $acquired = $false
+    try {
+        try {
+            $acquired = $mutex.WaitOne(0, $false)
+        }
+        catch [System.Threading.AbandonedMutexException] {
+            $acquired = $true
+        }
+        return (-not $acquired)
+    }
+    finally {
+        if ($acquired) {
+            try {
+                $mutex.ReleaseMutex()
+            }
+            catch {
+            }
+        }
+        try {
+            $mutex.Dispose()
+        }
+        catch {
+        }
+    }
+}
+
+function Get-TargetAutoloopWatcherMutexName {
+    param([Parameter(Mandatory)][string]$RunRoot)
+
+    $normalizedRunRoot = Get-NormalizedFullPath -Path $RunRoot
+    $hashHex = (Get-TextHashHex -Text $normalizedRunRoot)
+    $token = if ($hashHex.Length -ge 24) { $hashHex.Substring(0, 24) } else { $hashHex }
+    return ('Global\RelayTargetAutoloop_{0}' -f $token)
+}
+
+function Read-TargetAutoloopJsonObjectWithRetry {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [int]$RetryCount = 10,
+        [int]$RetryDelayMs = 100
+    )
+
+    $lastError = $null
+    for ($attempt = 0; $attempt -le [math]::Max(0, $RetryCount); $attempt++) {
+        try {
+            return (Read-JsonObject -Path $Path)
+        }
+        catch {
+            $lastError = $_
+            if ($attempt -ge [math]::Max(0, $RetryCount)) {
+                break
+            }
+            Start-Sleep -Milliseconds ([math]::Max(1, $RetryDelayMs))
+        }
+    }
+
+    throw $lastError
 }
 
 if (-not (Test-NonEmptyString $ConfigPath)) {
@@ -142,6 +245,13 @@ if (-not (Test-NonEmptyString $resolvedRunRoot)) {
 if (Test-NonEmptyString $resolvedRunRoot) {
     $manifestPath = Join-Path $resolvedRunRoot 'manifest.json'
     $statePaths = Get-TargetAutoloopStatePaths -RunRoot $resolvedRunRoot -Config $config
+}
+
+$watcherMutexName = if (Test-NonEmptyString $resolvedRunRoot) {
+    Get-TargetAutoloopWatcherMutexName -RunRoot $resolvedRunRoot
+}
+else {
+    ''
 }
 
 $needsPreparation = $false
@@ -190,7 +300,9 @@ if ($needsPreparation) {
     )
 }
 
-$manifestDocument = Read-JsonObject -Path $manifestPath
+$watcherMutexName = Get-TargetAutoloopWatcherMutexName -RunRoot $resolvedRunRoot
+
+$manifestDocument = Read-TargetAutoloopJsonObjectWithRetry -Path $manifestPath
 $manifestRunMode = [string](Get-ConfigValue -Object $manifestDocument -Name 'RunMode' -DefaultValue '')
 if ((Test-NonEmptyString $RunMode) -and (Test-NonEmptyString $manifestRunMode) -and $manifestRunMode -ne [string]$config.RunMode) {
     $mismatchPayload = [ordered]@{
@@ -268,16 +380,20 @@ if ([string]$config.RunMode -eq 'target-autoloop' -and @($manifestPublishReadyMi
 }
 
 $routerSessionState = Get-TargetAutoloopRouterSessionState -Config $config
-if ([string]$config.RunMode -eq 'target-autoloop' -and [bool](Get-ConfigValue -Object $routerSessionState -Name 'Mismatch' -DefaultValue $false)) {
-    $sessionMessage = New-TargetAutoloopRouterSessionMismatchMessage -RouterSessionState $routerSessionState
+$routerSessionStateName = [string](Get-ConfigValue -Object $routerSessionState -Name 'State' -DefaultValue '')
+$routerSessionMismatch = [bool](Get-ConfigValue -Object $routerSessionState -Name 'Mismatch' -DefaultValue $false)
+if ([string]$config.RunMode -eq 'target-autoloop' -and $routerSessionStateName -ne 'ok') {
+    $sessionMessage = New-TargetAutoloopRouterSessionNotReadyMessage -RouterSessionState $routerSessionState
+    $sessionResult = if ($routerSessionMismatch) { 'router-launcher-session-mismatch' } elseif (Test-NonEmptyString $routerSessionStateName) { $routerSessionStateName } else { 'router-session-not-ready' }
+    $sessionReasonCode = if ($routerSessionMismatch) { 'router_launcher_session_mismatch' } else { ('router_session_' + ($sessionResult -replace '[^A-Za-z0-9]+', '_').Trim('_').ToLowerInvariant()) }
     $sessionPayload = [ordered]@{
         SchemaVersion = $script:TargetAutoloopSchemaVersion
         Ok = $false
         RunMode = [string]$config.RunMode
         RunRoot = $resolvedRunRoot
-        Result = 'router-launcher-session-mismatch'
+        Result = $sessionResult
         Message = $sessionMessage
-        ReasonCodes = @('router_launcher_session_mismatch')
+        ReasonCodes = @($sessionReasonCode)
         ManifestPath = $manifestPath
         StatusPath = [string]$statePaths.StatusPath
         ControlPath = [string]$statePaths.ControlPath
@@ -286,6 +402,11 @@ if ([string]$config.RunMode -eq 'target-autoloop' -and [bool](Get-ConfigValue -O
         RouterStatePath = [string](Get-ConfigValue -Object $routerSessionState -Name 'RouterStatePath' -DefaultValue '')
         RouterLauncherSessionId = [string](Get-ConfigValue -Object $routerSessionState -Name 'RouterLauncherSessionId' -DefaultValue '')
         RouterStatus = [string](Get-ConfigValue -Object $routerSessionState -Name 'RouterStatus' -DefaultValue '')
+        RouterSessionState = $routerSessionStateName
+        RouterPid = [int](Get-ConfigValue -Object $routerSessionState -Name 'RouterPid' -DefaultValue 0)
+        RouterPidExists = [bool](Get-ConfigValue -Object $routerSessionState -Name 'RouterPidExists' -DefaultValue $false)
+        RouterMutexName = [string](Get-ConfigValue -Object $routerSessionState -Name 'RouterMutexName' -DefaultValue '')
+        RouterMutexHeld = [bool](Get-ConfigValue -Object $routerSessionState -Name 'RouterMutexHeld' -DefaultValue $false)
     }
     if ($AsJson) {
         $sessionPayload | ConvertTo-Json -Depth 12
@@ -295,10 +416,10 @@ if ([string]$config.RunMode -eq 'target-autoloop' -and [bool](Get-ConfigValue -O
     return
 }
 
-$stateDocument = Read-JsonObject -Path $statePaths.StatePath
-$controlDocument = Read-JsonObject -Path $statePaths.ControlPath
+$stateDocument = Read-TargetAutoloopJsonObjectWithRetry -Path $statePaths.StatePath
+$controlDocument = Read-TargetAutoloopJsonObjectWithRetry -Path $statePaths.ControlPath
 $statusDocument = if (Test-Path -LiteralPath $statePaths.StatusPath -PathType Leaf) {
-    Read-JsonObject -Path $statePaths.StatusPath
+    Read-TargetAutoloopJsonObjectWithRetry -Path $statePaths.StatusPath
 }
 else {
     New-TargetAutoloopStatusDocument -Config $config -RunRoot $resolvedRunRoot -StateDocument $stateDocument -ControlDocument $controlDocument
@@ -331,21 +452,14 @@ if (Test-NonEmptyString $pendingAction) {
 
 $currentWatcherState = [string](Get-ConfigValue -Object $statusDocument -Name 'WatcherState' -DefaultValue '')
 if (Test-TargetAutoloopWatcherFresh -StatusDocument $statusDocument -StaleAfterSeconds $watcherFreshWindowSec) {
-    $alreadyRunningPayload = [ordered]@{
-        SchemaVersion = $script:TargetAutoloopSchemaVersion
-        Ok = $false
-        RunMode = [string]$config.RunMode
-        RunRoot = $resolvedRunRoot
-        Result = 'already-running'
-        Message = ('target-autoloop watcher가 이미 active 상태입니다: {0}' -f $currentWatcherState)
-        ReasonCodes = @('watcher_already_active')
-        ControllerState = [string](Get-ConfigValue -Object $controlDocument -Name 'State' -DefaultValue '')
-        WatcherState = $currentWatcherState
-        HeartbeatAt = [string](Get-ConfigValue -Object $statusDocument -Name 'HeartbeatAt' -DefaultValue '')
-        ProcessStartedAt = [string](Get-ConfigValue -Object $statusDocument -Name 'ProcessStartedAt' -DefaultValue '')
-        StatusPath = [string]$statePaths.StatusPath
-        ControlPath = [string]$statePaths.ControlPath
-    }
+    $alreadyRunningPayload = New-TargetAutoloopAlreadyRunningPayload `
+        -Config $config `
+        -ResolvedRunRoot $resolvedRunRoot `
+        -StatePaths $statePaths `
+        -ControlDocument $controlDocument `
+        -StatusDocument $statusDocument `
+        -WatcherMutexName $watcherMutexName `
+        -ReasonCodes @('watcher_already_active')
     if ($AsJson) {
         $alreadyRunningPayload | ConvertTo-Json -Depth 12
         return
@@ -439,6 +553,37 @@ if ($Detached) {
     $stderrLogPath = Join-Path $stateRoot 'target-autoloop-watcher.stderr.log'
     $launcherPath = Join-Path $stateRoot 'target-autoloop-watcher.launch.ps1'
     $pwshPath = Get-TargetAutoloopWatcherHostPath
+    if (Test-TargetAutoloopWatcherMutexHeld -Name $watcherMutexName) {
+        $latestStatusDocument = if (Test-Path -LiteralPath $statePaths.StatusPath -PathType Leaf) {
+            Read-TargetAutoloopJsonObjectWithRetry -Path $statePaths.StatusPath
+        }
+        else {
+            $statusDocument
+        }
+        $reasonCodes = @('watcher_mutex_held')
+        $message = ('target-autoloop watcher mutex가 이미 사용 중입니다: {0}' -f $watcherMutexName)
+        $activeConfirmed = Test-TargetAutoloopWatcherFresh -StatusDocument $latestStatusDocument -StaleAfterSeconds $watcherFreshWindowSec
+        if ($activeConfirmed) {
+            $reasonCodes = @('watcher_already_active', 'watcher_mutex_held')
+            $message = ('target-autoloop watcher가 이미 active 상태입니다: {0}' -f ([string](Get-ConfigValue -Object $latestStatusDocument -Name 'WatcherState' -DefaultValue '')))
+        }
+        $alreadyRunningPayload = New-TargetAutoloopAlreadyRunningPayload `
+            -Config $config `
+            -ResolvedRunRoot $resolvedRunRoot `
+            -StatePaths $statePaths `
+            -ControlDocument $controlDocument `
+            -StatusDocument $latestStatusDocument `
+            -WatcherMutexName $watcherMutexName `
+            -ReasonCodes $reasonCodes `
+            -Message $message `
+            -ActiveConfirmed $activeConfirmed
+        if ($AsJson) {
+            $alreadyRunningPayload | ConvertTo-Json -Depth 12
+            return
+        }
+        $alreadyRunningPayload
+        return
+    }
     $watcherCommandLine = @(
         '&',
         (Quote-PowerShellLiteral -Value $pwshPath)

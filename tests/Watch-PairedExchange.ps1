@@ -122,7 +122,7 @@ function Write-JsonFileAtomically {
 }
 
 function Resolve-PowerShellExecutable {
-    foreach ($name in @('pwsh.exe', 'powershell.exe')) {
+    foreach ($name in @('pwsh.exe', 'pwsh')) {
         $command = Get-Command -Name $name -ErrorAction SilentlyContinue | Select-Object -First 1
         if ($null -eq $command) {
             continue
@@ -137,7 +137,7 @@ function Resolve-PowerShellExecutable {
         return [string]$name
     }
 
-    throw 'pwsh.exe 또는 powershell.exe를 찾지 못했습니다.'
+    throw 'pwsh (PowerShell 7+)를 찾지 못했습니다.'
 }
 
 function Get-HeadlessDispatchStatusPath {
@@ -448,6 +448,7 @@ function Get-WatcherStopCategory {
         'completed' { return 'completed' }
         'max-forward-count-reached' { return 'expected-limit' }
         'pair-roundtrip-limit-reached' { return 'expected-limit' }
+        'import-source-outbox-complete' { return 'expected-limit' }
         'control-stop-request' { return 'manual-stop' }
         'run-duration-reached' { return 'time-limit' }
         default { return 'error' }
@@ -1660,6 +1661,76 @@ function Save-SourceOutboxStatus {
     Write-JsonFileAtomically -Path $Path -Payload $payload -Depth 8
 }
 
+function Load-SourceOutboxStatusEntries {
+    param([Parameter(Mandatory)][string]$Path)
+
+    $entries = @{}
+    $doc = Read-JsonObject -Path $Path
+    if ($null -eq $doc) {
+        return $entries
+    }
+
+    foreach ($row in @($doc.Targets)) {
+        $targetId = [string](Get-ConfigValue -Object $row -Name 'TargetId' -DefaultValue '')
+        if (Test-NonEmptyString $targetId) {
+            $entries[$targetId] = $row
+        }
+    }
+
+    return $entries
+}
+
+function Test-SourceOutboxStatusEntryCoversReadiness {
+    param(
+        $StatusEntry,
+        $Readiness
+    )
+
+    if ($null -eq $StatusEntry -or $null -eq $Readiness) {
+        return $false
+    }
+
+    $state = [string](Get-ConfigValue -Object $StatusEntry -Name 'State' -DefaultValue '')
+    if ($state -notin @('imported', 'imported-archive-pending', 'duplicate-marker-archived', 'duplicate-marker-present', 'forwarded')) {
+        return $false
+    }
+
+    $marker = Get-ConfigValue -Object $Readiness -Name 'Marker' -DefaultValue $null
+    $markerCycleId = [string](Get-ConfigValue -Object $marker -Name 'PublishCycleId' -DefaultValue '')
+    if (Test-NonEmptyString $markerCycleId) {
+        $statusCycleId = [string](Get-ConfigValue -Object $StatusEntry -Name 'PublishCycleId' -DefaultValue '')
+        $importedCycleId = [string](Get-ConfigValue -Object $StatusEntry -Name 'ImportedSourcePublishCycleId' -DefaultValue '')
+        if ($markerCycleId -eq $statusCycleId -or $markerCycleId -eq $importedCycleId) {
+            return $true
+        }
+    }
+
+    $effectiveReadyPath = Get-NormalizedFullPath -Path ([string]$Readiness.Paths.EffectivePublishReadyPath)
+    if (Test-NonEmptyString $effectiveReadyPath) {
+        foreach ($candidatePath in @(
+                [string](Get-ConfigValue -Object $StatusEntry -Name 'ArchivedReadyPath' -DefaultValue ''),
+                [string](Get-ConfigValue -Object $StatusEntry -Name 'PublishReadyPath' -DefaultValue '')
+            )) {
+            if ($effectiveReadyPath -eq (Get-NormalizedFullPath -Path $candidatePath)) {
+                return $true
+            }
+        }
+    }
+
+    $markerSequence = [int](Get-ConfigValue -Object $marker -Name 'PublishSequence' -DefaultValue 0)
+    $publishedAt = [string](Get-ConfigValue -Object $Readiness -Name 'PublishedAt' -DefaultValue '')
+    if ($markerSequence -gt 0 -and (Test-NonEmptyString $publishedAt)) {
+        $statusSequence = [int](Get-ConfigValue -Object $StatusEntry -Name 'PublishSequence' -DefaultValue 0)
+        $importedSequence = [int](Get-ConfigValue -Object $StatusEntry -Name 'ImportedSourcePublishSequence' -DefaultValue 0)
+        $statusPublishedAt = [string](Get-ConfigValue -Object $StatusEntry -Name 'PublishedAt' -DefaultValue '')
+        if ($publishedAt -eq $statusPublishedAt -and ($markerSequence -eq $statusSequence -or $markerSequence -eq $importedSequence)) {
+            return $true
+        }
+    }
+
+    return $false
+}
+
 function Get-SourceOutboxRepairStatusMetadata {
     param(
         $ExistingEntry = $null,
@@ -2512,7 +2583,7 @@ try {
     $sourceOutboxFailureState = @{}
     $sourceOutboxRepairState = @{}
     $sourceOutboxRepairMetadataByTarget = @{}
-    $sourceOutboxStatusEntries = @{}
+    $sourceOutboxStatusEntries = Load-SourceOutboxStatusEntries -Path $sourceOutboxStatusPath
     $pairProfiles = Get-PairProfiles -TargetItems @($targetItems)
     $pairRoundtripLimitMap = Get-PairRoundtripLimitMap -TargetItems @($targetItems) -GlobalPairMaxRoundtripCount $PairMaxRoundtripCount
     $pairStateEntries = Load-PairStateEntries -Path $pairStatePath
@@ -2550,7 +2621,7 @@ try {
             -WatcherPaused:$watcherPaused
         $activeElapsedSeconds = Get-ActiveWatcherElapsedSeconds -Stopwatch $stopwatch -PausedDurationSeconds $pausedDurationSeconds
         if ($RunDurationSec -gt 0 -and $activeElapsedSeconds -ge $RunDurationSec) {
-            $watcherStopReason = 'run-duration-reached'
+            $watcherStopReason = if ($ImportSourceOutboxOnly) { 'import-source-outbox-complete' } else { 'run-duration-reached' }
             break
         }
 
@@ -2972,6 +3043,12 @@ try {
                         }
                     }
                     else {
+                        $existingSourceOutboxStatus = Get-ConfigValue -Object $sourceOutboxStatusEntries -Name ([string]$item.TargetId) -DefaultValue $null
+                        if ([bool]$sourceOutboxReadiness.Paths.PublishReadyArchived -and
+                            (Test-SourceOutboxStatusEntryCoversReadiness -StatusEntry $existingSourceOutboxStatus -Readiness $sourceOutboxReadiness)) {
+                            continue
+                        }
+
                         $duplicateArchivePath = ''
                         $duplicateArchiveFailure = ''
                         try {

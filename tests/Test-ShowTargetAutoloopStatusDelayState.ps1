@@ -50,7 +50,7 @@ New-Item -ItemType Directory -Path $tmpRoot -Force | Out-Null
 }
 "@, (New-Utf8NoBomEncoding))
 
-$startJson = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Start-TargetAutoloopRun.ps1') `
+$startJson = & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Start-TargetAutoloopRun.ps1') `
     -ConfigPath $configPath `
     -RunRoot $runRoot `
     -RunMode target-autoloop `
@@ -122,7 +122,7 @@ $dueStatus = [ordered]@{
 }
 $dueStatus | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $start.StatusPath -Encoding UTF8
 
-$dueJson = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Show-TargetAutoloopStatus.ps1') `
+$dueJson = & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Show-TargetAutoloopStatus.ps1') `
     -ConfigPath $configPath `
     -RunRoot $runRoot `
     -AsJson | ConvertFrom-Json
@@ -132,7 +132,7 @@ Assert-True ([string]$dueJson.DelaySummary.TargetId -eq 'target02') 'status json
 $actualDueAt = ([datetimeoffset]$dueJson.DelaySummary.DueAt).ToString('o')
 Assert-True ($actualDueAt -eq $pastEligibleAt) 'status json should surface due timestamp for the selected delayed target.'
 
-$dueOutput = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Show-TargetAutoloopStatus.ps1') `
+$dueOutput = & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Show-TargetAutoloopStatus.ps1') `
     -ConfigPath $configPath `
     -RunRoot $runRoot
 $dueJoined = (@($dueOutput) -join "`n")
@@ -199,7 +199,7 @@ $invalidStatus = [ordered]@{
 }
 $invalidStatus | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $start.StatusPath -Encoding UTF8
 
-$invalidOutput = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Show-TargetAutoloopStatus.ps1') `
+$invalidOutput = & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Show-TargetAutoloopStatus.ps1') `
     -ConfigPath $configPath `
     -RunRoot $runRoot
 $invalidJoined = (@($invalidOutput) -join "`n")

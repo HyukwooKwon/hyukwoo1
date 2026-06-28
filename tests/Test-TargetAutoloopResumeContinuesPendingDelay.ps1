@@ -51,7 +51,7 @@ New-Item -ItemType Directory -Path $routerInboxRoot -Force | Out-Null
 }
 "@, (New-Utf8NoBomEncoding))
 
-$startJson = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Start-TargetAutoloopRun.ps1') `
+$startJson = & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Start-TargetAutoloopRun.ps1') `
     -ConfigPath $configPath `
     -RunRoot $runRoot `
     -Targets target01 `
@@ -68,7 +68,7 @@ if (Test-Path -LiteralPath $target01.SourceReviewZipPath) {
     Remove-Item -LiteralPath $target01.SourceReviewZipPath -Force
 }
 Compress-Archive -LiteralPath $zipNotePath -DestinationPath $target01.SourceReviewZipPath -Force
-$null = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Publish-TargetAutoloopArtifact.ps1') `
+$null = & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Publish-TargetAutoloopArtifact.ps1') `
     -ConfigPath $configPath `
     -RunRoot $runRoot `
     -TargetId target01 `
@@ -80,7 +80,7 @@ $publishMarker = Get-Content -LiteralPath $target01.PublishReadyPath -Raw -Encod
 $publishMarker.PublishedAt = (Get-Date).ToString('o')
 $publishMarker | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $target01.PublishReadyPath -Encoding UTF8
 
-$watchDelayJson = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Watch-TargetAutoloop.ps1') `
+$watchDelayJson = & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Watch-TargetAutoloop.ps1') `
     -ConfigPath $configPath `
     -RunRoot $runRoot `
     -ProcessOnce `
@@ -96,7 +96,7 @@ Assert-True ([string]$delayTarget.NextAction -eq 'wait-dispatch-delay') 'target 
 Assert-True (([string]$originalEligibleAt).Length -gt 0) 'target should record pending dispatch due time before pause.'
 Assert-True ([int]$delayTarget.PendingDispatchDelaySeconds -eq 30) 'target should keep the fixed thirty-second publish-ready delay.'
 
-$pauseRequest = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Request-TargetAutoloopControl.ps1') `
+$pauseRequest = & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Request-TargetAutoloopControl.ps1') `
     -ConfigPath $configPath `
     -RunRoot $runRoot `
     -Action pause `
@@ -104,13 +104,13 @@ $pauseRequest = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path
     -AsJson | ConvertFrom-Json
 Assert-True ([bool]$pauseRequest.Ok) 'pause request should succeed for delayed publish-ready target.'
 
-$null = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Watch-TargetAutoloop.ps1') `
+$null = & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Watch-TargetAutoloop.ps1') `
     -ConfigPath $configPath `
     -RunRoot $runRoot `
     -ProcessOnce `
     -AsJson
 
-$pausedStatus = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Show-TargetAutoloopStatus.ps1') `
+$pausedStatus = & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Show-TargetAutoloopStatus.ps1') `
     -ConfigPath $configPath `
     -RunRoot $runRoot `
     -AsJson | ConvertFrom-Json
@@ -129,7 +129,7 @@ $publishMarker | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $target01.P
 (Get-Item -LiteralPath $target01.PublishReadyPath).LastWriteTime = $duePublishedAt
 $expectedEligibleAtAfterPause = ([datetimeoffset](Get-Item -LiteralPath $target01.PublishReadyPath).LastWriteTime).AddSeconds(30).ToString('o')
 
-$watchWhilePausedJson = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Watch-TargetAutoloop.ps1') `
+$watchWhilePausedJson = & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Watch-TargetAutoloop.ps1') `
     -ConfigPath $configPath `
     -RunRoot $runRoot `
     -ProcessOnce `
@@ -144,7 +144,7 @@ Assert-True (@($pausedQueueFiles).Count -eq 1) 'one queued command should appear
 Assert-True ([string]$pausedTargetAfterDue.Phase -eq 'queued') 'target should show queued after pause-time detection creates the command.'
 Assert-True ([string]$pausedTargetAfterDue.PendingTriggerKind -eq '') 'pending delayed trigger bookkeeping should clear after paused queue.'
 
-$blockedWorkerJson = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'visible\Start-TargetAutoloopWorker.ps1') `
+$blockedWorkerJson = & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'visible\Start-TargetAutoloopWorker.ps1') `
     -ConfigPath $configPath `
     -RunRoot $runRoot `
     -TargetId target01 `
@@ -154,7 +154,7 @@ $blockedWorker = $blockedWorkerJson | ConvertFrom-Json
 Assert-True ([int]$blockedWorker.ProcessedCount -eq 0) 'paused controller should still block dispatch for the queued delayed command.'
 Assert-True ([string]$blockedWorker.LastResult.State -eq 'blocked-by-controller') 'paused delayed command dispatch should be blocked by controller.'
 
-$resumeRequest = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Request-TargetAutoloopControl.ps1') `
+$resumeRequest = & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Request-TargetAutoloopControl.ps1') `
     -ConfigPath $configPath `
     -RunRoot $runRoot `
     -Action resume `
@@ -162,7 +162,7 @@ $resumeRequest = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Pat
     -AsJson | ConvertFrom-Json
 Assert-True ([bool]$resumeRequest.Ok) 'resume request should succeed after delayed pause.'
 
-$watchResumeJson = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Watch-TargetAutoloop.ps1') `
+$watchResumeJson = & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Watch-TargetAutoloop.ps1') `
     -ConfigPath $configPath `
     -RunRoot $runRoot `
     -ProcessOnce `
@@ -170,7 +170,7 @@ $watchResumeJson = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-P
 $watchResume = $watchResumeJson | ConvertFrom-Json
 Assert-True ([int]$watchResume.QueuedCount -eq 0) 'resume should not queue a duplicate delayed publish-ready command.'
 
-$resumedStatus = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Show-TargetAutoloopStatus.ps1') `
+$resumedStatus = & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Show-TargetAutoloopStatus.ps1') `
     -ConfigPath $configPath `
     -RunRoot $runRoot `
     -AsJson | ConvertFrom-Json
@@ -192,7 +192,7 @@ Assert-True ([string]$queuedTarget.Phase -eq 'queued') 'target should move to qu
 Assert-True ([string]$queuedTarget.PendingTriggerKind -eq '') 'pending delayed trigger bookkeeping should clear after resumed queue.'
 Assert-True ([string]$queuedTarget.LastHandledOutputFingerprint -eq 'output-fingerprint-resume-delay-001') 'resumed delayed queue should preserve handled output fingerprint.'
 
-$resumedWorkerJson = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'visible\Start-TargetAutoloopWorker.ps1') `
+$resumedWorkerJson = & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'visible\Start-TargetAutoloopWorker.ps1') `
     -ConfigPath $configPath `
     -RunRoot $runRoot `
     -TargetId target01 `

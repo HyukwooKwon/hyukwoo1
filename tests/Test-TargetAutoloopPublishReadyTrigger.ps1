@@ -48,7 +48,7 @@ New-Item -ItemType Directory -Path $routerInboxRoot -Force | Out-Null
 }
 "@, (New-Utf8NoBomEncoding))
 
-$startJson = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Start-TargetAutoloopRun.ps1') `
+$startJson = & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Start-TargetAutoloopRun.ps1') `
     -ConfigPath $configPath `
     -RunRoot $runRoot `
     -Targets target01 `
@@ -65,7 +65,7 @@ if (Test-Path -LiteralPath $target01.SourceReviewZipPath) {
     Remove-Item -LiteralPath $target01.SourceReviewZipPath -Force
 }
 Compress-Archive -LiteralPath $zipNotePath -DestinationPath $target01.SourceReviewZipPath -Force
-$publishJson = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Publish-TargetAutoloopArtifact.ps1') `
+$publishJson = & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Publish-TargetAutoloopArtifact.ps1') `
     -ConfigPath $configPath `
     -RunRoot $runRoot `
     -TargetId target01 `
@@ -76,7 +76,7 @@ $publishJson = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path 
 $publish = $publishJson | ConvertFrom-Json
 Assert-True ([string]$publish.Marker.OutputFingerprint -eq 'output-fingerprint-001') 'publish helper should keep the provided output fingerprint.'
 
-$watchJson = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Watch-TargetAutoloop.ps1') `
+$watchJson = & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Watch-TargetAutoloop.ps1') `
     -ConfigPath $configPath `
     -RunRoot $runRoot `
     -ProcessOnce `
@@ -90,6 +90,25 @@ $command = Get-Content -LiteralPath $queueFiles[0].FullName -Raw -Encoding UTF8 
 Assert-True ([string]$command.RunMode -eq 'target-autoloop') 'queued command should preserve target-autoloop run mode.'
 Assert-True ([string]$command.TriggerKind -eq 'publish-ready') 'queued command should record publish-ready trigger kind.'
 Assert-True ([string]$command.LoopSource -eq 'self-output') 'queued command should record self-output loop source.'
+
+$promptText = Get-Content -LiteralPath ([string]$command.PromptFilePath) -Raw -Encoding UTF8
+$expectedPublishHelperCommand = (
+    "pwsh -NoProfile -ExecutionPolicy Bypass -File '{0}' -ConfigPath '{1}' -RunRoot '{2}' -TargetId 'target01' -Overwrite" -f
+    ((Join-Path $root 'tests\Publish-TargetAutoloopArtifact.ps1') -replace "'", "''"),
+    ($configPath -replace "'", "''"),
+    ($runRoot -replace "'", "''")
+)
+Assert-True ($promptText.Contains('[고정문구 / 항상 포함]')) 'publish-ready prompt should keep the fixed suffix header.'
+Assert-True ($promptText.Contains('suffix-01')) 'publish-ready prompt should keep the target fixed suffix.'
+Assert-True ($promptText.Contains('[생성해야 할 파일]')) 'publish-ready prompt should include the output contract block.'
+Assert-True ($promptText.Contains(('1. summary.txt -> ' + [string]$target01.SourceSummaryPath))) 'publish-ready prompt should include the exact summary path.'
+Assert-True ($promptText.Contains(('2. review.zip -> ' + [string]$target01.SourceReviewZipPath))) 'publish-ready prompt should include the exact review zip path.'
+Assert-True ($promptText.Contains('[마지막 단계]')) 'publish-ready prompt should include the final-step block.'
+Assert-True ($promptText.Contains(('3. publish helper 실행 -> ' + $expectedPublishHelperCommand))) 'publish-ready prompt should include the publish helper command with the coordinator runroot.'
+Assert-True ($promptText.Contains(('4. helper output marker -> ' + [string]$target01.PublishReadyPath))) 'publish-ready prompt should include the publish ready marker path.'
+Assert-True ($promptText.Contains('[규칙]')) 'publish-ready prompt should include the target output rules.'
+Assert-True ($promptText.Contains('[현재 턴 메타]')) 'publish-ready prompt should keep publish metadata in a separate block.'
+Assert-True ($promptText.Contains('LoopSource') -eq $false) 'publish-ready prompt should not expose queue-only loop source as task text.'
 
 $state = Get-Content -LiteralPath $start.StatePath -Raw -Encoding UTF8 | ConvertFrom-Json
 $targetState = $state.Targets.target01

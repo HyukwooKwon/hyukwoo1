@@ -4,8 +4,11 @@ import json
 import os
 import subprocess
 import sys
+import time
+from copy import deepcopy
 from pathlib import Path
 from shutil import which
+from typing import Callable
 
 from relay_panel_contract import get_watcher_bridge_contract_errors
 from relay_panel_models import AppContext, DashboardRawBundle
@@ -30,6 +33,7 @@ SCRIPT_ARGUMENT_POLICY = {
     "check-target-window-visibility.ps1": {"config": True, "json_stdout_on_error": True},
     "tests/Confirm-PairedExchangeHandoffPrimitive.ps1": {"config": True, "run_root": True, "pair": True, "target": True},
     "tests/Confirm-PairedExchangePublishPrimitive.ps1": {"config": True, "run_root": True, "pair": True, "target": True},
+    "tests/Extend-TargetAutoloopCycleLimit.ps1": {"config": True, "run_root": True, "target": True},
     "tests/Request-TargetAutoloopControl.ps1": {"config": True, "run_root": True},
     "tests/Show-TargetAutoloopSeedComposer.ps1": {"config": True, "run_root": True, "target": True},
     "tests/Show-TargetAutoloopRouteMatrix.ps1": {"config": True, "run_root": True},
@@ -43,6 +47,7 @@ SCRIPT_ARGUMENT_POLICY = {
     "import-paired-exchange-artifact.ps1": {"config": True, "run_root": True, "target": True},
     "tests/Invoke-PairedExchangeOneShotSubmit.ps1": {"config": True, "run_root": True, "pair": True, "target": True},
     "refresh-binding-profile-from-existing.ps1": {"config": True, "json_stdout_on_error": True},
+    "router/Requeue-RetryPending.ps1": {"config": True},
     "router/Restart-RouterForConfig.ps1": {"config": True},
     "router.ps1": {"config": True},
     "show-effective-config.ps1": {"config": True, "run_root": True, "pair": True, "target": True},
@@ -52,6 +57,7 @@ SCRIPT_ARGUMENT_POLICY = {
     "tests/Start-PairedExchangeTest.ps1": {"config": True, "run_root": True},
     "tests/Watch-PairedExchange.ps1": {"config": True, "run_root": True},
 }
+VISIBILITY_STATUS_CACHE_TTL_SECONDS = 8.0
 
 
 class PowerShellError(RuntimeError):
@@ -143,14 +149,89 @@ def _background_process_kwargs() -> dict[str, object]:
     return kwargs
 
 
-def run_command(command: list[str]) -> subprocess.CompletedProcess[str]:
-    completed = subprocess.run(
-        command,
-        cwd=ROOT,
-        capture_output=True,
-        text=True,
-        **_background_process_kwargs(),
-    )
+def _timeout_stream_text(value: object) -> str:
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return str(value or "")
+
+
+def _terminate_process_tree(process: subprocess.Popen[str]) -> None:
+    if process.poll() is not None:
+        return
+    if os.name == "nt":
+        try:
+            subprocess.run(
+                ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=5,
+                **_background_process_kwargs(),
+            )
+            return
+        except Exception:
+            pass
+    try:
+        process.kill()
+    except Exception:
+        pass
+
+
+def run_command(command: list[str], *, timeout_sec: float | None = None) -> subprocess.CompletedProcess[str]:
+    timeout_value = float(timeout_sec) if timeout_sec is not None and float(timeout_sec) > 0 else None
+    if timeout_value is not None:
+        process = subprocess.Popen(
+            command,
+            cwd=ROOT,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            **_background_process_kwargs(),
+        )
+        try:
+            stdout, stderr = process.communicate(timeout=timeout_value)
+        except subprocess.TimeoutExpired as exc:
+            _terminate_process_tree(process)
+            try:
+                stdout, stderr = process.communicate(timeout=2)
+            except subprocess.TimeoutExpired:
+                stdout = _timeout_stream_text(exc.stdout)
+                stderr = _timeout_stream_text(exc.stderr)
+            timeout_label = f"{timeout_value:g}"
+            raise PowerShellError(
+                f"command timed out after {timeout_label}s: {subprocess.list2cmdline(command)}",
+                returncode=None,
+                stdout=_timeout_stream_text(stdout),
+                stderr=_timeout_stream_text(stderr),
+            ) from exc
+        completed = subprocess.CompletedProcess(command, process.returncode, stdout=stdout, stderr=stderr)
+        if completed.returncode != 0:
+            detail = completed.stderr.strip() or completed.stdout.strip() or f"exit={completed.returncode}"
+            raise PowerShellError(
+                detail,
+                returncode=completed.returncode,
+                stdout=completed.stdout,
+                stderr=completed.stderr,
+            )
+        return completed
+
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            timeout=timeout_value,
+            **_background_process_kwargs(),
+        )
+    except subprocess.TimeoutExpired as exc:
+        timeout_label = f"{timeout_value:g}" if timeout_value is not None else "unknown"
+        raise PowerShellError(
+            f"command timed out after {timeout_label}s: {subprocess.list2cmdline(command)}",
+            returncode=None,
+            stdout=_timeout_stream_text(exc.stdout),
+            stderr=_timeout_stream_text(exc.stderr),
+        ) from exc
     if completed.returncode != 0:
         detail = completed.stderr.strip() or completed.stdout.strip() or f"exit={completed.returncode}"
         raise PowerShellError(
@@ -215,12 +296,21 @@ class CommandService:
             command.extend(extra)
         return command
 
-    def run(self, command: list[str]) -> subprocess.CompletedProcess[str]:
-        return run_command(command)
+    def run(self, command: list[str], *, timeout_sec: float | None = None) -> subprocess.CompletedProcess[str]:
+        return run_command(command, timeout_sec=timeout_sec)
 
-    def run_json(self, command: list[str], *, allow_json_stdout_on_error: bool = False) -> dict:
+    def run_json(
+        self,
+        command: list[str],
+        *,
+        allow_json_stdout_on_error: bool = False,
+        timeout_sec: float | None = None,
+    ) -> dict:
         try:
-            completed = self.run(command)
+            if timeout_sec is None:
+                completed = self.run(command)
+            else:
+                completed = self.run(command, timeout_sec=timeout_sec)
         except PowerShellError as exc:
             if allow_json_stdout_on_error:
                 payload = _load_json_payload(exc.stdout)
@@ -251,8 +341,29 @@ class CommandService:
 
 
 class StatusService:
-    def __init__(self, command_service: CommandService) -> None:
+    def __init__(
+        self,
+        command_service: CommandService,
+        *,
+        visibility_cache_ttl_seconds: float = VISIBILITY_STATUS_CACHE_TTL_SECONDS,
+        clock: Callable[[], float] | None = None,
+    ) -> None:
         self.command_service = command_service
+        self._visibility_cache_ttl_seconds = max(0.0, float(visibility_cache_ttl_seconds))
+        self._visibility_cache_clock = clock or time.monotonic
+        self._visibility_cache: tuple[tuple[str, str, str, str], float, dict] | None = None
+
+    @staticmethod
+    def _visibility_cache_key(context: AppContext) -> tuple[str, str, str, str]:
+        return (
+            str(context.config_path or ""),
+            str(context.run_root or ""),
+            str(context.pair_id or ""),
+            str(context.target_id or ""),
+        )
+
+    def invalidate_visibility_cache(self) -> None:
+        self._visibility_cache = None
 
     def _annotate_watcher_bridge_contract_errors(self, payload: dict | None) -> dict | None:
         if not isinstance(payload, dict):
@@ -284,6 +395,7 @@ class StatusService:
         run_root_override: str | None = None,
         pair_id_override: str | None = None,
         target_id_override: str | None = None,
+        timeout_sec: float | None = None,
     ) -> subprocess.CompletedProcess[str]:
         command = self.command_service.build_script_command(
             script_name=script_name,
@@ -293,7 +405,9 @@ class StatusService:
             target_id=context.target_id if target_id_override is None else target_id_override,
             extra=extra,
         )
-        return self.command_service.run(command)
+        if timeout_sec is None:
+            return self.command_service.run(command)
+        return self.command_service.run(command, timeout_sec=timeout_sec)
 
     def run_json_script(
         self,
@@ -305,6 +419,7 @@ class StatusService:
         pair_id_override: str | None = None,
         target_id_override: str | None = None,
         allow_json_stdout_on_error: bool | None = None,
+        timeout_sec: float | None = None,
     ) -> dict:
         command = self.command_service.build_script_command(
             script_name=script_name,
@@ -329,13 +444,22 @@ class StatusService:
             else allow_json_stdout_on_error
         )
         if hasattr(self.command_service, "run_json"):
+            if timeout_sec is None:
+                return self.command_service.run_json(
+                    command,
+                    allow_json_stdout_on_error=resolved_allow,
+                )
             return self.command_service.run_json(
                 command,
                 allow_json_stdout_on_error=resolved_allow,
+                timeout_sec=timeout_sec,
             )
 
         try:
-            completed = self.command_service.run(command)
+            if timeout_sec is None:
+                completed = self.command_service.run(command)
+            else:
+                completed = self.command_service.run(command, timeout_sec=timeout_sec)
         except PowerShellError as exc:
             if resolved_allow:
                 payload = _load_json_payload(exc.stdout)
@@ -369,12 +493,41 @@ class StatusService:
     def load_relay_status(self, context: AppContext) -> dict:
         return self.run_json_script("show-relay-status.ps1", context, extra=["-AsJson"])
 
-    def load_visibility_status(self, context: AppContext) -> dict:
-        return self.run_json_script("check-target-window-visibility.ps1", context, extra=["-AsJson"])
+    def load_visibility_status(self, context: AppContext, *, force_refresh: bool = False) -> dict:
+        cache_key = self._visibility_cache_key(context)
+        now = self._visibility_cache_clock()
+        cache_entry = self._visibility_cache
+        if (
+            not force_refresh
+            and self._visibility_cache_ttl_seconds > 0
+            and cache_entry is not None
+            and cache_entry[0] == cache_key
+        ):
+            age_seconds = now - cache_entry[1]
+            if 0 <= age_seconds <= self._visibility_cache_ttl_seconds:
+                return deepcopy(cache_entry[2])
+
+        payload = self.run_json_script("check-target-window-visibility.ps1", context, extra=["-AsJson"])
+        if self._visibility_cache_ttl_seconds > 0:
+            self._visibility_cache = (cache_key, now, deepcopy(payload))
+        return payload
 
     def load_paired_status(self, context: AppContext, run_root: str | None = None) -> tuple[dict | None, str]:
         resolved_run_root = run_root if run_root is not None else context.run_root
         return self.try_load_paired_status(context, resolved_run_root)
+
+    @staticmethod
+    def _run_timed_dashboard_step(steps: list[dict[str, object]], label: str, callback):
+        started_at = time.monotonic()
+        try:
+            return callback()
+        finally:
+            steps.append(
+                {
+                    "label": str(label or "dashboard").strip() or "dashboard",
+                    "elapsed_seconds": max(0.0, time.monotonic() - started_at),
+                }
+            )
 
     def refresh_runtime_status(self, context: AppContext) -> tuple[dict, dict]:
         relay_payload = self.load_relay_status(context)
@@ -385,12 +538,29 @@ class StatusService:
         return self.load_paired_status(context, run_root=run_root)
 
     def load_dashboard_bundle(self, context: AppContext) -> DashboardRawBundle:
-        effective_payload = self.load_effective_config(context)
-        relay_payload = self.load_relay_status(context)
-        visibility_payload = self.load_visibility_status(context)
+        steps: list[dict[str, object]] = []
+        effective_payload = self._run_timed_dashboard_step(
+            steps,
+            "effective config",
+            lambda: self.load_effective_config(context),
+        )
+        relay_payload = self._run_timed_dashboard_step(
+            steps,
+            "relay status",
+            lambda: self.load_relay_status(context),
+        )
+        visibility_payload = self._run_timed_dashboard_step(
+            steps,
+            "visibility",
+            lambda: self.load_visibility_status(context),
+        )
 
         selected_run_root = effective_payload.get("RunContext", {}).get("SelectedRunRoot", "") or context.run_root
-        paired_payload, paired_error = self.load_paired_status(context, selected_run_root)
+        paired_payload, paired_error = self._run_timed_dashboard_step(
+            steps,
+            "paired status",
+            lambda: self.load_paired_status(context, selected_run_root),
+        )
 
         return DashboardRawBundle(
             effective_data=effective_payload,
@@ -398,4 +568,5 @@ class StatusService:
             visibility_status=visibility_payload,
             paired_status=paired_payload,
             paired_status_error=paired_error,
+            refresh_timing_steps=steps,
         )

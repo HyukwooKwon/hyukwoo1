@@ -29,7 +29,7 @@ function Get-DefaultConfigPath {
 }
 
 function Resolve-PowerShellExecutable {
-    $candidates = @('pwsh.exe', 'powershell.exe')
+    $candidates = @('pwsh.exe', 'pwsh')
     foreach ($name in $candidates) {
         $command = Get-Command -Name $name -ErrorAction SilentlyContinue | Select-Object -First 1
         if ($null -ne $command) {
@@ -43,7 +43,7 @@ function Resolve-PowerShellExecutable {
         }
     }
 
-    throw 'pwsh.exe 또는 powershell.exe를 찾지 못했습니다.'
+    throw 'pwsh (PowerShell 7+)를 찾지 못했습니다.'
 }
 
 function Invoke-LocalScriptAndCaptureOutput {

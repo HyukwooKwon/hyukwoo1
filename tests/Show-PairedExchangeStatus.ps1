@@ -569,6 +569,8 @@ function Get-WatcherStopCategoryDisplay {
     switch ($Reason) {
         'completed' { return 'completed' }
         'max-forward-count-reached' { return 'expected-limit' }
+        'pair-roundtrip-limit-reached' { return 'expected-limit' }
+        'import-source-outbox-complete' { return 'expected-limit' }
         'control-stop-request' { return 'manual-stop' }
         'run-duration-reached' { return 'time-limit' }
         default { return '' }
@@ -581,6 +583,7 @@ function Get-ContractNextActionDisplay {
     switch ($LatestState) {
         'ready-to-forward' { return 'handoff-ready' }
         'forwarded' { return 'already-forwarded' }
+        'limit-reached' { return 'limit-reached' }
         'error-present' { return 'manual-review' }
         'duplicate-skipped' { return 'duplicate-skipped' }
         default { return '' }
@@ -620,6 +623,10 @@ function Get-PairNextActionDisplay {
     $pairRows = @($Rows)
     if ((@($pairRows | Where-Object { $_.ErrorPresent -or $_.SourceOutboxNextAction -eq 'manual-review' })).Count -gt 0) {
         return 'manual-review'
+    }
+
+    if ((@($pairRows | Where-Object { $_.SourceOutboxNextAction -eq 'limit-reached' -or $_.LatestState -eq 'limit-reached' })).Count -gt 0) {
+        return 'limit-reached'
     }
 
     if ((@($pairRows | Where-Object { $_.SourceOutboxNextAction -eq 'handoff-ready' -or $_.LatestState -eq 'ready-to-forward' })).Count -gt 0) {
@@ -795,6 +802,13 @@ foreach ($item in $targetItems | Sort-Object TargetId) {
     $sourceReviewZipPath = [string]$sourceOutboxPaths.SourceReviewZipPath
     $publishReadyPath = [string]$sourceOutboxPaths.PublishReadyPath
     $publishedArchivePath = [string]$sourceOutboxPaths.PublishedArchivePath
+    $publishReadyInfo = Get-RecentFileSummary -Path $publishReadyPath
+    $publishedArchiveReadyCount = if (Test-Path -LiteralPath $publishedArchivePath -PathType Container) {
+        @(Get-ChildItem -LiteralPath $publishedArchivePath -Filter '*.ready.json' -File -ErrorAction SilentlyContinue).Count
+    }
+    else {
+        0
+    }
     $reviewRoot = [string]$contract.ReviewFolderPath
     $summaryPath = [string]$contract.SummaryPath
     $donePath = [string]$contract.DonePath
@@ -815,6 +829,30 @@ foreach ($item in $targetItems | Sort-Object TargetId) {
     $latestZip = if ($zipFiles.Count -gt 0) { $zipFiles[0] } else { $null }
     $latestFingerprint = if ($null -ne $latestZip) { Get-ZipFingerprint -TargetId ([string]$item.TargetId) -ZipFile $latestZip } else { '' }
     $latestForwardedAt = if (Test-NonEmptyString $latestFingerprint -and $forwardedState.ContainsKey($latestFingerprint)) { [string]$forwardedState[$latestFingerprint] } else { '' }
+    $targetPairStateRow = Get-ConfigValue -Object $pairStateById -Name ([string]$item.PairId) -DefaultValue $null
+    $targetPairPolicy = Get-ConfigValue -Object $item -Name 'PairPolicy' -DefaultValue $null
+    $targetPolicyRoundtripLimit = [int](Get-ConfigValue -Object $targetPairPolicy -Name 'DefaultPairMaxRoundtripCount' -DefaultValue 0)
+    $targetConfiguredMaxRoundtripCount = if ($watcherConfiguredMaxRoundtripCount -gt 0) {
+        $watcherConfiguredMaxRoundtripCount
+    }
+    elseif ($targetPolicyRoundtripLimit -gt 0) {
+        $targetPolicyRoundtripLimit
+    }
+    else {
+        0
+    }
+    $targetPairForwardedStateCount = 0
+    foreach ($peerTargetId in @($targetItems | Where-Object { [string]$_.PairId -eq [string]$item.PairId } | ForEach-Object { [string]$_.TargetId })) {
+        $targetPairForwardedStateCount += [int](Get-ConfigValue -Object $forwardedCountsByTarget -Name $peerTargetId -DefaultValue 0)
+    }
+    $targetPairRoundtripCount = [math]::Floor($targetPairForwardedStateCount / 2)
+    $targetPairLimitReached = [bool]($targetConfiguredMaxRoundtripCount -gt 0 -and $targetPairRoundtripCount -ge $targetConfiguredMaxRoundtripCount)
+    if ($null -ne $targetPairStateRow) {
+        $targetPairLimitReached = [bool](Get-ConfigValue -Object $targetPairStateRow -Name 'LimitReached' -DefaultValue $targetPairLimitReached)
+        $targetConfiguredMaxRoundtripCount = [int](Get-ConfigValue -Object $targetPairStateRow -Name 'ConfiguredMaxRoundtripCount' -DefaultValue $targetConfiguredMaxRoundtripCount)
+        $targetPairRoundtripCount = [int](Get-ConfigValue -Object $targetPairStateRow -Name 'RoundtripCount' -DefaultValue $targetPairRoundtripCount)
+        $targetPairForwardedStateCount = [int](Get-ConfigValue -Object $targetPairStateRow -Name 'ForwardCount' -DefaultValue $targetPairForwardedStateCount)
+    }
     $readinessStatus = $null
     if ($null -ne $doneInfo) {
         $readinessStatus = Test-DoneMarkerReadyForZip -DonePath $donePath -ZipFile $latestZip -MaxSkewSeconds ([double]$pairTest.SummaryZipMaxSkewSeconds)
@@ -843,6 +881,9 @@ foreach ($item in $targetItems | Sort-Object TargetId) {
     elseif (Test-NonEmptyString $latestForwardedAt) {
         'forwarded'
     }
+    elseif ($targetPairLimitReached) {
+        'limit-reached'
+    }
     else {
         'ready-to-forward'
     }
@@ -859,6 +900,13 @@ foreach ($item in $targetItems | Sort-Object TargetId) {
     $sourceOutboxNextAction = [string](Get-ConfigValue -Object $sourceOutboxRow -Name 'NextAction' -DefaultValue '')
     if (-not (Test-NonEmptyString $sourceOutboxNextAction)) {
         $sourceOutboxNextAction = Get-ContractNextActionDisplay -LatestState $sourceOutboxContractLatestState
+    }
+    elseif ($targetPairLimitReached -and $sourceOutboxNextAction -eq 'handoff-ready') {
+        $sourceOutboxNextAction = 'limit-reached'
+    }
+    if ($targetPairLimitReached -and $sourceOutboxContractLatestState -eq 'ready-to-forward') {
+        $sourceOutboxContractLatestState = 'limit-reached'
+        $sourceOutboxNextAction = 'limit-reached'
     }
     $sourceOutboxState = [string](Get-ConfigValue -Object $sourceOutboxRow -Name 'State' -DefaultValue '')
     $sourceOutboxReason = [string](Get-ConfigValue -Object $sourceOutboxRow -Name 'Reason' -DefaultValue '')
@@ -931,6 +979,9 @@ foreach ($item in $targetItems | Sort-Object TargetId) {
         SourceSummaryPath = $sourceSummaryPath
         SourceReviewZipPath = $sourceReviewZipPath
         PublishReadyPath  = $publishReadyPath
+        PublishReadyPresent = [bool]($null -ne $publishReadyInfo)
+        PublishReadyModifiedAt = if ($null -ne $publishReadyInfo) { [string]$publishReadyInfo.ModifiedAt } else { '' }
+        PublishedArchiveReadyCount = [int]$publishedArchiveReadyCount
         PublishedArchivePath = $publishedArchivePath
         SummaryPath       = $summaryPath
         ReviewFolderPath  = $reviewRoot
@@ -951,6 +1002,11 @@ foreach ($item in $targetItems | Sort-Object TargetId) {
         LatestZipName     = if ($null -ne $latestZip) { [string]$latestZip.Name } else { '' }
         LatestZipModifiedAt = if ($null -ne $latestZip) { $latestZip.LastWriteTime.ToString('o') } else { '' }
         LatestState       = $latestState
+        HandoffBlockedByRoundtripLimit = [bool]($targetPairLimitReached -and $latestState -eq 'limit-reached')
+        PairRoundtripCount = [int]$targetPairRoundtripCount
+        PairForwardedStateCount = [int]$targetPairForwardedStateCount
+        PairConfiguredMaxRoundtripCount = [int]$targetConfiguredMaxRoundtripCount
+        PairRoundtripLimitReached = [bool]$targetPairLimitReached
         SourceOutboxState = $sourceOutboxState
         SourceOutboxReason = $sourceOutboxReason
         SourceOutboxContractLatestState = $sourceOutboxContractLatestState
@@ -1116,6 +1172,11 @@ foreach ($pair in $pairDefinitions | Sort-Object PairId) {
         $reachedRoundtripLimit = [bool](Get-ConfigValue -Object $pairStateRow -Name 'LimitReached' -DefaultValue $reachedRoundtripLimit)
     }
     $currentPhase = Normalize-PairPhase -Phase $currentPhase -WatcherStatus $watcherEffectiveStatus -NextAction $nextAction -LimitReached:$reachedRoundtripLimit
+    if ($reachedRoundtripLimit) {
+        $handoffReadyCount = 0
+        $nextAction = 'limit-reached'
+        $currentPhase = 'limit-reached'
+    }
     $policySummary = Get-PairPolicySummary -Policy $pairPolicy
     $progressParts = @(
         ('왕복={0}' -f $pairRoundtripCount),
@@ -1271,6 +1332,7 @@ $status = [pscustomobject]@{
         TargetUnresponsiveCount = (@($targetRows | Where-Object { $_.SourceOutboxState -eq 'target-unresponsive-after-send' })).Count
         ManualAttentionCount = (@($targetRows | Where-Object { $_.SourceOutboxState -eq 'manual-attention-required' })).Count
         SourceOutboxImportedCount = (@($targetRows | Where-Object { $_.SourceOutboxState -in @('imported', 'imported-archive-pending') })).Count
+        SourceOutboxPendingReadyCount = (@($targetRows | Where-Object { $_.PublishReadyPresent })).Count
         HandoffReadyCount  = (@($targetRows | Where-Object { $_.SourceOutboxNextAction -eq 'handoff-ready' })).Count
         DispatchRunningCount = (@($targetRows | Where-Object { $_.DispatchState -eq 'running' })).Count
         DispatchFailedCount  = (@($targetRows | Where-Object { $_.DispatchState -eq 'failed' })).Count
@@ -1278,6 +1340,7 @@ $status = [pscustomobject]@{
         RelayFolderMissingCount = (@($targetRows | Where-Object { $_.RelayTargetFolderState -eq 'relay-folder-missing' })).Count
         RelayFolderConfigMissingCount = (@($targetRows | Where-Object { $_.RelayTargetFolderState -eq 'relay-folder-config-missing' })).Count
         ReadyToForwardCount = (@($targetRows | Where-Object { $_.LatestState -eq 'ready-to-forward' })).Count
+        LimitReachedReadyCount = (@($targetRows | Where-Object { $_.LatestState -eq 'limit-reached' })).Count
         ForwardedCount      = (@($targetRows | Where-Object { $_.LatestState -eq 'forwarded' })).Count
         SummaryMissingCount = (@($targetRows | Where-Object { $_.LatestState -eq 'summary-missing' })).Count
         SummaryStaleCount   = (@($targetRows | Where-Object { $_.LatestState -eq 'summary-stale' })).Count
@@ -1379,7 +1442,7 @@ $lines.Add(('AcceptanceReceipt: exists={0} state={1} reason={2} updatedAt={3} re
     $status.AcceptanceReceipt.RelayFolderMissingCount,
     $status.AcceptanceReceipt.RelayFolderConfigMissingCount,
     $status.AcceptanceReceipt.RelayIssuesSource))
-$lines.Add(('Counts: messages={0} summaries={1} done={2} errors={3} supersededErrors={4} zipTargets={5} outboxWaiting={6} seedProcessed={7} seedRetryPending={8} submitUnconfirmed={9} typedWindowRetry={10} typedWindowStalled={11} publishStarted={12} unresponsive={13} manualAttention={14} imported={15} handoffReady={16} dispatchRunning={17} dispatchFailed={18} relayMismatch={19} relayMissing={20} relayConfigMissing={21} ready={22} forwarded={23} missingSummary={24} staleSummary={25} doneStale={26} noZip={27} failures={28}' -f `
+$lines.Add(('Counts: messages={0} summaries={1} done={2} errors={3} supersededErrors={4} zipTargets={5} outboxWaiting={6} seedProcessed={7} seedRetryPending={8} submitUnconfirmed={9} typedWindowRetry={10} typedWindowStalled={11} publishStarted={12} unresponsive={13} manualAttention={14} imported={15} pendingReady={16} handoffReady={17} dispatchRunning={18} dispatchFailed={19} relayMismatch={20} relayMissing={21} relayConfigMissing={22} ready={23} limitReady={24} forwarded={25} missingSummary={26} staleSummary={27} doneStale={28} noZip={29} failures={30}' -f `
     $status.Counts.MessageFiles,
     $status.Counts.SummaryPresentCount,
     $status.Counts.DonePresentCount,
@@ -1396,6 +1459,7 @@ $lines.Add(('Counts: messages={0} summaries={1} done={2} errors={3} supersededEr
     $status.Counts.TargetUnresponsiveCount,
     $status.Counts.ManualAttentionCount,
     $status.Counts.SourceOutboxImportedCount,
+    $status.Counts.SourceOutboxPendingReadyCount,
     $status.Counts.HandoffReadyCount,
     $status.Counts.DispatchRunningCount,
     $status.Counts.DispatchFailedCount,
@@ -1403,6 +1467,7 @@ $lines.Add(('Counts: messages={0} summaries={1} done={2} errors={3} supersededEr
     $status.Counts.RelayFolderMissingCount,
     $status.Counts.RelayFolderConfigMissingCount,
     $status.Counts.ReadyToForwardCount,
+    $status.Counts.LimitReachedReadyCount,
     $status.Counts.ForwardedCount,
     $status.Counts.SummaryMissingCount,
     $status.Counts.SummaryStaleCount,
@@ -1453,6 +1518,7 @@ $lines.Add('')
 $lines.Add('Targets')
 $targetTable = ($status.Targets |
     Select-Object PairId, TargetId, RoleName, PartnerTargetId, ZipCount, LatestState,
+        @{ Name = 'PendingReady'; Expression = { $_.PublishReadyPresent } },
         @{ Name = 'OutboxState'; Expression = { $_.SourceOutboxState } },
         @{ Name = 'NextAction'; Expression = { $_.SourceOutboxNextAction } },
         @{ Name = 'Dispatch'; Expression = { $_.DispatchState } },

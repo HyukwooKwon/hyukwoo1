@@ -60,7 +60,8 @@ $null = Assert-RelayTargetFolderReady `
     -InboxRoot ([string](Get-ConfigValue -Object $config -Name 'InboxRoot' -DefaultValue '')) `
     -TargetKey $TargetId
 
-$queuePaths = Get-TargetAutoloopQueuePaths -RunRoot $resolvedRunRoot -TargetId $TargetId -Target $targetConfig[0] -Config $config
+$queuePaths = Get-TargetAutoloopQueuePaths -RunRoot $resolvedRunRoot -TargetId $TargetId -Target $targetRow[0] -Config $config
+$queuePaths = Use-TargetAutoloopManifestQueuePaths -Paths $queuePaths -ManifestTarget $targetRow[0]
 foreach ($queuePath in @($queuePaths.QueuedRoot, $queuePaths.ProcessingRoot, $queuePaths.CompletedRoot, $queuePaths.FailedRoot, $queuePaths.PayloadRoot)) {
     Ensure-Directory -Path $queuePath
 }

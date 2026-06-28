@@ -31,7 +31,7 @@ if (-not $ConfigPath) {
 
 $resolvedConfigPath = (Resolve-Path -LiteralPath $ConfigPath).Path
 $plannedRunRoot = Join-Path $root ('_tmp\four-pair-soak-plan_' + (Get-Date -Format 'yyyyMMdd_HHmmss_fff'))
-$powershellPath = (Get-Command -Name 'powershell.exe' -ErrorAction Stop | Select-Object -First 1).Source
+$powershellPath = (Get-Command -Name 'pwsh.exe' -ErrorAction Stop | Select-Object -First 1).Source
 $arguments = @(
     '-NoProfile',
     '-ExecutionPolicy', 'Bypass',
@@ -78,6 +78,12 @@ Assert-True ('watcher-restart' -in $stepIds) 'Expected restart step in default s
 Assert-True ('snapshot-final' -in $stepIds) 'Expected final status snapshot step.'
 Assert-True ('stop-watcher' -in $stepIds) 'Expected final watcher stop step.'
 Assert-True ('post-cleanup-visible-queue' -in $stepIds) 'Expected post-cleanup step.'
+$cleanupStep = @($plan.PlanSteps | Where-Object { [string]$_.Id -eq 'cleanup-visible-queue' } | Select-Object -First 1)
+$cleanupArgs = @($cleanupStep[0].ArgumentList | ForEach-Object { [string]$_ })
+$cleanupTargetArgIndex = [array]::IndexOf($cleanupArgs, '-TargetId')
+Assert-True ($cleanupTargetArgIndex -ge 0) 'Cleanup step should pass TargetId.'
+Assert-True ($cleanupArgs[$cleanupTargetArgIndex + 1] -match ',') 'Cleanup step should pass selected targets as one comma-separated argument.'
+Assert-True ($cleanupArgs[$cleanupTargetArgIndex + 2] -eq '-KeepRunRoot') 'Cleanup step should not pass target ids as extra positional arguments.'
 Assert-True ([string]$plan.SoakProfile.PauseAfterMinutes -eq '15') 'Expected default pause timing.'
 Assert-True ([string]$plan.SoakProfile.ResumeAfterMinutes -eq '18') 'Expected default resume timing.'
 Assert-True ([string]$plan.SoakProfile.RestartAfterMinutes -eq '30') 'Expected default restart timing.'

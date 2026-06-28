@@ -34,7 +34,7 @@ New-Item -ItemType Directory -Path $routerInboxRoot -Force | Out-Null
     LaneName = 'bottest-live-visible'
     AhkExePath = 'C:\Program Files\AutoHotkey\v2\AutoHotkey64.exe'
     AhkScriptPath = 'C:\dev\python\hyukwoo\hyukwoo1\sender\SendToWindow.ahk'
-    ResolverShellPath = 'powershell.exe'
+    ResolverShellPath = 'pwsh.exe'
     RuntimeMapPath = 'C:\dev\python\hyukwoo\hyukwoo1\runtime\bottest-live-visible\target-runtime.json'
     Targets = @(
         @{ Id = 'target01'; Folder = '$($routerInboxRoot.Replace("'", "''"))'; WindowTitle = 'Target01'; FixedSuffix = 'suffix-bridge' }
@@ -51,7 +51,7 @@ New-Item -ItemType Directory -Path $routerInboxRoot -Force | Out-Null
 }
 "@, (New-Utf8NoBomEncoding))
 
-$startJson = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Start-TargetAutoloopRun.ps1') `
+$startJson = & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Start-TargetAutoloopRun.ps1') `
     -ConfigPath $configPath `
     -RunRoot $runRoot `
     -Targets target01 `
@@ -63,7 +63,7 @@ $target01 = @($manifest.Targets | Where-Object { [string]$_.TargetId -eq 'target
 $inputPath = Join-Path $target01.InboxPendingRoot 'bridge_001.txt'
 Set-Content -LiteralPath $inputPath -Encoding UTF8 -Value 'bridge body for router'
 
-$watchJson = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Watch-TargetAutoloop.ps1') `
+$watchJson = & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Watch-TargetAutoloop.ps1') `
     -ConfigPath $configPath `
     -RunRoot $runRoot `
     -DispatchQueuedCommandsInline `
@@ -108,14 +108,14 @@ New-Item -ItemType Directory -Path $mismatchRouterInboxRoot -Force | Out-Null
 [ordered]@{
     Status = 'running'
     LauncherSessionId = 'router-session-old'
-    RouterPid = 5678
+    RouterPid = $PID
 } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $mismatchRouterStatePath -Encoding UTF8
 [System.IO.File]::WriteAllText($mismatchConfigPath, @"
 @{
     LaneName = 'bottest-live-visible'
     AhkExePath = 'C:\Program Files\AutoHotkey\v2\AutoHotkey64.exe'
     AhkScriptPath = 'C:\dev\python\hyukwoo\hyukwoo1\sender\SendToWindow.ahk'
-    ResolverShellPath = 'powershell.exe'
+    ResolverShellPath = 'pwsh.exe'
     RuntimeMapPath = '$($mismatchRuntimeMapPath.Replace("'", "''"))'
     RouterStatePath = '$($mismatchRouterStatePath.Replace("'", "''"))'
     Targets = @(
@@ -133,7 +133,7 @@ New-Item -ItemType Directory -Path $mismatchRouterInboxRoot -Force | Out-Null
 }
 "@, (New-Utf8NoBomEncoding))
 
-$mismatchStartJson = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Start-TargetAutoloopRun.ps1') `
+$mismatchStartJson = & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Start-TargetAutoloopRun.ps1') `
     -ConfigPath $mismatchConfigPath `
     -RunRoot $mismatchRunRoot `
     -Targets target01 `
@@ -145,7 +145,7 @@ $mismatchTarget01 = @($mismatchManifest.Targets | Where-Object { [string]$_.Targ
 $mismatchInputPath = Join-Path $mismatchTarget01.InboxPendingRoot 'bridge_session_mismatch_001.txt'
 Set-Content -LiteralPath $mismatchInputPath -Encoding UTF8 -Value 'bridge body blocked by router session mismatch'
 
-$mismatchWatchJson = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Watch-TargetAutoloop.ps1') `
+$mismatchWatchJson = & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Watch-TargetAutoloop.ps1') `
     -ConfigPath $mismatchConfigPath `
     -RunRoot $mismatchRunRoot `
     -DispatchQueuedCommandsInline `
@@ -166,5 +166,81 @@ $mismatchTargetState = $mismatchState.Targets.target01
 Assert-True ([string]$mismatchTargetState.Phase -eq 'queued') 'session mismatch target should remain queued.'
 Assert-True ([string]$mismatchTargetState.LastDispatchState -eq 'router-session-mismatch') 'session mismatch should be recorded in target state.'
 Assert-True ([string]$mismatchTargetState.LastFailureReason -like '*LauncherSessionId*') 'session mismatch should explain the LauncherSessionId problem.'
+
+$deadPidRoot = Join-Path $tmpRoot 'router-dead-pid'
+$deadPidRouterInboxRoot = Join-Path $deadPidRoot 'router-inbox\target01'
+$deadPidConfigPath = Join-Path $deadPidRoot 'settings.target-router-dead-pid.psd1'
+$deadPidRunRoot = Join-Path $deadPidRoot 'run_target_router_dead_pid'
+$deadPidRuntimeMapPath = Join-Path $deadPidRoot 'runtime-map.json'
+$deadPidRouterStatePath = Join-Path $deadPidRoot 'router-state.json'
+New-Item -ItemType Directory -Path $deadPidRouterInboxRoot -Force | Out-Null
+@(
+    [ordered]@{
+        TargetId = 'target01'
+        LauncherSessionId = 'runtime-session-current'
+    }
+) | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $deadPidRuntimeMapPath -Encoding UTF8
+[ordered]@{
+    Status = 'running'
+    LauncherSessionId = 'runtime-session-current'
+    RouterPid = 2147483647
+} | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $deadPidRouterStatePath -Encoding UTF8
+[System.IO.File]::WriteAllText($deadPidConfigPath, @"
+@{
+    LaneName = 'bottest-live-visible'
+    AhkExePath = 'C:\Program Files\AutoHotkey\v2\AutoHotkey64.exe'
+    AhkScriptPath = 'C:\dev\python\hyukwoo\hyukwoo1\sender\SendToWindow.ahk'
+    ResolverShellPath = 'pwsh.exe'
+    RuntimeMapPath = '$($deadPidRuntimeMapPath.Replace("'", "''"))'
+    RouterStatePath = '$($deadPidRouterStatePath.Replace("'", "''"))'
+    Targets = @(
+        @{ Id = 'target01'; Folder = '$($deadPidRouterInboxRoot.Replace("'", "''"))'; WindowTitle = 'Target01'; FixedSuffix = 'suffix-bridge' }
+    )
+    TargetAutoloop = @{
+        Enabled = `$true
+        RunMode = 'target-autoloop'
+        DispatchQueuedCommandsInline = `$true
+        RunRootBase = '$($deadPidRoot.Replace("'", "''"))'
+        Targets = @(
+            @{ TargetId = 'target01'; Enabled = `$true; TriggerKinds = @('input-file', 'publish-ready') }
+        )
+    }
+}
+"@, (New-Utf8NoBomEncoding))
+
+$deadPidStartJson = & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Start-TargetAutoloopRun.ps1') `
+    -ConfigPath $deadPidConfigPath `
+    -RunRoot $deadPidRunRoot `
+    -Targets target01 `
+    -RunMode target-autoloop `
+    -AsJson
+$deadPidStart = $deadPidStartJson | ConvertFrom-Json
+$deadPidManifest = Get-Content -LiteralPath $deadPidStart.ManifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
+$deadPidTarget01 = @($deadPidManifest.Targets | Where-Object { [string]$_.TargetId -eq 'target01' } | Select-Object -First 1)[0]
+
+$deadPidInputPath = Join-Path $deadPidTarget01.InboxPendingRoot 'bridge_dead_pid_001.txt'
+Set-Content -LiteralPath $deadPidInputPath -Encoding UTF8 -Value 'bridge body blocked by stale router pid'
+
+$deadPidWatchJson = & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Watch-TargetAutoloop.ps1') `
+    -ConfigPath $deadPidConfigPath `
+    -RunRoot $deadPidRunRoot `
+    -DispatchQueuedCommandsInline `
+    -ProcessOnce `
+    -AsJson
+$deadPidWatch = $deadPidWatchJson | ConvertFrom-Json
+Assert-True ([int]$deadPidWatch.QueuedCount -eq 1) 'dead pid flow should still queue one command.'
+Assert-True ([int]$deadPidWatch.DispatchedCount -eq 0) 'dead router pid flow must not create a router ready file.'
+Assert-True (@(Get-ChildItem -LiteralPath $deadPidRouterInboxRoot -File -Filter '*.ready.txt' -ErrorAction SilentlyContinue).Count -eq 0) 'router inbox should remain empty when router pid is stale.'
+
+$deadPidQueuedFiles = @(Get-ChildItem -LiteralPath $deadPidTarget01.QueueQueuedRoot -File -Filter '*.json' -ErrorAction SilentlyContinue)
+$deadPidCompletedFiles = @(Get-ChildItem -LiteralPath $deadPidTarget01.QueueCompletedRoot -File -Filter '*.json' -ErrorAction SilentlyContinue)
+Assert-True (@($deadPidQueuedFiles).Count -eq 1) 'dead pid should leave the queued command retryable.'
+Assert-True (@($deadPidCompletedFiles).Count -eq 0) 'dead pid must not archive the command as completed.'
+
+$deadPidState = Get-Content -LiteralPath $deadPidStart.StatePath -Raw -Encoding UTF8 | ConvertFrom-Json
+$deadPidTargetState = $deadPidState.Targets.target01
+Assert-True ([string]$deadPidTargetState.Phase -eq 'queued') 'dead pid target should remain queued.'
+Assert-True ([string]$deadPidTargetState.LastDispatchState -eq 'router-session-not-ready') 'dead pid should be recorded as router-session-not-ready.'
+Assert-True ([string]$deadPidTargetState.LastFailureReason -like '*router-pid-not-running*') 'dead pid should explain the stale router pid problem.'
 
 Write-Host 'target autoloop router bridge ok'

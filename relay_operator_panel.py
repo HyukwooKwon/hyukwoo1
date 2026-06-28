@@ -9,6 +9,8 @@ import tempfile
 import threading
 import time
 import uuid
+from collections.abc import Iterator
+from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
 import tkinter as tk
@@ -82,7 +84,11 @@ from relay_panel_policy_ui_specs import (
     target_autoloop_danger_action_specs,
     target_autoloop_selection_snapshot_action_specs,
 )
-from relay_panel_refresh_controller import PanelRefreshController
+import relay_panel_target_autoloop_commands as target_autoloop_commands
+import relay_panel_target_autoloop_outputs as target_autoloop_outputs
+import relay_panel_target_autoloop_presenter as target_autoloop_presenter
+import relay_panel_target_autoloop_runtime as target_autoloop_runtime
+from relay_panel_refresh_controller import PairedRefreshResult, PanelRefreshController
 from relay_panel_target_autoloop_selection import (
     TARGET_AUTOLOOP_POLICY_SELECTION_SCHEMA_VERSION,
     build_target_autoloop_policy_selection_payload,
@@ -137,6 +143,9 @@ from relay_panel_watchers import (
 
 SNAPSHOT_LIST_LIMIT = 20
 ARTIFACT_SOURCE_MEMORY_SCHEMA_VERSION = 1
+TARGET_AUTOLOOP_EXTEND_PREFERENCES_SCHEMA_VERSION = 1
+TARGET_AUTOLOOP_CARD_VIEW_PREFERENCES_SCHEMA_VERSION = 1
+DEFAULT_TARGET_AUTOLOOP_EXTEND_CYCLES = 3
 ARTIFACT_PATH_OPTIONS = [
     ("summary", "summary"),
     ("latest zip", "review_zip"),
@@ -180,7 +189,11 @@ MESSAGE_FILTER_RESET_POLICY = {
 }
 BOARD_TARGET_FALLBACK = [f"target{index:02d}" for index in range(1, 9)]
 PAIR_ID_OPTIONS = ["pair01", "pair02", "pair03", "pair04"]
+TARGET_AUTOLOOP_DIAGNOSTIC_TARGET_HINT = "진단/테스트는 작업 중인 target01 대신 target04 또는 target08에서 진행하세요."
 RUN_ROOT_CONTEXT_REFRESH_DEBOUNCE_MS = 250
+PANEL_SOURCE_STALE_CHECK_MS = 15000
+TARGET_AUTOLOOP_RUNTIME_SNAPSHOT_CACHE_TTL_SECONDS = 0.75
+ARTIFACT_VIEW_STATE_CACHE_TTL_SECONDS = 0.75
 WINDOW_ACTION_STARTUP_GUARD_SEC = 20.0
 WINDOW_ACTION_RECENT_INPUT_SEC = 2.5
 WINDOW_GUARD_SMOKE_HISTORY_SCHEMA_VERSION = 1
@@ -189,6 +202,7 @@ PANEL_WINDOW_LAUNCH_GUARD_SCHEMA_VERSION = 1
 PANEL_WINDOW_LAUNCH_ALLOW_SEC = 30.0
 PANEL_WINDOW_LAUNCH_ARM_ENV = "BOTTEST_PANEL_LAUNCH_ARM_TOKEN"
 PANEL_WINDOW_LAUNCH_GUARD_PATH_ENV = "BOTTEST_PANEL_LAUNCH_GUARD_PATH"
+PANEL_WINDOW_BINDINGS_OUTPUT_ENV = "BOTTEST_BINDINGS_OUTPUT_PATH"
 READ_ONLY_DASHBOARD_ACTION_KEYS = {
     "copy_command",
     "refresh_quick",
@@ -215,14 +229,14 @@ STICKY_ACTION_BUTTON_LABELS = {
     "visible_clean_preflight": "clean preflight 재점검",
     "visible_confirm": "shared confirm",
     "visible_receipt_confirm": "receipt 확인",
-    "watcher_recommended_action": "watch 권장 조치",
+    "watcher_recommended_action": "Pair watcher 권장 조치",
 }
 READ_ONLY_OPS_BUTTON_LABELS = {
     "창 audit 로그",
     "창 guard smoke",
     "watch 진단",
     "watch audit 로그",
-    "watch status 파일",
+    "Pair watcher status 파일",
     "watch control 파일",
     "릴레이 상태",
     "페어 상태",
@@ -293,7 +307,18 @@ MESSAGE_EDITOR_TAB_METADATA = {
 class RelayOperatorPanel(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
-        self.title("릴레이 운영 패널")
+        self.panel_process_id = os.getpid()
+        self.panel_source_path = str(Path(__file__).resolve())
+        self.panel_source_mtime = 0.0
+        try:
+            self.panel_source_mtime = float(Path(__file__).stat().st_mtime)
+            self.panel_source_modified_at = datetime.fromtimestamp(self.panel_source_mtime).strftime("%Y-%m-%d %H:%M:%S")
+        except OSError:
+            self.panel_source_modified_at = "unknown"
+        self.panel_source_stale_detected = False
+        self.title(
+            f"릴레이 운영 패널 | PID {self.panel_process_id} | source {self.panel_source_modified_at}"
+        )
         self.geometry("1500x920")
         self.minsize(1240, 760)
         self.notebook: ttk.Notebook | None = None
@@ -342,6 +367,7 @@ class RelayOperatorPanel(tk.Tk):
         self.operator_hint_var = tk.StringVar(value="설정을 고른 뒤 미리보기를 불러오고, Pair와 RunRoot를 확인한 다음 현재 lane에 맞는 Visible Acceptance 또는 진단 절차를 선택하세요.")
         self.last_result_var = tk.StringVar(value="마지막 결과: (없음)")
         self.last_query_result_var = tk.StringVar(value="마지막 조회: (없음)")
+        self.task_timing_var = tk.StringVar(value="최근 작업 시간: (없음)")
         self.query_history_var = tk.StringVar(value="최근 조회: (없음)")
         self.mode_banner_var = tk.StringVar(value="MODE: Home")
         self.mode_banner_detail_var = tk.StringVar(value="lane과 runroot를 먼저 확인한 뒤 visible acceptance 또는 진단 절차를 선택합니다.")
@@ -361,7 +387,7 @@ class RelayOperatorPanel(tk.Tk):
         self.home_overall_var = tk.StringVar(value="상태: -")
         self.home_overall_detail_var = tk.StringVar(value="안내: 상태를 불러오면 준비 단계와 다음 조치를 여기서 보여줍니다.")
         self.home_execution_badge_var = tk.StringVar(value="문맥 확인")
-        self.home_watcher_badge_var = tk.StringVar(value="watcher 준비")
+        self.home_watcher_badge_var = tk.StringVar(value="Pair watcher 준비")
         self.home_execution_summary_var = tk.StringVar(value="실행 Pair / Target / RunRoot를 여기서 고정 확인합니다.")
         self.home_execution_detail_var = tk.StringVar(value="보고 문맥과 실행 문맥이 다르면 먼저 반영한 뒤 실행하세요.")
         self.home_execution_warning_var = tk.StringVar(value="")
@@ -381,8 +407,8 @@ class RelayOperatorPanel(tk.Tk):
         self.sticky_action_context_var = tk.StringVar(value="pair01/(target 없음) [상단 실행 선택]")
         self.sticky_inspection_context_var = tk.StringVar(value="(없음)")
         self.sticky_run_root_context_var = tk.StringVar(value="RunRoot: (없음)")
-        self.sticky_runtime_context_var = tk.StringVar(value="대기 중 / watcher=미확인")
-        self.sticky_watcher_badge_var = tk.StringVar(value="watcher 준비")
+        self.sticky_runtime_context_var = tk.StringVar(value="대기 중 / Pair watcher=미확인")
+        self.sticky_watcher_badge_var = tk.StringVar(value="Pair watcher 준비")
         self.sticky_next_step_var = tk.StringVar(value="-")
         self.sticky_next_action_button_var = tk.StringVar(value="다음 단계 실행")
         self.sticky_artifact_browse_var = tk.StringVar(value="")
@@ -400,9 +426,9 @@ class RelayOperatorPanel(tk.Tk):
         self.visible_focus_guard_popup_dismissed_key = ""
         self.visible_start_context_var = tk.StringVar(value="시작 문맥: 현재 Run 시작 / 새 Run 시작 차이를 여기서 함께 확인합니다.")
         self.visible_watcher_badge_var = tk.StringVar(value="상태 배지: 준비")
-        self.visible_watcher_stage_var = tk.StringVar(value="제어 흐름: 아직 watcher 제어 결과가 없습니다.")
-        self.visible_watcher_step_var = tk.StringVar(value="단계 요약: 준비 (현재=watcher 제어 전)")
-        self.visible_watcher_meta_var = tk.StringVar(value="최근 제어 카드: 아직 watcher 제어 결과가 없습니다.")
+        self.visible_watcher_stage_var = tk.StringVar(value="제어 흐름: 아직 Pair watcher 제어 결과가 없습니다.")
+        self.visible_watcher_step_var = tk.StringVar(value="단계 요약: 준비 (현재=Pair watcher 제어 전)")
+        self.visible_watcher_meta_var = tk.StringVar(value="최근 제어 카드: 아직 Pair watcher 제어 결과가 없습니다.")
         self.visible_current_start_preview_var = tk.StringVar(value="현재 Run 시작 preview를 여기서 확인합니다.")
         self.visible_new_start_preview_var = tk.StringVar(value="새 Run 시작 preview를 여기서 확인합니다.")
         self.wrapper_audit_summary_var = tk.StringVar(value="창 audit: wrapper audit 로그를 아직 읽지 않았습니다.")
@@ -423,9 +449,10 @@ class RelayOperatorPanel(tk.Tk):
         self.message_preview_status_var = tk.StringVar(value="저장 전 편집본 preview는 '미리보기 갱신'으로 다시 계산합니다.")
         self.target_autoloop_guide_var = tk.StringVar(
             value=(
-                "기본 순서: 1. 공식 8창 재사용 확인 -> 2. 실행할 target 선택 -> "
-                "3. Enabled + publish-ready 켜기 -> 4. 선택 target RunRoot 준비 -> "
-                "5. 독립셀 감지 시작 -> 6. 시작문 복사 후 해당 셀창에 submit"
+                "기본 순서: 1. 이 탭의 [8창 재사용+router 동기화] -> 2. 실행할 target 선택 -> "
+                "3. [선택 target 실행 준비] -> 4. target 설정 저장 + 새로고침 -> "
+                "5. 선택 target RunRoot 준비 -> 6. 독립셀 감지 시작 -> 7. 시작문 복사 후 해당 셀창에 submit. "
+                "Home의 공식 8창 재사용은 공용/PAIR 후속 흐름과 이어질 수 있으니 독립셀 실행 전에는 이 탭의 전용 동기화 버튼을 우선 사용하세요."
             )
         )
         self.target_autoloop_detector_badge_var = tk.StringVar(
@@ -434,7 +461,17 @@ class RelayOperatorPanel(tk.Tk):
         self.target_autoloop_status_var = tk.StringVar(value="8 Cell Autoloop 상태/제어는 현재 RunRoot의 .state\\target-autoloop-status.json / target-autoloop-control.json 기준으로 표시됩니다.")
         self.target_autoloop_summary_var = tk.StringVar(value="controller/controlAction/delay/cycle 요약이 여기 표시됩니다.")
         self.target_autoloop_guidance_var = tk.StringVar(value="독립셀 감지기 health와 다음 권장 조치를 여기 표시합니다.")
+        self.target_autoloop_runroot_attention_var = tk.StringVar(value="RunRoot 상태: 현재 RunRoot와 target-autoloop manifest를 아직 확인하지 않았습니다.")
+        self.target_autoloop_selected_progress_badge_var = tk.StringVar(value="선택 target 진행: -")
+        self.target_autoloop_selected_progress_var = tk.StringVar(value="선택 target 진행: target 선택 또는 RunRoot 준비 후 표시됩니다.")
+        self.target_autoloop_selected_artifact_var = tk.StringVar(value="선택 target 산출물: source-outbox / summary.txt / review.zip 경로를 아직 확인하지 않았습니다.")
+        self.target_autoloop_start_precheck_badge_var = tk.StringVar(value="시작 전 체크: 미확인")
         self.target_autoloop_start_reason_var = tk.StringVar(value="독립셀 감지 시작: RunRoot 준비 전입니다.")
+        self.target_autoloop_prepare_reason_var = tk.StringVar(value="RunRoot 준비 차단 사유: 선택 target을 고르면 여기 표시됩니다.")
+        self.target_autoloop_process_once_reason_var = tk.StringVar(value="publish-ready 재검사 차단 사유: RunRoot 준비 전입니다.")
+        self.target_autoloop_extend_cycles_var = tk.StringVar(value=str(DEFAULT_TARGET_AUTOLOOP_EXTEND_CYCLES))
+        self.target_autoloop_extend_reason_var = tk.StringVar(value="추가 진행 차단 사유: limit-reached target 확인 전입니다.")
+        self.target_autoloop_control_reason_var = tk.StringVar(value="pause/resume/stop 차단 사유: 독립셀 감지기 상태 확인 전입니다.")
         self.target_autoloop_recommendation_var = tk.StringVar(value="권장 조치 없음")
         self.target_autoloop_retry_reason_var = tk.StringVar(value="재시도 사유: (없음)")
         self.target_autoloop_history_var = tk.StringVar(value="권장 이력: (없음)")
@@ -449,11 +486,15 @@ class RelayOperatorPanel(tk.Tk):
         self.target_autoloop_policy_filter_var = tk.StringVar(value="all")
         self.target_autoloop_policy_filter_status_var = tk.StringVar(value="filter=all / visible=8 / hidden=0 / selected=0 / dirty=0 / attention=0")
         self.target_autoloop_policy_selection_warning_var = tk.StringVar(value="")
+        self.target_autoloop_policy_card_detail_visible_var = tk.BooleanVar(value=False)
+        self.target_autoloop_policy_card_detail_toggle_var = tk.StringVar(value="카드 상세 펼치기")
         self.target_autoloop_seed_status_var = tk.StringVar(value="8 Cell Autoloop seed composer는 target별 summary/review/publish 경로를 자동 주입합니다.")
         self.target_autoloop_seed_target_var = tk.StringVar(value=BOARD_TARGET_FALLBACK[0])
         self.target_autoloop_seed_input_var = tk.StringVar(value="")
         self.target_autoloop_seed_banner_var = tk.StringVar(value="붙여넣기 대상: 8 Cell Autoloop / (target 미확인)")
         self.target_autoloop_seed_readiness_var = tk.StringVar(value="ConfigPath / RunRoot를 확인한 뒤 '미리보기'로 시작문을 계산하세요.")
+        self.target_autoloop_seed_copy_reason_var = tk.StringVar(value="시작문 복사 차단 사유: target과 RunRoot를 확인하세요.")
+        self.target_autoloop_seed_path_proof_var = tk.StringVar(value="경로 증명: 미리보기 전입니다.")
         self.target_autoloop_seed_runtime_var = tk.StringVar(value="runtime: 미리보기 또는 초기 입력 큐잉 후 현재 pending/queued/processing 상태를 여기 표시합니다.")
         self.target_autoloop_seed_guidance_var = tk.StringVar(value="권장 조치: 추가 입력 파일이 필요하면 외부 repo 경로의 파일을 선택하세요.")
         self.target_autoloop_seed_action_button_var = tk.StringVar(value="입력 파일 선택")
@@ -527,9 +568,9 @@ class RelayOperatorPanel(tk.Tk):
         self.watcher_start_note_var = tk.StringVar(value="")
         self.watcher_issue_status_var = tk.StringVar(value="시작 이슈: 현재 Run 시작 / 새 Run 시작 차이를 여기서 계속 확인합니다.")
         self.watcher_issue_badge_var = tk.StringVar(value="상태 배지: 준비")
-        self.watcher_issue_stage_var = tk.StringVar(value="제어 흐름: 아직 watcher 제어 결과가 없습니다.")
-        self.watcher_issue_step_var = tk.StringVar(value="단계 요약: 준비 (현재=watcher 제어 전)")
-        self.watcher_issue_meta_var = tk.StringVar(value="최근 제어 카드: 아직 watcher 제어 결과가 없습니다.")
+        self.watcher_issue_stage_var = tk.StringVar(value="제어 흐름: 아직 Pair watcher 제어 결과가 없습니다.")
+        self.watcher_issue_step_var = tk.StringVar(value="단계 요약: 준비 (현재=Pair watcher 제어 전)")
+        self.watcher_issue_meta_var = tk.StringVar(value="최근 제어 카드: 아직 Pair watcher 제어 결과가 없습니다.")
         self.watcher_issue_detail_var = tk.StringVar(value="현재/새 Run 시작 preview와 추천 실행을 여기서 함께 확인합니다.")
         self.watcher_issue_path_var = tk.StringVar(value="경로 힌트: RunRoot / ConfigPath / audit 로그 경로를 여기서 함께 확인합니다.")
         self.watcher_issue_action_var = tk.StringVar(value="권장 실행 없음")
@@ -546,6 +587,10 @@ class RelayOperatorPanel(tk.Tk):
         self.target_autoloop_recommendation_history_path = SNAPSHOT_DIR / "target-autoloop-recommendation-history.json"
         self.target_autoloop_policy_selection_path = SNAPSHOT_DIR / "target-autoloop-policy-selection.json"
         self.target_autoloop_recommendation_history_warning = ""
+        self.target_autoloop_extend_preferences_path = SNAPSHOT_DIR / "target-autoloop-extend-preferences.json"
+        self.target_autoloop_extend_preferences_warning = ""
+        self.target_autoloop_card_view_preferences_path = SNAPSHOT_DIR / "target-autoloop-card-view-preferences.json"
+        self.target_autoloop_card_view_preferences_warning = ""
         self.wrapper_audit_recent_var = tk.StringVar(value="최근 창 audit: wrapper audit 로그를 아직 읽지 않았습니다.")
         self.watcher_control_note_var = tk.StringVar(value=self.watcher_controller.control_semantics_guidance())
         self.artifact_source_memory_path = SNAPSHOT_DIR / "artifact-source-memory.json"
@@ -565,6 +610,7 @@ class RelayOperatorPanel(tk.Tk):
         self.artifact_last_sources_by_target: dict[str, dict[str, str]] = {}
         self.artifact_last_action_by_target: dict[str, dict[str, object]] = {}
         self.artifact_submit_active_targets: set[str] = set()
+        self._artifact_view_state_cache: dict[str, object] | None = None
         self.snapshot_paths: list[Path] = []
         self.snapshot_rows: list[dict] = []
         self.target_board_cells: dict[str, dict[str, object]] = {}
@@ -597,6 +643,7 @@ class RelayOperatorPanel(tk.Tk):
         self.message_backup_paths: list[Path] = []
         self.long_task_widgets: list[tk.Widget] = []
         self.read_only_widgets: set[tk.Widget] = set()
+        self._tooltip_windows_by_widget_id: dict[int, tk.Toplevel] = {}
         self.message_editor_tab_meta_by_widget: dict[str, dict[str, str]] = {}
         self.home_card_vars: dict[str, dict[str, tk.StringVar]] = {}
         self.home_stage_vars: dict[str, dict[str, tk.StringVar]] = {}
@@ -620,6 +667,12 @@ class RelayOperatorPanel(tk.Tk):
         self.target_autoloop_policy_card_trigger_publish_checkbuttons: dict[str, ttk.Checkbutton] = {}
         self.target_autoloop_policy_card_effective_preview_widgets: dict[str, tk.Text] = {}
         self.target_autoloop_policy_card_frames: dict[str, ttk.LabelFrame] = {}
+        self.target_autoloop_policy_card_seed_copy_buttons: dict[str, ttk.Button] = {}
+        self.target_autoloop_policy_card_extend_cycle_limit_buttons: dict[str, ttk.Button] = {}
+        self.target_autoloop_policy_card_extend_and_start_buttons: dict[str, ttk.Button] = {}
+        self.target_autoloop_policy_card_artifact_buttons: dict[str, dict[str, ttk.Button]] = {}
+        self.target_autoloop_policy_card_process_once_buttons: dict[str, ttk.Button] = {}
+        self.target_autoloop_policy_card_detail_widgets: dict[str, list[object]] = {}
         self.pair_policy_clone_source_combo: ttk.Combobox | None = None
         self.pair_policy_clone_target_combo: ttk.Combobox | None = None
         self.pair_policy_clone_button: ttk.Button | None = None
@@ -690,8 +743,15 @@ class RelayOperatorPanel(tk.Tk):
                 "policy_state_var": tk.StringVar(value="LOADED"),
                 "runtime_badge_var": tk.StringVar(value="IDLE"),
                 "runtime_summary_var": tk.StringVar(value="runtime=IDLE / phase=(미확인) / next=(미확인) / cycle=0/0"),
+                "compact_action_var": tk.StringVar(
+                    value="요약: 진행 대기 / 추가 대기 / 산출물 대기 / ready 재검사 대기"
+                ),
                 "route_state_var": tk.StringVar(value="route: (미확인)"),
                 "effective_preview_var": tk.StringVar(value="실효 경로 새로고침을 실행하면 target별 경로와 현재 phase를 여기서 확인합니다."),
+                "extend_cycles_var": tk.StringVar(value=str(DEFAULT_TARGET_AUTOLOOP_EXTEND_CYCLES)),
+                "extend_state_var": tk.StringVar(value="추가 상태: MaxCycleCount 도달 후 같은 RunRoot를 이어갈 수 있습니다."),
+                "artifact_state_var": tk.StringVar(value="산출물 상태: RunRoot 준비 후 source-outbox / summary / zip / ready 상태를 표시합니다."),
+                "process_once_state_var": tk.StringVar(value="ready 재검사 상태: RunRoot 준비 후 publish-ready trigger 기준으로 표시합니다."),
             }
             for field_name in ("enabled_var", "trigger_input_var", "trigger_publish_var", "max_cycle_var", "work_repo_root_var"):
                 try:
@@ -736,6 +796,8 @@ class RelayOperatorPanel(tk.Tk):
         self.watcher_pair_roundtrip_var.trace_add("write", self._on_watcher_start_option_changed)
 
         self._load_artifact_source_memory()
+        self._load_target_autoloop_extend_preferences()
+        self._load_target_autoloop_card_view_preferences()
         self._configure_watcher_badge_styles()
         self._build_ui()
         self.bind_all("<ButtonPress>", self._note_operator_input_event, add="+")
@@ -752,6 +814,7 @@ class RelayOperatorPanel(tk.Tk):
             "마지막 결과: 초기 상태 로드 대기",
         )
         self.after(200, self._run_initial_dashboard_load)
+        self.after(PANEL_SOURCE_STALE_CHECK_MS, self._check_panel_source_freshness)
 
     def _run_initial_dashboard_load(self) -> None:
         if self.__dict__.get("refresh_controller") is None:
@@ -773,21 +836,70 @@ class RelayOperatorPanel(tk.Tk):
             return bundle
 
         def on_success(bundle) -> None:
-            self._apply_dashboard_refresh_bundle(
-                bundle,
-                auto_pair_policy_preview=False,
-            )
+            def apply_when_idle() -> None:
+                if bool(self.__dict__.get("_busy", False)):
+                    try:
+                        self.after(500, apply_when_idle)
+                    except tk.TclError:
+                        return
+                    return
+                prior_operator_status = ""
+                prior_operator_hint = ""
+                prior_last_result = ""
+                try:
+                    prior_operator_status = str(self.operator_status_var.get() or "")
+                    prior_operator_hint = str(self.operator_hint_var.get() or "")
+                    prior_last_result = str(self.last_result_var.get() or "")
+                except Exception:
+                    pass
+                self._apply_dashboard_refresh_bundle(
+                    bundle,
+                    auto_pair_policy_preview=False,
+                )
+                if prior_operator_status and not prior_operator_status.startswith("초기 상태"):
+                    self.set_operator_status(
+                        prior_operator_status,
+                        prior_operator_hint,
+                        prior_last_result,
+                    )
 
-        self.run_background_task(
-            state="초기 상태 불러오는 중",
-            hint="패널 창은 먼저 표시했고, 초기 상태를 백그라운드에서 수집 중입니다.",
+            apply_when_idle()
+
+        self.set_operator_status(
+            "초기 상태 백그라운드 로드 중",
+            "패널 버튼은 사용할 수 있고, 초기 요약은 준비되는 대로 반영됩니다.",
+            "마지막 결과: 초기 상태 백그라운드 로드 중",
+        )
+        self.run_read_only_background_task(
+            label="초기 상태 불러오기",
             worker=worker,
             on_success=on_success,
-            success_state="초기 상태 불러오기 완료",
-            success_hint="초기 요약과 pair/runtime 상태를 반영했습니다.",
-            failure_state="초기 상태 불러오기 실패",
-            failure_hint="출력 영역의 오류와 마지막 명령을 확인하세요.",
         )
+
+    def _check_panel_source_freshness(self) -> None:
+        try:
+            current_mtime = float(Path(__file__).stat().st_mtime)
+        except OSError:
+            current_mtime = self.panel_source_mtime
+        if (
+            current_mtime > (float(self.panel_source_mtime or 0.0) + 1.0)
+            and not bool(self.__dict__.get("panel_source_stale_detected", False))
+        ):
+            self.panel_source_stale_detected = True
+            current_modified_at = datetime.fromtimestamp(current_mtime).strftime("%Y-%m-%d %H:%M:%S")
+            self.title(
+                "STALE - 릴레이 운영 패널 | "
+                f"PID {self.panel_process_id} | loaded {self.panel_source_modified_at} | source {current_modified_at}"
+            )
+            self.set_operator_status(
+                "패널 코드 변경 감지",
+                "현재 패널은 실행 후 코드가 바뀌었습니다. 공식 8창은 그대로 두고 패널만 다시 실행하세요.",
+                "마지막 결과: 패널 코드 변경 감지",
+            )
+        try:
+            self.after(PANEL_SOURCE_STALE_CHECK_MS, self._check_panel_source_freshness)
+        except tk.TclError:
+            return
 
     def _has_ui_attr(self, name: str) -> bool:
         try:
@@ -1332,6 +1444,71 @@ class RelayOperatorPanel(tk.Tk):
     def _register_read_only_widget(self, widget: tk.Widget) -> None:
         self.read_only_widgets.add(widget)
 
+    def _install_widget_tooltip(self, widget: object | None, text: str) -> None:
+        tooltip_text = str(text or "").strip()
+        if widget is None or not tooltip_text or not hasattr(widget, "bind"):
+            return
+
+        def _hide_tooltip(_event: object | None = None) -> None:
+            tooltip_windows = self.__dict__.setdefault("_tooltip_windows_by_widget_id", {})
+            if not isinstance(tooltip_windows, dict):
+                self.__dict__["_tooltip_windows_by_widget_id"] = {}
+                tooltip_windows = self.__dict__["_tooltip_windows_by_widget_id"]
+            tooltip = tooltip_windows.pop(id(widget), None)
+            if tooltip is not None:
+                try:
+                    tooltip.destroy()
+                except Exception:
+                    pass
+
+        def _show_tooltip(_event: object | None = None) -> None:
+            _hide_tooltip()
+            try:
+                root_x = int(widget.winfo_rootx())  # type: ignore[attr-defined]
+                root_y = int(widget.winfo_rooty())  # type: ignore[attr-defined]
+                widget_height = int(widget.winfo_height())  # type: ignore[attr-defined]
+                tooltip = tk.Toplevel(widget)  # type: ignore[arg-type]
+                tooltip.wm_overrideredirect(True)
+                tooltip.wm_geometry(f"+{root_x + 12}+{root_y + widget_height + 8}")
+                label = tk.Label(
+                    tooltip,
+                    text=tooltip_text,
+                    bg="#111827",
+                    fg="#FFFFFF",
+                    padx=8,
+                    pady=5,
+                    justify="left",
+                    wraplength=360,
+                )
+                label.pack()
+                tooltip_windows = self.__dict__.setdefault("_tooltip_windows_by_widget_id", {})
+                if isinstance(tooltip_windows, dict):
+                    tooltip_windows[id(widget)] = tooltip
+            except Exception:
+                pass
+
+        try:
+            widget.bind("<Enter>", _show_tooltip, add="+")  # type: ignore[attr-defined]
+            widget.bind("<Leave>", _hide_tooltip, add="+")  # type: ignore[attr-defined]
+            widget.bind("<ButtonPress>", _hide_tooltip, add="+")  # type: ignore[attr-defined]
+        except Exception:
+            pass
+
+    @staticmethod
+    def _target_autoloop_policy_card_artifact_button_tooltip_text(
+        *,
+        target_id: str,
+        short_label: str,
+        kind_label: str,
+    ) -> str:
+        normalized_target_id = str(target_id or "").strip() or "target"
+        normalized_short_label = str(short_label or "").strip() or "artifact"
+        normalized_kind_label = str(kind_label or "").strip() or normalized_short_label
+        return (
+            f"{normalized_target_id} {normalized_short_label}: 현재 RunRoot의 {normalized_kind_label} 경로를 엽니다. "
+            "비활성 상태이면 해당 파일/폴더가 아직 없거나 manifest 경로를 확인하지 못한 상태입니다."
+        )
+
     def _configure_watcher_badge_styles(self) -> None:
         style = ttk.Style(self)
         style.configure("WatcherBadgeNeutral.TLabel", foreground="#475569", font=("Segoe UI", 9, "bold"))
@@ -1740,6 +1917,38 @@ class RelayOperatorPanel(tk.Tk):
             return
         self.artifact_details_collapsed_var.set(not bool(self.artifact_details_collapsed_var.get()))
         self._apply_artifact_section_visibility()
+
+    def _apply_target_autoloop_policy_card_detail_visibility(self) -> None:
+        visible_var = self.__dict__.get("target_autoloop_policy_card_detail_visible_var")
+        toggle_var = self.__dict__.get("target_autoloop_policy_card_detail_toggle_var")
+        visible = bool(visible_var.get()) if visible_var is not None and hasattr(visible_var, "get") else True
+        if toggle_var is not None and hasattr(toggle_var, "set"):
+            try:
+                toggle_var.set("카드 상세 접기" if visible else "카드 상세 펼치기")
+            except Exception:
+                pass
+        detail_widgets = self.__dict__.get("target_autoloop_policy_card_detail_widgets", {}) or {}
+        if not isinstance(detail_widgets, dict):
+            return
+        for widgets in detail_widgets.values():
+            if not isinstance(widgets, list):
+                continue
+            for widget in widgets:
+                try:
+                    if visible:
+                        widget.grid()
+                    else:
+                        widget.grid_remove()
+                except Exception:
+                    continue
+
+    def toggle_target_autoloop_policy_card_details(self) -> None:
+        visible_var = self.__dict__.get("target_autoloop_policy_card_detail_visible_var")
+        if visible_var is None or not hasattr(visible_var, "get") or not hasattr(visible_var, "set"):
+            return
+        visible_var.set(not bool(visible_var.get()))
+        self._save_target_autoloop_card_view_preferences()
+        self._apply_target_autoloop_policy_card_detail_visibility()
 
     def _apply_message_fixed_section_visibility(self) -> None:
         body = self.__dict__.get("message_fixed_body_frame")
@@ -2418,7 +2627,7 @@ class RelayOperatorPanel(tk.Tk):
         return RelayOperatorPanel._format_typed_window_prepare_report(
             payload,
             heading=f"{action_title} 전 typed-window 세션 준비 완료",
-            completion_note="watcher 시작을 이어서 진행합니다.",
+            completion_note="Pair watcher 시작을 이어서 진행합니다.",
         )
 
     @staticmethod
@@ -2613,7 +2822,14 @@ class RelayOperatorPanel(tk.Tk):
             pair_max_roundtrip_count=defaults["pair_max_roundtrip_count"],
         )
 
-    def _resolve_watcher_start_config_path(self, *, config_path: str, run_root: str, pair_id: str = "") -> str:
+    def _resolve_watcher_start_config_path(
+        self,
+        *,
+        config_path: str,
+        run_root: str,
+        pair_id: str = "",
+        allow_config_generation: bool = True,
+    ) -> str:
         resolved_config_path = str(config_path or "").strip()
         resolved_run_root = str(run_root or "").strip()
         if resolved_run_root:
@@ -2631,9 +2847,44 @@ class RelayOperatorPanel(tk.Tk):
         if not resolved_pair_id or not resolved_config_path:
             return resolved_config_path
         try:
-            return self._resolve_run_prepare_config_path(pair_id=resolved_pair_id, config_path=resolved_config_path)
+            if allow_config_generation:
+                return self._resolve_run_prepare_config_path(pair_id=resolved_pair_id, config_path=resolved_config_path)
+            return self._resolve_run_prepare_config_path_without_generation(
+                pair_id=resolved_pair_id,
+                config_path=resolved_config_path,
+            )
         except Exception:
             return resolved_config_path
+
+    def _resolve_watcher_start_config_path_for_request(
+        self,
+        *,
+        config_path: str,
+        run_root: str,
+        pair_id: str = "",
+        allow_config_generation: bool = True,
+    ) -> str:
+        try:
+            return self._resolve_watcher_start_config_path(
+                config_path=config_path,
+                run_root=run_root,
+                pair_id=pair_id,
+                allow_config_generation=allow_config_generation,
+            )
+        except TypeError as exc:
+            if "allow_config_generation" not in str(exc) and "pair_id" not in str(exc):
+                raise
+            if pair_id:
+                try:
+                    return self._resolve_watcher_start_config_path(
+                        config_path=config_path,
+                        run_root=run_root,
+                        pair_id=pair_id,
+                    )
+                except TypeError as pair_exc:
+                    if "pair_id" not in str(pair_exc):
+                        raise
+            return self._resolve_watcher_start_config_path(config_path=config_path, run_root=run_root)
 
     def _watcher_quick_start_request(
         self,
@@ -2641,10 +2892,12 @@ class RelayOperatorPanel(tk.Tk):
         config_path: str,
         run_root: str,
         start_mode: str = START_MODE_CURRENT_RUN,
+        allow_config_generation: bool = True,
     ) -> WatcherStartRequest:
-        effective_config_path = self._resolve_watcher_start_config_path(
+        effective_config_path = self._resolve_watcher_start_config_path_for_request(
             config_path=config_path,
             run_root=run_root,
+            allow_config_generation=allow_config_generation,
         )
         defaults = self._watcher_default_start_values(
             include_global_pair_roundtrip_override=False,
@@ -2782,13 +3035,14 @@ class RelayOperatorPanel(tk.Tk):
 
         if normalized_mode == START_MODE_NEW_RUN:
             try:
-                allowed, blocked_reason = self._new_watcher_start_allowed()
+                allowed, blocked_reason = self._new_watcher_start_allowed_without_config_generation()
             except (AttributeError, RecursionError, tk.TclError):
                 allowed, blocked_reason = False, "새 Run 준비 상태를 아직 계산하지 못했습니다."
             effective_request = request or self._watcher_quick_start_request(
                 config_path=config_path,
                 run_root="",
                 start_mode=START_MODE_NEW_RUN,
+                allow_config_generation=False,
             )
             effective_request = self._watcher_request_with_context(
                 effective_request,
@@ -2815,6 +3069,7 @@ class RelayOperatorPanel(tk.Tk):
                 config_path=config_path,
                 run_root=current_run_root,
                 start_mode=START_MODE_CURRENT_RUN,
+                allow_config_generation=False,
             )
             preview_run_root = current_run_root
             target_ids = self._start_run_preview_target_ids(
@@ -2934,7 +3189,7 @@ class RelayOperatorPanel(tk.Tk):
 
     def _start_run_recommendation_text(self, recommendation: PrimaryActionRecommendation | None) -> str:
         if recommendation is None:
-            return "추천 실행: watcher 시작 관련 권장 실행이 아직 없습니다."
+            return "추천 실행: Pair watcher 시작 관련 권장 실행이 아직 없습니다."
         label = str(recommendation.button_label or recommendation.title or recommendation.action_key or "실행").strip()
         detail = str(recommendation.detail or "").strip()
         parts = [f"추천 실행: {label}"]
@@ -3038,13 +3293,13 @@ class RelayOperatorPanel(tk.Tk):
         if self._has_ui_attr("watcher_issue_path_var"):
             self.watcher_issue_path_var.set(self._watcher_issue_path_text())
         if self._has_ui_attr("watcher_issue_meta_var") and not str(self.watcher_issue_meta_var.get() or "").strip():
-            self._set_watcher_issue_meta_text("최근 제어 카드: 아직 watcher 제어 결과가 없습니다.")
+            self._set_watcher_issue_meta_text("최근 제어 카드: 아직 Pair watcher 제어 결과가 없습니다.")
         if self._has_ui_attr("watcher_issue_badge_var") and not str(self.watcher_issue_badge_var.get() or "").strip():
             self._set_watcher_issue_badge_text("상태 배지: 준비")
         if self._has_ui_attr("watcher_issue_stage_var") and not str(self.watcher_issue_stage_var.get() or "").strip():
-            self._set_watcher_issue_stage_text("제어 흐름: [준비] 아직 watcher 제어 결과가 없습니다.")
+            self._set_watcher_issue_stage_text("제어 흐름: [준비] 아직 Pair watcher 제어 결과가 없습니다.")
         if self._has_ui_attr("watcher_issue_step_var") and not str(self.watcher_issue_step_var.get() or "").strip():
-            self._set_watcher_issue_step_text("단계 요약: 준비 (현재=watcher 제어 전)")
+            self._set_watcher_issue_step_text("단계 요약: 준비 (현재=Pair watcher 제어 전)")
 
     def _build_start_run_cta_recommendation(
         self,
@@ -3099,15 +3354,15 @@ class RelayOperatorPanel(tk.Tk):
                 title="현재 Run 시작 가능",
                 action_key="start_current_watcher_run",
                 button_label="현재 Run 시작",
-                detail="현재 RunRoot 기준 watcher 시작 조건을 만족합니다.",
+                detail="현재 RunRoot 기준 Pair watcher 시작 조건을 만족합니다.",
                 read_only=False,
             )
         if watcher_recommendation is not None and getattr(watcher_recommendation, "action_key", ""):
             return PrimaryActionRecommendation(
-                title=watcher_recommendation.label or "watch 권장 조치",
+                title=watcher_recommendation.label or "Pair watcher 권장 조치",
                 action_key="watcher_recommended_action",
-                button_label=watcher_recommendation.label or "watch 권장 조치",
-                detail=watcher_recommendation.detail or "현재 watcher 진단 기준 권장 조치입니다.",
+                button_label=watcher_recommendation.label or "Pair watcher 권장 조치",
+                detail=watcher_recommendation.detail or "현재 Pair watcher 진단 기준 권장 조치입니다.",
                 read_only=self._dashboard_action_is_read_only(getattr(watcher_recommendation, "action_key", "")),
             )
         return None
@@ -3230,7 +3485,7 @@ class RelayOperatorPanel(tk.Tk):
         self._set_watcher_issue_step_text(self._watcher_panel_update_step_text(update, state_label=state_label))
 
     def _set_watcher_issue_meta_text(self, value: str) -> None:
-        text = str(value or "").strip() or "최근 제어 카드: 아직 watcher 제어 결과가 없습니다."
+        text = str(value or "").strip() or "최근 제어 카드: 아직 Pair watcher 제어 결과가 없습니다."
         if self._has_ui_attr("watcher_issue_meta_var"):
             self.watcher_issue_meta_var.set(text)
         if self._has_ui_attr("visible_watcher_meta_var"):
@@ -3274,14 +3529,14 @@ class RelayOperatorPanel(tk.Tk):
                 pass
 
     def _set_watcher_issue_step_text(self, value: str) -> None:
-        text = str(value or "").strip() or "단계 요약: 준비 (현재=watcher 제어 전)"
+        text = str(value or "").strip() or "단계 요약: 준비 (현재=Pair watcher 제어 전)"
         if self._has_ui_attr("watcher_issue_step_var"):
             self.watcher_issue_step_var.set(text)
         if self._has_ui_attr("visible_watcher_step_var"):
             self.visible_watcher_step_var.set(text)
 
     def _set_watcher_issue_stage_text(self, value: str) -> None:
-        text = str(value or "").strip() or "제어 흐름: 아직 watcher 제어 결과가 없습니다."
+        text = str(value or "").strip() or "제어 흐름: 아직 Pair watcher 제어 결과가 없습니다."
         if self._has_ui_attr("watcher_issue_stage_var"):
             self.watcher_issue_stage_var.set(text)
         if self._has_ui_attr("visible_watcher_stage_var"):
@@ -3327,13 +3582,13 @@ class RelayOperatorPanel(tk.Tk):
 
     @staticmethod
     def _watcher_issue_stage_text_for_status(state_label: str) -> str:
-        label = str(state_label or "").strip() or "watcher 상태"
+        label = str(state_label or "").strip() or "Pair watcher 상태"
         badge = RelayOperatorPanel._watcher_issue_badge_text(prefix="", state_label=label, detail=label)
         return f"제어 흐름: [{badge}] {label}"
 
     @staticmethod
     def _watcher_issue_badge_label_for_status(state_label: str) -> str:
-        label = str(state_label or "").strip() or "watcher 상태"
+        label = str(state_label or "").strip() or "Pair watcher 상태"
         badge = RelayOperatorPanel._watcher_issue_badge_text(prefix="", state_label=label, detail=label)
         return f"상태 배지: {badge}"
 
@@ -3409,13 +3664,13 @@ class RelayOperatorPanel(tk.Tk):
 
     @staticmethod
     def _watcher_issue_step_text_for_status(state_label: str) -> str:
-        label = str(state_label or "").strip() or "watcher 상태"
+        label = str(state_label or "").strip() or "Pair watcher 상태"
         badge = RelayOperatorPanel._watcher_issue_badge_text(prefix="", state_label=label, detail=label)
         return f"단계 요약: {badge} (현재={label})"
 
     def _watcher_panel_update_stage_text(self, update: WatcherPanelUpdate, *, state_label: str = "") -> str:
         states = self._watcher_panel_update_states(update)
-        label = str(state_label or update.operator_state or "watcher 상태").strip() or "watcher 상태"
+        label = str(state_label or update.operator_state or "Pair watcher 상태").strip() or "Pair watcher 상태"
         if len(states) >= 2:
             return f"제어 흐름: [요청] {states[0]} -> [확인] {states[-1]} -> [완료] {label}"
         if len(states) == 1:
@@ -3425,14 +3680,14 @@ class RelayOperatorPanel(tk.Tk):
 
     def _watcher_panel_update_step_text(self, update: WatcherPanelUpdate, *, state_label: str = "") -> str:
         states = self._watcher_panel_update_states(update)
-        label = str(state_label or update.operator_state or "watcher 상태").strip() or "watcher 상태"
+        label = str(state_label or update.operator_state or "Pair watcher 상태").strip() or "Pair watcher 상태"
         if len(states) >= 2:
             return f"단계 요약: 요청 -> 확인 -> 완료 (현재={label})"
         return self._watcher_issue_step_text_for_status(label)
 
     def _watcher_panel_update_badge_text(self, update: WatcherPanelUpdate, *, state_label: str = "") -> str:
         states = self._watcher_panel_update_states(update)
-        label = str(state_label or update.operator_state or "watcher 상태").strip() or "watcher 상태"
+        label = str(state_label or update.operator_state or "Pair watcher 상태").strip() or "Pair watcher 상태"
         if len(states) >= 2:
             return "상태 배지: 완료"
         return self._watcher_issue_badge_label_for_status(label)
@@ -3554,6 +3809,7 @@ class RelayOperatorPanel(tk.Tk):
         run_root: str,
         show_error: bool,
         start_mode: str = START_MODE_CURRENT_RUN,
+        allow_config_generation: bool = True,
     ) -> WatcherStartRequest | None:
         try:
             defaults = self._watcher_default_start_values(
@@ -3591,9 +3847,10 @@ class RelayOperatorPanel(tk.Tk):
                 messagebox.showwarning("Run 시작 옵션 오류", str(exc))
             return None
 
-        effective_config_path = self._resolve_watcher_start_config_path(
+        effective_config_path = self._resolve_watcher_start_config_path_for_request(
             config_path=config_path,
             run_root=run_root,
+            allow_config_generation=allow_config_generation,
         )
         request = WatcherStartRequest(
             config_path=effective_config_path,
@@ -3605,8 +3862,8 @@ class RelayOperatorPanel(tk.Tk):
             pair_roundtrip_limit_map=self._watcher_request_pair_roundtrip_limit_map(run_root),
             start_mode=start_mode,
         )
-        request_review = self._review_watcher_start_request(request)
-        if show_error and request_review is not None and not request_review.allowed:
+        request_review = self._review_watcher_start_request(request) if show_error else None
+        if request_review is not None and not request_review.allowed:
             self._set_watcher_start_issue(request_review.message)
             self._publish_watcher_start_issue_output(
                 action_title=self._start_run_mode_label(start_mode or START_MODE_CURRENT_RUN),
@@ -3623,6 +3880,7 @@ class RelayOperatorPanel(tk.Tk):
             run_root="",
             show_error=False,
             start_mode=START_MODE_NEW_RUN,
+            allow_config_generation=False,
         )
         if request is None:
             self.watcher_start_note_var.set(self._watcher_start_note_invalid_text())
@@ -3664,6 +3922,7 @@ class RelayOperatorPanel(tk.Tk):
             run_root="",
             show_error=False,
             start_mode=START_MODE_NEW_RUN,
+            allow_config_generation=False,
         )
         if new_request is None:
             new_preview = self._build_start_run_preview(START_MODE_NEW_RUN)
@@ -3907,7 +4166,25 @@ class RelayOperatorPanel(tk.Tk):
             self.runtime_workflow_service = service
         return service
 
-    def _resolve_run_prepare_config_path(self, *, pair_id: str, config_path: str) -> str:
+    def _resolve_run_prepare_config_path_without_generation(self, *, pair_id: str, config_path: str) -> str:
+        try:
+            return self._resolve_run_prepare_config_path(
+                pair_id=pair_id,
+                config_path=config_path,
+                allow_generate=False,
+            )
+        except TypeError as exc:
+            if "allow_generate" not in str(exc):
+                raise
+            return self._resolve_run_prepare_config_path(pair_id=pair_id, config_path=config_path)
+
+    def _resolve_run_prepare_config_path(
+        self,
+        *,
+        pair_id: str,
+        config_path: str,
+        allow_generate: bool = True,
+    ) -> str:
         resolved_config_path = str(config_path or "").strip()
         if not resolved_config_path:
             return resolved_config_path
@@ -3939,6 +4216,8 @@ class RelayOperatorPanel(tk.Tk):
         cached_path = str(cache.get(cache_key, "") or "").strip()
         if cached_path and Path(cached_path).exists():
             return cached_path
+        if not allow_generate:
+            return resolved_config_path
 
         build_helper = getattr(self.command_service, "build_powershell_file_command", None)
         if build_helper is None:
@@ -4162,8 +4441,8 @@ class RelayOperatorPanel(tk.Tk):
     ) -> dict[str, object]:
         with tempfile.TemporaryDirectory() as temp_dir:
             draft_config_path = Path(temp_dir) / (Path(config_path).name or "settings.preview.psd1")
-            serialized = self.message_config_service.serialize_psd1(document).replace("\n", "\r\n")
-            draft_config_path.write_text(serialized, encoding="utf-8")
+            serialized = self.message_config_service.serialize_psd1(document)
+            draft_config_path.write_text(serialized, encoding="utf-8", newline="\n")
             preview_config_path = self._resolve_run_prepare_config_path(
                 pair_id=pair_id,
                 config_path=str(draft_config_path),
@@ -4500,10 +4779,13 @@ class RelayOperatorPanel(tk.Tk):
     def _run_with_panel_window_launch_arm(self, *, action_label: str, callback):
         arm_token = uuid.uuid4().hex
         guard_path = self._panel_window_launch_guard_file_path()
+        binding_profile_path = self._binding_profile_path().strip()
         previous_token_present = PANEL_WINDOW_LAUNCH_ARM_ENV in os.environ
         previous_token = os.environ.get(PANEL_WINDOW_LAUNCH_ARM_ENV, "")
         previous_path_present = PANEL_WINDOW_LAUNCH_GUARD_PATH_ENV in os.environ
         previous_path = os.environ.get(PANEL_WINDOW_LAUNCH_GUARD_PATH_ENV, "")
+        previous_bindings_output_present = PANEL_WINDOW_BINDINGS_OUTPUT_ENV in os.environ
+        previous_bindings_output = os.environ.get(PANEL_WINDOW_BINDINGS_OUTPUT_ENV, "")
         self._write_panel_window_launch_guard(
             allow_launch=True,
             action_label=action_label,
@@ -4512,6 +4794,8 @@ class RelayOperatorPanel(tk.Tk):
         )
         os.environ[PANEL_WINDOW_LAUNCH_ARM_ENV] = arm_token
         os.environ[PANEL_WINDOW_LAUNCH_GUARD_PATH_ENV] = str(guard_path)
+        if binding_profile_path:
+            os.environ[PANEL_WINDOW_BINDINGS_OUTPUT_ENV] = binding_profile_path
         try:
             return callback()
         finally:
@@ -4523,6 +4807,10 @@ class RelayOperatorPanel(tk.Tk):
                 os.environ[PANEL_WINDOW_LAUNCH_GUARD_PATH_ENV] = previous_path
             else:
                 os.environ.pop(PANEL_WINDOW_LAUNCH_GUARD_PATH_ENV, None)
+            if previous_bindings_output_present:
+                os.environ[PANEL_WINDOW_BINDINGS_OUTPUT_ENV] = previous_bindings_output
+            else:
+                os.environ.pop(PANEL_WINDOW_BINDINGS_OUTPUT_ENV, None)
             self._write_panel_window_launch_guard(
                 allow_launch=False,
                 action_label=action_label,
@@ -4580,12 +4868,36 @@ class RelayOperatorPanel(tk.Tk):
         self.run_root_context_refresh_after_id = None
         self._apply_run_root_context_refresh()
 
+    def _notebook_tab_is_selected(self, tab_name: str) -> bool:
+        notebook = self.__dict__.get("notebook")
+        if notebook is None or not self._has_ui_attr(tab_name):
+            return False
+        try:
+            return str(notebook.select()) == str(getattr(self, tab_name))
+        except Exception:
+            return False
+
+    def _refresh_artifacts_if_visible_or_mark_pending(self) -> None:
+        if not self._has_ui_attr("artifact_tree"):
+            return
+        if self._notebook_tab_is_selected("artifacts_tab"):
+            self.refresh_artifacts_tab()
+            return
+        self.__dict__["artifact_refresh_pending"] = True
+
+    def _refresh_target_autoloop_status_if_visible_or_mark_pending(self) -> None:
+        if not self._has_ui_attr("target_autoloop_status_var"):
+            return
+        if self._notebook_tab_is_selected("target_autoloop_tab"):
+            self.refresh_target_autoloop_status_panel()
+            return
+        self.__dict__["target_autoloop_status_refresh_pending"] = True
+
     def _apply_run_root_context_refresh(self) -> None:
         if not self.effective_data:
             return
         self.rebuild_panel_state()
-        if self._has_ui_attr("artifact_tree"):
-            self.refresh_artifacts_tab()
+        self._refresh_artifacts_if_visible_or_mark_pending()
         self.update_pair_button_states()
         self._refresh_sticky_context_bar()
 
@@ -4617,17 +4929,22 @@ class RelayOperatorPanel(tk.Tk):
             return
         if self._has_ui_attr("visible_acceptance_tab") and selected_tab == str(self.visible_acceptance_tab):
             self._set_mode_banner(self._last_visible_mode_label, self._last_visible_mode_detail)
+            self.__dict__.pop("visible_acceptance_refresh_pending", None)
+            self.update_pair_button_states()
             return
         if self._has_ui_attr("artifacts_tab") and selected_tab == str(self.artifacts_tab):
             self._set_mode_banner("MODE: Recovery", "artifact / receipt / watcher evidence 검토 및 복구 중심으로 작업합니다.")
+            if self.__dict__.pop("artifact_refresh_pending", False) and self._has_ui_attr("artifact_tree"):
+                self.refresh_artifacts_tab()
             return
         if self._has_ui_attr("pair_settings_tab") and selected_tab == str(self.pair_settings_tab):
             self._set_mode_banner("MODE: Pair 설정", "pair별 repo / runroot / contract / roundtrip / seed 시작문을 설정합니다.")
             self._schedule_settings_preview_refresh()
             return
         if self._has_ui_attr("target_autoloop_tab") and selected_tab == str(self.target_autoloop_tab):
-            self._set_mode_banner("MODE: 8 Cell Autoloop", "target01~target08 독립 감지, queue, watcher 제어를 설정합니다.")
+            self._set_mode_banner("MODE: 8 Cell Autoloop", "target01~target08 독립 감지, queue, 독립셀 감지기 제어를 설정합니다.")
             self._schedule_settings_preview_refresh()
+            self.__dict__.pop("target_autoloop_status_refresh_pending", None)
             self.refresh_target_autoloop_status_panel()
             return
         if self._has_ui_attr("message_editor_tab_container") and selected_tab == str(self.message_editor_tab_container):
@@ -5359,7 +5676,15 @@ class RelayOperatorPanel(tk.Tk):
             return True, ""
         return False, start_eligibility.message or "현재 Run 시작 조건을 아직 만족하지 않습니다."
 
-    def _new_watcher_start_allowed(self) -> tuple[bool, str]:
+    def _new_watcher_start_allowed_without_config_generation(self) -> tuple[bool, str]:
+        try:
+            return self._new_watcher_start_allowed(allow_config_generation=False)
+        except TypeError as exc:
+            if "allow_config_generation" not in str(exc):
+                raise
+            return self._new_watcher_start_allowed()
+
+    def _new_watcher_start_allowed(self, *, allow_config_generation: bool = True) -> tuple[bool, str]:
         pair_id = self._selected_pair_id()
         if not pair_id:
             return False, "PairId 값을 먼저 선택하세요."
@@ -5376,7 +5701,10 @@ class RelayOperatorPanel(tk.Tk):
         if not config_path:
             return False, "새 Run 시작에는 ConfigPath가 필요합니다."
         try:
-            self._resolve_run_prepare_config_path(pair_id=pair_id, config_path=config_path)
+            if allow_config_generation:
+                self._resolve_run_prepare_config_path(pair_id=pair_id, config_path=config_path)
+            else:
+                self._resolve_run_prepare_config_path_without_generation(pair_id=pair_id, config_path=config_path)
         except Exception as exc:
             return False, str(exc)
         return True, ""
@@ -5385,17 +5713,172 @@ class RelayOperatorPanel(tk.Tk):
         if not self.effective_data:
             self.load_effective_config()
             return
-        runtime_result = self.refresh_controller.refresh_runtime(self._effective_refresh_context())
-        self._apply_runtime_refresh_result(runtime_result)
+        started_at = time.monotonic()
+        steps: list[dict[str, object]] = []
+        try:
+            context = self._run_timed_refresh_step(steps, "문맥 계산", self._effective_refresh_context)
+            runtime_result = self._run_timed_refresh_step(
+                steps,
+                "runtime 수집",
+                lambda: self.refresh_controller.refresh_runtime(context),
+            )
+            self._append_refresh_timing_steps(
+                steps,
+                getattr(runtime_result, "refresh_timing_steps", ()),
+                prefix="수집: ",
+            )
+            ui_steps: list[dict[str, object]] = []
+            self._run_timed_refresh_step(
+                steps,
+                "UI 적용",
+                lambda: self._apply_runtime_refresh_result(runtime_result, timing_steps=ui_steps),
+            )
+            self._append_refresh_timing_steps(steps, ui_steps, prefix="UI: ")
+        except Exception:
+            self._record_refresh_timing(
+                label="runtime 부분 갱신",
+                started_at=started_at,
+                steps=steps,
+                outcome="실패",
+            )
+            raise
+        self._record_refresh_timing(
+            label="runtime 부분 갱신",
+            started_at=started_at,
+            steps=steps,
+        )
 
-    def _apply_runtime_refresh_result(self, runtime_result) -> None:
-        self.relay_status_data = runtime_result.relay_status
-        self.visibility_status_data = runtime_result.visibility_status
-        self._clear_start_run_preview_cache()
-        self._coerce_selected_pair_into_runtime_scope()
-        self.rebuild_panel_state()
-        self.render_target_board()
-        self.update_pair_button_states()
+    def refresh_runtime_status_background(
+        self,
+        *,
+        label: str = "runtime 부분 갱신",
+        state: str = "runtime 부분 갱신 중",
+        hint: str = "relay/visibility 상태를 백그라운드에서 다시 읽는 중입니다.",
+        read_only: bool = True,
+    ) -> None:
+        if not self.effective_data or self.__dict__.get("refresh_controller") is None:
+            self.refresh_full_dashboard_status()
+            return
+
+        started_at = time.monotonic()
+        steps: list[dict[str, object]] = []
+        try:
+            context = self._run_timed_refresh_step(steps, "문맥 계산", self._effective_refresh_context)
+        except Exception as exc:
+            self._record_refresh_timing(
+                label="runtime 부분 갱신",
+                started_at=started_at,
+                steps=steps,
+                outcome="실패",
+            )
+            messagebox.showerror("runtime 갱신 실패", str(exc))
+            return
+
+        def worker():
+            self._post_background_progress(state, "1/2 runtime 수집 중")
+            runtime_result = self._run_timed_refresh_step(
+                steps,
+                "runtime 수집",
+                lambda: self.refresh_controller.refresh_runtime(context),
+            )
+            self._append_refresh_timing_steps(
+                steps,
+                getattr(runtime_result, "refresh_timing_steps", ()),
+                prefix="수집: ",
+            )
+            return runtime_result
+
+        def on_success(runtime_result) -> None:
+            self._set_background_task_step(state, "2/2 UI 적용 중")
+            ui_steps: list[dict[str, object]] = []
+            self._run_timed_refresh_step(
+                steps,
+                "UI 적용",
+                lambda: self._apply_runtime_refresh_result(runtime_result, timing_steps=ui_steps),
+            )
+            self._append_refresh_timing_steps(steps, ui_steps, prefix="UI: ")
+            self._record_refresh_timing(
+                label="runtime 부분 갱신",
+                started_at=started_at,
+                steps=steps,
+            )
+
+        def on_failure(exc: Exception) -> str:
+            self._record_refresh_timing(
+                label="runtime 부분 갱신",
+                started_at=started_at,
+                steps=steps,
+                outcome="실패",
+            )
+            return self._format_background_exception(exc)
+
+        if read_only or self._busy:
+            self.run_read_only_background_task(
+                label=label,
+                worker=worker,
+                on_success=on_success,
+                on_failure=on_failure,
+            )
+            return
+
+        self.run_background_task(
+            state=state,
+            hint=hint,
+            worker=worker,
+            on_success=on_success,
+            success_state="runtime 부분 갱신 완료",
+            success_hint="relay/visibility 상태를 다시 읽었습니다.",
+            failure_state="runtime 부분 갱신 실패",
+            failure_hint="relay/visibility 상태 조회에 실패했습니다.",
+            on_failure=on_failure,
+        )
+
+    def _invalidate_visibility_status_cache(self) -> None:
+        invalidate = getattr(self.status_service, "invalidate_visibility_cache", None)
+        if not callable(invalidate):
+            return
+        try:
+            invalidate()
+        except Exception:
+            pass
+
+    def _refresh_after_window_launch(self) -> None:
+        self._invalidate_visibility_status_cache()
+        if self.effective_data and self.__dict__.get("refresh_controller") is not None:
+            self.refresh_runtime_status_background(
+                label="8창 작업 후 runtime 상태 갱신",
+                state="8창 작업 후 runtime 갱신 중",
+                hint="창 작업은 끝났고, runtime/visibility 상태만 백그라운드에서 다시 읽는 중입니다.",
+                read_only=True,
+            )
+            return
+        self.load_effective_config()
+
+    def _apply_runtime_refresh_result(self, runtime_result, *, timing_steps: list[dict[str, object]] | None = None) -> None:
+        def apply_payload() -> None:
+            self.relay_status_data = runtime_result.relay_status
+            self.visibility_status_data = runtime_result.visibility_status
+            self._clear_start_run_preview_cache()
+
+        self._run_refresh_ui_step(timing_steps, "runtime payload 반영", apply_payload)
+        self._run_refresh_ui_step(timing_steps, "pair scope 보정", self._coerce_selected_pair_into_runtime_scope)
+        panel_state_steps: list[dict[str, object]] = []
+        self._run_refresh_ui_step(
+            timing_steps,
+            "panel state rebuild",
+            lambda: self._rebuild_panel_state_with_optional_timing(panel_state_steps),
+        )
+        if timing_steps is not None:
+            self._append_refresh_timing_steps(timing_steps, panel_state_steps, prefix="panel: ")
+        target_board_steps: list[dict[str, object]] = []
+        self._run_refresh_ui_step(
+            timing_steps,
+            "target board render",
+            lambda: self._render_target_board_with_optional_timing(target_board_steps, update_buttons=False),
+        )
+        if timing_steps is not None:
+            self._append_refresh_timing_steps(timing_steps, target_board_steps, prefix="board: ")
+        self._run_refresh_ui_step(timing_steps, "button state update", self.update_pair_button_states)
 
     def _runtime_refresh_command_preview(self, context: AppContext | None = None) -> str:
         context = context or self._effective_refresh_context()
@@ -5635,21 +6118,151 @@ class RelayOperatorPanel(tk.Tk):
             refresh_artifacts=refresh_artifacts,
         )
 
+    def _collect_paired_refresh_result(self) -> PairedRefreshResult | None:
+        run_root = self._current_run_root_for_actions()
+        if not run_root:
+            return None
+        refresh_paired = getattr(self.__dict__.get("refresh_controller"), "refresh_paired", None)
+        if callable(refresh_paired):
+            return refresh_paired(self._current_context(), run_root=run_root)
+        status_refresh = getattr(self.__dict__.get("status_service"), "refresh_paired_status", None)
+        if callable(status_refresh):
+            paired_payload, paired_error = status_refresh(self._current_context(), run_root=run_root)
+            return PairedRefreshResult(
+                paired_status=paired_payload,
+                paired_status_error=paired_error,
+            )
+        status_load = getattr(self.__dict__.get("status_service"), "load_paired_status", None)
+        if callable(status_load):
+            paired_payload, paired_error = status_load(self._current_context(), run_root=run_root)
+            return PairedRefreshResult(
+                paired_status=paired_payload,
+                paired_status_error=paired_error,
+            )
+        raise RuntimeError("paired status refresh service is not available")
+
+    def _apply_paired_refresh_result(
+        self,
+        paired_result: PairedRefreshResult | None,
+        *,
+        refresh_artifacts: bool = True,
+        timing_steps: list[dict[str, object]] | None = None,
+    ) -> None:
+        if paired_result is None:
+            self._apply_paired_status_snapshot(
+                None,
+                "",
+                refresh_artifacts=refresh_artifacts,
+                timing_steps=timing_steps,
+            )
+            return
+        self._apply_paired_status_snapshot(
+            paired_result.paired_status,
+            paired_result.paired_status_error,
+            refresh_artifacts=refresh_artifacts,
+            timing_steps=timing_steps,
+        )
+
+    def refresh_paired_status_background(
+        self,
+        *,
+        refresh_artifacts: bool = True,
+        label: str = "paired status 갱신",
+        state: str = "paired status 갱신 중",
+        hint: str = "paired status를 백그라운드에서 다시 읽는 중입니다.",
+        read_only: bool = True,
+    ) -> None:
+        started_at = time.monotonic()
+        steps: list[dict[str, object]] = []
+
+        def worker() -> PairedRefreshResult | None:
+            return self._run_timed_refresh_step(
+                steps,
+                "paired status 수집",
+                self._collect_paired_refresh_result,
+            )
+
+        def on_success(paired_result: PairedRefreshResult | None) -> None:
+            ui_steps: list[dict[str, object]] = []
+            self._run_timed_refresh_step(
+                steps,
+                "UI 적용",
+                lambda: self._apply_paired_refresh_result(
+                    paired_result,
+                    refresh_artifacts=refresh_artifacts,
+                    timing_steps=ui_steps,
+                ),
+            )
+            self._append_refresh_timing_steps(steps, ui_steps, prefix="UI: ")
+            self._record_refresh_timing(
+                label="paired status 갱신",
+                started_at=started_at,
+                steps=steps,
+            )
+
+        def on_failure(exc: Exception) -> str:
+            self._record_refresh_timing(
+                label="paired status 갱신",
+                started_at=started_at,
+                steps=steps,
+                outcome="실패",
+            )
+            return self._format_background_exception(exc)
+
+        if read_only or self._busy:
+            self.run_read_only_background_task(
+                label=label,
+                worker=worker,
+                on_success=on_success,
+                on_failure=on_failure,
+            )
+            return
+
+        self.run_background_task(
+            state=state,
+            hint=hint,
+            worker=worker,
+            on_success=on_success,
+            success_state="paired status 갱신 완료",
+            success_hint="paired status와 보드 상태를 다시 읽었습니다.",
+            failure_state="paired status 갱신 실패",
+            failure_hint="paired status 조회에 실패했습니다.",
+            on_failure=on_failure,
+        )
+
     def _apply_paired_status_snapshot(
         self,
         paired_payload: dict | None,
         paired_error: str,
         *,
         refresh_artifacts: bool = True,
+        timing_steps: list[dict[str, object]] | None = None,
     ) -> None:
-        self.paired_status_data = paired_payload
-        self.paired_status_error = paired_error
-        self.rebuild_panel_state()
-        self.render_target_board()
+        def apply_payload() -> None:
+            self.paired_status_data = paired_payload
+            self.paired_status_error = paired_error
+
+        self._run_refresh_ui_step(timing_steps, "paired payload 반영", apply_payload)
+        panel_state_steps: list[dict[str, object]] = []
+        self._run_refresh_ui_step(
+            timing_steps,
+            "panel state rebuild",
+            lambda: self._rebuild_panel_state_with_optional_timing(panel_state_steps),
+        )
+        if timing_steps is not None:
+            self._append_refresh_timing_steps(timing_steps, panel_state_steps, prefix="panel: ")
+        target_board_steps: list[dict[str, object]] = []
+        self._run_refresh_ui_step(
+            timing_steps,
+            "target board render",
+            lambda: self._render_target_board_with_optional_timing(target_board_steps),
+        )
+        if timing_steps is not None:
+            self._append_refresh_timing_steps(timing_steps, target_board_steps, prefix="board: ")
         if refresh_artifacts:
-            self.refresh_artifacts_tab()
-        self._refresh_watcher_notes()
-        self.update_pair_button_states()
+            self._run_refresh_ui_step(timing_steps, "artifact refresh/pending", self._refresh_artifacts_if_visible_or_mark_pending)
+        self._run_refresh_ui_step(timing_steps, "watcher notes refresh", self._refresh_watcher_notes)
+        self._run_refresh_ui_step(timing_steps, "button state update", self.update_pair_button_states)
 
     def _apply_paired_status_snapshot_from_payload(
         self,
@@ -5669,55 +6282,220 @@ class RelayOperatorPanel(tk.Tk):
         )
         return True
 
-    def refresh_quick_status(self) -> None:
+    def _collect_quick_refresh_result(self):
+        current_context = self._current_context()
+        runtime_context = self._effective_refresh_context()
         try:
-            quick_result = self.refresh_controller.refresh_quick(self._current_context())
-            self.relay_status_data = quick_result.runtime.relay_status
-            self.visibility_status_data = quick_result.runtime.visibility_status
-            self.paired_status_data = quick_result.paired.paired_status
-            self.paired_status_error = quick_result.paired.paired_status_error
-            self.rebuild_panel_state()
-            self.render_target_board()
-            self._refresh_watcher_notes()
-            self.update_pair_button_states()
-        except Exception as exc:
-            messagebox.showerror("빠른 새로고침 실패", str(exc))
-            self.set_operator_status("빠른 새로고침 실패", "부분 상태 갱신에 실패했습니다.", f"마지막 결과: 실패 ({exc})")
-            return
+            return self.refresh_controller.refresh_quick(
+                current_context,
+                runtime_context=runtime_context,
+            )
+        except TypeError as exc:
+            if "runtime_context" not in str(exc):
+                raise
+            return self.refresh_controller.refresh_quick(current_context)
 
-        result_text = "마지막 결과: 빠른 새로고침 완료"
-        if self.paired_status_error:
-            result_text += " / pair-status 일부 생략"
-        detail = "relay/visibility/paired 상태만 다시 읽었습니다. 결과 탭 산출물은 건드리지 않았습니다."
-        self.set_query_text("\n".join(["빠른 새로고침 완료", detail, result_text]))
-        self.set_query_result(
-            result_text.replace("마지막 결과", "마지막 조회"),
-            context=self._query_context_summary(),
-        )
-        if self._busy:
-            return
-        self.set_operator_status("빠른 새로고침 완료", detail, result_text)
+    def _collect_artifacts_refresh_result(self, *, report_progress: bool = True):
+        if report_progress:
+            self._post_background_progress("결과 / 산출물 새로고침 중", "1/2 RunRoot 확인 중")
+        run_root = self._current_run_root_for_actions()
+        if not run_root:
+            return None
 
-    def refresh_artifacts_status(self) -> None:
-        try:
-            self.refresh_paired_status_only()
-        except Exception as exc:
-            messagebox.showerror("결과 새로고침 실패", str(exc))
-            self.set_operator_status("결과 새로고침 실패", "paired status와 산출물 갱신에 실패했습니다.", f"마지막 결과: 실패 ({exc})")
-            return
+        if report_progress:
+            self._post_background_progress("결과 / 산출물 새로고침 중", "2/2 paired status 조회 중")
+        return self.refresh_controller.refresh_paired(self._current_context(), run_root=run_root)
+
+    def _apply_artifacts_refresh_result(
+        self,
+        paired_result,
+        *,
+        timing_steps: list[dict[str, object]] | None = None,
+    ) -> str:
+        if paired_result is None:
+            self._apply_paired_status_snapshot(None, "", refresh_artifacts=True, timing_steps=timing_steps)
+        else:
+            self._apply_paired_status_snapshot(
+                paired_result.paired_status,
+                paired_result.paired_status_error,
+                refresh_artifacts=True,
+                timing_steps=timing_steps,
+            )
 
         result_text = "마지막 결과: 결과 / 산출물 새로고침 완료"
         if self.paired_status_error:
             result_text += " / pair-status 일부 생략"
         detail = "현재 RunRoot 기준 paired status와 산출물을 다시 읽었습니다."
-        self.set_query_text("\n".join(["결과 / 산출물 새로고침 완료", detail, result_text]))
-        self.set_query_result(
-            result_text.replace("마지막 결과", "마지막 조회"),
-            context=self._artifact_query_context_summary(),
+
+        def update_result_text() -> None:
+            self.last_result_var.set(result_text)
+            self.set_query_text("\n".join(["결과 / 산출물 새로고침 완료", detail, result_text]))
+            self.set_query_result(
+                result_text.replace("마지막 결과", "마지막 조회"),
+                context=self._artifact_query_context_summary(),
+            )
+
+        self._run_refresh_ui_step(timing_steps, "result text update", update_result_text)
+        return result_text
+
+    def _apply_quick_refresh_result(self, quick_result, *, timing_steps: list[dict[str, object]] | None = None) -> None:
+        def apply_payload() -> None:
+            self.relay_status_data = quick_result.runtime.relay_status
+            self.visibility_status_data = quick_result.runtime.visibility_status
+            self.paired_status_data = quick_result.paired.paired_status
+            self.paired_status_error = quick_result.paired.paired_status_error
+
+        self._run_refresh_ui_step(timing_steps, "quick payload 반영", apply_payload)
+        panel_state_steps: list[dict[str, object]] = []
+        self._run_refresh_ui_step(
+            timing_steps,
+            "panel state rebuild",
+            lambda: self._rebuild_panel_state_with_optional_timing(panel_state_steps),
         )
-        if self._busy:
+        if timing_steps is not None:
+            self._append_refresh_timing_steps(timing_steps, panel_state_steps, prefix="panel: ")
+        target_board_steps: list[dict[str, object]] = []
+        self._run_refresh_ui_step(
+            timing_steps,
+            "target board render",
+            lambda: self._render_target_board_with_optional_timing(target_board_steps),
+        )
+        if timing_steps is not None:
+            self._append_refresh_timing_steps(timing_steps, target_board_steps, prefix="board: ")
+        self._run_refresh_ui_step(timing_steps, "watcher notes refresh", self._refresh_watcher_notes)
+        self._run_refresh_ui_step(timing_steps, "button state update", self.update_pair_button_states)
+
+        def update_result_text() -> None:
+            result_text = "마지막 결과: 빠른 새로고침 완료"
+            if self.paired_status_error:
+                result_text += " / pair-status 일부 생략"
+            detail = "relay/visibility/paired 상태만 다시 읽었습니다. 결과 탭 산출물은 건드리지 않았습니다."
+            self.last_result_var.set(result_text)
+            self.set_query_text("\n".join(["빠른 새로고침 완료", detail, result_text]))
+            self.set_query_result(
+                result_text.replace("마지막 결과", "마지막 조회"),
+                context=self._query_context_summary(),
+            )
+
+        self._run_refresh_ui_step(timing_steps, "result text update", update_result_text)
+
+    def refresh_quick_status(self) -> None:
+        was_busy = bool(self._busy)
+        detail = "relay/visibility/paired 상태만 다시 읽었습니다. 결과 탭 산출물은 건드리지 않았습니다."
+        started_at = time.monotonic()
+        steps: list[dict[str, object]] = []
+
+        def worker():
+            return self._run_timed_refresh_step(
+                steps,
+                "quick status 수집",
+                self._collect_quick_refresh_result,
+            )
+
+        def on_success(quick_result) -> None:
+            ui_steps: list[dict[str, object]] = []
+            self._run_timed_refresh_step(
+                steps,
+                "UI 적용",
+                lambda: self._apply_quick_refresh_result(quick_result, timing_steps=ui_steps),
+            )
+            self._append_refresh_timing_steps(steps, ui_steps, prefix="UI: ")
+            self._record_refresh_timing(
+                label="빠른 새로고침",
+                started_at=started_at,
+                steps=steps,
+            )
+
+        def on_failure(exc: Exception) -> str:
+            self._record_refresh_timing(
+                label="빠른 새로고침",
+                started_at=started_at,
+                steps=steps,
+                outcome="실패",
+            )
+            if not was_busy:
+                messagebox.showerror("빠른 새로고침 실패", str(exc))
+                self.set_operator_status("빠른 새로고침 실패", "부분 상태 갱신에 실패했습니다.", f"마지막 결과: 실패 ({exc})")
+            return self._format_background_exception(exc)
+
+        if was_busy:
+            self.run_read_only_background_task(
+                label="빠른 새로고침",
+                worker=worker,
+                on_success=on_success,
+                on_failure=on_failure,
+            )
             return
-        self.set_operator_status("결과 새로고침 완료", detail, result_text)
+        self.run_background_task(
+            state="빠른 새로고침 중",
+            hint="relay/visibility/paired 상태를 백그라운드에서 다시 읽는 중입니다.",
+            worker=worker,
+            on_success=on_success,
+            success_state="빠른 새로고침 완료",
+            success_hint=detail,
+            failure_state="빠른 새로고침 실패",
+            failure_hint="부분 상태 갱신에 실패했습니다.",
+            on_failure=on_failure,
+        )
+
+    def refresh_artifacts_status(self) -> None:
+        was_busy = bool(self._busy)
+        detail = "현재 RunRoot 기준 paired status와 산출물을 다시 읽었습니다."
+        started_at = time.monotonic()
+        steps: list[dict[str, object]] = []
+
+        def worker(*, report_progress: bool):
+            return self._run_timed_refresh_step(
+                steps,
+                "artifact paired status 수집",
+                lambda: self._collect_artifacts_refresh_result(report_progress=report_progress),
+            )
+
+        def on_success(paired_result) -> None:
+            ui_steps: list[dict[str, object]] = []
+            self._run_timed_refresh_step(
+                steps,
+                "UI 적용",
+                lambda: self._apply_artifacts_refresh_result(paired_result, timing_steps=ui_steps),
+            )
+            self._append_refresh_timing_steps(steps, ui_steps, prefix="UI: ")
+            self._record_refresh_timing(
+                label="결과 / 산출물 새로고침",
+                started_at=started_at,
+                steps=steps,
+            )
+
+        def on_failure(exc: Exception) -> str:
+            self._record_refresh_timing(
+                label="결과 / 산출물 새로고침",
+                started_at=started_at,
+                steps=steps,
+                outcome="실패",
+            )
+            if not was_busy:
+                messagebox.showerror("결과 새로고침 실패", str(exc))
+                self.set_operator_status("결과 새로고침 실패", "paired status와 산출물 갱신에 실패했습니다.", f"마지막 결과: 실패 ({exc})")
+            return self._format_background_exception(exc)
+
+        if was_busy:
+            self.run_read_only_background_task(
+                label="결과 / 산출물 새로고침",
+                worker=lambda: worker(report_progress=False),
+                on_success=on_success,
+                on_failure=on_failure,
+            )
+            return
+        self.run_background_task(
+            state="결과 / 산출물 새로고침 중",
+            hint="paired status와 산출물을 백그라운드에서 다시 읽는 중입니다.",
+            worker=lambda: worker(report_progress=True),
+            on_success=on_success,
+            success_state="결과 새로고침 완료",
+            success_hint=detail,
+            failure_state="결과 새로고침 실패",
+            failure_hint="paired status와 산출물 갱신에 실패했습니다.",
+            on_failure=on_failure,
+        )
 
     def toggle_simple_mode(self) -> None:
         if self.notebook is None:
@@ -6271,6 +7049,23 @@ class RelayOperatorPanel(tk.Tk):
             )
         )
 
+    def select_all_target_autoloop_policy_cards(self) -> None:
+        target_ids = self._target_autoloop_policy_target_ids(self.__dict__.get("message_config_doc", {}) or {})
+        self.__dict__["_target_autoloop_policy_selection_change_guard"] = True
+        try:
+            for target_id in target_ids:
+                store = self._target_autoloop_policy_card_store(target_id)
+                store["bulk_selected_var"].set(True)
+        finally:
+            self.__dict__["_target_autoloop_policy_selection_change_guard"] = False
+        self._apply_target_autoloop_policy_filter_layout()
+        self.target_autoloop_policy_editor_status_var.set(
+            "전체 target {count}개를 선택했습니다: {targets}".format(
+                count=len(target_ids),
+                targets=", ".join(target_ids) if target_ids else "(없음)",
+            )
+        )
+
     def clear_target_autoloop_policy_selection(self) -> None:
         self.__dict__["_target_autoloop_policy_selection_change_guard"] = True
         try:
@@ -6280,7 +7075,7 @@ class RelayOperatorPanel(tk.Tk):
         finally:
             self.__dict__["_target_autoloop_policy_selection_change_guard"] = False
         self._apply_target_autoloop_policy_filter_layout()
-        self.target_autoloop_policy_editor_status_var.set("target-autoloop bulk selection을 모두 해제했습니다.")
+        self.target_autoloop_policy_editor_status_var.set("target-autoloop 실행 선택을 모두 해제했습니다.")
 
     def _select_target_autoloop_policy_cards_by_filter_mode(self, filter_mode: str, *, mode_label: str) -> None:
         effective_document = self.__dict__.get("message_config_doc", {}) or {}
@@ -6722,8 +7517,7 @@ class RelayOperatorPanel(tk.Tk):
             messagebox.showerror("selected dirty target 저장 실패", str(exc))
             self.target_autoloop_policy_editor_status_var.set(f"selected dirty target 저장 실패: {exc}")
             return
-        self.load_message_editor_document()
-        self.load_effective_config()
+        self._apply_saved_target_autoloop_policy_document(document)
         self.target_autoloop_policy_editor_status_var.set(
             "selected dirty target {count}개 저장 완료 / targets={targets} / 백업: {backup}".format(
                 count=len(selected_dirty_target_ids),
@@ -6731,6 +7525,22 @@ class RelayOperatorPanel(tk.Tk):
                 backup=backup_path,
             )
         )
+
+    def _apply_saved_target_autoloop_policy_document(self, document: dict) -> None:
+        saved_document = self.message_config_service.clone_document(document)
+        self.message_config_doc = saved_document
+        self.message_config_original = self.message_config_service.clone_document(saved_document)
+        self.__dict__["message_document_version"] = int(self.__dict__.get("message_document_version", 0) or 0) + 1
+        self.message_preview_payload = None
+        self.message_preview_doc_version = -1
+        self.message_preview_cached_context_key = ""
+        self.message_editor_dirty = False
+        self.__dict__.pop("_message_snapshot_text_cache", None)
+        self.__dict__.pop("_message_diff_summary_text_cache", None)
+        self.__dict__.pop("_message_diff_body_text_cache", None)
+        self._clear_pair_policy_route_snapshot_cache()
+        self.refresh_target_autoloop_policy_editor(document=saved_document, refresh_reason="config")
+        self._refresh_target_autoloop_status_if_visible_or_mark_pending()
 
     @staticmethod
     def _target_autoloop_policy_trigger_summary(trigger_kinds: list[str]) -> str:
@@ -6766,6 +7576,89 @@ class RelayOperatorPanel(tk.Tk):
             return {"text": "STOPPED", "background": "#6B7280", "foreground": "#FFFFFF"}
         return {"text": "IDLE", "background": "#6B7280", "foreground": "#FFFFFF"}
 
+    @staticmethod
+    def _target_autoloop_cycle_progress_text(*, phase: str, cycle_count: int, max_cycle_count: int) -> str:
+        normalized_phase = str(phase or "").strip()
+        cycle_count = max(0, int(cycle_count or 0))
+        max_cycle_count = max(0, int(max_cycle_count or 0))
+        active_phases = {"input-detected", "claimed", "waiting-output"}
+        waiting_phases = {"queued", "dispatch-delay", "cooldown"}
+        if max_cycle_count <= 0:
+            if normalized_phase in active_phases:
+                return f"{cycle_count} 완료 / {cycle_count + 1}번째 진행 중 / max 미설정"
+            if normalized_phase in waiting_phases:
+                return f"{cycle_count} 완료 / {cycle_count + 1}번째 대기 / max 미설정"
+            return f"{cycle_count} 완료 / max 미설정"
+        remaining = max(0, max_cycle_count - cycle_count)
+        if normalized_phase in active_phases and cycle_count < max_cycle_count:
+            return f"{cycle_count}/{max_cycle_count} 완료 / {cycle_count + 1}번째 진행 중 / 남은 {remaining}"
+        if normalized_phase in waiting_phases and cycle_count < max_cycle_count:
+            return f"{cycle_count}/{max_cycle_count} 완료 / {cycle_count + 1}번째 대기 / 남은 {remaining}"
+        if normalized_phase == "paused":
+            return f"{cycle_count}/{max_cycle_count} 완료 / 일시정지 / 남은 {remaining}"
+        if normalized_phase in {"failed"}:
+            return f"{cycle_count}/{max_cycle_count} 완료 / 실패 / 남은 {remaining}"
+        if normalized_phase in {"limit-reached", "output-ready"} or cycle_count >= max_cycle_count:
+            return f"{cycle_count}/{max_cycle_count} 완료 / 완료 / 남은 {remaining}"
+        return f"{cycle_count}/{max_cycle_count} 완료 / 남은 {remaining}"
+
+    def _target_autoloop_policy_progress_badge_spec(
+        self,
+        *,
+        target_id: str,
+        phase: str,
+        next_action: str,
+        dispatch_state: str,
+        cycle_count: int,
+        max_cycle_count: int,
+        enabled: bool,
+    ) -> dict[str, str]:
+        normalized_target_id = str(target_id or "target").strip() or "target"
+        if not bool(enabled):
+            return {
+                "text": f"{normalized_target_id} DISABLED",
+                "background": "#6B7280",
+                "foreground": "#FFFFFF",
+            }
+        remaining_count = max(0, max_cycle_count - cycle_count) if max_cycle_count > 0 else 0
+        return self._target_autoloop_selected_progress_badge_spec(
+            target_id=normalized_target_id,
+            phase=phase,
+            next_action=next_action,
+            dispatch_state=dispatch_state,
+            cycle_count=cycle_count,
+            max_cycle_count=max_cycle_count,
+            remaining_count=remaining_count,
+        )
+
+    def _target_autoloop_policy_runtime_summary_text(
+        self,
+        *,
+        runtime_state: str,
+        phase: str,
+        next_action: str,
+        dispatch_state: str,
+        cycle_count: int,
+        max_cycle_count: int,
+    ) -> str:
+        progress_text = self._target_autoloop_cycle_progress_text(
+            phase=phase,
+            cycle_count=cycle_count,
+            max_cycle_count=max_cycle_count,
+        )
+        return (
+            "runtime={runtime} / phase={phase} / next={next_action} / cycle={cycle}/{max_cycle} "
+            "/ progress={progress} / dispatch={dispatch}"
+        ).format(
+            runtime=runtime_state,
+            phase=phase or "(미확인)",
+            next_action=next_action or "(미확인)",
+            cycle=cycle_count,
+            max_cycle=max_cycle_count,
+            progress=progress_text,
+            dispatch=dispatch_state or "(미확인)",
+        )
+
     def _target_autoloop_policy_build_preview_text(
         self,
         *,
@@ -6775,6 +7668,16 @@ class RelayOperatorPanel(tk.Tk):
     ) -> str:
         route_row = route_row or {}
         trigger_summary = self._target_autoloop_policy_trigger_summary(list(policy.get("TriggerKinds", []) or []))
+        route_phase = str(route_row.get("Phase", "") or "")
+        route_cycle_count = self._target_autoloop_int_or_zero(route_row.get("CycleCount", 0))
+        route_max_cycle_count = self._target_autoloop_int_or_zero(
+            route_row.get("MaxCycleCount", policy.get("MaxCycleCount", 0))
+        )
+        route_progress_text = self._target_autoloop_cycle_progress_text(
+            phase=route_phase,
+            cycle_count=route_cycle_count,
+            max_cycle_count=route_max_cycle_count,
+        )
         lines = [
             "target={0} / enabled={1} / triggers={2} / maxCycle={3}".format(
                 policy.get("TargetId", "") or "(없음)",
@@ -6796,12 +7699,13 @@ class RelayOperatorPanel(tk.Tk):
             ),
             "runtime={0} / cycle={1}/{2}".format(
                 self._target_autoloop_policy_runtime_badge_spec(
-                    phase=str(route_row.get("Phase", "") or ""),
+                    phase=route_phase,
                     enabled=bool(policy.get("Enabled", False)),
                 )["text"],
-                int(route_row.get("CycleCount", 0) or 0),
-                int(route_row.get("MaxCycleCount", 0) or 0),
+                route_cycle_count,
+                route_max_cycle_count,
             ),
+            "progress={0}".format(route_progress_text),
             "outbox={0}".format(route_row.get("SourceOutboxPath", "") or "(없음)"),
             "queue={0}".format(route_row.get("QueueRoot", "") or "(없음)"),
             "targetRunRoot={0}".format(route_row.get("TargetRunRoot", "") or "(공통 RunRoot 사용)"),
@@ -6857,23 +7761,37 @@ class RelayOperatorPanel(tk.Tk):
             phase=phase,
             enabled=bool(policy.get("Enabled", False)),
         )
-        store["runtime_badge_var"].set(runtime_badge_spec["text"])
+        cycle_count = self._target_autoloop_int_or_zero((route_row or {}).get("CycleCount", 0))
+        max_cycle_count = self._target_autoloop_int_or_zero(
+            (route_row or {}).get("MaxCycleCount", policy.get("MaxCycleCount", 0))
+        )
+        progress_badge_spec = self._target_autoloop_policy_progress_badge_spec(
+            target_id=target_id,
+            phase=phase,
+            next_action=str((route_row or {}).get("NextAction", "") or ""),
+            dispatch_state=str((route_row or {}).get("LastDispatchState", "") or ""),
+            cycle_count=cycle_count,
+            max_cycle_count=max_cycle_count,
+            enabled=bool(policy.get("Enabled", False)),
+        )
+        store["runtime_badge_var"].set(progress_badge_spec["text"])
         store["runtime_summary_var"].set(
-            "runtime={runtime} / phase={phase} / next={next_action} / cycle={cycle}/{max_cycle}".format(
-                runtime=runtime_badge_spec["text"],
+            self._target_autoloop_policy_runtime_summary_text(
+                runtime_state=runtime_badge_spec["text"],
                 phase=phase or "(미확인)",
                 next_action=str((route_row or {}).get("NextAction", "") or "(미확인)"),
-                cycle=int((route_row or {}).get("CycleCount", 0) or 0),
-                max_cycle=int((route_row or {}).get("MaxCycleCount", 0) or 0),
+                dispatch_state=str((route_row or {}).get("LastDispatchState", "") or "(미확인)"),
+                cycle_count=cycle_count,
+                max_cycle_count=max_cycle_count,
             )
         )
         runtime_badge_label = self.__dict__.get("target_autoloop_policy_card_runtime_badge_labels", {}).get(target_id)
         if runtime_badge_label is not None:
             self._configure_optional_widget(
                 runtime_badge_label,
-                text=runtime_badge_spec["text"],
-                bg=runtime_badge_spec["background"],
-                fg=runtime_badge_spec["foreground"],
+                text=progress_badge_spec["text"],
+                bg=progress_badge_spec["background"],
+                fg=progress_badge_spec["foreground"],
             )
 
     def _apply_target_autoloop_policy_card_values_to_document(self, document: dict, target_id: str) -> dict[str, object]:
@@ -6904,6 +7822,35 @@ class RelayOperatorPanel(tk.Tk):
             max_cycle_count=max_cycle_count,
             work_repo_root=str(store["work_repo_root_var"].get() or "").strip(),
         )
+
+    def _ensure_target_autoloop_prepare_config_enabled(
+        self,
+        config_path: str,
+        target_ids: list[str],
+    ) -> str:
+        normalized_config_path = str(config_path or "").strip()
+        if not normalized_config_path:
+            return ""
+        path = Path(normalized_config_path)
+        if not path.is_absolute():
+            path = ROOT / path
+        if not path.exists() or not path.is_file():
+            return ""
+
+        document = self.message_config_service.load_config_document(str(path))
+        original_document = self.message_config_service.clone_document(document)
+        target_autoloop_section = document.setdefault("TargetAutoloop", {})
+        if not isinstance(target_autoloop_section, dict):
+            raise ValueError("TargetAutoloop section is not editable")
+        target_autoloop_section["Enabled"] = True
+        target_autoloop_section["RunMode"] = "target-autoloop"
+        for target_id in target_ids:
+            self._apply_target_autoloop_policy_card_values_to_document(document, target_id)
+        if document == original_document:
+            return ""
+        backup_path = self.message_config_service.save_document(str(path), document)
+        self._apply_saved_target_autoloop_policy_document(document)
+        return str(backup_path)
 
     def refresh_target_autoloop_policy_editor(self, *, document: dict | None = None, refresh_reason: str = "config") -> None:
         config_path = self.config_path_var.get().strip()
@@ -7022,12 +7969,12 @@ class RelayOperatorPanel(tk.Tk):
             messagebox.showerror("target-autoloop 설정 저장 실패", str(exc))
             self.target_autoloop_policy_editor_status_var.set(f"target-autoloop 설정 저장 실패: {exc}")
             return
-        self.load_message_editor_document()
-        self.load_effective_config()
+        self._apply_saved_target_autoloop_policy_document(document)
         status_message = f"target-autoloop 설정 저장 완료 / 백업: {backup_path}"
         refresh_status_message = str(self.target_autoloop_policy_editor_status_var.get() or "").strip()
         if refresh_status_message and refresh_status_message != status_message:
             status_message += "\n" + refresh_status_message
+        status_message += "\nAutoloop 부분 새로고침만 수행했습니다. 전체 상태가 필요하면 별도 전체 새로고침을 누르세요."
         self.target_autoloop_policy_editor_status_var.set(status_message)
 
     def _refresh_target_autoloop_policy_clone_controls(self, target_ids: list[str]) -> None:
@@ -7188,6 +8135,93 @@ class RelayOperatorPanel(tk.Tk):
             ]
             self.set_text(self.output_text, "\n".join(lines))
 
+    def prepare_selected_target_autoloop_policy_cards_for_run(self) -> None:
+        selected_target_ids = self._target_autoloop_policy_selected_target_ids(
+            self.__dict__.get("message_config_doc", {}) or {}
+        )
+        if not selected_target_ids:
+            message = "선택된 target이 없어 실행 준비를 적용하지 않았습니다. 먼저 전체 선택 또는 target별 선택을 체크하세요."
+            self.target_autoloop_policy_editor_status_var.set(message)
+            if self._has_ui_attr("target_autoloop_guidance_var"):
+                self.target_autoloop_guidance_var.set(message)
+            if self._has_ui_attr("output_text"):
+                self.set_text(self.output_text, "[target-autoloop selected run prepare]\n" + message)
+            return
+
+        result = self._prepare_target_autoloop_policy_cards_for_run(target_ids=selected_target_ids)
+        prepared_target_ids = list(result.get("prepared_target_ids", []) or [])
+        enabled_changed_target_ids = list(result.get("enabled_changed_target_ids", []) or [])
+        input_changed_target_ids = list(result.get("input_changed_target_ids", []) or [])
+        publish_changed_target_ids = list(result.get("publish_changed_target_ids", []) or [])
+        already_ready_target_ids = list(result.get("already_ready_target_ids", []) or [])
+        message = (
+            "선택 target {count}개 실행 준비 완료: {targets}. "
+            "Enabled/input-file/publish-ready를 켰습니다. 이제 'target 설정 저장 + 새로고침' 후 새 RunRoot를 준비하세요."
+        ).format(
+            count=len(prepared_target_ids),
+            targets=", ".join(prepared_target_ids) if prepared_target_ids else "(없음)",
+        )
+        self.target_autoloop_policy_editor_status_var.set(message)
+        if self._has_ui_attr("target_autoloop_guidance_var"):
+            self.target_autoloop_guidance_var.set(
+                "선택 target 실행 준비는 카드 설정만 바꾼 상태입니다. 저장 후 새 RunRoot를 준비해야 manifest에 반영됩니다."
+            )
+        if self._has_ui_attr("output_text"):
+            lines = [
+                "[target-autoloop selected run prepare]",
+                "PreparedTargets: " + (", ".join(prepared_target_ids) if prepared_target_ids else "(none)"),
+                "EnabledChanged: " + (", ".join(enabled_changed_target_ids) if enabled_changed_target_ids else "(none)"),
+                "InputTriggerChanged: " + (", ".join(input_changed_target_ids) if input_changed_target_ids else "(none)"),
+                "PublishReadyChanged: " + (", ".join(publish_changed_target_ids) if publish_changed_target_ids else "(none)"),
+                "AlreadyReadyTargets: " + (", ".join(already_ready_target_ids) if already_ready_target_ids else "(none)"),
+                "",
+                "Next:",
+                "1. target 설정 저장 + 새로고침",
+                "2. 선택 target만 새 RunRoot 준비",
+                "3. 독립셀 감지 시작",
+            ]
+            self.set_text(self.output_text, "\n".join(lines))
+
+    def _prepare_target_autoloop_policy_cards_for_run(
+        self,
+        *,
+        target_ids: list[str],
+    ) -> dict[str, list[str]]:
+        prepared_target_ids: list[str] = []
+        enabled_changed_target_ids: list[str] = []
+        input_changed_target_ids: list[str] = []
+        publish_changed_target_ids: list[str] = []
+        already_ready_target_ids: list[str] = []
+
+        for target_id in target_ids:
+            try:
+                store = self._target_autoloop_policy_card_store(target_id)
+            except KeyError:
+                continue
+            prepared_target_ids.append(target_id)
+            if not bool(store["enabled_var"].get()):
+                store["enabled_var"].set(True)
+                enabled_changed_target_ids.append(target_id)
+            if not bool(store["trigger_input_var"].get()):
+                store["trigger_input_var"].set(True)
+                input_changed_target_ids.append(target_id)
+            if not bool(store["trigger_publish_var"].get()):
+                store["trigger_publish_var"].set(True)
+                publish_changed_target_ids.append(target_id)
+            else:
+                already_ready_target_ids.append(target_id)
+            self._refresh_target_autoloop_policy_card_loaded_badge(target_id)
+
+        self._apply_target_autoloop_policy_filter_layout()
+        self.refresh_target_autoloop_seed_composer()
+        return {
+            "prepared_target_ids": prepared_target_ids,
+            "enabled_changed_target_ids": enabled_changed_target_ids,
+            "input_changed_target_ids": input_changed_target_ids,
+            "publish_changed_target_ids": publish_changed_target_ids,
+            "already_ready_target_ids": already_ready_target_ids,
+        }
+
     def _enable_publish_ready_for_enabled_target_autoloop_policy_cards(
         self,
         *,
@@ -7233,6 +8267,7 @@ class RelayOperatorPanel(tk.Tk):
         history_detail: str | None = None,
         *,
         selected_only: bool = False,
+        continue_with_start: bool = False,
     ) -> None:
         action_label = "선택 target publish-ready 켜고 새 RunRoot 준비" if selected_only else "publish-ready 켜고 새 RunRoot 준비"
         if self._message_editor_has_unsaved_changes():
@@ -7319,8 +8354,7 @@ class RelayOperatorPanel(tk.Tk):
             messagebox.showerror("publish-ready 자동 준비 실패", detail)
             return
 
-        self.load_message_editor_document()
-        self.load_effective_config()
+        self._apply_saved_target_autoloop_policy_document(document)
         self.target_autoloop_policy_editor_status_var.set(
             "{label}: 설정 저장 완료 / changed={changed} / already={already} / disabled={disabled} / 백업={backup}".format(
                 label=action_label,
@@ -7329,6 +8363,7 @@ class RelayOperatorPanel(tk.Tk):
                 disabled=", ".join(disabled_target_ids) if disabled_target_ids else "(none)",
                 backup=backup_path,
             )
+            + " / Autoloop 부분 새로고침만 수행했습니다."
         )
         self.set_text(
             self.output_text,
@@ -7357,6 +8392,10 @@ class RelayOperatorPanel(tk.Tk):
         self.request_prepare_target_autoloop_run_root(
             selected_only=selected_only,
             selected_target_ids_override=selected_target_ids if selected_only else None,
+            continue_with_start=continue_with_start,
+            history_label=str(history_label or action_label),
+            history_action_key=str(history_action_key or "fix_publish_ready_prepare_autoloop_runroot"),
+            history_detail=str(history_detail or "publish-ready 자동 보정 후 새 RunRoot 준비"),
         )
 
     def clone_target_autoloop_policy_card_settings(self) -> None:
@@ -8541,6 +9580,22 @@ class RelayOperatorPanel(tk.Tk):
             bool(normalized_policy.get("UseExternalWorkRepoContractPaths", False)),
         )
 
+    def _apply_saved_pair_policy_document(self, document: dict) -> None:
+        saved_document = self.message_config_service.clone_document(document)
+        self.message_config_doc = saved_document
+        self.message_config_original = self.message_config_service.clone_document(saved_document)
+        self.__dict__["message_document_version"] = int(self.__dict__.get("message_document_version", 0) or 0) + 1
+        self.message_preview_payload = None
+        self.message_preview_doc_version = -1
+        self.message_preview_cached_context_key = ""
+        self.message_editor_dirty = False
+        self.__dict__.pop("_message_snapshot_text_cache", None)
+        self.__dict__.pop("_message_diff_summary_text_cache", None)
+        self.__dict__.pop("_message_diff_body_text_cache", None)
+        self._clear_pair_policy_route_snapshot_cache()
+        self.refresh_pair_policy_editor(document=saved_document, auto_preview_requested=False)
+        self.refresh_target_autoloop_policy_editor(document=saved_document)
+
     def save_pair_policy_editor(self) -> None:
         if self._message_editor_has_unsaved_changes():
             messagebox.showwarning("저장 차단", "Initial/Handoff 문구 편집에 미저장 변경이 있습니다. 먼저 저장하거나 취소한 뒤 pair 설정을 저장하세요.")
@@ -8595,8 +9650,7 @@ class RelayOperatorPanel(tk.Tk):
             status_message += " / route 변경: " + ", ".join(changed_route_pairs)
         if cleared_run_root:
             status_message += " / old RunRoot override 자동 비움"
-        self.load_message_editor_document()
-        self.load_effective_config()
+        self._apply_saved_pair_policy_document(document)
         preview_status_message = str(self.pair_policy_editor_status_var.get() or "").strip()
         applied_lines: list[str] = []
         for pair_id in changed_route_pairs or known_pair_ids[:1]:
@@ -8622,6 +9676,7 @@ class RelayOperatorPanel(tk.Tk):
             status_message += "\n" + preview_status_message
         if applied_lines:
             status_message += "\n적용 확인:\n" + "\n".join(applied_lines)
+        status_message += "\nPair 설정 부분 새로고침만 수행했습니다. 전체 상태가 필요하면 별도 전체 새로고침을 누르세요."
         self.pair_policy_editor_status_var.set(status_message)
 
     def _pair_policy_card_matches_loaded_policy(self, pair_id: str) -> bool:
@@ -8746,6 +9801,50 @@ class RelayOperatorPanel(tk.Tk):
         except Exception:
             pass
 
+    def _target_autoloop_fixed_suffix_label(self, value: object) -> str:
+        text = str(value or "")
+        if not text:
+            return "(없음)"
+        return self._target_autoloop_compact_text(text, max_chars=48)
+
+    def _target_autoloop_fixed_suffix_runroot_notice(self, target_id: str, effective_suffix: object) -> str:
+        normalized_target_id = str(target_id or "").strip()
+        if not normalized_target_id:
+            return "current RunRoot fixedSuffix: target 미확인"
+        try:
+            run_root = str(self._current_run_root_for_actions() or "").strip()
+        except Exception as exc:
+            return f"current RunRoot fixedSuffix 확인 실패: {self._target_autoloop_compact_text(exc, max_chars=64)}"
+        if not run_root:
+            return "current RunRoot=(없음); 저장값은 다음 새 RunRoot 준비부터 manifest에 반영"
+        try:
+            snapshot = self._target_autoloop_runtime_snapshot(run_root)
+        except Exception as exc:
+            return f"current RunRoot fixedSuffix 확인 실패: {self._target_autoloop_compact_text(exc, max_chars=64)}"
+        manifest_error = str(snapshot.get("manifest_error", "") or "").strip()
+        if manifest_error and manifest_error != "missing":
+            return f"current RunRoot manifest 확인 실패: {self._target_autoloop_compact_text(manifest_error, max_chars=64)}"
+        if not bool(snapshot.get("manifest_exists", False)):
+            return "current RunRoot manifest=(없음); 저장값은 다음 새 RunRoot 준비부터 manifest에 반영"
+        manifest_row = self._target_autoloop_row_for_target(
+            snapshot.get("manifest_targets", []),
+            normalized_target_id,
+        )
+        if not manifest_row:
+            return f"current RunRoot manifest에 {normalized_target_id} 없음; 새 RunRoot 준비 필요"
+        manifest_suffix = str(manifest_row.get("FixedSuffix", "") or "")
+        effective_text = str(effective_suffix or "")
+        if manifest_suffix == effective_text:
+            return "current RunRoot fixedSuffix=CONFIG와 같음 ({value})".format(
+                value=self._target_autoloop_fixed_suffix_label(manifest_suffix),
+            )
+        return (
+            "CONFIG 변경됨: current RunRoot fixedSuffix={manifest}; "
+            "새 문구는 새 RunRoot 준비부터 적용"
+        ).format(
+            manifest=self._target_autoloop_fixed_suffix_label(manifest_suffix),
+        )
+
     def refresh_target_autoloop_fixed_suffix_editor(self, *, document: dict | None = None) -> None:
         target_var = self.__dict__.get("target_autoloop_fixed_target_var")
         status_var = self.__dict__.get("target_autoloop_fixed_status_var")
@@ -8799,11 +9898,12 @@ class RelayOperatorPanel(tk.Tk):
         self._apply_target_autoloop_fixed_text_state()
         if status_var is not None and hasattr(status_var, "set"):
             status_var.set(
-                "Autoloop Target 고정문구: target={target} / mode={mode} / shared={shared} / effective={effective}".format(
+                "Autoloop Target 고정문구: target={target} / mode={mode} / shared={shared} / effective={effective} / {runroot_notice}".format(
                     target=target_id,
                     mode=self._target_autoloop_fixed_mode_label(mode),
                     shared=shared_suffix if shared_suffix else "(없음)",
                     effective=effective_suffix if effective_suffix else "(없음)",
+                    runroot_notice=self._target_autoloop_fixed_suffix_runroot_notice(target_id, effective_suffix),
                 )
             )
 
@@ -8857,11 +9957,14 @@ class RelayOperatorPanel(tk.Tk):
             messagebox.showerror("Autoloop 고정문구 저장 실패", str(exc))
             self.target_autoloop_fixed_status_var.set(f"Autoloop Target 고정문구 저장 실패: {exc}")
             return
-        self.load_message_editor_document()
-        self.load_effective_config()
+        self._apply_saved_target_autoloop_policy_document(document)
         mode = "INHERIT SHARED" if inherit_shared else ("AUTOLOOP ONLY" if suffix_text else "NONE")
+        effective_suffix = self.message_config_service.get_effective_target_autoloop_fixed_suffix(document, target_id)
+        runroot_notice = self._target_autoloop_fixed_suffix_runroot_notice(target_id, effective_suffix)
         self.target_autoloop_fixed_status_var.set(
             f"Autoloop Target 고정문구 저장 완료 / target={target_id} / mode={mode} / 백업: {backup_path}"
+            " / config 저장 완료, 현재 RunRoot manifest는 자동 수정하지 않습니다."
+            f" / {runroot_notice}"
         )
 
     def preview_target_autoloop_fixed_seed_message(self) -> None:
@@ -8881,6 +9984,35 @@ class RelayOperatorPanel(tk.Tk):
             return
         runtime_summary = str(payload.get("SeedRuntimeSummary", "") or "").strip()
         runtime_var.set(runtime_summary or default_summary)
+
+    def _apply_target_autoloop_seed_path_proof(self, payload: dict[str, object] | None = None) -> None:
+        proof_var = self.__dict__.get("target_autoloop_seed_path_proof_var")
+        if proof_var is None or not hasattr(proof_var, "set"):
+            return
+        default_summary = "경로 증명: 미리보기 전입니다."
+        if payload is None:
+            proof_var.set(default_summary)
+            return
+        proof = payload.get("ContractPathProof", {})
+        if not isinstance(proof, dict):
+            proof = {}
+        summary = str(payload.get("ContractPathProofSummary", "") or proof.get("Summary", "") or "").strip()
+        source = str(proof.get("StrictPathSource", "") or "").strip()
+        config_drift = bool(proof.get("ConfigDriftDetected", False))
+        resolved_matches_manifest = bool(proof.get("ResolvedPathsMatchManifest", False))
+        computed_matches_manifest = bool(proof.get("ComputedPathsMatchManifest", False))
+        if not summary:
+            if source:
+                summary = f"source={source}"
+            else:
+                summary = "proof unavailable"
+            if config_drift:
+                summary += " / config drift"
+            if source == "manifest":
+                summary += " / resolved matches manifest" if resolved_matches_manifest else " / resolved mismatch"
+            elif computed_matches_manifest:
+                summary += " / computed matches manifest"
+        proof_var.set("경로 증명: " + summary)
 
     def _apply_target_autoloop_seed_detail_visibility(self) -> None:
         detail_frame = self.__dict__.get("target_autoloop_seed_detail_frame")
@@ -8913,10 +10045,37 @@ class RelayOperatorPanel(tk.Tk):
         detail = str(recommendation.get("Detail", "") or "").strip()
         input_badge = str(payload.get("InputBadge", "") or "").strip() or "INPUT NONE"
         input_reason = str(payload.get("InputCheckReason", "") or "").strip() or "none"
+        operational_state = str(payload.get("OperationalState", "") or "").strip()
+        operational_reason = str(payload.get("OperationalReason", "") or "").strip()
+        operational_notice = str(payload.get("OperationalNotice", "") or "").strip()
+        delivery_summary = str(payload.get("DeliverySummary", "") or "").strip()
+        delivery_action = str(payload.get("DeliveryNextAction", "") or "").strip()
+        delivery_action_label = str(payload.get("DeliveryNextActionLabel", "") or "").strip()
+        delivery_action_hint = delivery_action_label or delivery_action
+        repo_notice = str(payload.get("RepoNoticeSummary", "") or "").strip()
         guidance = "권장 조치: {label}".format(label=label)
         if detail:
             guidance += " - " + detail
         guidance += " (input={badge} / reason={reason})".format(badge=input_badge, reason=input_reason)
+        if delivery_summary and delivery_action_hint:
+            guidance = "진행 단계: {delivery} / 다음 확인: {action} / {guidance}".format(
+                delivery=delivery_summary,
+                action=delivery_action_hint,
+                guidance=guidance,
+            )
+        elif delivery_summary:
+            guidance = "진행 단계: {delivery} / {guidance}".format(delivery=delivery_summary, guidance=guidance)
+        if repo_notice:
+            guidance = "Repo 확인: {repo} / {guidance}".format(repo=repo_notice, guidance=guidance)
+        if operational_state in {"blocked", "warning"}:
+            op_label = operational_state
+            if operational_reason:
+                op_label += "/" + operational_reason
+            guidance = "시작 가능 여부: {op}{notice} / {guidance}".format(
+                op=op_label,
+                notice=(" - " + operational_notice) if operational_notice else "",
+                guidance=guidance,
+            )
         if action_var is not None and hasattr(action_var, "set"):
             action_var.set(label)
         if guidance_var is not None and hasattr(guidance_var, "set"):
@@ -8935,6 +10094,9 @@ class RelayOperatorPanel(tk.Tk):
         target_id = str(payload.get("TargetId", "") or "").strip()
         if not target_id or not self._target_autoloop_policy_card_matches_loaded_policy(target_id):
             return False, "현재 target 카드에 미저장 설정이 있습니다. 먼저 'target 설정 저장 + 새로고침'을 완료하세요."
+        operational_block = self._target_autoloop_seed_copy_block_reason(payload)
+        if operational_block:
+            return False, operational_block
         queue_allowed = bool(payload.get("QueueAllowed", False))
         blocked_reason = str(payload.get("QueueBlockedReason", "") or "").strip()
         if not queue_allowed:
@@ -8943,6 +10105,37 @@ class RelayOperatorPanel(tk.Tk):
         if not queue_prompt_text:
             return False, "queue 등록용 본문을 계산하지 못했습니다."
         return True, ""
+
+    def _target_autoloop_seed_copy_block_reason(self, payload: dict[str, object]) -> str:
+        operational_state = str(payload.get("OperationalState", "") or "").strip()
+        operational_blocks = bool(payload.get("OperationalBlocksQueue", False))
+        if operational_blocks or operational_state == "blocked":
+            reason = (
+                str(payload.get("OperationalNotice", "") or "").strip()
+                or str(payload.get("Readiness", "") or "").strip()
+                or "현재 target 상태에서는 시작문 복사를 진행할 수 없습니다."
+            )
+            operational_reason = str(payload.get("OperationalReason", "") or "").strip()
+            if operational_reason == "max-cycle-reached" or "MaxCycleCount" in reason:
+                target_id = str(payload.get("TargetId", "") or "").strip() or "선택 target"
+                reason += (
+                    f" / {target_id} 같은 RunRoot 이어가기는 시작문 복사가 아니라 "
+                    "[추가 N회+감지] 또는 [독립셀 감지 시작/재시작] / [ready 재검사]로 진행합니다. "
+                    "이미 추가했다면 상태 새로고침 후 같은 target의 cycle/max가 늘었는지 확인하세요. "
+                    "처음부터 다시 시작할 때만 [선택 target만 새 RunRoot] 후 시작문을 복사하세요."
+                )
+            return reason
+        return ""
+
+    @staticmethod
+    def _target_autoloop_seed_readiness_text(payload: dict[str, object]) -> str:
+        readiness_text = str(payload.get("Readiness", "") or "").strip() or "준비 상태를 다시 확인하세요."
+        delivery_action_label = str(payload.get("DeliveryNextActionLabel", "") or "").strip()
+        delivery_action = str(payload.get("DeliveryNextAction", "") or "").strip()
+        delivery_action_hint = delivery_action_label or delivery_action
+        if delivery_action_hint and delivery_action_hint not in readiness_text:
+            readiness_text = readiness_text + " / 다음 확인: " + delivery_action_hint
+        return readiness_text
 
     def _refresh_target_autoloop_status_after_seed_queue(self, *, schedule_follow_up: bool = True) -> None:
         refresh = getattr(self, "refresh_target_autoloop_status_panel", None)
@@ -8973,6 +10166,7 @@ class RelayOperatorPanel(tk.Tk):
         if not allowed:
             messagebox.showwarning("target-autoloop 초기 입력 큐잉 차단", detail)
             self.target_autoloop_seed_status_var.set(f"target-autoloop 초기 입력 큐잉 차단: {detail}")
+            self._apply_target_autoloop_seed_path_proof(payload)
             self._apply_target_autoloop_seed_input_guidance(payload)
             return
 
@@ -9014,6 +10208,7 @@ class RelayOperatorPanel(tk.Tk):
                 runtime=runtime_summary or "runtime: 미확인",
             )
         )
+        self._apply_target_autoloop_seed_path_proof(merged_payload)
         self._apply_target_autoloop_seed_runtime_summary(merged_payload)
         self._apply_target_autoloop_seed_input_guidance(merged_payload)
         self._refresh_target_autoloop_status_after_seed_queue()
@@ -9059,6 +10254,8 @@ class RelayOperatorPanel(tk.Tk):
         self.target_autoloop_seed_readiness_var.set(
             "ConfigPath / RunRoot를 확인한 뒤 '미리보기' 또는 '초간단 시작문 복사'를 실행하세요. target별 summary/review/publish 절대경로는 자동으로 계산됩니다."
         )
+        self._refresh_target_autoloop_seed_copy_reason(target_id=current_target_id)
+        self._apply_target_autoloop_seed_path_proof()
         self._apply_target_autoloop_seed_runtime_summary()
         self._apply_target_autoloop_seed_input_guidance()
         self._apply_target_autoloop_seed_detail_visibility()
@@ -9111,27 +10308,62 @@ class RelayOperatorPanel(tk.Tk):
             target_id_override=target_id,
         )
 
+    def _target_autoloop_seed_copy_issue(self, target_id: str | None = None) -> tuple[bool, str]:
+        config_path = str(self.config_path_var.get() or "").strip()
+        if not config_path:
+            return False, "ConfigPath가 없어 시작문을 계산할 수 없습니다."
+        current_target_id = str(target_id if target_id is not None else self.target_autoloop_seed_target_var.get() or "").strip()
+        if not current_target_id:
+            return False, "target을 먼저 선택하세요."
+        run_root = self._current_run_root_for_actions().strip()
+        if not run_root:
+            return False, "RunRoot가 없어 target-local 계약 경로를 계산할 수 없습니다."
+        if current_target_id in getattr(self, "target_autoloop_policy_card_vars", {}) and not self._target_autoloop_policy_card_matches_loaded_policy(current_target_id):
+            return False, "현재 target 카드에 미저장 설정이 있습니다. 먼저 'target 설정 저장 + 새로고침'을 완료하세요."
+        return True, f"{current_target_id} 시작문 복사 가능"
+
+    def _refresh_target_autoloop_seed_copy_reason(self, *, target_id: str | None = None) -> None:
+        if not self._has_ui_attr("target_autoloop_seed_copy_reason_var"):
+            return
+        allowed, detail = self._target_autoloop_seed_copy_issue(target_id)
+        prefix = "시작문 복사 가능" if allowed else "시작문 복사 차단 사유"
+        self.target_autoloop_seed_copy_reason_var.set(f"{prefix}: {detail}")
+
     def preview_target_autoloop_seed_message(self) -> None:
         try:
             payload = self._target_autoloop_seed_preview_payload()
         except Exception as exc:
             messagebox.showwarning("target-autoloop seed 미리보기 실패", str(exc))
             self.target_autoloop_seed_status_var.set(f"target-autoloop seed 미리보기 실패: {exc}")
+            if self._has_ui_attr("target_autoloop_seed_copy_reason_var"):
+                self.target_autoloop_seed_copy_reason_var.set(f"시작문 복사 차단 사유: {exc}")
             return
         self.target_autoloop_seed_last_preview = payload
         self.target_autoloop_seed_banner_var.set(str(payload.get("TargetBanner", "") or "").strip() or "붙여넣기 대상: 8 Cell Autoloop / (target 미확인)")
-        self.target_autoloop_seed_readiness_var.set(str(payload.get("Readiness", "") or "").strip() or "준비 상태를 다시 확인하세요.")
+        self.target_autoloop_seed_readiness_var.set(self._target_autoloop_seed_readiness_text(payload))
         input_badge = str(payload.get("InputBadge", "") or "").strip() or "INPUT NONE"
         input_reason = str(payload.get("InputCheckReason", "") or "").strip() or "none"
         input_summary = str(payload.get("InputSummary", "") or "").strip() or "추가 입력 파일: (없음)"
         input_warning = str(payload.get("InputWarning", "") or "").strip()
+        operational_state = str(payload.get("OperationalState", "") or "").strip()
+        operational_reason = str(payload.get("OperationalReason", "") or "").strip()
+        delivery_summary = str(payload.get("DeliverySummary", "") or "").strip()
+        delivery_action_label = str(payload.get("DeliveryNextActionLabel", "") or "").strip()
+        operational_suffix = ""
+        if operational_state:
+            operational_suffix = " / op=" + operational_state + ((":" + operational_reason) if operational_reason else "")
+        delivery_suffix = (" / delivery=" + delivery_summary) if delivery_summary else ""
+        delivery_next_suffix = (" / next=" + delivery_action_label) if delivery_action_label else ""
         runtime_summary = str(payload.get("SeedRuntimeSummary", "") or "").strip()
         warning_suffix = (" / warning=" + input_warning) if input_warning else ""
         self.target_autoloop_seed_status_var.set(
-            "target-autoloop seed 미리보기 갱신 / target={target} / route={route} / runrootMode={mode} / input={input_badge} / inputReason={input_reason}{warning_suffix} / {input_summary} / {runtime}".format(
+            "target-autoloop seed 미리보기 갱신 / target={target} / route={route} / runrootMode={mode}{operational_suffix}{delivery_suffix}{delivery_next_suffix} / input={input_badge} / inputReason={input_reason}{warning_suffix} / {input_summary} / {runtime}".format(
                 target=str(payload.get("TargetId", "") or "(없음)"),
                 route=str(payload.get("RouteBadge", "") or "ROUTE 미확인"),
                 mode=str(payload.get("RunRootMode", "") or "(없음)"),
+                operational_suffix=operational_suffix,
+                delivery_suffix=delivery_suffix,
+                delivery_next_suffix=delivery_next_suffix,
                 input_badge=input_badge,
                 input_reason=input_reason,
                 warning_suffix=warning_suffix,
@@ -9139,6 +10371,11 @@ class RelayOperatorPanel(tk.Tk):
                 runtime=runtime_summary or "runtime: 미확인",
             )
         )
+        if self._has_ui_attr("target_autoloop_seed_copy_reason_var"):
+            copy_block_reason = self._target_autoloop_seed_copy_block_reason(payload)
+            if copy_block_reason:
+                self.target_autoloop_seed_copy_reason_var.set("시작문 복사 차단 사유: " + copy_block_reason)
+        self._apply_target_autoloop_seed_path_proof(payload)
         self._apply_target_autoloop_seed_runtime_summary(payload)
         self._apply_target_autoloop_seed_input_guidance(payload)
         if getattr(self, "target_autoloop_seed_simple_text", None) is not None:
@@ -9153,43 +10390,109 @@ class RelayOperatorPanel(tk.Tk):
         self.set_text(self.output_text, str(payload.get("FullPreviewText", "") or ""))
 
     def copy_target_autoloop_seed_full_text(self) -> None:
+        allowed, detail = self._target_autoloop_seed_copy_issue()
+        if self._has_ui_attr("target_autoloop_seed_copy_reason_var"):
+            self.target_autoloop_seed_copy_reason_var.set(
+                ("시작문 복사 가능: " if allowed else "시작문 복사 차단 사유: ") + detail
+            )
+        if not allowed:
+            messagebox.showwarning("target-autoloop 시작문 복사 차단", detail)
+            self.target_autoloop_seed_status_var.set("target-autoloop 시작문 복사 차단: " + detail)
+            self.target_autoloop_seed_readiness_var.set(detail)
+            return
         try:
             payload = self._target_autoloop_seed_preview_payload()
         except Exception as exc:
             messagebox.showwarning("복사 실패", str(exc))
+            if self._has_ui_attr("target_autoloop_seed_copy_reason_var"):
+                self.target_autoloop_seed_copy_reason_var.set(f"시작문 복사 차단 사유: {exc}")
             return
         self.target_autoloop_seed_last_preview = payload
+        copy_block_reason = self._target_autoloop_seed_copy_block_reason(payload)
+        if copy_block_reason:
+            messagebox.showwarning("target-autoloop 시작문 복사 차단", copy_block_reason)
+            self.target_autoloop_seed_readiness_var.set(copy_block_reason)
+            self.target_autoloop_seed_status_var.set("target-autoloop 시작문 복사 차단: " + copy_block_reason)
+            if self._has_ui_attr("target_autoloop_seed_copy_reason_var"):
+                self.target_autoloop_seed_copy_reason_var.set("시작문 복사 차단 사유: " + copy_block_reason)
+            self._apply_target_autoloop_seed_path_proof(payload)
+            self._apply_target_autoloop_seed_runtime_summary(payload)
+            self._apply_target_autoloop_seed_input_guidance(payload)
+            if getattr(self, "target_autoloop_seed_simple_text", None) is not None:
+                self.set_text(self.target_autoloop_seed_simple_text, str(payload.get("ManualStartText", "") or ""))
+            return
         text = str(payload.get("ManualStartText", "") or "")
         self._copy_to_clipboard(text)
         self.target_autoloop_seed_banner_var.set(str(payload.get("TargetBanner", "") or "").strip())
-        self.target_autoloop_seed_readiness_var.set(str(payload.get("Readiness", "") or "").strip())
+        self.target_autoloop_seed_readiness_var.set(self._target_autoloop_seed_readiness_text(payload))
         input_badge = str(payload.get("InputBadge", "") or "").strip() or "INPUT NONE"
         input_reason = str(payload.get("InputCheckReason", "") or "").strip() or "none"
         input_summary = str(payload.get("InputSummary", "") or "").strip() or "추가 입력 파일: (없음)"
         input_warning = str(payload.get("InputWarning", "") or "").strip()
         warning_suffix = (" / warning=" + input_warning) if input_warning else ""
         self.target_autoloop_seed_status_var.set("target-autoloop 초간단 시작문을 클립보드로 복사했습니다. / input=" + input_badge + " / inputReason=" + input_reason + warning_suffix + " / " + input_summary)
+        if self._has_ui_attr("target_autoloop_seed_copy_reason_var"):
+            self.target_autoloop_seed_copy_reason_var.set(
+                "시작문 복사 완료: " + str(payload.get("TargetId", "") or self.target_autoloop_seed_target_var.get() or "(target 미확인)")
+            )
+        self._apply_target_autoloop_seed_path_proof(payload)
         self._apply_target_autoloop_seed_runtime_summary(payload)
         self._apply_target_autoloop_seed_input_guidance(payload)
         if getattr(self, "target_autoloop_seed_simple_text", None) is not None:
             self.set_text(self.target_autoloop_seed_simple_text, text)
         self.set_text(self.output_text, "target-autoloop 초간단 시작문 복사 완료:\n\n" + text)
 
+    def copy_target_autoloop_seed_for_target(self, target_id: str) -> None:
+        normalized_target_id = str(target_id or "").strip()
+        if not normalized_target_id:
+            messagebox.showwarning("복사 실패", "target을 확인하지 못했습니다.")
+            return
+        self.target_autoloop_seed_target_var.set(normalized_target_id)
+        self._refresh_target_autoloop_seed_copy_reason(target_id=normalized_target_id)
+        self.copy_target_autoloop_seed_full_text()
+
     def copy_target_autoloop_seed_detailed_text(self) -> None:
+        allowed, detail = self._target_autoloop_seed_copy_issue()
+        if self._has_ui_attr("target_autoloop_seed_copy_reason_var"):
+            self.target_autoloop_seed_copy_reason_var.set(
+                ("시작문 복사 가능: " if allowed else "시작문 복사 차단 사유: ") + detail
+            )
+        if not allowed:
+            messagebox.showwarning("target-autoloop 상세 시작문 복사 차단", detail)
+            self.target_autoloop_seed_status_var.set("target-autoloop 상세 시작문 복사 차단: " + detail)
+            self.target_autoloop_seed_readiness_var.set(detail)
+            return
         try:
             payload = self._target_autoloop_seed_preview_payload()
         except Exception as exc:
             messagebox.showwarning("복사 실패", str(exc))
+            if self._has_ui_attr("target_autoloop_seed_copy_reason_var"):
+                self.target_autoloop_seed_copy_reason_var.set(f"시작문 복사 차단 사유: {exc}")
             return
         self.target_autoloop_seed_last_preview = payload
+        copy_block_reason = self._target_autoloop_seed_copy_block_reason(payload)
+        if copy_block_reason:
+            messagebox.showwarning("target-autoloop 상세 시작문 복사 차단", copy_block_reason)
+            self.target_autoloop_seed_readiness_var.set(copy_block_reason)
+            self.target_autoloop_seed_status_var.set("target-autoloop 상세 시작문 복사 차단: " + copy_block_reason)
+            if self._has_ui_attr("target_autoloop_seed_copy_reason_var"):
+                self.target_autoloop_seed_copy_reason_var.set("시작문 복사 차단 사유: " + copy_block_reason)
+            self._apply_target_autoloop_seed_path_proof(payload)
+            self._apply_target_autoloop_seed_runtime_summary(payload)
+            self._apply_target_autoloop_seed_input_guidance(payload)
+            if getattr(self, "target_autoloop_seed_simple_text", None) is not None:
+                self.set_text(self.target_autoloop_seed_simple_text, str(payload.get("ManualStartText", "") or ""))
+            return
         text = str(payload.get("DetailedStartText", "") or "")
         self._copy_to_clipboard(text)
+        self.target_autoloop_seed_readiness_var.set(self._target_autoloop_seed_readiness_text(payload))
         input_badge = str(payload.get("InputBadge", "") or "").strip() or "INPUT NONE"
         input_reason = str(payload.get("InputCheckReason", "") or "").strip() or "none"
         input_summary = str(payload.get("InputSummary", "") or "").strip() or "추가 입력 파일: (없음)"
         input_warning = str(payload.get("InputWarning", "") or "").strip()
         warning_suffix = (" / warning=" + input_warning) if input_warning else ""
         self.target_autoloop_seed_status_var.set("target-autoloop 상세 시작문을 클립보드로 복사했습니다. / input=" + input_badge + " / inputReason=" + input_reason + warning_suffix + " / " + input_summary)
+        self._apply_target_autoloop_seed_path_proof(payload)
         self._apply_target_autoloop_seed_runtime_summary(payload)
         self._apply_target_autoloop_seed_input_guidance(payload)
         self.set_text(self.output_text, "target-autoloop 상세 시작문 복사 완료:\n\n" + text)
@@ -9208,6 +10511,7 @@ class RelayOperatorPanel(tk.Tk):
             return
         self._copy_to_clipboard(path_value)
         self.target_autoloop_seed_status_var.set(f"target-autoloop {label} 경로를 클립보드로 복사했습니다.")
+        self._apply_target_autoloop_seed_path_proof(payload)
         self._apply_target_autoloop_seed_runtime_summary(payload)
         self.set_text(self.output_text, f"target-autoloop {label} 경로 복사 완료:\n{path_value}")
 
@@ -9229,6 +10533,7 @@ class RelayOperatorPanel(tk.Tk):
         self.target_autoloop_seed_last_preview = payload
         text = str(payload.get("ContractText", "") or "")
         self._copy_to_clipboard(text)
+        self._apply_target_autoloop_seed_path_proof(payload)
         self._apply_target_autoloop_seed_runtime_summary(payload)
         self.target_autoloop_seed_status_var.set("target-autoloop 계약/경로 블록을 클립보드로 복사했습니다.")
         self.set_text(self.output_text, "target-autoloop 계약/경로 블록 복사 완료:\n\n" + text)
@@ -9242,6 +10547,7 @@ class RelayOperatorPanel(tk.Tk):
         self.target_autoloop_seed_last_preview = payload
         text = str(payload.get("StartStepsText", "") or "")
         self._copy_to_clipboard(text)
+        self._apply_target_autoloop_seed_path_proof(payload)
         self._apply_target_autoloop_seed_runtime_summary(payload)
         self.target_autoloop_seed_status_var.set("target-autoloop 시작 순서를 클립보드로 복사했습니다.")
         self.set_text(self.output_text, "target-autoloop 시작 순서 복사 완료:\n\n" + text)
@@ -9255,6 +10561,7 @@ class RelayOperatorPanel(tk.Tk):
         self.target_autoloop_seed_last_preview = payload
         text = str(payload.get("HelperText", "") or "")
         self._copy_to_clipboard(text)
+        self._apply_target_autoloop_seed_path_proof(payload)
         self._apply_target_autoloop_seed_runtime_summary(payload)
         self.target_autoloop_seed_status_var.set("target-autoloop helper 블록을 클립보드로 복사했습니다.")
         self.set_text(self.output_text, "target-autoloop helper 블록 복사 완료:\n\n" + text)
@@ -9272,6 +10579,7 @@ class RelayOperatorPanel(tk.Tk):
             return
         self._copy_to_clipboard(command_value)
         self.target_autoloop_seed_status_var.set("target-autoloop publish helper 명령을 클립보드로 복사했습니다.")
+        self._apply_target_autoloop_seed_path_proof(payload)
         self._apply_target_autoloop_seed_runtime_summary(payload)
         self.set_text(self.output_text, "target-autoloop publish helper 명령 복사 완료:\n" + command_value)
 
@@ -9466,7 +10774,7 @@ class RelayOperatorPanel(tk.Tk):
                 "",
                 "[시작 방법]",
                 "- 수동 시작: '초간단 시작문 복사'로 전체 문구를 복사해 대상 PowerShell/셀 창에 직접 붙여넣습니다.",
-                "- 이후 대상이 summary.txt / review.zip 을 만들고 마지막에 publish helper를 실행하면 watcher가 다음 단계부터 자동 진행합니다.",
+                "- 이후 대상이 summary.txt / review.zip 을 만들고 마지막에 publish helper를 실행하면 Pair watcher가 다음 단계부터 자동 진행합니다.",
                 "",
                 "[queue 등록 동작]",
                 "- '초기 입력 큐잉'은 위 작업 설명 블록만 1회성 queue에 등록합니다.",
@@ -9719,7 +11027,7 @@ class RelayOperatorPanel(tk.Tk):
         self.artifact_target_filter_var.set(target_id)
         self._update_artifact_home_browse_toggle_label()
         if refresh and self._has_ui_attr("artifact_tree"):
-            self.refresh_artifacts_tab()
+            self._refresh_artifacts_if_visible_or_mark_pending()
 
     def _disable_artifact_home_browse_pair_scope(self, *, restore_saved_filters: bool = False) -> None:
         browse_var = self.__dict__.get("artifact_home_browse_pair_filter_var")
@@ -9746,7 +11054,7 @@ class RelayOperatorPanel(tk.Tk):
         target_id = self.target_id_var.get().strip() if include_target else ""
         self.artifact_target_filter_var.set(target_id)
         if refresh and self._has_ui_attr("artifact_tree"):
-            self.refresh_artifacts_tab()
+            self._refresh_artifacts_if_visible_or_mark_pending()
 
     def _sync_pair_scoped_views_with_action_context(self, *, refresh_artifacts: bool = True) -> None:
         self._sync_seed_kickoff_with_action_context()
@@ -9798,7 +11106,7 @@ class RelayOperatorPanel(tk.Tk):
         if bool(browse_var.get()):
             self._disable_artifact_home_browse_pair_scope(restore_saved_filters=True)
             if self._has_ui_attr("artifact_tree"):
-                self.refresh_artifacts_tab()
+                self._refresh_artifacts_if_visible_or_mark_pending()
             self.set_query_result(
                 "마지막 조회: Home Pair 고정 결과 필터를 해제했습니다.",
                 context=self._artifact_query_context_summary(),
@@ -9822,7 +11130,7 @@ class RelayOperatorPanel(tk.Tk):
         self.artifact_pair_filter_var.set("")
         self.artifact_target_filter_var.set("")
         if self._has_ui_attr("artifact_tree"):
-            self.refresh_artifacts_tab()
+            self._refresh_artifacts_if_visible_or_mark_pending()
 
     def _apply_artifact_tree_highlights(self) -> None:
         tree = self.__dict__.get("artifact_tree")
@@ -10125,7 +11433,7 @@ class RelayOperatorPanel(tk.Tk):
                 f"5. 마지막에는 publish helper만 실행합니다: {publish_helper_command or '(없음)'}",
                 f"   - helper output marker: {publish_ready_path or '(없음)'}",
                 "6. 순서는 summary.txt -> review.zip -> publish helper 입니다.",
-                "7. helper가 marker를 생성하면 watcher가 다음 단계부터 자동으로 handoff를 진행합니다.",
+                "7. helper가 marker를 생성하면 Pair watcher가 다음 단계부터 자동으로 handoff를 진행합니다.",
             ]
         )
 
@@ -12588,9 +13896,10 @@ class RelayOperatorPanel(tk.Tk):
             messagebox.showerror("설정 저장 실패", str(exc))
             self.message_editor_status_var.set(f"설정 저장 실패: {exc}")
             return
-        self.message_editor_status_var.set(f"저장 완료 / 백업: {backup_path}")
-        self.load_message_editor_document()
-        self.load_effective_config()
+        self.load_message_editor_document(document=self.message_config_doc)
+        self.message_editor_status_var.set(
+            f"저장 완료 / 백업: {backup_path} / 설정 편집기 부분 새로고침만 수행했습니다. 전체 상태가 필요하면 별도 전체 새로고침을 누르세요."
+        )
 
     def rollback_message_editor(self) -> None:
         config_path = self.config_path_var.get().strip()
@@ -12605,15 +13914,25 @@ class RelayOperatorPanel(tk.Tk):
             messagebox.showerror("롤백 실패", str(exc))
             self.message_editor_status_var.set(f"롤백 실패: {exc}")
             return
-        self.message_editor_status_var.set(f"롤백 완료 / 복원: {backup_path}")
         self.load_message_editor_document()
-        self.load_effective_config()
+        self.message_editor_status_var.set(
+            f"롤백 완료 / 복원: {backup_path} / 설정 편집기 부분 새로고침만 수행했습니다. 전체 상태가 필요하면 별도 전체 새로고침을 누르세요."
+        )
 
     def _target_board_items(self) -> list[dict[str, str]]:
-        target_ids = self.message_config_service.target_ids(self.message_config_doc or {}) or BOARD_TARGET_FALLBACK
+        message_config_doc = self.message_config_doc or {}
+        target_ids = self.message_config_service.target_ids(message_config_doc) or BOARD_TARGET_FALLBACK
+        target_map = self.message_config_service.target_map(message_config_doc)
         relay_map = {str(item.get("TargetId", "")): item for item in (self.relay_status_data or {}).get("Targets", [])}
         visibility_map = {str(item.get("TargetId", "")): item for item in (self.visibility_status_data or {}).get("Targets", [])}
-        preview_map = {str(item.get("TargetId", "")): item for item in self.preview_rows}
+        preview_rows = list(self.preview_rows)
+        preview_map = {str(item.get("TargetId", "")): item for item in preview_rows}
+        pair_target_ids: dict[str, list[str]] = {}
+        for row in preview_rows:
+            pair_id = str(row.get("PairId", "") or "")
+            target_id = str(row.get("TargetId", "") or "")
+            if pair_id and target_id:
+                pair_target_ids.setdefault(pair_id, []).append(target_id)
         items: list[dict[str, str]] = []
         for target_id in target_ids:
             runtime = relay_map.get(target_id, {})
@@ -12629,13 +13948,11 @@ class RelayOperatorPanel(tk.Tk):
                 pair_id = pair_id or (match.group(1) if match else "")
                 role_name = role_name or (match.group(2) if match else "")
             if not partner_target_id and pair_id:
-                for candidate in self.preview_rows:
-                    if str(candidate.get("PairId", "") or "") != pair_id:
-                        continue
-                    candidate_target = str(candidate.get("TargetId", "") or "")
+                for candidate_target in pair_target_ids.get(pair_id, []):
                     if candidate_target and candidate_target != target_id:
                         partner_target_id = candidate_target
                         break
+            target_config = target_map.get(target_id, {}) or {}
             items.append(
                 {
                     "TargetId": target_id,
@@ -12648,37 +13965,56 @@ class RelayOperatorPanel(tk.Tk):
                     "RegistrationMode": str(visibility.get("RegistrationMode", "") or runtime.get("RegistrationMode", "")),
                     "Hwnd": str(visibility.get("RuntimeHwnd", "") or runtime.get("Hwnd", "")),
                     "ShellPid": str(visibility.get("RuntimeShellPid", "") or runtime.get("ShellPid", "")),
-                    "WindowTitle": str((self.message_config_service.target_map(self.message_config_doc or {}).get(target_id, {}) or {}).get("WindowTitle", "")),
+                    "WindowTitle": str(target_config.get("WindowTitle", "")),
                     "SourceOutboxSummary": self._source_outbox_preview_summary(preview_row, target_status=target_status),
                 }
             )
         return items
 
-    def render_target_board(self) -> None:
+    def render_target_board(
+        self,
+        *,
+        timing_steps: list[dict[str, object]] | None = None,
+        update_buttons: bool = True,
+    ) -> None:
         if not self._has_ui_attr("board_grid"):
             return
-        items = self._target_board_items()
-        selected_target = self._selected_inspection_target_id()
-        selected_pair = self._selected_inspection_pair_id()
-        action_pair = self._selected_pair_id()
-        action_target = self.target_id_var.get().strip()
-        self.board_status_var.set(
-            self._board_status_text(
-                items=items,
-                selected_target=selected_target,
-                selected_pair=selected_pair,
-                action_pair=action_pair,
-                action_target=action_target,
-                inspection_source=self._selected_inspection_context_state().source,
+        items = self._run_refresh_ui_step(timing_steps, "board items build", self._target_board_items)
+
+        def resolve_context() -> tuple[str, str, str, str, str]:
+            return (
+                self._selected_inspection_target_id(),
+                self._selected_inspection_pair_id(),
+                self._selected_pair_id(),
+                self.target_id_var.get().strip(),
+                self._selected_inspection_context_state().source,
             )
+
+        selected_target, selected_pair, action_pair, action_target, inspection_source = self._run_refresh_ui_step(
+            timing_steps,
+            "board context resolve",
+            resolve_context,
         )
-        self.update_pair_button_states()
 
-        for child in self.board_grid.winfo_children():
-            child.destroy()
-        self.target_board_cells.clear()
+        def update_status_text() -> None:
+            self.board_status_var.set(
+                self._board_status_text(
+                    items=items,
+                    selected_target=selected_target,
+                    selected_pair=selected_pair,
+                    action_pair=action_pair,
+                    action_target=action_target,
+                    inspection_source=inspection_source,
+                )
+            )
 
-        for index, item in enumerate(items):
+        self._run_refresh_ui_step(timing_steps, "board status text", update_status_text)
+        if update_buttons:
+            self._run_refresh_ui_step(timing_steps, "board button state update", self.update_pair_button_states)
+
+        cell_specs: list[dict[str, object]] = []
+
+        def build_cell_spec(index: int, item: dict[str, str]) -> dict[str, object]:
             row = index // 4
             column = index % 4
             is_selected = item["TargetId"] == selected_target
@@ -12691,22 +14027,107 @@ class RelayOperatorPanel(tk.Tk):
                 background = "#fde68a"
             border = "#2563eb" if is_selected else ("#0f766e" if is_selected_pair else "#94a3b8")
             thickness = 4 if is_selected else (3 if is_selected_pair else 2)
-            frame = tk.Frame(self.board_grid, bg=background, bd=1, relief="solid", highlightthickness=thickness, highlightbackground=border)
-            frame.grid(row=row, column=column, sticky="nsew", padx=8, pady=8)
-            title = f"{item['TargetId']}  {item['PairId'] or '-'} {item['RoleName'] or ''}".strip()
-            labels = [
-                tk.Label(frame, text=title, bg=background, anchor="w", font=("Segoe UI", 11, "bold")),
-                tk.Label(frame, text=f"partner={item['PartnerTargetId'] or '-'} / attach={item['RuntimePresent']} / injectable={item['Injectable']}", bg=background, anchor="w"),
-                tk.Label(frame, text=f"outbox={item['SourceOutboxSummary']}", bg=background, anchor="w", justify="left", wraplength=280),
-                tk.Label(frame, text=f"mode={item['RegistrationMode'] or '-'} / hwnd={item['Hwnd'] or '-'}", bg=background, anchor="w"),
-                tk.Label(frame, text=f"shell={item['ShellPid'] or '-'}", bg=background, anchor="w"),
-                tk.Label(frame, text=item["WindowTitle"] or item["RuntimeTitle"] or "(window title 없음)", bg=background, anchor="w", justify="left", wraplength=280),
-            ]
-            for label_index, label in enumerate(labels):
-                label.grid(row=label_index, column=0, sticky="ew", padx=10, pady=(8 if label_index == 0 else 0, 4))
-                label.bind("<Button-1>", lambda _event, target=item["TargetId"], pair=item["PairId"]: self.select_target_from_board(target, pair))
-            frame.bind("<Button-1>", lambda _event, target=item["TargetId"], pair=item["PairId"]: self.select_target_from_board(target, pair))
-            self.target_board_cells[item["TargetId"]] = {"frame": frame, "item": item}
+            signature_keys = (
+                "TargetId",
+                "PairId",
+                "RoleName",
+                "PartnerTargetId",
+                "RuntimePresent",
+                "Injectable",
+                "RuntimeTitle",
+                "RegistrationMode",
+                "Hwnd",
+                "ShellPid",
+                "WindowTitle",
+                "SourceOutboxSummary",
+            )
+            signature = (
+                row,
+                column,
+                is_selected,
+                is_selected_pair,
+                background,
+                border,
+                thickness,
+                tuple((key, item.get(key, "")) for key in signature_keys),
+            )
+            return {
+                "item": item,
+                "target_id": item["TargetId"],
+                "row": row,
+                "column": column,
+                "background": background,
+                "border": border,
+                "thickness": thickness,
+                "signature": signature,
+            }
+
+        def clear_board_grid() -> None:
+            nonlocal cell_specs
+            cell_specs = [build_cell_spec(index, item) for index, item in enumerate(items)]
+            current_target_ids = {str(spec["target_id"]) for spec in cell_specs}
+            known_frame_ids = {
+                id(cell.get("frame"))
+                for cell in self.target_board_cells.values()
+                if isinstance(cell, dict) and cell.get("frame") is not None
+            }
+            for child in self.board_grid.winfo_children():
+                if id(child) not in known_frame_ids:
+                    child.destroy()
+            for target_id, cell in list(self.target_board_cells.items()):
+                if target_id not in current_target_ids:
+                    frame = cell.get("frame") if isinstance(cell, dict) else None
+                    if hasattr(frame, "destroy"):
+                        frame.destroy()
+                    self.target_board_cells.pop(target_id, None)
+            for spec in cell_specs:
+                target_id = str(spec["target_id"])
+                cell = self.target_board_cells.get(target_id)
+                if not isinstance(cell, dict):
+                    continue
+                if cell.get("signature") == spec["signature"]:
+                    continue
+                frame = cell.get("frame")
+                if hasattr(frame, "destroy"):
+                    frame.destroy()
+                self.target_board_cells.pop(target_id, None)
+
+        self._run_refresh_ui_step(timing_steps, "board grid clear", clear_board_grid)
+
+        def render_cells() -> None:
+            for spec in cell_specs:
+                item = spec["item"]
+                target_id = str(spec["target_id"])
+                existing_cell = self.target_board_cells.get(target_id)
+                if isinstance(existing_cell, dict) and existing_cell.get("signature") == spec["signature"]:
+                    continue
+                row = int(spec["row"])
+                column = int(spec["column"])
+                background = str(spec["background"])
+                border = str(spec["border"])
+                thickness = int(spec["thickness"])
+                frame = tk.Frame(self.board_grid, bg=background, bd=1, relief="solid", highlightthickness=thickness, highlightbackground=border)
+                frame.grid(row=row, column=column, sticky="nsew", padx=8, pady=8)
+                title = f"{item['TargetId']}  {item['PairId'] or '-'} {item['RoleName'] or ''}".strip()
+                labels = [
+                    tk.Label(frame, text=title, bg=background, anchor="w", font=("Segoe UI", 11, "bold")),
+                    tk.Label(frame, text=f"partner={item['PartnerTargetId'] or '-'} / attach={item['RuntimePresent']} / injectable={item['Injectable']}", bg=background, anchor="w"),
+                    tk.Label(frame, text=f"outbox={item['SourceOutboxSummary']}", bg=background, anchor="w", justify="left", wraplength=280),
+                    tk.Label(frame, text=f"mode={item['RegistrationMode'] or '-'} / hwnd={item['Hwnd'] or '-'}", bg=background, anchor="w"),
+                    tk.Label(frame, text=f"shell={item['ShellPid'] or '-'}", bg=background, anchor="w"),
+                    tk.Label(frame, text=item["WindowTitle"] or item["RuntimeTitle"] or "(window title 없음)", bg=background, anchor="w", justify="left", wraplength=280),
+                ]
+                for label_index, label in enumerate(labels):
+                    label.grid(row=label_index, column=0, sticky="ew", padx=10, pady=(8 if label_index == 0 else 0, 4))
+                    label.bind("<Button-1>", lambda _event, target=item["TargetId"], pair=item["PairId"]: self.select_target_from_board(target, pair))
+                frame.bind("<Button-1>", lambda _event, target=item["TargetId"], pair=item["PairId"]: self.select_target_from_board(target, pair))
+                self.target_board_cells[target_id] = {
+                    "frame": frame,
+                    "item": item,
+                    "signature": spec["signature"],
+                }
+
+        self._run_refresh_ui_step(timing_steps, "board cell render", render_cells)
 
     def select_target_from_board(self, target_id: str, pair_id: str = "") -> None:
         self._set_inspection_context(
@@ -12778,7 +14199,7 @@ class RelayOperatorPanel(tk.Tk):
         self.config_combo.grid(row=0, column=1, columnspan=3, sticky="ew")
         ttk.Button(controls, text="찾아보기", command=self.browse_config).grid(row=0, column=4, padx=(8, 0))
         ttk.Button(controls, text="빠른 새로고침", command=self.refresh_quick_status).grid(row=0, column=5, sticky="e", padx=(8, 0))
-        ttk.Button(controls, text="전체 새로고침", command=self.load_effective_config).grid(row=0, column=6, sticky="e", padx=(8, 0))
+        ttk.Button(controls, text="전체 새로고침", command=self.refresh_full_dashboard_status).grid(row=0, column=6, sticky="e", padx=(8, 0))
         ttk.Checkbutton(controls, text="간단 모드", variable=self.simple_mode_var, command=self.toggle_simple_mode).grid(row=0, column=7, sticky="e", padx=(8, 0))
         ttk.Button(controls, textvariable=self.header_toggle_button_var, command=self.toggle_header_compact).grid(row=0, column=8, sticky="e", padx=(8, 0))
 
@@ -12904,8 +14325,9 @@ class RelayOperatorPanel(tk.Tk):
         ttk.Label(status_frame, textvariable=self.operator_hint_var, wraplength=1100, justify="left").grid(row=3, column=1, sticky="w", pady=(6, 0))
         ttk.Label(status_frame, textvariable=self.last_result_var, wraplength=1100, justify="left").grid(row=4, column=0, columnspan=2, sticky="w", pady=(6, 0))
         ttk.Label(status_frame, textvariable=self.last_query_result_var, wraplength=1100, justify="left").grid(row=5, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        ttk.Label(status_frame, textvariable=self.task_timing_var, wraplength=1100, justify="left").grid(row=6, column=0, columnspan=2, sticky="w", pady=(6, 0))
         wrapper_caller_row = ttk.Frame(status_frame)
-        wrapper_caller_row.grid(row=6, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        wrapper_caller_row.grid(row=7, column=0, columnspan=2, sticky="ew", pady=(6, 0))
         wrapper_caller_row.columnconfigure(1, weight=1)
         wrapper_audit_caller_badge_label = tk.Label(
             wrapper_caller_row,
@@ -12920,7 +14342,7 @@ class RelayOperatorPanel(tk.Tk):
         wrapper_audit_caller_badge_label.bind("<Button-1>", self.run_wrapper_audit_caller_badge_action)
         self.wrapper_audit_caller_badge_label = wrapper_audit_caller_badge_label
         ttk.Label(wrapper_caller_row, textvariable=self.wrapper_audit_caller_var, wraplength=1020, justify="left").grid(row=0, column=1, sticky="w", padx=(8, 0))
-        ttk.Label(status_frame, textvariable=self.wrapper_audit_compare_var, wraplength=1100, justify="left").grid(row=7, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        ttk.Label(status_frame, textvariable=self.wrapper_audit_compare_var, wraplength=1100, justify="left").grid(row=8, column=0, columnspan=2, sticky="w", pady=(6, 0))
 
         notebook = ttk.Notebook(self)
         notebook.grid(row=1, column=0, sticky="nsew", padx=10, pady=(0, 10))
@@ -13584,24 +15006,34 @@ class RelayOperatorPanel(tk.Tk):
         ).grid(row=0, column=3, padx=(8, 0))
         ttk.Button(
             target_autoloop_filter_controls,
-            text="보이는 target 선택",
-            command=self.select_visible_target_autoloop_policy_cards,
+            text="전체 선택",
+            command=self.select_all_target_autoloop_policy_cards,
         ).grid(row=0, column=4, padx=(8, 0))
         ttk.Button(
             target_autoloop_filter_controls,
-            text="선택 해제",
-            command=self.clear_target_autoloop_policy_selection,
+            text="보이는 target 선택",
+            command=self.select_visible_target_autoloop_policy_cards,
         ).grid(row=0, column=5, padx=(8, 0))
+        ttk.Button(
+            target_autoloop_filter_controls,
+            text="전체 해제",
+            command=self.clear_target_autoloop_policy_selection,
+        ).grid(row=0, column=6, padx=(8, 0))
         ttk.Button(
             target_autoloop_filter_controls,
             text="선택 target에 일괄 적용",
             command=self.apply_target_autoloop_policy_clone_to_selected_targets,
-        ).grid(row=0, column=6, padx=(8, 0))
+        ).grid(row=0, column=7, padx=(8, 0))
         ttk.Button(
             target_autoloop_filter_controls,
             text="선택 target에 repo만 적용",
             command=self.apply_target_autoloop_work_repo_root_to_selected_targets,
-        ).grid(row=0, column=7, padx=(8, 0))
+        ).grid(row=0, column=8, padx=(8, 0))
+        ttk.Button(
+            target_autoloop_filter_controls,
+            textvariable=self.target_autoloop_policy_card_detail_toggle_var,
+            command=self.toggle_target_autoloop_policy_card_details,
+        ).grid(row=0, column=9, padx=(8, 0))
         target_autoloop_quick_select_controls = ttk.Frame(target_autoloop_policy_actions)
         target_autoloop_quick_select_controls.grid(row=3, column=1, columnspan=5, sticky="w", pady=(8, 0))
         ttk.Label(target_autoloop_policy_actions, text="빠른 선택").grid(row=3, column=0, sticky="w", pady=(8, 0))
@@ -13637,9 +15069,14 @@ class RelayOperatorPanel(tk.Tk):
         ).grid(row=0, column=5, padx=(8, 0))
         ttk.Button(
             target_autoloop_quick_select_controls,
+            text="선택 target 실행 준비",
+            command=self.prepare_selected_target_autoloop_policy_cards_for_run,
+        ).grid(row=0, column=6, padx=(8, 0))
+        ttk.Button(
+            target_autoloop_quick_select_controls,
             text="enabled publish-ready 켜기",
             command=self.enable_publish_ready_for_enabled_target_autoloop_policy_cards,
-        ).grid(row=0, column=6, padx=(8, 0))
+        ).grid(row=0, column=7, padx=(8, 0))
         target_autoloop_selection_controls = ttk.Frame(target_autoloop_policy_actions)
         target_autoloop_selection_controls.grid(row=4, column=1, columnspan=5, sticky="w", pady=(8, 0))
         ttk.Label(target_autoloop_policy_actions, text="선택 snapshot").grid(row=4, column=0, sticky="w", pady=(8, 0))
@@ -13692,7 +15129,7 @@ class RelayOperatorPanel(tk.Tk):
             )
             self.target_autoloop_policy_card_frames[target_id] = card
             card.columnconfigure(1, weight=1)
-            card.rowconfigure(9, weight=1)
+            card.rowconfigure(10, weight=1)
             ttk.Label(card, textvariable=card_vars["meta_var"], wraplength=420, justify="left").grid(row=0, column=0, columnspan=2, sticky="w")
             badge_label = tk.Label(
                 card,
@@ -13724,7 +15161,21 @@ class RelayOperatorPanel(tk.Tk):
             )
             runtime_badge_label.grid(row=2, column=0, sticky="w", pady=(6, 0))
             self.target_autoloop_policy_card_runtime_badge_labels[target_id] = runtime_badge_label
-            ttk.Label(card, textvariable=card_vars["runtime_summary_var"], wraplength=420, justify="left").grid(row=2, column=1, sticky="e", pady=(6, 0))
+            runtime_summary_frame = ttk.Frame(card)
+            runtime_summary_frame.grid(row=2, column=1, sticky="ew", pady=(6, 0))
+            runtime_summary_frame.columnconfigure(0, weight=1)
+            ttk.Label(
+                runtime_summary_frame,
+                textvariable=card_vars["runtime_summary_var"],
+                wraplength=420,
+                justify="left",
+            ).grid(row=0, column=0, sticky="e")
+            ttk.Label(
+                runtime_summary_frame,
+                textvariable=card_vars["compact_action_var"],
+                wraplength=420,
+                justify="left",
+            ).grid(row=1, column=0, sticky="e", pady=(2, 0))
             policy_toggle_row = ttk.Frame(card)
             policy_toggle_row.grid(row=3, column=0, columnspan=2, sticky="w", pady=(8, 0))
             ttk.Checkbutton(policy_toggle_row, text="선택", variable=card_vars["bulk_selected_var"]).grid(row=0, column=0, sticky="w")
@@ -13756,12 +15207,126 @@ class RelayOperatorPanel(tk.Tk):
                 command=lambda current_target_id=target_id: self.open_target_autoloop_work_repo_root(current_target_id),
             ).grid(row=0, column=2, padx=(4, 0))
             ttk.Label(card, textvariable=card_vars["route_state_var"], wraplength=420, justify="left").grid(row=7, column=0, columnspan=2, sticky="w", pady=(6, 0))
-            ttk.Label(card, text="실효값 상세").grid(row=8, column=0, columnspan=2, sticky="w", pady=(6, 0))
+            card_seed_actions = ttk.Frame(card)
+            card_seed_actions.grid(row=8, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+            card_detail_widgets: list[object] = []
+            ttk.Label(card_seed_actions, text="시작").grid(row=0, column=0, sticky="w")
+            seed_copy_button = ttk.Button(
+                card_seed_actions,
+                text=f"{target_id} 시작문 복사",
+                command=lambda current_target_id=target_id: self.copy_target_autoloop_seed_for_target(current_target_id),
+            )
+            seed_copy_button.grid(row=0, column=1, sticky="e", padx=(8, 0))
+            self.target_autoloop_policy_card_seed_copy_buttons[target_id] = seed_copy_button
+            ttk.Label(card_seed_actions, text="추가").grid(row=1, column=0, sticky="w", pady=(6, 0))
+            card_extend_entry = ttk.Entry(
+                card_seed_actions,
+                textvariable=card_vars["extend_cycles_var"],
+                width=5,
+            )
+            card_extend_entry.grid(row=1, column=1, sticky="w", padx=(8, 0), pady=(6, 0))
+            self.long_task_widgets.append(card_extend_entry)
+            card_extend_button = ttk.Button(
+                card_seed_actions,
+                text=f"{target_id} 추가 3회",
+                command=lambda current_target_id=target_id: self.request_extend_target_autoloop_cycle_limit(
+                    target_id=current_target_id
+                ),
+            )
+            card_extend_button.grid(row=1, column=2, sticky="w", padx=(8, 0), pady=(6, 0))
+            self.target_autoloop_policy_card_extend_cycle_limit_buttons[target_id] = card_extend_button
+            self.long_task_widgets.append(card_extend_button)
+            card_extend_start_button = ttk.Button(
+                card_seed_actions,
+                text=f"{target_id} 추가 3회+감지",
+                command=lambda current_target_id=target_id: self.request_extend_target_autoloop_cycle_limit(
+                    continue_with_start=True,
+                    target_id=current_target_id,
+                ),
+            )
+            card_extend_start_button.grid(row=1, column=3, sticky="w", padx=(8, 0), pady=(6, 0))
+            self.target_autoloop_policy_card_extend_and_start_buttons[target_id] = card_extend_start_button
+            self.long_task_widgets.append(card_extend_start_button)
+            extend_state_label = ttk.Label(card_seed_actions, text="추가 상태")
+            extend_state_label.grid(row=2, column=0, sticky="nw", pady=(6, 0))
+            extend_state_value = ttk.Label(
+                card_seed_actions,
+                textvariable=card_vars["extend_state_var"],
+                wraplength=360,
+                justify="left",
+            )
+            extend_state_value.grid(row=2, column=1, columnspan=3, sticky="w", padx=(8, 0), pady=(6, 0))
+            card_detail_widgets.extend([extend_state_label, extend_state_value])
+            ttk.Label(card_seed_actions, text="산출물 열기").grid(row=3, column=0, sticky="w", pady=(6, 0))
+            artifact_button_specs = (
+                ("source_outbox", "outbox", "source_outbox_path", "source-outbox"),
+                ("summary", "summary", "summary_path", "summary.txt"),
+                ("review_zip", "zip", "review_zip_path", "review.zip"),
+                ("publish_ready", "ready", "publish_ready_path", "publish.ready.json"),
+            )
+            self.target_autoloop_policy_card_artifact_buttons[target_id] = {}
+            for artifact_index, (artifact_key, label, path_key, kind_label) in enumerate(artifact_button_specs, start=1):
+                artifact_button = ttk.Button(
+                    card_seed_actions,
+                    text=label,
+                    command=lambda current_target_id=target_id, current_path_key=path_key, current_kind_label=kind_label: (
+                        self.open_target_autoloop_target_artifact_path(
+                            current_target_id,
+                            current_path_key,
+                            current_kind_label,
+                        )
+                    ),
+                )
+                artifact_button.grid(row=3, column=artifact_index, sticky="w", padx=(8, 0), pady=(6, 0))
+                self.target_autoloop_policy_card_artifact_buttons[target_id][artifact_key] = artifact_button
+                self._register_read_only_widget(artifact_button)
+                self._install_widget_tooltip(
+                    artifact_button,
+                    self._target_autoloop_policy_card_artifact_button_tooltip_text(
+                        target_id=target_id,
+                        short_label=label,
+                        kind_label=kind_label,
+                    ),
+                )
+            artifact_state_label = ttk.Label(card_seed_actions, text="산출물 상태")
+            artifact_state_label.grid(row=4, column=0, sticky="nw", pady=(6, 0))
+            artifact_state_value = ttk.Label(
+                card_seed_actions,
+                textvariable=card_vars["artifact_state_var"],
+                wraplength=360,
+                justify="left",
+            )
+            artifact_state_value.grid(row=4, column=1, columnspan=3, sticky="w", padx=(8, 0), pady=(6, 0))
+            card_detail_widgets.extend([artifact_state_label, artifact_state_value])
+            ttk.Label(card_seed_actions, text="ready 재검사").grid(row=5, column=0, sticky="w", pady=(6, 0))
+            card_process_once_button = ttk.Button(
+                card_seed_actions,
+                text=f"{target_id} ready 재검사",
+                command=lambda current_target_id=target_id: self.request_target_autoloop_process_once_sweep(
+                    target_id=current_target_id
+                ),
+            )
+            card_process_once_button.grid(row=5, column=1, columnspan=2, sticky="w", padx=(8, 0), pady=(6, 0))
+            self.target_autoloop_policy_card_process_once_buttons[target_id] = card_process_once_button
+            self.long_task_widgets.append(card_process_once_button)
+            process_once_state_value = ttk.Label(
+                card_seed_actions,
+                textvariable=card_vars["process_once_state_var"],
+                wraplength=360,
+                justify="left",
+            )
+            process_once_state_value.grid(row=6, column=1, columnspan=3, sticky="w", padx=(8, 0), pady=(2, 0))
+            card_detail_widgets.append(process_once_state_value)
+            effective_preview_label = ttk.Label(card, text="실효값 상세")
+            effective_preview_label.grid(row=9, column=0, columnspan=2, sticky="w", pady=(6, 0))
             effective_preview_text = scrolledtext.ScrolledText(card, height=8, wrap="char")
-            effective_preview_text.grid(row=9, column=0, columnspan=2, sticky="nsew", pady=(4, 0))
+            effective_preview_text.grid(row=10, column=0, columnspan=2, sticky="nsew", pady=(4, 0))
             self.target_autoloop_policy_card_effective_preview_widgets[target_id] = effective_preview_text
             self.set_text(effective_preview_text, str(card_vars["effective_preview_var"].get() or ""))
+            card_detail_widgets.extend([effective_preview_label, effective_preview_text])
+            self.target_autoloop_policy_card_detail_widgets[target_id] = card_detail_widgets
 
+        self._apply_target_autoloop_policy_card_detail_visibility()
         target_autoloop_fixed_frame = ttk.LabelFrame(target_autoloop_tab, text="Autoloop Target 고정문구", padding=8)
         target_autoloop_fixed_frame.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(10, 0))
         target_autoloop_fixed_frame.columnconfigure(1, weight=1)
@@ -13859,68 +15424,109 @@ class RelayOperatorPanel(tk.Tk):
         )
         target_autoloop_detector_badge_label.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(8, 0))
         self.target_autoloop_detector_badge_label = target_autoloop_detector_badge_label
+        target_autoloop_runroot_attention_label = tk.Label(
+            target_autoloop_actions,
+            textvariable=self.target_autoloop_runroot_attention_var,
+            anchor="w",
+            justify="left",
+            bg="#374151",
+            fg="#FFFFFF",
+            padx=10,
+            pady=7,
+        )
+        target_autoloop_runroot_attention_label.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        self.target_autoloop_runroot_attention_label = target_autoloop_runroot_attention_label
         target_autoloop_primary_buttons = ttk.Frame(target_autoloop_actions)
-        target_autoloop_primary_buttons.grid(row=2, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        target_autoloop_primary_buttons.grid(row=3, column=0, columnspan=2, sticky="w", pady=(8, 0))
         self.target_autoloop_refresh_button = ttk.Button(
             target_autoloop_primary_buttons,
-            text="현재 Run 기준 새로고침",
+            text="현재 RunRoot 다시 읽기",
             command=self.refresh_target_autoloop_status_panel,
         )
         self.target_autoloop_refresh_button.grid(row=0, column=0, padx=(0, 8))
         self._register_read_only_widget(self.target_autoloop_refresh_button)
+        self.target_autoloop_sync_windows_router_button = ttk.Button(
+            target_autoloop_primary_buttons,
+            text="8창 재사용+router 동기화",
+            command=self.request_sync_target_autoloop_windows_router_session,
+        )
+        self.target_autoloop_sync_windows_router_button.grid(row=0, column=1, padx=(0, 8))
+        self.long_task_widgets.append(self.target_autoloop_sync_windows_router_button)
         self.target_autoloop_prepare_selected_runroot_button = ttk.Button(
             target_autoloop_primary_buttons,
             text="선택 target만 새 RunRoot",
             command=self.request_prepare_selected_target_autoloop_run_root,
         )
-        self.target_autoloop_prepare_selected_runroot_button.grid(row=0, column=1, padx=(0, 8))
+        self.target_autoloop_prepare_selected_runroot_button.grid(row=0, column=2, padx=(0, 8))
         self.long_task_widgets.append(self.target_autoloop_prepare_selected_runroot_button)
         self.target_autoloop_fix_selected_publish_ready_button = ttk.Button(
             target_autoloop_primary_buttons,
             text="선택 target publish-ready 켜고 RunRoot 준비",
             command=self.request_fix_publish_ready_and_prepare_selected_target_autoloop_run_root,
         )
-        self.target_autoloop_fix_selected_publish_ready_button.grid(row=0, column=2, padx=(0, 8))
+        self.target_autoloop_fix_selected_publish_ready_button.grid(row=0, column=3, padx=(0, 8))
         self.long_task_widgets.append(self.target_autoloop_fix_selected_publish_ready_button)
         self.target_autoloop_start_button = ttk.Button(
             target_autoloop_primary_buttons,
             text="독립셀 감지 시작/재시작",
             command=self.request_start_target_autoloop_watcher,
         )
-        self.target_autoloop_start_button.grid(row=0, column=3, padx=(0, 8))
+        self.target_autoloop_start_button.grid(row=0, column=4, padx=(0, 8))
         self.long_task_widgets.append(self.target_autoloop_start_button)
         target_autoloop_control_buttons = ttk.Frame(target_autoloop_actions)
-        target_autoloop_control_buttons.grid(row=3, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        target_autoloop_control_buttons.grid(row=4, column=0, columnspan=2, sticky="w", pady=(8, 0))
         self.target_autoloop_pause_button = ttk.Button(
             target_autoloop_control_buttons,
-            text="일시정지",
+            text="전체 감지기 일시정지",
             command=self.request_pause_target_autoloop,
         )
         self.target_autoloop_pause_button.grid(row=0, column=0, padx=(0, 8))
         self.long_task_widgets.append(self.target_autoloop_pause_button)
         self.target_autoloop_resume_button = ttk.Button(
             target_autoloop_control_buttons,
-            text="재개",
+            text="전체 감지기 재개",
             command=self.request_resume_target_autoloop,
         )
         self.target_autoloop_resume_button.grid(row=0, column=1, padx=(0, 8))
         self.long_task_widgets.append(self.target_autoloop_resume_button)
         self.target_autoloop_stop_button = ttk.Button(
             target_autoloop_control_buttons,
-            text="정지",
+            text="전체 감지기 정지",
             command=self.request_stop_target_autoloop,
         )
         self.target_autoloop_stop_button.grid(row=0, column=2, padx=(0, 8))
         self.long_task_widgets.append(self.target_autoloop_stop_button)
         self.target_autoloop_process_once_button = ttk.Button(
             target_autoloop_control_buttons,
-            text="publish.ready 1회 재검사",
+            text="전체 publish.ready 1회 재검사",
             command=self.request_target_autoloop_process_once_sweep,
         )
         self.target_autoloop_process_once_button.grid(row=0, column=3, padx=(0, 8))
         self.long_task_widgets.append(self.target_autoloop_process_once_button)
+        ttk.Label(target_autoloop_control_buttons, text="추가 횟수").grid(row=0, column=4, sticky="w", padx=(0, 4))
+        self.target_autoloop_extend_cycles_entry = ttk.Entry(
+            target_autoloop_control_buttons,
+            textvariable=self.target_autoloop_extend_cycles_var,
+            width=5,
+        )
+        self.target_autoloop_extend_cycles_entry.grid(row=0, column=5, padx=(0, 8))
+        self.target_autoloop_extend_cycle_limit_button = ttk.Button(
+            target_autoloop_control_buttons,
+            text="선택 target 추가 3회 이어가기",
+            command=self.request_extend_target_autoloop_cycle_limit,
+        )
+        self.target_autoloop_extend_cycle_limit_button.grid(row=0, column=6, padx=(0, 8))
+        self.target_autoloop_extend_and_start_button = ttk.Button(
+            target_autoloop_control_buttons,
+            text="선택 target 추가 3회+감지 시작",
+            command=lambda: self.request_extend_target_autoloop_cycle_limit(continue_with_start=True),
+        )
+        self.target_autoloop_extend_and_start_button.grid(row=0, column=7, padx=(0, 8))
+        self.long_task_widgets.append(self.target_autoloop_extend_cycles_entry)
+        self.long_task_widgets.append(self.target_autoloop_extend_cycle_limit_button)
+        self.long_task_widgets.append(self.target_autoloop_extend_and_start_button)
         target_autoloop_advanced_buttons = ttk.Frame(target_autoloop_actions)
-        target_autoloop_advanced_buttons.grid(row=4, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        target_autoloop_advanced_buttons.grid(row=5, column=0, columnspan=2, sticky="w", pady=(8, 0))
         ttk.Label(target_autoloop_advanced_buttons, text="고급/전체 실행").grid(row=0, column=0, sticky="w", padx=(0, 8))
         self.target_autoloop_prepare_runroot_button = ttk.Button(
             target_autoloop_advanced_buttons,
@@ -13929,14 +15535,105 @@ class RelayOperatorPanel(tk.Tk):
         )
         self.target_autoloop_prepare_runroot_button.grid(row=0, column=1, padx=(0, 8))
         self.long_task_widgets.append(self.target_autoloop_prepare_runroot_button)
+        target_autoloop_artifact_buttons = ttk.Frame(target_autoloop_actions)
+        target_autoloop_artifact_buttons.grid(row=6, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        ttk.Label(target_autoloop_artifact_buttons, text="선택 target 산출물").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        self.target_autoloop_open_source_outbox_button = ttk.Button(
+            target_autoloop_artifact_buttons,
+            text="source-outbox 열기",
+            command=self.open_target_autoloop_selected_source_outbox,
+        )
+        self.target_autoloop_open_source_outbox_button.grid(row=0, column=1, padx=(0, 8))
+        self._register_read_only_widget(self.target_autoloop_open_source_outbox_button)
+        self.target_autoloop_open_summary_button = ttk.Button(
+            target_autoloop_artifact_buttons,
+            text="summary.txt 열기",
+            command=self.open_target_autoloop_selected_summary,
+        )
+        self.target_autoloop_open_summary_button.grid(row=0, column=2, padx=(0, 8))
+        self._register_read_only_widget(self.target_autoloop_open_summary_button)
+        self.target_autoloop_open_review_zip_button = ttk.Button(
+            target_autoloop_artifact_buttons,
+            text="review.zip 열기",
+            command=self.open_target_autoloop_selected_review_zip,
+        )
+        self.target_autoloop_open_review_zip_button.grid(row=0, column=3, padx=(0, 8))
+        self._register_read_only_widget(self.target_autoloop_open_review_zip_button)
+        self.target_autoloop_open_publish_ready_button = ttk.Button(
+            target_autoloop_artifact_buttons,
+            text="publish.ready 열기",
+            command=self.open_target_autoloop_selected_publish_ready,
+        )
+        self.target_autoloop_open_publish_ready_button.grid(row=0, column=4, padx=(0, 8))
+        self._register_read_only_widget(self.target_autoloop_open_publish_ready_button)
+        target_autoloop_selected_progress_badge_label = tk.Label(
+            target_autoloop_actions,
+            textvariable=self.target_autoloop_selected_progress_badge_var,
+            anchor="w",
+            justify="left",
+            bg="#6B7280",
+            fg="#FFFFFF",
+            padx=8,
+            pady=5,
+        )
+        target_autoloop_selected_progress_badge_label.grid(row=7, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        self.target_autoloop_selected_progress_badge_label = target_autoloop_selected_progress_badge_label
+        ttk.Label(
+            target_autoloop_actions,
+            textvariable=self.target_autoloop_selected_progress_var,
+            wraplength=1180,
+            justify="left",
+        ).grid(row=8, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        ttk.Label(
+            target_autoloop_actions,
+            textvariable=self.target_autoloop_selected_artifact_var,
+            wraplength=1180,
+            justify="left",
+        ).grid(row=9, column=0, columnspan=2, sticky="w", pady=(2, 0))
+        target_autoloop_start_precheck_badge_label = tk.Label(
+            target_autoloop_actions,
+            textvariable=self.target_autoloop_start_precheck_badge_var,
+            anchor="w",
+            justify="left",
+            bg="#6B7280",
+            fg="#FFFFFF",
+            padx=8,
+            pady=5,
+        )
+        target_autoloop_start_precheck_badge_label.grid(row=10, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        self.target_autoloop_start_precheck_badge_label = target_autoloop_start_precheck_badge_label
         ttk.Label(
             target_autoloop_actions,
             textvariable=self.target_autoloop_start_reason_var,
             wraplength=1180,
             justify="left",
-        ).grid(row=5, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        ).grid(row=11, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        ttk.Label(
+            target_autoloop_actions,
+            textvariable=self.target_autoloop_prepare_reason_var,
+            wraplength=1180,
+            justify="left",
+        ).grid(row=12, column=0, columnspan=2, sticky="w", pady=(2, 0))
+        ttk.Label(
+            target_autoloop_actions,
+            textvariable=self.target_autoloop_process_once_reason_var,
+            wraplength=1180,
+            justify="left",
+        ).grid(row=13, column=0, columnspan=2, sticky="w", pady=(2, 0))
+        ttk.Label(
+            target_autoloop_actions,
+            textvariable=self.target_autoloop_extend_reason_var,
+            wraplength=1180,
+            justify="left",
+        ).grid(row=14, column=0, columnspan=2, sticky="w", pady=(2, 0))
+        ttk.Label(
+            target_autoloop_actions,
+            textvariable=self.target_autoloop_control_reason_var,
+            wraplength=1180,
+            justify="left",
+        ).grid(row=15, column=0, columnspan=2, sticky="w", pady=(2, 0))
         target_autoloop_diagnostic_buttons = ttk.Frame(target_autoloop_actions)
-        target_autoloop_diagnostic_buttons.grid(row=6, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        target_autoloop_diagnostic_buttons.grid(row=16, column=0, columnspan=2, sticky="w", pady=(8, 0))
         self.target_autoloop_stdout_log_button = ttk.Button(
             target_autoloop_diagnostic_buttons,
             text="stdout 로그",
@@ -14086,8 +15783,20 @@ class RelayOperatorPanel(tk.Tk):
             wraplength=1180,
             justify="left",
         ).grid(row=3, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        ttk.Label(
+            target_autoloop_seed_frame,
+            textvariable=self.target_autoloop_seed_copy_reason_var,
+            wraplength=1180,
+            justify="left",
+        ).grid(row=4, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        ttk.Label(
+            target_autoloop_seed_frame,
+            textvariable=self.target_autoloop_seed_path_proof_var,
+            wraplength=1180,
+            justify="left",
+        ).grid(row=5, column=0, columnspan=2, sticky="w", pady=(4, 0))
         target_autoloop_seed_input_row = ttk.Frame(target_autoloop_seed_frame)
-        target_autoloop_seed_input_row.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        target_autoloop_seed_input_row.grid(row=6, column=0, columnspan=2, sticky="ew", pady=(8, 0))
         target_autoloop_seed_input_row.columnconfigure(1, weight=1)
         ttk.Label(target_autoloop_seed_input_row, text="추가 입력 파일").grid(row=0, column=0, sticky="w")
         ttk.Entry(target_autoloop_seed_input_row, textvariable=self.target_autoloop_seed_input_var).grid(row=0, column=1, sticky="ew", padx=(6, 6))
@@ -14099,27 +15808,27 @@ class RelayOperatorPanel(tk.Tk):
             textvariable=self.target_autoloop_seed_guidance_var,
             wraplength=1180,
             justify="left",
-        ).grid(row=5, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        ).grid(row=7, column=0, columnspan=2, sticky="w", pady=(6, 0))
         ttk.Label(
             target_autoloop_seed_frame,
             textvariable=self.target_autoloop_seed_runtime_var,
             wraplength=1180,
             justify="left",
-        ).grid(row=6, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        ).grid(row=8, column=0, columnspan=2, sticky="w", pady=(4, 0))
         ttk.Checkbutton(
             target_autoloop_seed_frame,
             text="세부 블록 표시",
             variable=self.target_autoloop_seed_detail_visible_var,
             command=self._apply_target_autoloop_seed_detail_visibility,
-        ).grid(row=7, column=0, columnspan=2, sticky="w", pady=(6, 0))
-        ttk.Label(target_autoloop_seed_frame, text="작업 설명").grid(row=8, column=0, sticky="w", pady=(8, 0))
-        ttk.Label(target_autoloop_seed_frame, text="초간단 시작문 미리보기").grid(row=8, column=1, sticky="w", pady=(8, 0))
+        ).grid(row=9, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        ttk.Label(target_autoloop_seed_frame, text="작업 설명").grid(row=10, column=0, sticky="w", pady=(8, 0))
+        ttk.Label(target_autoloop_seed_frame, text="초간단 시작문 미리보기").grid(row=10, column=1, sticky="w", pady=(8, 0))
         self.target_autoloop_seed_task_text = scrolledtext.ScrolledText(target_autoloop_seed_frame, height=7, wrap="word")
-        self.target_autoloop_seed_task_text.grid(row=9, column=0, sticky="nsew", padx=(0, 10))
+        self.target_autoloop_seed_task_text.grid(row=11, column=0, sticky="nsew", padx=(0, 10))
         self.target_autoloop_seed_simple_text = scrolledtext.ScrolledText(target_autoloop_seed_frame, height=7, wrap="word")
-        self.target_autoloop_seed_simple_text.grid(row=9, column=1, sticky="nsew")
+        self.target_autoloop_seed_simple_text.grid(row=11, column=1, sticky="nsew")
         target_autoloop_seed_detail_frame = ttk.Frame(target_autoloop_seed_frame)
-        target_autoloop_seed_detail_frame.grid(row=10, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        target_autoloop_seed_detail_frame.grid(row=12, column=0, columnspan=2, sticky="ew", pady=(8, 0))
         target_autoloop_seed_detail_frame.columnconfigure(0, weight=1)
         target_autoloop_seed_detail_frame.columnconfigure(1, weight=1)
         self.target_autoloop_seed_detail_frame = target_autoloop_seed_detail_frame
@@ -14137,7 +15846,7 @@ class RelayOperatorPanel(tk.Tk):
         self.target_autoloop_seed_steps_text = scrolledtext.ScrolledText(target_autoloop_seed_detail_right, height=5, wrap="word")
         self.target_autoloop_seed_steps_text.grid(row=3, column=0, sticky="nsew")
         target_autoloop_seed_actions = ttk.Frame(target_autoloop_seed_frame)
-        target_autoloop_seed_actions.grid(row=11, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        target_autoloop_seed_actions.grid(row=13, column=0, columnspan=2, sticky="ew", pady=(8, 0))
         ttk.Button(target_autoloop_seed_actions, text="summary 경로 복사", command=self.copy_target_autoloop_seed_summary_path).grid(row=0, column=0, padx=(0, 8))
         ttk.Button(target_autoloop_seed_actions, text="review.zip 경로 복사", command=self.copy_target_autoloop_seed_review_zip_path).grid(row=0, column=1, padx=(0, 8))
         ttk.Button(target_autoloop_seed_actions, text="publish.ready 경로 복사", command=self.copy_target_autoloop_seed_publish_ready_path).grid(row=0, column=2, padx=(0, 8))
@@ -15315,7 +17024,7 @@ class RelayOperatorPanel(tk.Tk):
             (
                 "지금 시작",
                 [
-                    ("pair01 preset 실행", self.run_fixed_pair01_drill, "fixed_pair01_button"),
+                    ("pair01 preset 차단(target01 보호)", self.run_fixed_pair01_drill, "fixed_pair01_button"),
                     ("선택 Pair 실행", self.run_selected_pair_drill, "selected_pair_button"),
                     ("현재 Run 시작", self.start_current_watcher_run, "ops_current_watch_button"),
                     ("새 Run 시작", self.start_new_watcher_run, "ops_new_watch_button"),
@@ -15344,19 +17053,19 @@ class RelayOperatorPanel(tk.Tk):
                     ("선택 pair typed-window 복구", self.recover_selected_pair_typed_window_sessions, "ops_pair_typed_window_recovery_button"),
                     ("watch 일시중지", self.request_pause_watcher, "ops_pause_watch_button"),
                     ("watch 재개", self.request_resume_watcher, "ops_resume_watch_button"),
-                    ("watcher 종료 요청", self.request_stop_watcher, "ops_stop_watch_button"),
-                    ("watch 재시작", self.restart_watcher, "ops_restart_watch_button"),
+                    ("Pair watcher 종료 요청", self.request_stop_watcher, "ops_stop_watch_button"),
+                    ("Pair watcher 재시작", self.restart_watcher, "ops_restart_watch_button"),
                     ("watch stale 정리", self.recover_stale_watcher_state, "ops_recover_watch_button"),
                     ("watch 진단", self.show_watcher_diagnostics, ""),
-                    ("watch 권장 조치", self.apply_watcher_recommended_action, ""),
+                    ("Pair watcher 권장 조치", self.apply_watcher_recommended_action, ""),
                     ("창 audit 로그", self.open_wrapper_audit_log, ""),
                     ("watch audit 로그", self.open_watcher_audit_log, ""),
-                    ("watch status 파일", self.open_watcher_status_file, ""),
+                    ("Pair watcher status 파일", self.open_watcher_status_file, ""),
                     ("watch control 파일", self.open_watcher_control_file, ""),
                 ],
             ),
         ]
-        read_only_ops_labels = {"릴레이 상태", "페어 상태", "runroot 요약", "창 guard smoke", "요약 리포트 열기", "Headless 준비 확인", "적용 설정 JSON", "watch 진단", "watch audit 로그", "watch status 파일", "watch control 파일"}
+        read_only_ops_labels = {"릴레이 상태", "페어 상태", "runroot 요약", "창 guard smoke", "요약 리포트 열기", "Headless 준비 확인", "적용 설정 JSON", "watch 진단", "watch audit 로그", "Pair watcher status 파일", "watch control 파일"}
         for column, (title, specs) in enumerate(grouped_ops_buttons):
             group = ttk.LabelFrame(ops_action_groups, text=title, padding=8)
             group.grid(row=0, column=column, sticky="nsew", padx=(0, 8) if column < 2 else (0, 0))
@@ -15635,6 +17344,28 @@ class RelayOperatorPanel(tk.Tk):
             self.last_result_var.set(last_result)
         self._refresh_sticky_context_bar()
 
+    def _set_background_task_step(self, state: str, detail: str = "") -> None:
+        normalized_state = str(state or "작업").strip() or "작업"
+        normalized_detail = str(detail or "").strip()
+        text = f"현재 작업 단계: {normalized_state}"
+        if normalized_detail:
+            text += f" / {normalized_detail}"
+        self._safe_set_var("task_timing_var", text)
+
+    def _post_background_progress(self, state: str, hint: str) -> None:
+        def apply_progress() -> None:
+            self.set_operator_status(state, hint)
+            self._set_background_task_step(state, hint)
+
+        after_callback = getattr(self, "after", None)
+        if callable(after_callback) and "tk" in self.__dict__:
+            try:
+                after_callback(0, apply_progress)
+                return
+            except Exception:
+                pass
+        apply_progress()
+
     def _apply_watcher_panel_update(self, update: WatcherPanelUpdate) -> None:
         if update.command_text:
             self.last_command_var.set(update.command_text)
@@ -15650,17 +17381,218 @@ class RelayOperatorPanel(tk.Tk):
             widget.configure(state="disabled")
         self._update_target_autoloop_control_buttons()
         self.set_operator_status(state, hint)
+        self._set_background_task_step(state, "시작")
         if self.panel_state:
-            self.render_home_dashboard()
+            self._set_home_dashboard_busy_controls()
 
     def set_idle(self, state: str = "대기 중", hint: str = "", last_result: str = "") -> None:
+        started_at = time.monotonic()
+        steps: list[dict[str, object]] = []
         self._busy = False
-        for widget in self.__dict__.get("long_task_widgets", []):
-            widget.configure(state="normal")
-        self.set_operator_status(state, hint, last_result)
-        self.update_pair_button_states()
+        self.__dict__.pop("_home_dashboard_render_deferred_until_idle", None)
+
+        def enable_widgets() -> None:
+            for widget in self.__dict__.get("long_task_widgets", []):
+                widget.configure(state="normal")
+
+        self._run_timed_refresh_step(steps, "long task widgets enable", enable_widgets)
+        self._run_timed_refresh_step(
+            steps,
+            "operator status update",
+            lambda: self.set_operator_status(state, hint, last_result),
+        )
+        self._run_timed_refresh_step(steps, "button state update", self.update_pair_button_states)
         if self.panel_state:
-            self.render_home_dashboard()
+            self._run_timed_refresh_step(steps, "home dashboard render", self.render_home_dashboard)
+        self._record_idle_ui_timing(started_at=started_at, steps=steps)
+
+    @staticmethod
+    def _format_task_elapsed_seconds(elapsed_seconds: float) -> str:
+        elapsed = max(0.0, float(elapsed_seconds or 0.0))
+        if elapsed < 10.0:
+            return f"{elapsed:.2f}s"
+        if elapsed < 60.0:
+            return f"{elapsed:.1f}s"
+        minutes = int(elapsed // 60)
+        seconds = int(round(elapsed - (minutes * 60)))
+        if seconds >= 60:
+            minutes += 1
+            seconds = 0
+        return f"{minutes}m {seconds:02d}s"
+
+    def _record_background_task_timing(
+        self,
+        *,
+        label: str,
+        started_at: float | None,
+        outcome: str,
+    ) -> None:
+        if started_at is None:
+            return
+        elapsed_seconds = max(0.0, time.monotonic() - started_at)
+        elapsed_text = self._format_task_elapsed_seconds(elapsed_seconds)
+        normalized_label = str(label or "작업").strip() or "작업"
+        normalized_outcome = str(outcome or "완료").strip() or "완료"
+        record = {
+            "label": normalized_label,
+            "outcome": normalized_outcome,
+            "elapsed_seconds": elapsed_seconds,
+            "elapsed_text": elapsed_text,
+            "recorded_at": self._utc_now_iso() if hasattr(self, "_utc_now_iso") else datetime.now(timezone.utc).isoformat(),
+        }
+        records = list(self.__dict__.get("background_task_timing_records", []))
+        records.append(record)
+        self.__dict__["background_task_timing_records"] = records[-20:]
+        slow_marker = " / 느림" if elapsed_seconds >= 10.0 else ""
+        self._safe_set_var(
+            "task_timing_var",
+            f"최근 작업 시간: {normalized_label} / {normalized_outcome} / {elapsed_text}{slow_marker}",
+        )
+
+    def _run_timed_refresh_step(self, steps: list[dict[str, object]], label: str, callback):
+        step_started_at = time.monotonic()
+        try:
+            return callback()
+        finally:
+            elapsed_seconds = max(0.0, time.monotonic() - step_started_at)
+            steps.append(
+                {
+                    "label": str(label or "refresh").strip() or "refresh",
+                    "elapsed_seconds": elapsed_seconds,
+                    "elapsed_text": self._format_task_elapsed_seconds(elapsed_seconds),
+                }
+            )
+
+    def _run_refresh_ui_step(self, timing_steps: list[dict[str, object]] | None, label: str, callback):
+        if timing_steps is None:
+            return callback()
+        return self._run_timed_refresh_step(timing_steps, label, callback)
+
+    def _rebuild_panel_state_with_optional_timing(self, timing_steps: list[dict[str, object]]) -> None:
+        try:
+            self.rebuild_panel_state(timing_steps=timing_steps)
+        except TypeError:
+            self.rebuild_panel_state()
+
+    def _render_target_board_with_optional_timing(
+        self,
+        timing_steps: list[dict[str, object]],
+        *,
+        update_buttons: bool = True,
+    ) -> None:
+        try:
+            self.render_target_board(timing_steps=timing_steps, update_buttons=update_buttons)
+        except TypeError:
+            self.render_target_board()
+
+    def _append_refresh_timing_steps(
+        self,
+        steps: list[dict[str, object]],
+        source_steps: object,
+        *,
+        prefix: str = "",
+    ) -> None:
+        if not isinstance(source_steps, (list, tuple)):
+            return
+        for source_step in source_steps:
+            if not isinstance(source_step, dict):
+                continue
+            label = str(source_step.get("label", "") or "step").strip() or "step"
+            try:
+                elapsed_seconds = max(0.0, float(source_step.get("elapsed_seconds", 0.0) or 0.0))
+            except (TypeError, ValueError):
+                elapsed_seconds = 0.0
+            steps.append(
+                {
+                    "label": f"{prefix}{label}",
+                    "elapsed_seconds": elapsed_seconds,
+                    "elapsed_text": self._format_task_elapsed_seconds(elapsed_seconds),
+                }
+            )
+
+    def _record_refresh_timing(
+        self,
+        *,
+        label: str,
+        started_at: float | None,
+        steps: list[dict[str, object]],
+        outcome: str = "완료",
+    ) -> None:
+        if started_at is None:
+            return
+        elapsed_seconds = max(0.0, time.monotonic() - started_at)
+        elapsed_text = self._format_task_elapsed_seconds(elapsed_seconds)
+        normalized_label = str(label or "refresh").strip() or "refresh"
+        normalized_outcome = str(outcome or "완료").strip() or "완료"
+        normalized_steps = [dict(step) for step in steps]
+        record = {
+            "label": normalized_label,
+            "outcome": normalized_outcome,
+            "elapsed_seconds": elapsed_seconds,
+            "elapsed_text": elapsed_text,
+            "steps": normalized_steps,
+            "recorded_at": self._utc_now_iso() if hasattr(self, "_utc_now_iso") else datetime.now(timezone.utc).isoformat(),
+        }
+        records = list(self.__dict__.get("refresh_timing_records", []))
+        records.append(record)
+        self.__dict__["refresh_timing_records"] = records[-20:]
+        max_step_parts = 8
+        step_parts = [
+            "{0} {1}".format(
+                str(step.get("label", "") or "step"),
+                str(step.get("elapsed_text", "") or self._format_task_elapsed_seconds(float(step.get("elapsed_seconds", 0.0) or 0.0))),
+            )
+            for step in normalized_steps[:max_step_parts]
+        ]
+        if len(normalized_steps) > max_step_parts:
+            step_parts.append(f"+{len(normalized_steps) - max_step_parts}단계")
+        slow_marker = " / 느림" if elapsed_seconds >= 10.0 else ""
+        detail = " / " + ", ".join(step_parts) if step_parts else ""
+        self._safe_set_var(
+            "task_timing_var",
+            f"최근 refresh 시간: {normalized_label} / {normalized_outcome} / {elapsed_text}{slow_marker}{detail}",
+        )
+
+    def _record_idle_ui_timing(
+        self,
+        *,
+        started_at: float | None,
+        steps: list[dict[str, object]],
+    ) -> None:
+        if started_at is None:
+            return
+        elapsed_seconds = max(0.0, time.monotonic() - started_at)
+        elapsed_text = self._format_task_elapsed_seconds(elapsed_seconds)
+        normalized_steps = [dict(step) for step in steps]
+        record = {
+            "label": "idle UI 복구",
+            "outcome": "완료",
+            "elapsed_seconds": elapsed_seconds,
+            "elapsed_text": elapsed_text,
+            "steps": normalized_steps,
+            "recorded_at": self._utc_now_iso() if hasattr(self, "_utc_now_iso") else datetime.now(timezone.utc).isoformat(),
+        }
+        records = list(self.__dict__.get("idle_ui_timing_records", []))
+        records.append(record)
+        self.__dict__["idle_ui_timing_records"] = records[-20:]
+        if elapsed_seconds < 1.0:
+            return
+        max_step_parts = 6
+        step_parts = [
+            "{0} {1}".format(
+                str(step.get("label", "") or "step"),
+                str(step.get("elapsed_text", "") or self._format_task_elapsed_seconds(float(step.get("elapsed_seconds", 0.0) or 0.0))),
+            )
+            for step in normalized_steps[:max_step_parts]
+        ]
+        if len(normalized_steps) > max_step_parts:
+            step_parts.append(f"+{len(normalized_steps) - max_step_parts}단계")
+        slow_marker = " / 느림" if elapsed_seconds >= 10.0 else ""
+        detail = " / " + ", ".join(step_parts) if step_parts else ""
+        self._safe_set_var(
+            "task_timing_var",
+            f"최근 UI 복구 시간: idle / 완료 / {elapsed_text}{slow_marker}{detail}",
+        )
 
     def run_background_task(
         self,
@@ -15680,12 +17612,23 @@ class RelayOperatorPanel(tk.Tk):
             return
 
         self.set_busy(state, hint)
+        started_at = time.monotonic()
 
         def runner() -> None:
             try:
                 result = worker()
             except Exception as exc:
-                self.after(0, lambda exc=exc: self._handle_background_failure(exc, failure_state, failure_hint, on_failure))
+                self.after(
+                    0,
+                    lambda exc=exc: self._handle_background_failure(
+                        exc,
+                        failure_state,
+                        failure_hint,
+                        on_failure,
+                        started_at=started_at,
+                        action_label=state,
+                    ),
+                )
                 return
 
             self.after(
@@ -15697,6 +17640,8 @@ class RelayOperatorPanel(tk.Tk):
                     success_hint,
                     failure_state,
                     failure_hint,
+                    started_at=started_at,
+                    action_label=state,
                 ),
             )
 
@@ -15710,17 +17655,44 @@ class RelayOperatorPanel(tk.Tk):
         on_success,
         on_failure=None,
     ) -> None:
+        started_at = time.monotonic()
+
         def runner() -> None:
             try:
                 result = worker()
             except Exception as exc:
-                self.after(0, lambda exc=exc: self._handle_read_only_background_failure(exc, label, on_failure))
+                self.after(
+                    0,
+                    lambda exc=exc: self._handle_read_only_background_failure(
+                        exc,
+                        label,
+                        on_failure,
+                        started_at=started_at,
+                    ),
+                )
                 return
-            self.after(0, lambda result=result: self._handle_read_only_background_success(result, label, on_success))
+            self.after(
+                0,
+                lambda result=result: self._handle_read_only_background_success(
+                    result,
+                    label,
+                    on_success,
+                    started_at=started_at,
+                ),
+            )
 
         threading.Thread(target=runner, daemon=True).start()
 
-    def _handle_background_failure(self, exc: Exception, state: str, hint: str, on_failure=None) -> None:
+    def _handle_background_failure(
+        self,
+        exc: Exception,
+        state: str,
+        hint: str,
+        on_failure=None,
+        *,
+        started_at: float | None = None,
+        action_label: str = "",
+    ) -> None:
         rendered_exc = exc
         output_text = self._format_background_exception(exc)
         if on_failure is not None:
@@ -15736,9 +17708,17 @@ class RelayOperatorPanel(tk.Tk):
                     + self._format_background_exception(exc)
                 )
         self.set_text(self.output_text, output_text)
+        self._record_background_task_timing(label=action_label or state, started_at=started_at, outcome="실패")
         self.set_idle(state, hint, f"마지막 결과: 실패 ({rendered_exc})")
 
-    def _handle_read_only_background_failure(self, exc: Exception, label: str, on_failure=None) -> None:
+    def _handle_read_only_background_failure(
+        self,
+        exc: Exception,
+        label: str,
+        on_failure=None,
+        *,
+        started_at: float | None = None,
+    ) -> None:
         rendered_exc = exc
         output_text = self._format_background_exception(exc)
         if on_failure is not None:
@@ -15758,6 +17738,7 @@ class RelayOperatorPanel(tk.Tk):
             f"마지막 조회: {label} 실패 ({rendered_exc})",
             context=self._query_context_summary(),
         )
+        self._record_background_task_timing(label=f"조회: {label}", started_at=started_at, outcome="실패")
 
     def _handle_background_follow_up_failure(self, exc: Exception, state: str, hint: str) -> None:
         self.set_text(self.output_text, self._format_background_exception(exc))
@@ -15779,7 +17760,14 @@ class RelayOperatorPanel(tk.Tk):
             lines.extend(["", "STDERR:", stderr])
         return "\n".join(lines)
 
-    def _handle_read_only_background_success(self, result, label: str, on_success) -> None:
+    def _handle_read_only_background_success(
+        self,
+        result,
+        label: str,
+        on_success,
+        *,
+        started_at: float | None = None,
+    ) -> None:
         try:
             on_success(result)
         except Exception as exc:
@@ -15788,6 +17776,9 @@ class RelayOperatorPanel(tk.Tk):
                 f"마지막 조회: {label} 실패 ({exc})",
                 context=self._query_context_summary(),
             )
+            self._record_background_task_timing(label=f"조회: {label}", started_at=started_at, outcome="실패")
+            return
+        self._record_background_task_timing(label=f"조회: {label}", started_at=started_at, outcome="완료")
 
     def _handle_background_success(
         self,
@@ -15797,12 +17788,18 @@ class RelayOperatorPanel(tk.Tk):
         hint: str,
         failure_state: str,
         failure_hint: str,
+        *,
+        started_at: float | None = None,
+        action_label: str = "",
     ) -> None:
         idle_state = state
         idle_hint = hint
         last_result = ""
         follow_up = None
         success = False
+        previous_home_defer_present = "_defer_home_dashboard_render_until_idle" in self.__dict__
+        previous_home_defer = self.__dict__.get("_defer_home_dashboard_render_until_idle", False)
+        self.__dict__["_defer_home_dashboard_render_until_idle"] = True
         try:
             follow_up = on_success(result)
             success = True
@@ -15812,6 +17809,15 @@ class RelayOperatorPanel(tk.Tk):
             last_result = f"마지막 결과: 실패 ({exc})"
             self.set_text(self.output_text, self._format_background_exception(exc))
         finally:
+            if previous_home_defer_present:
+                self.__dict__["_defer_home_dashboard_render_until_idle"] = previous_home_defer
+            else:
+                self.__dict__.pop("_defer_home_dashboard_render_until_idle", None)
+            self._record_background_task_timing(
+                label=action_label or state,
+                started_at=started_at,
+                outcome="완료" if success else "실패",
+            )
             self.set_idle(idle_state, idle_hint, last_result)
 
         if success and callable(follow_up):
@@ -15878,6 +17884,50 @@ class RelayOperatorPanel(tk.Tk):
                 return item
         return None
 
+    def _apply_pair_activation_payload(self, payload: dict) -> bool:
+        if not isinstance(payload, dict):
+            return False
+        activation_raw = payload.get("PairActivation", {})
+        if not isinstance(activation_raw, dict):
+            return False
+        pair_id = str(payload.get("PairId", "") or activation_raw.get("PairId", "") or "").strip()
+        if not pair_id:
+            return False
+
+        activation = dict(activation_raw)
+        activation["PairId"] = pair_id
+        effective_payload = dict(self.effective_data or {})
+        summary_rows: list[dict] = []
+        replaced = False
+        for item in list(effective_payload.get("PairActivationSummary", []) or []):
+            row = dict(item or {})
+            if str(row.get("PairId", "") or "") == pair_id:
+                row = dict(activation)
+                replaced = True
+            summary_rows.append(row)
+        if not replaced:
+            summary_rows.append(dict(activation))
+        effective_payload["PairActivationSummary"] = summary_rows
+
+        preview_rows: list[dict] = []
+        for item in list(self.preview_rows or effective_payload.get("PreviewRows", []) or []):
+            row = dict(item or {})
+            if str(row.get("PairId", "") or "") == pair_id:
+                row["PairActivation"] = dict(activation)
+            preview_rows.append(row)
+        effective_payload["PreviewRows"] = preview_rows
+
+        self.effective_data = effective_payload
+        self.preview_rows = preview_rows
+        self._clear_start_run_preview_cache()
+        self.rebuild_panel_state()
+        self.render_target_board()
+        self.update_pair_button_states()
+        if self.panel_state:
+            self.render_home_dashboard()
+        self._refresh_sticky_context_bar()
+        return True
+
     def _shared_visible_typed_window_headless_block_reason(self) -> str:
         effective = self.effective_data or {}
         config = (effective.get("Config", {}) or {})
@@ -15939,25 +17989,25 @@ class RelayOperatorPanel(tk.Tk):
 
         headless_block_reason = self._shared_visible_typed_window_headless_block_reason()
         headless_allowed = not bool(headless_block_reason)
+        current_action_run_root = self._current_run_root_for_actions()
+        selected_pair_allowed, _selected_pair_detail = self._selected_pair_execution_allowed()
         pair01_state = self.get_pair_activation_state("pair01")
         if self._has_ui_attr("fixed_pair01_button"):
             enabled = bool((pair01_state or {}).get("EffectiveEnabled", True)) and headless_allowed
             self.fixed_pair01_button.configure(state="normal" if enabled else "disabled")
-            self.fixed_pair01_button.configure(text="pair01 preset 실행" if headless_allowed else "pair01 preset 실행 (shared visible 차단)")
+            self.fixed_pair01_button.configure(text="pair01 preset 차단(target01 보호)")
 
         selected_pair = self.pair_id_var.get().strip()
         selected_state = self.get_pair_activation_state(selected_pair) if selected_pair else None
         home_pair_id = self._selected_home_pair_id() if self._has_ui_attr("home_pair_tree") else selected_pair
         home_selected_state = self.get_pair_activation_state(home_pair_id) if home_pair_id else None
         if self._has_ui_attr("selected_pair_button"):
-            enabled, _detail = self._selected_pair_execution_allowed()
-            enabled = enabled and headless_allowed
+            enabled = selected_pair_allowed and headless_allowed
             self.selected_pair_button.configure(state="normal" if enabled else "disabled")
             self.selected_pair_button.configure(text="선택 Pair 실행" if headless_allowed else "선택 Pair 실행 (shared visible 차단)")
 
         if self._has_ui_attr("home_run_pair_button"):
-            enabled, _detail = self._selected_pair_execution_allowed()
-            enabled = enabled and headless_allowed
+            enabled = selected_pair_allowed and headless_allowed
             self.home_run_pair_button.configure(state="normal" if enabled else "disabled")
             self.home_run_pair_button.configure(text="선택 Pair 실행" if headless_allowed else "선택 Pair 실행 (shared visible 차단)")
 
@@ -15977,11 +18027,12 @@ class RelayOperatorPanel(tk.Tk):
             )
             recovery_enabled = False
             if self._watcher_requires_typed_window_prepare_before_start():
-                recovery_run_root = self._current_run_root_for_actions().strip()
-                recovery_config_path = self._resolve_watcher_start_config_path(
+                recovery_run_root = current_action_run_root.strip()
+                recovery_config_path = self._resolve_watcher_start_config_path_for_request(
                     config_path=self.config_path_var.get().strip(),
                     run_root=recovery_run_root,
                     pair_id=selected_pair,
+                    allow_config_generation=False,
                 )
                 recovery_rows = self._pair_typed_window_prepare_target_rows(
                     pair_id=selected_pair,
@@ -16014,15 +18065,20 @@ class RelayOperatorPanel(tk.Tk):
 
         start_eligibility = self._watcher_start_eligibility()
         stop_eligibility = self._watcher_stop_eligibility()
-        pause_eligibility = self.watcher_controller.pause_eligibility(self.paired_status_data, self._current_run_root_for_actions())
-        resume_eligibility = self.watcher_controller.resume_eligibility(self.paired_status_data, self._current_run_root_for_actions())
-        current_watch_start_allowed, _detail = self._watch_start_allowed()
-        new_watch_start_allowed, _detail = self._new_watcher_start_allowed()
+        pause_eligibility = self.watcher_controller.pause_eligibility(self.paired_status_data, current_action_run_root)
+        resume_eligibility = self.watcher_controller.resume_eligibility(self.paired_status_data, current_action_run_root)
+        current_watch_start_allowed = bool(
+            selected_pair_allowed
+            and (getattr(start_eligibility, "allowed", False) or getattr(start_eligibility, "cleanup_allowed", False))
+        )
+        new_watch_start_allowed, _detail = self._new_watcher_start_allowed_without_config_generation()
+        config_path_text = self.config_path_var.get().strip()
         watcher_option_request = self._build_watcher_start_request_from_controls(
-            config_path=self.config_path_var.get().strip(),
+            config_path=config_path_text,
             run_root="",
             show_error=False,
             start_mode=START_MODE_NEW_RUN,
+            allow_config_generation=False,
         )
         watcher_option_review = self._review_watcher_start_request(watcher_option_request)
         watcher_option_allowed = bool(watcher_option_request is not None and (watcher_option_review is None or watcher_option_review.allowed))
@@ -16053,7 +18109,7 @@ class RelayOperatorPanel(tk.Tk):
         if self._has_ui_attr("ops_stop_watch_button"):
             self.ops_stop_watch_button.configure(state="normal" if stop_eligibility.allowed else "disabled")
         if self._has_ui_attr("ops_restart_watch_button"):
-            restart_enabled = bool(self._current_run_root_for_actions()) and stop_eligibility.allowed and bool(self.config_path_var.get().strip()) and watcher_option_allowed
+            restart_enabled = bool(current_action_run_root) and stop_eligibility.allowed and bool(config_path_text) and watcher_option_allowed
             self.ops_restart_watch_button.configure(state="normal" if restart_enabled else "disabled")
         if self._has_ui_attr("ops_recover_watch_button"):
             self.ops_recover_watch_button.configure(state="normal" if start_eligibility.cleanup_allowed else "disabled")
@@ -16093,6 +18149,10 @@ class RelayOperatorPanel(tk.Tk):
         if self._has_ui_attr("board_visibility_button"):
             visibility_allowed, _detail = self._visibility_action_allowed()
             self.board_visibility_button.configure(state="normal" if visibility_allowed else "disabled")
+
+        if self._visible_acceptance_refresh_can_defer():
+            self.__dict__["visible_acceptance_refresh_pending"] = True
+            return
 
         visible_state = self._refresh_visible_acceptance_summary()
         config_present = visible_state.config_present
@@ -16328,6 +18388,11 @@ class RelayOperatorPanel(tk.Tk):
         self._refresh_visible_primitive_summary()
         self._refresh_sticky_context_bar()
 
+    def _visible_acceptance_refresh_can_defer(self) -> bool:
+        if not self._has_ui_attr("notebook") or not self._has_ui_attr("visible_acceptance_tab"):
+            return False
+        return not self._notebook_tab_is_selected("visible_acceptance_tab")
+
     def on_pair_or_target_changed(self, _event: object | None = None) -> None:
         self.action_context_source = "controls"
         selected_pair = self._selected_pair_id()
@@ -16459,86 +18524,582 @@ class RelayOperatorPanel(tk.Tk):
             return self.effective_data.get("RunContext", {}).get("SelectedRunRoot", "") or ""
         return ""
 
+    def _apply_prepared_run_root_context(self, prepared_run_root: str, *, source: str = "runroot-prepare") -> None:
+        normalized_run_root = str(prepared_run_root or "").strip()
+        if not normalized_run_root:
+            return
+
+        self._clear_target_autoloop_runtime_snapshot_cache()
+        self.__dict__.pop("_target_autoloop_sync_notice_run_root", None)
+        self.__dict__.pop("_target_autoloop_sync_notice_pending", None)
+        effective_payload = dict(self.effective_data or {})
+        run_context = dict(effective_payload.get("RunContext", {}) or {})
+        run_context["SelectedRunRoot"] = normalized_run_root
+        run_context["SelectedRunRootSource"] = source
+        run_context["SelectedRunRootIsStale"] = False
+        run_context["SelectedRunRootAgeSeconds"] = 0
+        run_root_path = Path(normalized_run_root)
+        if run_root_path.exists():
+            try:
+                stat = run_root_path.stat()
+            except OSError:
+                pass
+            else:
+                run_context["SelectedRunRootLastWriteAt"] = datetime.fromtimestamp(
+                    stat.st_mtime,
+                    tz=timezone.utc,
+                ).isoformat()
+        effective_payload["RunContext"] = run_context
+        self.effective_data = effective_payload
+        self._set_action_context(run_root=normalized_run_root, source=source)
+        if "relay_status_data" in self.__dict__ and "visibility_status_data" in self.__dict__:
+            self._apply_run_root_context_refresh()
+        else:
+            self._update_run_root_controls()
+
     @staticmethod
     def _read_json_dict_if_present(path_value: str) -> dict[str, object]:
-        normalized_path = str(path_value or "").strip()
-        if not normalized_path:
-            return {}
-        path = Path(normalized_path)
-        if not path.exists() or not path.is_file():
-            return {}
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except Exception:
-            return {}
-        return payload if isinstance(payload, dict) else {}
+        return target_autoloop_runtime.read_json_dict_if_present(path_value)
 
     @staticmethod
     def _read_json_list_if_present(path_value: str) -> list[object]:
-        normalized_path = str(path_value or "").strip()
-        if not normalized_path:
-            return []
-        path = Path(normalized_path)
-        if not path.exists() or not path.is_file():
-            return []
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except Exception:
-            return []
-        if isinstance(payload, list):
-            return payload
-        if isinstance(payload, dict):
-            return [payload]
-        return []
+        return target_autoloop_runtime.read_json_list_if_present(path_value)
 
-    def _target_autoloop_router_session_snapshot(self) -> dict[str, object]:
-        effective = self.effective_data if isinstance(self.effective_data, dict) else {}
-        config = effective.get("Config", {}) if isinstance(effective.get("Config", {}), dict) else {}
-        runtime_map_path = str(config.get("RuntimeMapPath", "") or "").strip()
-        router_state_path = str(config.get("RouterStatePath", "") or "").strip()
-        runtime_items = self._read_json_list_if_present(runtime_map_path)
-        runtime_session_ids = sorted(
-            {
-                str(item.get("LauncherSessionId", "") or "").strip()
-                for item in runtime_items
-                if isinstance(item, dict) and str(item.get("LauncherSessionId", "") or "").strip()
+    @staticmethod
+    def _target_autoloop_manifest_summary_for_run_root(run_root: str | Path) -> dict[str, object]:
+        run_root_text = str(run_root or "").strip()
+        if not run_root_text:
+            return {
+                "run_root": "",
+                "manifest_path": "",
+                "exists": False,
+                "error": "runroot-empty",
+                "run_mode": "",
+                "target_ids": [],
+                "enabled_count": 0,
+                "publish_ready_count": 0,
+                "mtime_ns": 0,
             }
-        )
-        runtime_launcher_session_id = runtime_session_ids[0] if len(runtime_session_ids) == 1 else ""
-        router_state = self._read_json_dict_if_present(router_state_path)
-        router_status = str(router_state.get("Status", "") or "").strip()
-        router_launcher_session_id = str(router_state.get("LauncherSessionId", "") or "").strip()
-        state = "not-configured"
-        if runtime_map_path or router_state_path:
-            state = "insufficient-data"
-        if len(runtime_session_ids) > 1:
-            state = "runtime-session-ambiguous"
-        elif router_status and router_status != "running":
-            state = "router-not-running"
-        elif runtime_launcher_session_id and router_launcher_session_id:
-            state = "ok" if runtime_launcher_session_id == router_launcher_session_id else "mismatch"
+        run_root_path = Path(run_root_text)
+        manifest_path = run_root_path / "manifest.json"
+        payload: dict[str, object] = {}
+        error = ""
+        mtime_ns = 0
+        if manifest_path.exists() and manifest_path.is_file():
+            try:
+                stat = manifest_path.stat()
+                mtime_ns = int(getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1_000_000_000)))
+            except OSError:
+                mtime_ns = 0
+            try:
+                loaded = json.loads(manifest_path.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    payload = loaded
+                else:
+                    error = "manifest-payload-not-dict"
+            except Exception as exc:
+                error = str(exc)
+        else:
+            error = "missing"
+
+        targets = payload.get("Targets", []) if isinstance(payload, dict) else []
+        if not isinstance(targets, list):
+            targets = []
+        target_ids: list[str] = []
+        enabled_target_ids: list[str] = []
+        publish_ready_target_ids: list[str] = []
+        enabled_count = 0
+        publish_ready_count = 0
+        for row in targets:
+            if not isinstance(row, dict):
+                continue
+            target_id = str(row.get("TargetId", "") or "").strip()
+            if target_id and target_id not in target_ids:
+                target_ids.append(target_id)
+            if bool(row.get("Enabled", False)):
+                enabled_count += 1
+                if target_id and target_id not in enabled_target_ids:
+                    enabled_target_ids.append(target_id)
+                raw_trigger_kinds = row.get("TriggerKinds", []) or []
+                if isinstance(raw_trigger_kinds, str):
+                    trigger_values = [raw_trigger_kinds]
+                elif isinstance(raw_trigger_kinds, (list, tuple, set)):
+                    trigger_values = list(raw_trigger_kinds)
+                else:
+                    trigger_values = []
+                trigger_kinds = {str(trigger_kind or "").strip().lower() for trigger_kind in trigger_values}
+                if "publish-ready" in trigger_kinds:
+                    publish_ready_count += 1
+                    if target_id and target_id not in publish_ready_target_ids:
+                        publish_ready_target_ids.append(target_id)
         return {
-            "state": state,
-            "mismatch": state == "mismatch",
-            "runtime_map_path": runtime_map_path,
-            "runtime_map_exists": bool(runtime_map_path and Path(runtime_map_path).exists()),
-            "runtime_launcher_session_ids": runtime_session_ids,
-            "runtime_launcher_session_id": runtime_launcher_session_id,
-            "router_state_path": router_state_path,
-            "router_state_exists": bool(router_state_path and Path(router_state_path).exists()),
-            "router_status": router_status,
-            "router_launcher_session_id": router_launcher_session_id,
-            "router_pid": str(router_state.get("RouterPid", "") or "").strip(),
+            "run_root": str(run_root_path),
+            "manifest_path": str(manifest_path),
+            "exists": manifest_path.exists(),
+            "error": error,
+            "run_mode": str(payload.get("RunMode", "") or ""),
+            "target_ids": target_ids,
+            "enabled_target_ids": enabled_target_ids,
+            "publish_ready_target_ids": publish_ready_target_ids,
+            "enabled_count": enabled_count,
+            "publish_ready_count": publish_ready_count,
+            "mtime_ns": mtime_ns,
         }
 
     @staticmethod
-    def _target_autoloop_router_session_mismatch_message(snapshot: dict[str, object]) -> str:
+    def _target_autoloop_run_root_is_pair_scoped(run_root: str | Path) -> bool:
+        return target_autoloop_presenter.target_autoloop_run_root_is_pair_scoped(run_root)
+
+    @staticmethod
+    def _target_autoloop_run_root_is_canonical(run_root: str | Path) -> bool:
+        return target_autoloop_presenter.target_autoloop_run_root_is_canonical(run_root)
+
+    def _target_autoloop_run_root_needs_prepare(self, run_root: str | Path) -> bool:
+        normalized_run_root = str(run_root or "").strip()
+        if not normalized_run_root:
+            return False
         return (
-            "router/runtime LauncherSessionId가 달라 autoloop ready 파일이 router에서 ignored 됩니다. "
-            "공식 8창 재사용/attach 후 router를 현재 세션으로 다시 시작한 뒤 감지를 재시작하세요. "
-            f"router={snapshot.get('router_launcher_session_id', '') or '-'} "
-            f"runtime={snapshot.get('runtime_launcher_session_id', '') or '-'}"
+            self._target_autoloop_run_root_is_pair_scoped(normalized_run_root)
+            or not self._target_autoloop_run_root_is_canonical(normalized_run_root)
         )
+
+    def _target_autoloop_prepare_notice_active(self, runtime_snapshot: dict[str, object] | None = None) -> bool:
+        snapshot = runtime_snapshot or {}
+        run_root = str(snapshot.get("run_root", "") or "").strip()
+        if not run_root or not self._target_autoloop_run_root_needs_prepare(run_root):
+            return False
+        sync_notice_run_root = str(self.__dict__.get("_target_autoloop_sync_notice_run_root", "") or "").strip()
+        sync_notice_pending = bool(self.__dict__.get("_target_autoloop_sync_notice_pending", False))
+        if sync_notice_pending:
+            return True
+        if sync_notice_run_root and self._same_run_root_path(sync_notice_run_root, run_root):
+            return True
+        return target_autoloop_presenter.target_autoloop_router_session_ready(snapshot)
+
+    @staticmethod
+    def _target_autoloop_pair_runroot_block_detail(run_root: str | Path) -> str:
+        return target_autoloop_presenter.target_autoloop_pair_runroot_block_detail(run_root)
+
+    @staticmethod
+    def _target_autoloop_runroot_search_bases(run_root: str | Path) -> list[Path]:
+        run_root_text = str(run_root or "").strip()
+        if not run_root_text:
+            return []
+        try:
+            start = Path(run_root_text)
+        except Exception:
+            return []
+        if start.is_file():
+            start = start.parent
+        bases: list[Path] = []
+
+        def _append(path: Path) -> None:
+            if path.name.lower() != "target-autoloop":
+                return
+            path_text = str(path)
+            if path_text and all(str(existing) != path_text for existing in bases):
+                bases.append(path)
+
+        if start.name.lower() == "target-autoloop":
+            _append(start)
+        if start.name.lower().startswith("run_") and start.parent.name.lower() == "target-autoloop":
+            _append(start.parent)
+        for parent in list(start.parents)[:10]:
+            if parent.name.lower() == "target-autoloop":
+                _append(parent)
+                break
+        return bases
+
+    def _target_autoloop_latest_valid_sibling_run_root(
+        self,
+        run_root: str | Path,
+        *,
+        intended_target_ids: list[str] | None = None,
+        require_publish_ready_complete: bool = False,
+    ) -> dict[str, object]:
+        current_text = str(run_root or "").strip()
+        candidates: list[tuple[int, int, str, dict[str, object]]] = []
+        seen: set[str] = set()
+        intended_set = {
+            str(target_id or "").strip()
+            for target_id in (intended_target_ids or [])
+            if str(target_id or "").strip()
+        }
+        for base in self._target_autoloop_runroot_search_bases(current_text):
+            try:
+                children = list(base.iterdir())
+            except OSError:
+                continue
+            for child in children:
+                try:
+                    is_dir = child.is_dir()
+                except OSError:
+                    is_dir = False
+                if not is_dir:
+                    continue
+                if not child.name.lower().startswith("run_"):
+                    continue
+                child_text = str(child)
+                if child_text in seen:
+                    continue
+                seen.add(child_text)
+                summary = self._target_autoloop_manifest_summary_for_run_root(child)
+                if not bool(summary.get("exists", False)):
+                    continue
+                if str(summary.get("error", "") or ""):
+                    continue
+                if str(summary.get("run_mode", "") or "").strip() != "target-autoloop":
+                    continue
+                enabled_count = int(summary.get("enabled_count", 0) or 0)
+                if enabled_count <= 0:
+                    continue
+                publish_ready_count = int(summary.get("publish_ready_count", 0) or 0)
+                if require_publish_ready_complete and publish_ready_count < enabled_count:
+                    continue
+                if intended_set:
+                    enabled_ids = {
+                        str(target_id or "").strip()
+                        for target_id in summary.get("enabled_target_ids", []) or []
+                        if str(target_id or "").strip()
+                    }
+                    if enabled_ids != intended_set:
+                        continue
+                publish_ready_complete = 1 if publish_ready_count >= enabled_count else 0
+                candidates.append(
+                    (
+                        publish_ready_complete,
+                        int(summary.get("mtime_ns", 0) or 0),
+                        child_text,
+                        summary,
+                    )
+                )
+        if not candidates:
+            return {}
+        candidates.sort(key=lambda item: (item[0], item[1], item[2]), reverse=True)
+        return candidates[0][3]
+
+    def _target_autoloop_autoswitch_reject_hint(self, run_root: str | Path, intended_target_ids: list[str]) -> str:
+        intended_set = {
+            str(target_id or "").strip()
+            for target_id in (intended_target_ids or [])
+            if str(target_id or "").strip()
+        }
+        if not intended_set:
+            return "자동 전환 후보 없음: 현재 선택/카드 target의 Enabled와 publish-ready trigger를 먼저 맞춰야 합니다."
+        latest_any = self._target_autoloop_latest_valid_sibling_run_root(
+            run_root,
+            require_publish_ready_complete=False,
+        )
+        if not latest_any:
+            return "자동 전환 후보 없음: 같은 target-autoloop 폴더에 enabled target이 있는 정식 run_... RunRoot가 없습니다."
+        candidate_enabled_ids = [
+            str(target_id or "").strip()
+            for target_id in latest_any.get("enabled_target_ids", []) or []
+            if str(target_id or "").strip()
+        ]
+        candidate_enabled_set = set(candidate_enabled_ids)
+        enabled_text = self._target_autoloop_join_target_ids(sorted(candidate_enabled_set))
+        intended_text = self._target_autoloop_join_target_ids(sorted(intended_set))
+        if candidate_enabled_set != intended_set:
+            return (
+                "자동 전환 후보 거부: latestCandidate target set이 현재 의도와 다릅니다 "
+                f"(candidate={enabled_text}, intended={intended_text}, rejectReason=target-set-mismatch)."
+            )
+        candidate_enabled_count = int(latest_any.get("enabled_count", 0) or 0)
+        candidate_publish_ready_count = int(latest_any.get("publish_ready_count", 0) or 0)
+        if candidate_publish_ready_count < candidate_enabled_count:
+            return (
+                "자동 전환 후보 거부: latestCandidate의 publish-ready trigger가 enabled target 전체에 켜져 있지 않습니다 "
+                f"(publish-ready trigger={candidate_publish_ready_count}/{candidate_enabled_count}, "
+                "rejectReason=publish-ready-trigger-incomplete)."
+            )
+        return "자동 전환 후보 없음: 현재 의도와 일치하는 최신 RunRoot를 찾지 못했습니다."
+
+    def _target_autoloop_autoswitch_intended_target_ids(self) -> list[str]:
+        selected_target_ids = self._target_autoloop_policy_selected_target_ids()
+        enabled_target_ids, publish_ready_target_ids = self._target_autoloop_policy_enabled_publish_ready_target_ids()
+        enabled_set = set(enabled_target_ids)
+        publish_ready_set = set(publish_ready_target_ids)
+        if selected_target_ids:
+            selected_set = {
+                str(target_id or "").strip()
+                for target_id in selected_target_ids
+                if str(target_id or "").strip()
+            }
+            if not selected_set:
+                return []
+            if not selected_set.issubset(enabled_set):
+                return []
+            if not selected_set.issubset(publish_ready_set):
+                return []
+            return sorted(selected_set)
+        if not enabled_target_ids:
+            return []
+        if not set(enabled_target_ids).issubset(publish_ready_set):
+            return []
+        return sorted(set(enabled_target_ids))
+
+    def _target_autoloop_auto_switch_stale_no_enabled_run_root(
+        self,
+        runtime_snapshot: dict[str, object],
+    ) -> tuple[dict[str, object], str]:
+        snapshot = runtime_snapshot if isinstance(runtime_snapshot, dict) else {}
+        run_root = str(snapshot.get("run_root", "") or "").strip()
+        if not run_root:
+            return runtime_snapshot, ""
+        if not bool(snapshot.get("manifest_exists", False)):
+            return runtime_snapshot, ""
+        if int(snapshot.get("manifest_enabled_count", 0) or 0) > 0:
+            return runtime_snapshot, ""
+        intended_target_ids = self._target_autoloop_autoswitch_intended_target_ids()
+        if not intended_target_ids:
+            return runtime_snapshot, ""
+        latest = self._target_autoloop_latest_valid_sibling_run_root(
+            run_root,
+            intended_target_ids=intended_target_ids,
+            require_publish_ready_complete=True,
+        )
+        latest_run_root = str(latest.get("run_root", "") or "").strip()
+        if not latest_run_root or latest_run_root == run_root:
+            return runtime_snapshot, ""
+
+        self._apply_prepared_run_root_context(
+            latest_run_root,
+            source="target-autoloop-latest-valid-autoswitch",
+        )
+        switched_snapshot = self._target_autoloop_runtime_snapshot(latest_run_root)
+        latest_targets = latest.get("target_ids", [])
+        if isinstance(latest_targets, list):
+            latest_targets_text = self._target_autoloop_join_target_ids([str(item) for item in latest_targets])
+        else:
+            latest_targets_text = "(unknown)"
+        detail = (
+            "현재 RunRoot manifest는 enabled target 0개인 stale run이라 최신 유효 target-autoloop RunRoot로 자동 전환했습니다. "
+            f"old={run_root} / new={latest_run_root} / "
+            f"newEnabled={int(latest.get('enabled_count', 0) or 0)} / "
+            f"newPublishReadyTrigger={int(latest.get('publish_ready_count', 0) or 0)}/{int(latest.get('enabled_count', 0) or 0)} / "
+            f"newTargets={latest_targets_text} / "
+            f"intendedTargets={self._target_autoloop_join_target_ids(intended_target_ids)}"
+        )
+        return switched_snapshot, detail
+
+    @staticmethod
+    def _single_quoted_psd1_value(raw_text: str, key: str) -> str:
+        return target_autoloop_runtime.single_quoted_psd1_value(raw_text, key)
+
+    def _target_autoloop_router_session_paths_from_config_file(self) -> dict[str, str]:
+        config_path = ""
+        try:
+            config_path = str(self.config_path_var.get() or "").strip()
+        except Exception:
+            config_path = ""
+        if not config_path:
+            try:
+                config_path = str(self._current_context().config_path or "").strip()
+            except Exception:
+                config_path = ""
+        return target_autoloop_runtime.target_autoloop_router_session_paths_from_config_file(
+            config_path,
+            root=ROOT,
+        )
+
+    def _target_autoloop_router_session_paths(self) -> dict[str, str]:
+        config_path = ""
+        try:
+            config_path = str(self.config_path_var.get() or "").strip()
+        except Exception:
+            config_path = ""
+        if not config_path:
+            try:
+                config_path = str(self._current_context().config_path or "").strip()
+            except Exception:
+                config_path = ""
+        return target_autoloop_runtime.target_autoloop_router_session_paths(
+            effective_data=self.effective_data if isinstance(self.effective_data, dict) else {},
+            config_path=config_path,
+            root=ROOT,
+        )
+
+    def _target_autoloop_router_session_snapshot(self) -> dict[str, object]:
+        return target_autoloop_runtime.target_autoloop_router_session_snapshot(
+            self._target_autoloop_router_session_paths()
+        )
+
+    @staticmethod
+    def _target_autoloop_router_session_paths_ready(session_snapshot: dict[str, object]) -> bool:
+        return target_autoloop_runtime.target_autoloop_router_session_paths_ready(session_snapshot)
+
+    def _wait_for_target_autoloop_router_session_paths_ok(
+        self,
+        *,
+        timeout_sec: float = 5.0,
+        poll_interval_sec: float = 0.25,
+    ) -> dict[str, object]:
+        deadline = time.monotonic() + max(0.0, timeout_sec)
+        last_snapshot: dict[str, object] = {}
+        while True:
+            self._clear_target_autoloop_runtime_snapshot_cache()
+            last_snapshot = self._target_autoloop_router_session_snapshot()
+            if self._target_autoloop_router_session_paths_ready(last_snapshot):
+                return last_snapshot
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(max(0.0, poll_interval_sec))
+
+        raise RuntimeError(target_autoloop_runtime.target_autoloop_router_session_paths_not_ready_message(last_snapshot))
+
+    @staticmethod
+    def _target_autoloop_router_session_mismatch_message(snapshot: dict[str, object]) -> str:
+        return target_autoloop_presenter.target_autoloop_router_session_mismatch_message(snapshot)
+
+    @staticmethod
+    def _target_autoloop_router_session_not_ready_message(snapshot: dict[str, object]) -> str:
+        return target_autoloop_presenter.target_autoloop_router_session_not_ready_message(snapshot)
+
+    @staticmethod
+    def _target_autoloop_router_session_ready(snapshot: dict[str, object]) -> bool:
+        return target_autoloop_presenter.target_autoloop_router_session_ready(snapshot)
+
+    def _wait_for_target_autoloop_router_session_ok(
+        self,
+        run_root: str,
+        *,
+        timeout_sec: float = 5.0,
+        poll_interval_sec: float = 0.25,
+    ) -> dict[str, object]:
+        deadline = time.monotonic() + max(0.0, timeout_sec)
+        last_snapshot: dict[str, object] = {}
+        while True:
+            self._clear_target_autoloop_runtime_snapshot_cache()
+            last_snapshot = self._target_autoloop_runtime_snapshot(run_root)
+            if self._target_autoloop_router_session_ready(last_snapshot):
+                return last_snapshot
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(max(0.0, poll_interval_sec))
+
+        router_session = last_snapshot.get("router_session", {})
+        if not isinstance(router_session, dict):
+            router_session = {}
+        raise RuntimeError(
+            "router restart completed but session mismatch remains: "
+            f"state={last_snapshot.get('router_session_state', '') or '-'} "
+            f"router={router_session.get('router_launcher_session_id', '') or '-'} "
+            f"runtime={router_session.get('runtime_launcher_session_id', '') or '-'}"
+        )
+
+    @staticmethod
+    def _target_autoloop_file_signature(path_value: object) -> tuple[str, bool, int, int]:
+        path_text = str(path_value or "").strip()
+        if not path_text:
+            return ("", False, 0, 0)
+        path = Path(path_text)
+        try:
+            stat = path.stat()
+        except OSError:
+            return (str(path), False, 0, 0)
+        return (str(path), True, int(getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1_000_000_000))), int(stat.st_size))
+
+    @staticmethod
+    def _target_autoloop_source_outbox_signature_paths(resolved_run_root: str) -> list[object]:
+        run_root_path = Path(str(resolved_run_root or "").strip())
+        manifest_path = run_root_path / "manifest.json"
+        manifest_payload = target_autoloop_runtime.read_json_dict_if_present(manifest_path)
+        manifest_targets = target_autoloop_runtime.target_autoloop_manifest_targets(manifest_payload)
+        paths: list[object] = []
+        seen: set[str] = set()
+
+        def append_path(path_value: object) -> None:
+            path_text = str(path_value or "").strip()
+            if not path_text or path_text in seen:
+                return
+            seen.add(path_text)
+            paths.append(path_text)
+
+        for row in manifest_targets:
+            if not isinstance(row, dict):
+                continue
+            append_path(row.get("SourceSummaryPath", ""))
+            append_path(row.get("SourceReviewZipPath", ""))
+            append_path(row.get("PublishReadyPath", ""))
+            source_outbox = str(row.get("SourceOutboxPath", "") or "").strip()
+            if source_outbox:
+                outbox_path = Path(source_outbox)
+                append_path(outbox_path / "summary.txt")
+                append_path(outbox_path / "review.zip")
+                append_path(outbox_path / "publish.ready.json")
+
+        if not paths:
+            targets_root = run_root_path / "targets"
+            try:
+                target_dirs = list(targets_root.iterdir())
+            except OSError:
+                target_dirs = []
+            for target_dir in target_dirs:
+                source_outbox = target_dir / "source-outbox"
+                append_path(source_outbox / "summary.txt")
+                append_path(source_outbox / "review.zip")
+                append_path(source_outbox / "publish.ready.json")
+        return paths
+
+    def _target_autoloop_runtime_snapshot_cache_signature(self, resolved_run_root: str) -> tuple[tuple[str, bool, int, int], ...]:
+        session_paths = self._target_autoloop_router_session_paths()
+        run_root_path = Path(resolved_run_root)
+        watched_paths: list[object] = [
+            run_root_path / "manifest.json",
+            run_root_path / ".state" / "target-state.json",
+            run_root_path / ".state" / "target-autoloop-status.json",
+            run_root_path / ".state" / "target-autoloop-control.json",
+            run_root_path / ".state" / "target-autoloop-watcher.stdout.log",
+            run_root_path / ".state" / "target-autoloop-watcher.stderr.log",
+            run_root_path / ".state" / "target-autoloop-live-smoke-result.json",
+            acceptance_receipt_path_for_run_root(resolved_run_root),
+            session_paths.get("config_path", ""),
+            session_paths.get("RuntimeMapPath", ""),
+            session_paths.get("runtime_map_path", ""),
+            session_paths.get("RouterStatePath", ""),
+            session_paths.get("router_state_path", ""),
+            session_paths.get("RetryPendingRoot", ""),
+            session_paths.get("retry_pending_root", ""),
+        ]
+        watched_paths.extend(self._target_autoloop_source_outbox_signature_paths(resolved_run_root))
+        return tuple(self._target_autoloop_file_signature(path) for path in watched_paths)
+
+    def _target_autoloop_cached_runtime_snapshot(
+        self,
+        resolved_run_root: str,
+        signature: tuple[tuple[str, bool, int, int], ...],
+    ) -> dict[str, object] | None:
+        cache = self.__dict__.get("_target_autoloop_runtime_snapshot_cache")
+        if not isinstance(cache, dict):
+            return None
+        if str(cache.get("run_root", "") or "") != str(resolved_run_root or ""):
+            return None
+        if cache.get("signature") != signature:
+            return None
+        cached_at = float(cache.get("cached_at", 0.0) or 0.0)
+        if (time.monotonic() - cached_at) > TARGET_AUTOLOOP_RUNTIME_SNAPSHOT_CACHE_TTL_SECONDS:
+            return None
+        snapshot = cache.get("snapshot")
+        if not isinstance(snapshot, dict):
+            return None
+        return deepcopy(snapshot)
+
+    def _store_target_autoloop_runtime_snapshot_cache(
+        self,
+        resolved_run_root: str,
+        signature: tuple[tuple[str, bool, int, int], ...],
+        snapshot: dict[str, object],
+    ) -> None:
+        self.__dict__["_target_autoloop_runtime_snapshot_cache"] = {
+            "run_root": str(resolved_run_root or ""),
+            "signature": signature,
+            "cached_at": time.monotonic(),
+            "snapshot": deepcopy(snapshot),
+        }
+
+    def _clear_target_autoloop_runtime_snapshot_cache(self) -> None:
+        self.__dict__.pop("_target_autoloop_runtime_snapshot_cache", None)
 
     def _target_autoloop_runtime_snapshot(self, run_root: str | None = None) -> dict[str, object]:
         try:
@@ -16588,107 +19149,81 @@ class RelayOperatorPanel(tk.Tk):
                 "router_session_mismatch": False,
             }
 
+        cache_signature = self._target_autoloop_runtime_snapshot_cache_signature(resolved_run_root) if resolved_run_root else ()
+        if cache_signature:
+            cached_snapshot = self._target_autoloop_cached_runtime_snapshot(resolved_run_root, cache_signature)
+            if cached_snapshot is not None:
+                return cached_snapshot
+
+        router_session_paths = self._target_autoloop_router_session_paths()
         router_session = self._target_autoloop_router_session_snapshot()
-        status_path = Path(resolved_run_root) / ".state" / "target-autoloop-status.json"
-        control_path = Path(resolved_run_root) / ".state" / "target-autoloop-control.json"
-        manifest_path = Path(resolved_run_root) / "manifest.json"
-        watcher_stdout_log_path = Path(resolved_run_root) / ".state" / "target-autoloop-watcher.stdout.log"
-        watcher_stderr_log_path = Path(resolved_run_root) / ".state" / "target-autoloop-watcher.stderr.log"
-        smoke_receipt_path = Path(resolved_run_root) / ".state" / "target-autoloop-live-smoke-result.json"
+        run_paths = target_autoloop_runtime.target_autoloop_run_paths(resolved_run_root)
+        status_path = run_paths["status_path"]
+        control_path = run_paths["control_path"]
+        manifest_path = run_paths["manifest_path"]
+        watcher_stdout_log_path = run_paths["watcher_stdout_log_path"]
+        watcher_stderr_log_path = run_paths["watcher_stderr_log_path"]
+        smoke_receipt_path = run_paths["smoke_receipt_path"]
         acceptance_receipt_path = Path(acceptance_receipt_path_for_run_root(resolved_run_root))
-        status_payload: dict[str, object] = {}
-        control_payload: dict[str, object] = {}
-        manifest_payload: dict[str, object] = {}
-        smoke_receipt_payload: dict[str, object] = {}
-        acceptance_receipt_payload: dict[str, object] = {}
-        status_error = ""
-        control_error = ""
-        manifest_error = ""
-        smoke_receipt_error = ""
-        acceptance_receipt_error = ""
 
-        if manifest_path.exists():
-            try:
-                loaded_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-                if isinstance(loaded_manifest, dict):
-                    manifest_payload = loaded_manifest
-                else:
-                    manifest_error = "manifest-payload-not-dict"
-            except Exception as exc:
-                manifest_error = str(exc)
-        else:
-            manifest_error = "missing"
-
-        if status_path.exists():
-            try:
-                loaded_status = json.loads(status_path.read_text(encoding="utf-8"))
-                if isinstance(loaded_status, dict):
-                    status_payload = loaded_status
-                else:
-                    status_error = "status-payload-not-dict"
-            except Exception as exc:
-                status_error = str(exc)
-        else:
-            status_error = "missing"
-
-        if control_path.exists():
-            try:
-                loaded_control = json.loads(control_path.read_text(encoding="utf-8"))
-                if isinstance(loaded_control, dict):
-                    control_payload = loaded_control
-                else:
-                    control_error = "control-payload-not-dict"
-            except Exception as exc:
-                control_error = str(exc)
-
-        if smoke_receipt_path.exists():
-            try:
-                loaded_smoke_receipt = json.loads(smoke_receipt_path.read_text(encoding="utf-8"))
-                if isinstance(loaded_smoke_receipt, dict):
-                    smoke_receipt_payload = loaded_smoke_receipt
-                else:
-                    smoke_receipt_error = "smoke-receipt-payload-not-dict"
-            except Exception as exc:
-                smoke_receipt_error = str(exc)
+        manifest_payload, manifest_error = target_autoloop_runtime.read_json_dict_with_error(
+            manifest_path,
+            missing_error="missing",
+            not_dict_error="manifest-payload-not-dict",
+        )
+        status_payload, status_error = target_autoloop_runtime.read_json_dict_with_error(
+            status_path,
+            missing_error="missing",
+            not_dict_error="status-payload-not-dict",
+        )
+        control_payload, control_error = target_autoloop_runtime.read_json_dict_with_error(
+            control_path,
+            missing_error="",
+            not_dict_error="control-payload-not-dict",
+        )
+        smoke_receipt_payload, smoke_receipt_error = target_autoloop_runtime.read_json_dict_with_error(
+            smoke_receipt_path,
+            missing_error="",
+            not_dict_error="smoke-receipt-payload-not-dict",
+        )
 
         acceptance_receipt_summary = load_acceptance_receipt_summary_from_path(str(acceptance_receipt_path))
-        if acceptance_receipt_path.exists():
-            try:
-                loaded_acceptance_receipt = json.loads(acceptance_receipt_path.read_text(encoding="utf-8"))
-                if isinstance(loaded_acceptance_receipt, dict):
-                    acceptance_receipt_payload = loaded_acceptance_receipt
-                else:
-                    acceptance_receipt_error = "acceptance-receipt-payload-not-dict"
-            except Exception as exc:
-                acceptance_receipt_error = str(exc)
+        acceptance_receipt_payload, acceptance_receipt_error = target_autoloop_runtime.read_json_dict_with_error(
+            acceptance_receipt_path,
+            missing_error="",
+            not_dict_error="acceptance-receipt-payload-not-dict",
+        )
 
-        counts = status_payload.get("Counts", {}) if isinstance(status_payload.get("Counts", {}), dict) else {}
-        targets = status_payload.get("Targets", [])
-        if not isinstance(targets, list):
-            targets = []
-        manifest_targets = manifest_payload.get("Targets", [])
-        if not isinstance(manifest_targets, list):
-            manifest_targets = []
-        manifest_enabled_count = 0
-        manifest_publish_ready_count = 0
-        for manifest_row in manifest_targets:
-            if not isinstance(manifest_row, dict):
-                continue
-            if bool(manifest_row.get("Enabled", False)):
-                manifest_enabled_count += 1
-                trigger_kinds = {
-                    str(trigger_kind or "").strip().lower()
-                    for trigger_kind in manifest_row.get("TriggerKinds", []) or []
-                }
-                if "publish-ready" in trigger_kinds:
-                    manifest_publish_ready_count += 1
+        counts = target_autoloop_runtime.target_autoloop_status_counts(status_payload)
+        targets = target_autoloop_runtime.target_autoloop_status_targets(status_payload)
+        manifest_targets = target_autoloop_runtime.target_autoloop_manifest_targets(manifest_payload)
+        manifest_enabled_count, manifest_publish_ready_count = (
+            target_autoloop_runtime.target_autoloop_manifest_enabled_publish_ready_counts(manifest_targets)
+        )
+        manifest_target_ids = [
+            str(row.get("TargetId", "") or "").strip()
+            for row in manifest_targets
+            if isinstance(row, dict) and str(row.get("TargetId", "") or "").strip()
+        ]
+        retry_pending_summary = target_autoloop_runtime.target_autoloop_retry_pending_summary(
+            router_session_paths.get("retry_pending_root", ""),
+            target_ids=manifest_target_ids,
+        )
+        router_inbox_ready_summary = target_autoloop_runtime.target_autoloop_router_inbox_ready_summary(
+            manifest_targets,
+            target_ids=manifest_target_ids,
+        )
+        output_block_summary = target_autoloop_runtime.target_autoloop_source_outbox_contract_summary(
+            manifest_targets,
+            targets,
+        )
         controller_state = str(
             status_payload.get("ControllerState", "")
             or control_payload.get("State", "")
             or "-"
         )
         state = str(status_payload.get("State", "") or "-")
-        return {
+        snapshot = {
             "run_root": resolved_run_root,
             "run_root_error": "",
             "manifest_path": manifest_path,
@@ -16743,6 +19278,13 @@ class RelayOperatorPanel(tk.Tk):
             "router_session": router_session,
             "router_session_state": str(router_session.get("state", "") or ""),
             "router_session_mismatch": bool(router_session.get("mismatch", False)),
+            "retry_pending_summary": retry_pending_summary,
+            "retry_pending_count": int(retry_pending_summary.get("count", 0) or 0),
+            "retry_pending_root": str(retry_pending_summary.get("root", "") or ""),
+            "router_inbox_ready_summary": router_inbox_ready_summary,
+            "router_inbox_ready_count": int(router_inbox_ready_summary.get("count", 0) or 0),
+            "output_block_summary": output_block_summary,
+            "output_block_count": int(output_block_summary.get("limit_reached_ready_unaccepted_count", 0) or 0),
             "acceptance_receipt_path": str(acceptance_receipt_path),
             "acceptance_receipt_exists": acceptance_receipt_path.exists(),
             "acceptance_receipt_error": acceptance_receipt_error,
@@ -16759,6 +19301,9 @@ class RelayOperatorPanel(tk.Tk):
                 targets=targets,
             ),
         }
+        if cache_signature:
+            self._store_target_autoloop_runtime_snapshot_cache(resolved_run_root, cache_signature, snapshot)
+        return snapshot
 
     def _target_autoloop_control_eligibility(
         self,
@@ -16766,45 +19311,7 @@ class RelayOperatorPanel(tk.Tk):
         runtime_snapshot: dict[str, object] | None = None,
     ) -> tuple[bool, str]:
         snapshot = runtime_snapshot or self._target_autoloop_runtime_snapshot()
-        run_root_error = str(snapshot.get("run_root_error", "") or "")
-        if run_root_error:
-            return False, "RunRoot 문맥을 아직 읽지 못했습니다."
-        run_root = str(snapshot.get("run_root", "") or "")
-        if not run_root:
-            return False, "현재 RunRoot가 없어 target-autoloop 제어를 막았습니다."
-        status_error = str(snapshot.get("status_error", "") or "")
-        if status_error:
-            if status_error == "missing":
-                return False, "target-autoloop 상태 파일이 없어 제어를 막았습니다."
-            return False, f"target-autoloop 상태 파일을 읽지 못해 제어를 막았습니다: {status_error}"
-        control_error = str(snapshot.get("control_error", "") or "")
-        if control_error:
-            return False, f"target-autoloop control 파일을 읽지 못해 제어를 막았습니다: {control_error}"
-
-        controller_state = str(snapshot.get("controller_state", "") or "")
-        pending_action = str(snapshot.get("control_pending_action", "") or "")
-        if pending_action:
-            if pending_action == action:
-                return False, f"이미 target-autoloop {action} 요청이 진행 중입니다."
-            return False, f"다른 target-autoloop 제어 요청({pending_action})이 이미 진행 중입니다."
-        if action == "pause":
-            if controller_state == "paused":
-                return False, "현재 target-autoloop이 이미 paused 상태입니다."
-            if controller_state == "stopped":
-                return False, "stopped 상태에서는 pause가 아니라 restart가 필요합니다."
-            if controller_state != "running":
-                return False, f"현재 target-autoloop controller 상태가 running이 아닙니다: {controller_state or '-'}"
-        elif action == "resume":
-            if controller_state == "running":
-                return False, "현재 target-autoloop이 이미 running 상태입니다."
-            if controller_state == "stopped":
-                return False, "stopped 상태에서는 resume이 아니라 restart가 필요합니다."
-            if controller_state != "paused":
-                return False, f"현재 target-autoloop controller 상태가 paused가 아닙니다: {controller_state or '-'}"
-        elif action == "stop":
-            if controller_state == "stopped":
-                return False, "현재 target-autoloop이 이미 stopped 상태입니다."
-        return True, ""
+        return target_autoloop_presenter.target_autoloop_control_eligibility(action, snapshot)
 
     def _target_autoloop_watcher_stale_after_seconds(self) -> float:
         return 15.0
@@ -16858,39 +19365,15 @@ class RelayOperatorPanel(tk.Tk):
         runtime_snapshot: dict[str, object] | None = None,
     ) -> str:
         snapshot = runtime_snapshot or self._target_autoloop_runtime_snapshot()
-        router_session = snapshot.get("router_session", {})
-        if not isinstance(router_session, dict):
-            router_session = {}
-        if bool(snapshot.get("router_session_mismatch", False)):
-            return self._target_autoloop_router_session_mismatch_message(router_session)
         watcher_health, _detail = self._target_autoloop_watcher_health(snapshot)
-        controller_state = str(snapshot.get("controller_state", "") or "").strip()
-        watcher_state = str(snapshot.get("watcher_state", "") or "").strip()
-        if watcher_health == "active":
-            if watcher_state == "paused":
-                return "paused 상태입니다. resume 또는 stop을 선택하세요."
-            return "watcher가 정상 heartbeat를 보내고 있습니다."
-        if watcher_health == "stale":
-            return "heartbeat가 stale입니다. watch start/restart 후 stderr 로그를 먼저 확인하세요."
-        if watcher_health == "stopped":
-            if controller_state == "stopped":
-                return "controller와 watcher가 모두 stopped입니다. watch restart가 필요합니다."
-            return "watcher가 stopped입니다. watch start로 다시 올리세요."
-        return "status가 없거나 watcher 메타데이터가 비어 있습니다. watch start로 초기화하세요."
+        return target_autoloop_presenter.target_autoloop_watcher_recommendation(
+            snapshot,
+            watcher_health=watcher_health,
+        )
 
     @staticmethod
     def _target_autoloop_retry_recommendation_label(label: str, action_key: str) -> str:
-        normalized_label = str(label or "").strip()
-        normalized_action_key = str(action_key or "").strip()
-        if not normalized_label:
-            return normalized_label
-        if normalized_action_key == "open_stderr_log":
-            return "stderr 다시 열기"
-        if normalized_label.endswith("요청"):
-            return normalized_label[:-2] + "재요청"
-        if normalized_label.endswith("재시도") or normalized_label.endswith("재요청"):
-            return normalized_label
-        return normalized_label + " 재시도"
+        return target_autoloop_presenter.target_autoloop_retry_recommendation_label(label, action_key)
 
     @staticmethod
     def _target_autoloop_recommendation_detail_sections(
@@ -16899,89 +19382,23 @@ class RelayOperatorPanel(tk.Tk):
         latest_outcome: str = "",
         latest_detail: str = "",
     ) -> list[str]:
-        normalized_base_detail = str(base_detail or "").strip()
-        normalized_latest_outcome = str(latest_outcome or "").strip().lower()
-        normalized_latest_detail = str(latest_detail or "").strip()
-        if normalized_latest_outcome not in {"failed", "blocked"}:
-            return [normalized_base_detail] if normalized_base_detail else []
-
-        outcome_label = "실패" if normalized_latest_outcome == "failed" else "차단"
-        sections = []
-        if normalized_latest_detail:
-            sections.append(f"이전 {outcome_label}: {normalized_latest_detail}")
-        else:
-            sections.append(f"이전 {outcome_label}")
-        if normalized_base_detail:
-            sections.append(f"이번 조치: {normalized_base_detail}")
-        return sections
+        return target_autoloop_presenter.target_autoloop_recommendation_detail_sections(
+            base_detail=base_detail,
+            latest_outcome=latest_outcome,
+            latest_detail=latest_detail,
+        )
 
     @staticmethod
     def _target_autoloop_retry_reason_badge_spec(recommendation_spec: dict[str, object] | None) -> dict[str, str]:
-        if not isinstance(recommendation_spec, dict):
-            return {
-                "text": "재시도 사유: (없음)",
-                "background": "#6B7280",
-                "foreground": "#FFFFFF",
-            }
-        retry_outcome = str(recommendation_spec.get("retry_outcome", "") or "").strip().lower()
-        retry_detail = RelayOperatorPanel._target_autoloop_compact_text(
-            recommendation_spec.get("retry_detail", ""),
-            max_chars=88,
-        )
-        if retry_outcome == "failed":
-            text = "재시도 사유: 이전 실패"
-            if retry_detail:
-                text += f" / {retry_detail}"
-            return {
-                "text": text,
-                "background": "#991B1B",
-                "foreground": "#FFFFFF",
-            }
-        if retry_outcome == "blocked":
-            text = "재시도 사유: 이전 차단"
-            if retry_detail:
-                text += f" / {retry_detail}"
-            return {
-                "text": text,
-                "background": "#B45309",
-                "foreground": "#FFFFFF",
-            }
-        return {
-            "text": "재시도 사유: (없음)",
-            "background": "#6B7280",
-            "foreground": "#FFFFFF",
-        }
+        return target_autoloop_presenter.target_autoloop_retry_reason_badge_spec(recommendation_spec)
 
     @staticmethod
     def _target_autoloop_recommendation_mode(recommendation_spec: dict[str, object] | None) -> str:
-        if not isinstance(recommendation_spec, dict):
-            return "none"
-        action_key = str(recommendation_spec.get("action_key", "") or "").strip()
-        if not action_key:
-            return "none"
-        return "read-only" if bool(recommendation_spec.get("read_only", False)) else "mutating"
+        return target_autoloop_presenter.target_autoloop_recommendation_mode(recommendation_spec)
 
     @staticmethod
     def _target_autoloop_recommendation_level(recommendation_spec: dict[str, object] | None) -> str:
-        if not isinstance(recommendation_spec, dict):
-            return "none"
-        action_key = str(recommendation_spec.get("action_key", "") or "").strip()
-        if not action_key:
-            return "none"
-        if bool(recommendation_spec.get("read_only", False)):
-            return "safe"
-        if action_key in {"stop", "force_restart", "force_stop"}:
-            return "danger"
-        if action_key in {
-            "resume",
-            "start_watch",
-            "enable_publish_ready",
-            "fix_publish_ready_prepare_autoloop_runroot",
-            "prepare_autoloop_runroot",
-            "restart_router_for_autoloop",
-        }:
-            return "normal"
-        return "normal"
+        return target_autoloop_presenter.target_autoloop_recommendation_level(recommendation_spec)
 
     def _target_autoloop_policy_enabled_publish_ready_counts(self) -> tuple[int, int]:
         try:
@@ -17002,120 +19419,59 @@ class RelayOperatorPanel(tk.Tk):
                 publish_ready_count += 1
         return enabled_count, publish_ready_count
 
+    def _target_autoloop_prepare_recommendation_from_start_detail(self, start_detail: str) -> dict[str, str] | None:
+        enabled_count, publish_ready_count = self._target_autoloop_policy_enabled_publish_ready_counts()
+        return target_autoloop_presenter.target_autoloop_prepare_recommendation_from_start_detail(
+            start_detail,
+            card_enabled_count=enabled_count,
+            card_publish_ready_count=publish_ready_count,
+        )
+
     def _target_autoloop_recommendation_spec(
         self,
         runtime_snapshot: dict[str, object] | None = None,
     ) -> dict[str, object]:
         snapshot = runtime_snapshot or self._target_autoloop_runtime_snapshot()
         watcher_health, watcher_health_detail = self._target_autoloop_watcher_health(snapshot)
-        watcher_state = str(snapshot.get("watcher_state", "") or "").strip()
-        controller_state = str(snapshot.get("controller_state", "") or "").strip()
-        stderr_exists = bool(snapshot.get("watcher_stderr_log_exists", False))
-        stderr_path = str(snapshot.get("watcher_stderr_log_path", "") or "").strip()
         start_allowed, start_detail = self._target_autoloop_start_eligibility(snapshot)
         resume_allowed, _resume_detail = self._target_autoloop_control_eligibility("resume", snapshot)
-
-        label = "권장 조치 없음"
-        action_key = ""
-        detail = self._target_autoloop_watcher_recommendation(snapshot)
-        read_only = False
-
-        if bool(snapshot.get("router_session_mismatch", False)):
-            label = "router 세션 재시작"
-            action_key = "restart_router_for_autoloop"
-            detail = self._target_autoloop_watcher_recommendation(snapshot)
-        elif watcher_health == "stale":
-            if stderr_exists and stderr_path:
-                label = "stderr 우선 열기"
-                action_key = "open_stderr_log"
-                read_only = True
-                detail = (
-                    f"watcher stale ({watcher_health_detail or 'unknown'}) 상태입니다. "
-                    "stderr 로그를 먼저 열어 원인을 확인한 뒤 watch restart를 진행하세요."
-                )
-            elif start_allowed:
-                label = "watch restart"
-                action_key = "start_watch"
-                detail = (
-                    f"watcher stale ({watcher_health_detail or 'unknown'}) 상태입니다. "
-                    "로그가 없으므로 restart로 heartbeat를 다시 세우는 편이 안전합니다."
-                )
-            elif "publish-ready" in str(start_detail or ""):
-                enabled_count, publish_ready_count = self._target_autoloop_policy_enabled_publish_ready_counts()
-                if enabled_count > 0 and publish_ready_count >= enabled_count:
-                    label = "새 RunRoot 준비"
-                    action_key = "prepare_autoloop_runroot"
-                    detail = start_detail + " / 현재 카드 설정은 publish-ready가 켜져 있으므로 새 RunRoot 준비가 필요합니다."
-                else:
-                    label = "publish-ready 켜고 새 RunRoot 준비"
-                    action_key = "fix_publish_ready_prepare_autoloop_runroot"
-                    detail = start_detail + " / 누르면 enabled target의 publish-ready를 켜고 저장한 뒤 새 RunRoot를 준비합니다."
-            elif "target-autoloop용 run이 아닙니다" in str(start_detail or ""):
-                label = "새 RunRoot 준비"
-                action_key = "prepare_autoloop_runroot"
-                detail = start_detail
-        elif watcher_health == "stopped":
-            if controller_state == "paused" and resume_allowed:
-                label = "resume 요청"
-                action_key = "resume"
-                detail = "controller는 paused이고 watcher는 stopped입니다. resume으로 pause 중 쌓인 target별 queue를 순차 처리하세요."
-            elif start_allowed:
-                label = "watch restart" if controller_state == "stopped" else "watch start"
-                action_key = "start_watch"
-                detail = (
-                    "watcher가 stopped 상태입니다. "
-                    + ("controller도 stopped라 restart가 필요합니다." if controller_state == "stopped" else "watch start로 다시 올리세요.")
-                )
-            elif "publish-ready" in str(start_detail or ""):
-                enabled_count, publish_ready_count = self._target_autoloop_policy_enabled_publish_ready_counts()
-                if enabled_count > 0 and publish_ready_count >= enabled_count:
-                    label = "새 RunRoot 준비"
-                    action_key = "prepare_autoloop_runroot"
-                    detail = start_detail + " / 현재 카드 설정은 publish-ready가 켜져 있으므로 새 RunRoot 준비가 필요합니다."
-                else:
-                    label = "publish-ready 켜고 새 RunRoot 준비"
-                    action_key = "fix_publish_ready_prepare_autoloop_runroot"
-                    detail = start_detail + " / 누르면 enabled target의 publish-ready를 켜고 저장한 뒤 새 RunRoot를 준비합니다."
-            elif "target-autoloop용 run이 아닙니다" in str(start_detail or ""):
-                label = "새 RunRoot 준비"
-                action_key = "prepare_autoloop_runroot"
-                detail = start_detail
-        elif watcher_state == "paused" and resume_allowed:
-            label = "resume 요청"
-            action_key = "resume"
-            detail = "watcher가 paused 상태입니다. 감지는 유지되고 submit만 멈춘 상태이므로 resume 요청으로 쌓인 queue를 순차 처리하세요."
 
         run_root = str(snapshot.get("run_root", "") or "").strip()
         latest_history_records = self._target_autoloop_recommendation_history_records_for_run_root(run_root) if run_root else []
         latest_history = latest_history_records[-1] if latest_history_records else {}
-        latest_outcome = str(latest_history.get("outcome", "") or "").strip().lower()
-        latest_action_key = str(latest_history.get("action_key", "") or "").strip()
-        latest_detail = self._target_autoloop_compact_text(latest_history.get("detail", ""), max_chars=120)
-        detail_sections = [detail] if detail else []
-        retry_outcome = ""
-        retry_detail = ""
-        if action_key and latest_action_key == action_key and latest_outcome in {"failed", "blocked"}:
-            label = self._target_autoloop_retry_recommendation_label(label, action_key)
-            detail_sections = self._target_autoloop_recommendation_detail_sections(
-                base_detail=detail,
-                latest_outcome=latest_outcome,
-                latest_detail=latest_detail,
+        enabled_count, publish_ready_count = self._target_autoloop_policy_enabled_publish_ready_counts()
+        recommendation_spec = target_autoloop_presenter.target_autoloop_recommendation_spec(
+            snapshot,
+            watcher_health=watcher_health,
+            watcher_health_detail=watcher_health_detail,
+            start_allowed=start_allowed,
+            start_detail=start_detail,
+            resume_allowed=resume_allowed,
+            card_enabled_count=enabled_count,
+            card_publish_ready_count=publish_ready_count,
+            latest_history=latest_history,
+        )
+        additional_cycles, additional_detail = self._target_autoloop_extend_cycles_value()
+        if not additional_detail:
+            extend_allowed, extend_detail = self._target_autoloop_extend_cycle_limit_eligibility(
+                snapshot,
+                additional_cycles=additional_cycles,
             )
-            detail = " / ".join(section for section in detail_sections if section)
-            retry_outcome = latest_outcome
-            retry_detail = latest_detail
-
-        return {
-            "label": label,
-            "action_key": action_key,
-            "detail": detail,
-            "detail_sections": detail_sections,
-            "retry_outcome": retry_outcome,
-            "retry_detail": retry_detail,
-            "read_only": read_only,
-            "watcher_health": watcher_health,
-            "watcher_health_detail": watcher_health_detail,
-        }
+            recommendation_action_key = str(recommendation_spec.get("action_key", "") or "").strip()
+            if extend_allowed and recommendation_action_key in {"", "prepare_autoloop_runroot"}:
+                detail = (
+                    f"{extend_detail} / 현재 RunRoot에서 MaxCycleCount만 늘린 뒤 감지 시작까지 이어갑니다. "
+                    "새 RunRoot를 만들지 않습니다."
+                )
+                recommendation_spec = {
+                    **recommendation_spec,
+                    "label": f"추가 {additional_cycles}회+감지 시작",
+                    "action_key": "extend_cycle_limit_then_start_watch",
+                    "detail": detail,
+                    "detail_sections": [detail],
+                    "read_only": False,
+                }
+        return recommendation_spec
 
     @staticmethod
     def _target_autoloop_recommendation_history_summary_text(history_records: list[dict[str, str]]) -> str:
@@ -17128,10 +19484,7 @@ class RelayOperatorPanel(tk.Tk):
 
     @staticmethod
     def _target_autoloop_compact_text(value: object, *, max_chars: int = 120) -> str:
-        text = re.sub(r"\s+", " ", str(value or "")).strip()
-        if len(text) > max_chars:
-            return text[: max_chars - 3] + "..."
-        return text
+        return target_autoloop_presenter.target_autoloop_compact_text(value, max_chars=max_chars)
 
     def _append_target_autoloop_recommendation_history(
         self,
@@ -17559,17 +19912,7 @@ class RelayOperatorPanel(tk.Tk):
 
     def _target_autoloop_detector_included_target_ids(self, runtime_snapshot: dict[str, object] | None = None) -> list[str]:
         snapshot = runtime_snapshot or self._target_autoloop_runtime_snapshot()
-        source_rows = snapshot.get("manifest_targets", []) or snapshot.get("targets", []) or []
-        if not isinstance(source_rows, list):
-            return []
-        target_ids: list[str] = []
-        for row in source_rows:
-            if not isinstance(row, dict):
-                continue
-            target_id = str(row.get("TargetId", "") or "").strip()
-            if target_id and target_id not in target_ids:
-                target_ids.append(target_id)
-        return target_ids
+        return target_autoloop_presenter.target_autoloop_detector_included_target_ids(snapshot)
 
     def _target_autoloop_detector_sweep_label(self, runtime_snapshot: dict[str, object] | None = None) -> str:
         snapshot = runtime_snapshot or self._target_autoloop_runtime_snapshot()
@@ -17583,40 +19926,15 @@ class RelayOperatorPanel(tk.Tk):
 
     def _target_autoloop_detector_state_label(self, runtime_snapshot: dict[str, object] | None = None) -> str:
         snapshot = runtime_snapshot or self._target_autoloop_runtime_snapshot()
-        if str(snapshot.get("run_root_error", "") or "").strip():
-            return "차단"
-        run_root = str(snapshot.get("run_root", "") or "").strip()
-        if not run_root:
-            return "대기"
-        status_error = str(snapshot.get("status_error", "") or "").strip()
-        control_error = str(snapshot.get("control_error", "") or "").strip()
-        if status_error and status_error != "missing":
-            return "차단"
-        if control_error:
-            return "차단"
-        if bool(snapshot.get("router_session_mismatch", False)):
-            return "차단"
-        watcher_state = str(snapshot.get("watcher_state", "") or "").strip()
-        controller_state = str(snapshot.get("controller_state", "") or "").strip()
-        if self._target_autoloop_watcher_is_fresh(snapshot):
-            if watcher_state == "paused":
-                return "일시정지"
-            if watcher_state == "running":
-                return "감지중"
+        if self._target_autoloop_prepare_notice_active(snapshot):
+            return "준비필요"
         start_allowed, start_detail = self._target_autoloop_start_eligibility(snapshot)
-        if (
-            not start_allowed
-            and "이미 active" not in start_detail
-            and any(token in start_detail for token in ("publish-ready", "target-autoloop용", "router", "읽지 못", "처리 중"))
-        ):
-            return "차단"
-        if watcher_state == "paused" or controller_state == "paused":
-            return "일시정지"
-        if watcher_state == "stopped" or controller_state == "stopped":
-            return "정지"
-        if status_error == "missing":
-            return "대기"
-        return "대기"
+        return target_autoloop_presenter.target_autoloop_detector_state_label(
+            snapshot,
+            watcher_fresh=self._target_autoloop_watcher_is_fresh(snapshot),
+            start_allowed=start_allowed,
+            start_detail=start_detail,
+        )
 
     def _target_autoloop_detector_badge_spec(
         self,
@@ -17624,34 +19942,94 @@ class RelayOperatorPanel(tk.Tk):
     ) -> dict[str, str]:
         snapshot = runtime_snapshot or self._target_autoloop_runtime_snapshot()
         detector_state = self._target_autoloop_detector_state_label(snapshot)
-        counts = snapshot.get("counts", {})
-        if not isinstance(counts, dict):
-            counts = {}
         target_ids = self._target_autoloop_detector_included_target_ids(snapshot)
-        target_text = ",".join(target_ids) if target_ids else "-"
-        text = (
-            "감지 상태: {state} | 마지막 sweep: {sweep} | 포함 target: {targets} | "
-            "queue: {queued} / waiting-output: {waiting} / failed: {failed}"
-        ).format(
-            state=detector_state,
-            sweep=self._target_autoloop_detector_sweep_label(snapshot),
-            targets=target_text,
-            queued=int(counts.get("QueuedTargets", 0) or 0),
-            waiting=int(counts.get("WaitingOutputTargets", 0) or 0),
-            failed=int(counts.get("FailedTargets", 0) or 0),
+        return target_autoloop_presenter.target_autoloop_detector_badge_spec(
+            snapshot,
+            detector_state=detector_state,
+            sweep_label=self._target_autoloop_detector_sweep_label(snapshot),
+            target_ids=target_ids,
         )
-        palette = {
-            "감지중": "#15803D",
-            "일시정지": "#B45309",
-            "정지": "#6B7280",
-            "차단": "#B91C1C",
-            "대기": "#6B7280",
-        }
-        return {
-            "text": text,
-            "background": palette.get(detector_state, "#6B7280"),
-            "foreground": "#FFFFFF",
-        }
+
+    def _target_autoloop_policy_enabled_publish_ready_target_ids(self) -> tuple[list[str], list[str]]:
+        enabled_target_ids: list[str] = []
+        publish_ready_target_ids: list[str] = []
+        card_vars = self.__dict__.get("target_autoloop_policy_card_vars", {}) or {}
+        if not isinstance(card_vars, dict):
+            return enabled_target_ids, publish_ready_target_ids
+        for target_id, store in sorted(card_vars.items(), key=lambda item: str(item[0])):
+            if not isinstance(store, dict):
+                continue
+            normalized_target_id = str(target_id or "").strip()
+            enabled_var = store.get("enabled_var")
+            trigger_publish_var = store.get("trigger_publish_var")
+            try:
+                enabled = bool(enabled_var.get()) if enabled_var is not None else False
+            except Exception:
+                enabled = False
+            if not enabled or not normalized_target_id:
+                continue
+            enabled_target_ids.append(normalized_target_id)
+            try:
+                publish_ready_enabled = bool(trigger_publish_var.get()) if trigger_publish_var is not None else False
+            except Exception:
+                publish_ready_enabled = False
+            if publish_ready_enabled:
+                publish_ready_target_ids.append(normalized_target_id)
+        return enabled_target_ids, publish_ready_target_ids
+
+    @staticmethod
+    def _target_autoloop_join_target_ids(target_ids: list[str]) -> str:
+        return target_autoloop_presenter.target_autoloop_join_target_ids(target_ids)
+
+    def _target_autoloop_runroot_attention_spec(
+        self,
+        runtime_snapshot: dict[str, object] | None = None,
+    ) -> dict[str, str]:
+        snapshot = runtime_snapshot or self._target_autoloop_runtime_snapshot()
+        run_root = str(snapshot.get("run_root", "") or "").strip()
+        if self._target_autoloop_prepare_notice_active(snapshot):
+            self.__dict__["_target_autoloop_sync_notice_run_root"] = run_root
+            return {
+                "text": (
+                    "8창/router 동기화 완료: 현재 RunRoot는 독립셀 실행용이 아니라 아직 target-autoloop RunRoot 준비 전 단계입니다. "
+                    "실행할 target 선택, Enabled, publish-ready를 확인한 뒤 "
+                    "[선택 target만 새 RunRoot] 또는 [전체 enabled target 새 RunRoot]를 누르세요. "
+                    f"현재 RunRoot={run_root}"
+                ),
+                "background": "#1D4ED8",
+                "foreground": "#FFFFFF",
+            }
+        manifest_enabled_count = self._target_autoloop_manifest_enabled_count(snapshot)
+        config_enabled_ids, config_publish_ready_ids = self._target_autoloop_policy_enabled_publish_ready_target_ids()
+        start_allowed, start_detail = self._target_autoloop_start_eligibility(snapshot)
+        watcher_health, watcher_health_detail = self._target_autoloop_watcher_health(snapshot)
+        intended_target_ids: list[str] = []
+        latest: dict[str, object] = {}
+        reject_hint = ""
+        if bool(snapshot.get("manifest_exists", False)) and manifest_enabled_count <= 0 and config_enabled_ids:
+            intended_target_ids = self._target_autoloop_autoswitch_intended_target_ids()
+            latest = (
+                self._target_autoloop_latest_valid_sibling_run_root(
+                    run_root,
+                    intended_target_ids=intended_target_ids,
+                    require_publish_ready_complete=True,
+                )
+                if intended_target_ids
+                else {}
+            )
+            reject_hint = self._target_autoloop_autoswitch_reject_hint(run_root, intended_target_ids)
+        return target_autoloop_presenter.target_autoloop_runroot_attention_spec(
+            snapshot,
+            config_enabled_ids=config_enabled_ids,
+            config_publish_ready_ids=config_publish_ready_ids,
+            intended_target_ids=intended_target_ids,
+            latest_valid_sibling_run_root=latest,
+            autoswitch_reject_hint=reject_hint,
+            start_allowed=start_allowed,
+            start_detail=start_detail,
+            watcher_health=watcher_health,
+            watcher_health_detail=watcher_health_detail,
+        )
 
     def _apply_target_autoloop_detector_badge(self, runtime_snapshot: dict[str, object] | None = None) -> None:
         if not self._has_ui_attr("target_autoloop_detector_badge_var"):
@@ -17666,85 +20044,862 @@ class RelayOperatorPanel(tk.Tk):
             fg=badge_spec["foreground"],
         )
 
+    def _apply_target_autoloop_runroot_attention(self, runtime_snapshot: dict[str, object] | None = None) -> None:
+        if not self._has_ui_attr("target_autoloop_runroot_attention_var"):
+            return
+        attention_spec = self._target_autoloop_runroot_attention_spec(runtime_snapshot)
+        self.target_autoloop_runroot_attention_var.set(attention_spec["text"])
+        label = self.__dict__.get("target_autoloop_runroot_attention_label")
+        self._configure_optional_widget(
+            label,
+            text=attention_spec["text"],
+            bg=attention_spec["background"],
+            fg=attention_spec["foreground"],
+        )
+
     def _target_autoloop_start_button_label(
         self,
         runtime_snapshot: dict[str, object] | None = None,
     ) -> str:
         snapshot = runtime_snapshot or self._target_autoloop_runtime_snapshot()
-        watcher_state = str(snapshot.get("watcher_state", "") or "").strip()
-        controller_state = str(snapshot.get("controller_state", "") or "").strip()
-        watcher_fresh = self._target_autoloop_watcher_is_fresh(snapshot)
-        if watcher_fresh and watcher_state == "paused":
-            return "독립셀 감지중(일시정지)"
-        if watcher_fresh and watcher_state == "running":
-            return "독립셀 감지중"
-        if controller_state == "stopped":
-            return "독립셀 감지 재시작"
-        if watcher_state in {"running", "paused"}:
-            return "독립셀 감지 재시작(stale)"
-        return "독립셀 감지 시작"
+        latest_valid_run_root_available = False
+        if self._target_autoloop_manifest_enabled_count(snapshot) == 0 and bool(snapshot.get("manifest_exists", False)):
+            intended_target_ids = self._target_autoloop_autoswitch_intended_target_ids()
+            latest = (
+                self._target_autoloop_latest_valid_sibling_run_root(
+                    str(snapshot.get("run_root", "") or ""),
+                    intended_target_ids=intended_target_ids,
+                    require_publish_ready_complete=True,
+                )
+                if intended_target_ids
+                else {}
+            )
+            latest_run_root = str(latest.get("run_root", "") or "").strip()
+            latest_valid_run_root_available = bool(
+                latest_run_root and latest_run_root != str(snapshot.get("run_root", "") or "").strip()
+            )
+        return target_autoloop_presenter.target_autoloop_start_button_label(
+            snapshot,
+            watcher_fresh=self._target_autoloop_watcher_is_fresh(snapshot),
+            latest_valid_run_root_available=latest_valid_run_root_available,
+        )
+
+    @staticmethod
+    def _target_autoloop_manifest_enabled_count(runtime_snapshot: dict[str, object] | None) -> int:
+        return target_autoloop_presenter.target_autoloop_manifest_enabled_count(runtime_snapshot)
+
+    @staticmethod
+    def _target_autoloop_manifest_target_ids(runtime_snapshot: dict[str, object] | None) -> list[str]:
+        return target_autoloop_presenter.target_autoloop_manifest_target_ids(runtime_snapshot)
+
+    def _target_autoloop_no_enabled_manifest_detail(
+        self,
+        runtime_snapshot: dict[str, object] | None = None,
+    ) -> str:
+        snapshot = runtime_snapshot or {}
+        enabled_count, publish_ready_count = self._target_autoloop_policy_enabled_publish_ready_counts()
+        return target_autoloop_presenter.target_autoloop_no_enabled_manifest_detail(
+            snapshot,
+            card_enabled_count=enabled_count,
+            card_publish_ready_count=publish_ready_count,
+        )
 
     def _target_autoloop_start_eligibility(
         self,
         runtime_snapshot: dict[str, object] | None = None,
     ) -> tuple[bool, str]:
         snapshot = runtime_snapshot or self._target_autoloop_runtime_snapshot()
-        run_root_error = str(snapshot.get("run_root_error", "") or "")
+        enabled_count, publish_ready_count = self._target_autoloop_policy_enabled_publish_ready_counts()
+        return target_autoloop_presenter.target_autoloop_start_eligibility(
+            snapshot,
+            card_enabled_count=enabled_count,
+            card_publish_ready_count=publish_ready_count,
+            watcher_fresh=self._target_autoloop_watcher_is_fresh(snapshot),
+        )
+
+    def _target_autoloop_start_precheck_text(
+        self,
+        runtime_snapshot: dict[str, object] | None = None,
+        *,
+        artifact_snapshot: dict[str, object] | None = None,
+        start_allowed: bool | None = None,
+        start_detail: str = "",
+    ) -> str:
+        snapshot = runtime_snapshot or self._target_autoloop_runtime_snapshot()
+        if artifact_snapshot is None:
+            artifact_snapshot = self._target_autoloop_selected_target_artifact_snapshot(snapshot)
+        if start_allowed is None:
+            start_allowed, start_detail = self._target_autoloop_start_eligibility(snapshot)
+
+        run_root = str(snapshot.get("run_root", "") or "").strip()
+        run_root_error = str(snapshot.get("run_root_error", "") or "").strip()
         if run_root_error:
-            return False, "RunRoot 문맥을 아직 읽지 못했습니다."
-        run_root = str(snapshot.get("run_root", "") or "")
-        if not run_root:
-            return False, "현재 RunRoot가 없어 target-autoloop watcher 시작을 막았습니다."
-        status_error = str(snapshot.get("status_error", "") or "")
-        if status_error and status_error != "missing":
-            return False, f"target-autoloop 상태 파일을 읽지 못해 watcher 시작을 막았습니다: {status_error}"
-        control_error = str(snapshot.get("control_error", "") or "")
-        if control_error:
-            return False, f"target-autoloop control 파일을 읽지 못해 watcher 시작을 막았습니다: {control_error}"
-        manifest_error = str(snapshot.get("manifest_error", "") or "")
-        if manifest_error and manifest_error != "missing":
-            return False, f"target-autoloop manifest를 읽지 못해 watcher 시작을 막았습니다: {manifest_error}"
+            run_root_state = "오류"
+        elif not run_root:
+            run_root_state = "없음"
+        elif not self._target_autoloop_run_root_is_canonical(run_root):
+            run_root_state = "비표준"
+        else:
+            run_root_state = "OK"
+
+        manifest_error = str(snapshot.get("manifest_error", "") or "").strip()
         manifest_run_mode = str(snapshot.get("manifest_run_mode", "") or "").strip()
-        if bool(snapshot.get("manifest_exists", False)) and manifest_run_mode and manifest_run_mode != "target-autoloop":
+        if manifest_error:
+            manifest_state = "오류"
+        elif not bool(snapshot.get("manifest_exists", False)):
+            manifest_state = "없음"
+        elif manifest_run_mode != "target-autoloop":
+            manifest_state = f"mode={manifest_run_mode or '(none)'}"
+        else:
+            manifest_state = "OK"
+
+        manifest_enabled_count = self._target_autoloop_int_or_zero(snapshot.get("manifest_enabled_count", 0))
+        manifest_publish_ready_count = self._target_autoloop_int_or_zero(snapshot.get("manifest_publish_ready_count", 0))
+        router_session_state = str(snapshot.get("router_session_state", "") or "").strip() or "미확인"
+        watcher_state = str(snapshot.get("watcher_state", "") or "").strip() or "미확인"
+        selected_target_id = str((artifact_snapshot or {}).get("target_id", "") or "").strip() or "선택 없음"
+        artifact_state_summary = str(
+            (artifact_snapshot or {}).get("artifact_state_summary", "")
+            or "source-outbox=경로 없음 / summary=경로 없음 / review.zip=경로 없음 / publish.ready=경로 없음"
+        )
+        verdict = "가능" if bool(start_allowed) else "차단"
+        if not bool(start_allowed) and start_detail:
+            verdict += f"({self._target_autoloop_compact_text(start_detail, max_chars=80)})"
+        return (
+            "시작 전 체크: "
+            f"판정={verdict} / "
+            f"RunRoot={run_root_state} / "
+            f"manifest={manifest_state} / "
+            f"publish-ready={manifest_publish_ready_count}/{manifest_enabled_count} / "
+            f"router={router_session_state} / "
+            f"watcher={watcher_state} / "
+            f"선택 target={selected_target_id} / "
+            f"산출물 현재: {artifact_state_summary}"
+        )
+
+    def _target_autoloop_start_precheck_badge_spec(
+        self,
+        runtime_snapshot: dict[str, object] | None = None,
+        *,
+        artifact_snapshot: dict[str, object] | None = None,
+        start_allowed: bool | None = None,
+        start_detail: str = "",
+    ) -> dict[str, str]:
+        snapshot = runtime_snapshot or self._target_autoloop_runtime_snapshot()
+        if artifact_snapshot is None:
+            artifact_snapshot = self._target_autoloop_selected_target_artifact_snapshot(snapshot)
+        if start_allowed is None:
+            start_allowed, start_detail = self._target_autoloop_start_eligibility(snapshot)
+
+        manifest_enabled_count = self._target_autoloop_int_or_zero(snapshot.get("manifest_enabled_count", 0))
+        manifest_publish_ready_count = self._target_autoloop_int_or_zero(snapshot.get("manifest_publish_ready_count", 0))
+        router_session_state = str(snapshot.get("router_session_state", "") or "").strip() or "미확인"
+        selected_target_id = str((artifact_snapshot or {}).get("target_id", "") or "").strip() or "선택 없음"
+        manifest_error = str(snapshot.get("manifest_error", "") or "").strip()
+        run_root_error = str(snapshot.get("run_root_error", "") or "").strip()
+        status_error = str(snapshot.get("status_error", "") or "").strip()
+        control_error = str(snapshot.get("control_error", "") or "").strip()
+        hard_blocked = any(
+            value and value != "missing"
+            for value in (run_root_error, status_error, control_error, manifest_error)
+        )
+
+        if bool(start_allowed):
+            label = "시작 전 체크 OK"
+            background = "#15803D"
+        elif hard_blocked:
+            label = "시작 전 체크 차단"
+            background = "#B91C1C"
+        else:
+            label = "시작 전 체크 대기"
+            background = "#B45309"
+
+        text = (
+            f"{label} | publish-ready {manifest_publish_ready_count}/{manifest_enabled_count} "
+            f"| router {router_session_state} | target {selected_target_id}"
+        )
+        if not bool(start_allowed) and start_detail:
+            text += f" | {self._target_autoloop_compact_text(start_detail, max_chars=72)}"
+        return {
+            "text": text,
+            "background": background,
+            "foreground": "#FFFFFF",
+        }
+
+    def _target_autoloop_prepare_reason_text(self) -> str:
+        if bool(self.__dict__.get("_busy", False)):
+            return "RunRoot 준비 차단 사유: 다른 작업이 실행 중입니다."
+
+        selected_target_ids = self._target_autoloop_policy_selected_target_ids()
+        enabled_target_ids, publish_ready_target_ids = self._target_autoloop_policy_enabled_publish_ready_target_ids()
+        enabled_text = self._target_autoloop_join_target_ids(enabled_target_ids)
+        publish_ready_text = self._target_autoloop_join_target_ids(publish_ready_target_ids)
+        if not selected_target_ids:
+            if enabled_target_ids:
+                return (
+                    "RunRoot 준비 안내: 선택 target 없음. "
+                    f"현재 enabled target={enabled_text}, publish-ready={publish_ready_text}. "
+                    "일부 target만 테스트하려면 target 카드의 '선택'을 켠 뒤 [선택 target만 새 RunRoot]를 누르세요. "
+                    "전체 enabled target으로 실행하려면 [전체 enabled target 새 RunRoot]를 누르세요."
+                )
+            return (
+                "RunRoot 준비 차단 사유: 선택 target도 enabled target도 없습니다. "
+                "실행할 target 카드에서 Enabled와 publish-ready를 켠 뒤 저장하고 새 RunRoot를 준비하세요."
+            )
+
+        disabled_selected = []
+        dirty_selected = []
+        publish_missing = []
+        for target_id in selected_target_ids:
+            try:
+                store = self._target_autoloop_policy_card_store(target_id)
+            except KeyError:
+                continue
+            if str(store["policy_state_var"].get() or "").strip() == "SAVE REQUIRED":
+                dirty_selected.append(target_id)
+            if not bool(store["enabled_var"].get()):
+                disabled_selected.append(target_id)
+            elif not bool(store["trigger_publish_var"].get()):
+                publish_missing.append(target_id)
+        selected_text = self._target_autoloop_join_target_ids(selected_target_ids)
+        if dirty_selected:
+            return (
+                "RunRoot 준비 차단 사유: 선택 target 설정이 아직 저장되지 않았습니다 "
+                f"(선택={selected_text}, 미저장={self._target_autoloop_join_target_ids(dirty_selected)}). "
+                "먼저 [target 설정 저장 + 새로고침]을 누르세요."
+            )
+        if disabled_selected:
+            return (
+                "RunRoot 준비 차단 사유: 선택 target 중 disabled가 있습니다 "
+                f"(선택={selected_text}, disabled={self._target_autoloop_join_target_ids(disabled_selected)}). "
+                "해당 target의 Enabled를 켜거나 선택을 해제하세요."
+            )
+        if publish_missing:
+            return (
+                "RunRoot 준비 차단 사유: 선택 target 중 publish-ready가 꺼져 있습니다 "
+                f"(선택={selected_text}, publish-ready 꺼짐={self._target_autoloop_join_target_ids(publish_missing)}). "
+                "산출물 생성 후 다음 동작으로 이어지려면 publish-ready를 켜고 저장하세요."
+            )
+        return (
+            f"RunRoot 준비 가능: 선택 target={selected_text}. "
+            "[선택 target만 새 RunRoot]를 누른 뒤 감지 시작을 누르면 이 target들만 감지합니다."
+        )
+
+    def _target_autoloop_extend_cycles_value(self, *, target_id: str | None = None) -> tuple[int, str]:
+        raw_value = ""
+        normalized_target_id = str(target_id or "").strip()
+        value_var = None
+        if normalized_target_id:
+            card_vars = self.__dict__.get("target_autoloop_policy_card_vars", {}) or {}
+            if isinstance(card_vars, dict):
+                store = card_vars.get(normalized_target_id)
+                if isinstance(store, dict):
+                    value_var = store.get("extend_cycles_var")
+        if value_var is None:
+            value_var = self.__dict__.get("target_autoloop_extend_cycles_var")
+        if value_var is not None and hasattr(value_var, "get"):
+            try:
+                raw_value = str(value_var.get() or "").strip()
+            except Exception:
+                raw_value = ""
+        return self._target_autoloop_parse_extend_cycles_value(raw_value)
+
+    def _target_autoloop_extend_cycle_limit_eligibility(
+        self,
+        runtime_snapshot: dict[str, object] | None = None,
+        *,
+        additional_cycles: int | None = None,
+        target_id: str | None = None,
+    ) -> tuple[bool, str]:
+        if additional_cycles is None:
+            additional_cycles, detail = self._target_autoloop_extend_cycles_value()
+            if detail:
+                return False, detail
+        elif additional_cycles < 1:
+            return False, "추가 횟수는 1 이상이어야 합니다."
+
+        snapshot = runtime_snapshot or self._target_autoloop_runtime_snapshot()
+        run_root_error = str(snapshot.get("run_root_error", "") or "").strip()
+        if run_root_error:
+            return False, f"RunRoot를 읽지 못했습니다: {run_root_error}"
+        run_root = str(snapshot.get("run_root", "") or "").strip()
+        if not run_root:
+            return False, "RunRoot가 필요합니다."
+        manifest_error = str(snapshot.get("manifest_error", "") or "").strip()
+        if manifest_error:
+            return False, f"manifest를 읽지 못했습니다: {manifest_error}"
+        if not bool(snapshot.get("manifest_exists", False)):
+            return False, "target-autoloop manifest가 없습니다."
+        manifest_run_mode = str(snapshot.get("manifest_run_mode", "") or "").strip()
+        if manifest_run_mode != "target-autoloop":
+            return False, f"manifest RunMode가 target-autoloop가 아닙니다: {manifest_run_mode or '(none)'}"
+
+        artifact_snapshot = self._target_autoloop_selected_target_artifact_snapshot(
+            snapshot,
+            target_id=target_id,
+        )
+        target_id = str(artifact_snapshot.get("target_id", "") or "").strip()
+        if not target_id:
+            return False, "선택 target이 필요합니다."
+        max_cycle_count = self._target_autoloop_int_or_zero(artifact_snapshot.get("max_cycle_count", 0))
+        if max_cycle_count <= 0:
+            return False, f"{target_id} MaxCycleCount가 유한값이 아닙니다."
+        cycle_count = self._target_autoloop_int_or_zero(artifact_snapshot.get("cycle_count", 0))
+        phase = str(artifact_snapshot.get("phase", "") or "").strip()
+        limit_reached = phase == "limit-reached" or cycle_count >= max_cycle_count
+        if not limit_reached:
             return (
                 False,
-                (
-                    "현재 RunRoot는 target-autoloop용 run이 아닙니다 "
-                    f"(manifest RunMode={manifest_run_mode}). 새 RunRoot를 준비하거나 8 Cell Autoloop run을 다시 준비하세요."
-                ),
+                f"아직 limit-reached가 아닙니다: {target_id} {cycle_count}/{max_cycle_count} phase={phase or '-'}",
             )
-        manifest_enabled_count = int(snapshot.get("manifest_enabled_count", 0) or 0)
-        manifest_publish_ready_count = int(snapshot.get("manifest_publish_ready_count", 0) or 0)
-        if (
-            bool(snapshot.get("manifest_exists", False))
-            and manifest_enabled_count > 0
-            and manifest_publish_ready_count < manifest_enabled_count
+        after_max_cycle_count = max(cycle_count, max_cycle_count) + int(additional_cycles)
+        return (
+            True,
+            (
+                f"추가 진행 가능: {target_id} {cycle_count}/{max_cycle_count} -> "
+                f"{cycle_count}/{after_max_cycle_count} (+{additional_cycles})"
+            ),
+        )
+
+    def _target_autoloop_extend_strategy_text(
+        self,
+        artifact_snapshot: dict[str, object] | None,
+        *,
+        extend_cycles: int,
+        extend_allowed: bool,
+        extend_detail: str,
+    ) -> str:
+        snapshot = artifact_snapshot or {}
+        target_id = str(snapshot.get("target_id", "") or "").strip() or "선택 target"
+        phase = str(snapshot.get("phase", "") or "").strip() or "-"
+        cycle_count = self._target_autoloop_int_or_zero(snapshot.get("cycle_count", 0))
+        max_cycle_count = self._target_autoloop_int_or_zero(snapshot.get("max_cycle_count", 0))
+        remaining_count = max(0, max_cycle_count - cycle_count) if max_cycle_count > 0 else 0
+        if extend_allowed:
+            return (
+                f"{extend_detail} / 현재 RunRoot 유지: [추가 {extend_cycles}회+감지 시작]으로 같은 run을 이어갑니다. "
+                "시작문 복사는 같은 RunRoot 이어가기가 아닙니다. "
+                "새 RunRoot 재시작: [선택 target만 새 RunRoot] 후 시작문을 다시 submit합니다."
+            )
+        if max_cycle_count > 0 and (phase == "limit-reached" or cycle_count >= max_cycle_count):
+            return (
+                f"추가 진행 차단 사유: {extend_detail} / 현재 RunRoot 추가 진행은 선택 target과 추가 횟수를 확인하세요. "
+                "새 RunRoot 재시작은 [선택 target만 새 RunRoot] 후 시작문을 다시 submit합니다."
+            )
+        if max_cycle_count > 0:
+            return (
+                f"추가 진행 차단 사유: {extend_detail} / 진행 중: {target_id} {cycle_count}/{max_cycle_count}, 남은 {remaining_count}. "
+                "Max 도달 후 [추가 N회+감지 시작]=현재 RunRoot 유지, [선택 target만 새 RunRoot]=처음부터 재시작입니다."
+            )
+        return f"추가 진행 차단 사유: {extend_detail}"
+
+    def _target_autoloop_policy_card_extend_state_text(
+        self,
+        *,
+        target_id: str,
+        additional_cycles: int,
+        allowed: bool,
+        detail: str,
+        artifact_snapshot: dict[str, object] | None,
+        busy: bool,
+    ) -> str:
+        snapshot = artifact_snapshot if isinstance(artifact_snapshot, dict) else {}
+        normalized_target_id = str(target_id or snapshot.get("target_id", "") or "target").strip() or "target"
+        phase = str(snapshot.get("phase", "") or "").strip() or "-"
+        cycle_count = self._target_autoloop_int_or_zero(snapshot.get("cycle_count", 0))
+        max_cycle_count = self._target_autoloop_int_or_zero(snapshot.get("max_cycle_count", 0))
+        remaining_count = max(0, max_cycle_count - cycle_count) if max_cycle_count > 0 else 0
+        if additional_cycles <= 0:
+            return f"추가 상태: {normalized_target_id} 비활성 / 추가 횟수를 1 이상으로 입력하세요."
+        if allowed:
+            after_max = max(cycle_count, max_cycle_count) + additional_cycles
+            busy_suffix = " / 다른 작업 실행 중이라 버튼은 잠시 비활성입니다." if busy else ""
+            return (
+                f"추가 상태: 권장 - {normalized_target_id} 추가 {additional_cycles}회+감지로 같은 RunRoot 이어가기 "
+                f"({cycle_count}/{max_cycle_count} -> {cycle_count}/{after_max}). "
+                f"시작문 복사는 새 RunRoot에서만 사용하세요. 새 시작은 [선택 target만 새 RunRoot].{busy_suffix}"
+            )
+        if max_cycle_count > 0:
+            return (
+                f"추가 상태: 비활성 - {detail or '조건 미충족'} / 현재 {cycle_count}/{max_cycle_count}, "
+                f"남은 {remaining_count}, phase={phase}. Max 도달 후 이 카드 버튼을 사용하세요."
+            )
+        return f"추가 상태: 비활성 - {detail or 'MaxCycleCount 또는 RunRoot 상태를 확인하세요.'}"
+
+    def _update_target_autoloop_policy_card_extend_buttons(
+        self,
+        runtime_snapshot: dict[str, object],
+        *,
+        extend_cycles: int,
+        extend_cycles_detail: str,
+    ) -> None:
+        card_vars = self.__dict__.get("target_autoloop_policy_card_vars", {}) or {}
+        if not isinstance(card_vars, dict):
+            return
+        extend_buttons = self.__dict__.get("target_autoloop_policy_card_extend_cycle_limit_buttons", {}) or {}
+        extend_start_buttons = self.__dict__.get("target_autoloop_policy_card_extend_and_start_buttons", {}) or {}
+        if not isinstance(extend_buttons, dict):
+            extend_buttons = {}
+        if not isinstance(extend_start_buttons, dict):
+            extend_start_buttons = {}
+        busy = bool(self.__dict__.get("_busy", False))
+        for target_id in sorted(str(item or "").strip() for item in card_vars if str(item or "").strip()):
+            store = card_vars.get(target_id)
+            if not isinstance(store, dict):
+                continue
+            card_extend_cycles, card_extend_detail = self._target_autoloop_extend_cycles_value(target_id=target_id)
+            if card_extend_detail and not extend_cycles_detail:
+                effective_detail = card_extend_detail
+            else:
+                effective_detail = extend_cycles_detail
+            if card_extend_cycles <= 0 and extend_cycles > 0 and not card_extend_detail:
+                card_extend_cycles = extend_cycles
+            allowed = False
+            detail = effective_detail
+            if not effective_detail:
+                allowed, detail = self._target_autoloop_extend_cycle_limit_eligibility(
+                    runtime_snapshot,
+                    additional_cycles=card_extend_cycles,
+                    target_id=target_id,
+                )
+            artifact_snapshot = self._target_autoloop_selected_target_artifact_snapshot(
+                runtime_snapshot,
+                target_id=target_id,
+            )
+            extend_state_var = store.get("extend_state_var")
+            if extend_state_var is not None and hasattr(extend_state_var, "set"):
+                try:
+                    extend_state_var.set(
+                        self._target_autoloop_policy_card_extend_state_text(
+                            target_id=target_id,
+                            additional_cycles=card_extend_cycles,
+                            allowed=allowed,
+                            detail=detail,
+                            artifact_snapshot=artifact_snapshot,
+                            busy=busy,
+                        )
+                    )
+                except Exception:
+                    pass
+            extend_label = f"{target_id} 추가 {card_extend_cycles}회" if card_extend_cycles > 0 else f"{target_id} 추가 ?회"
+            extend_start_label = (
+                f"{target_id} 추가 {card_extend_cycles}회+감지" if card_extend_cycles > 0 else f"{target_id} 추가 ?회+감지"
+            )
+            state = "normal" if allowed and not busy else "disabled"
+            button = extend_buttons.get(target_id)
+            if button is not None:
+                self._configure_optional_widget(button, text=extend_label, state=state)
+            start_button = extend_start_buttons.get(target_id)
+            if start_button is not None:
+                self._configure_optional_widget(start_button, text=extend_start_label, state=state)
+        self._update_target_autoloop_policy_card_compact_action_summaries(runtime_snapshot)
+
+    def _update_target_autoloop_policy_card_artifact_buttons(
+        self,
+        runtime_snapshot: dict[str, object],
+    ) -> None:
+        card_buttons = self.__dict__.get("target_autoloop_policy_card_artifact_buttons", {}) or {}
+        if not isinstance(card_buttons, dict):
+            return
+        card_vars = self.__dict__.get("target_autoloop_policy_card_vars", {}) or {}
+        if not isinstance(card_vars, dict):
+            card_vars = {}
+        for target_id, button_map in sorted(card_buttons.items(), key=lambda item: str(item[0])):
+            normalized_target_id = str(target_id or "").strip()
+            if not normalized_target_id or not isinstance(button_map, dict):
+                continue
+            artifact_snapshot = self._target_autoloop_selected_target_artifact_snapshot(
+                runtime_snapshot,
+                target_id=normalized_target_id,
+            )
+            store = card_vars.get(normalized_target_id)
+            if isinstance(store, dict):
+                artifact_state_var = store.get("artifact_state_var")
+                if artifact_state_var is not None and hasattr(artifact_state_var, "set"):
+                    try:
+                        artifact_state_var.set(
+                            self._target_autoloop_policy_card_artifact_state_text(
+                                target_id=normalized_target_id,
+                                artifact_snapshot=artifact_snapshot,
+                            )
+                        )
+                    except Exception:
+                        pass
+            path_states = artifact_snapshot.get("path_states", {})
+            if not isinstance(path_states, dict):
+                path_states = {}
+            label_specs = {
+                "source_outbox": "outbox",
+                "summary": "summary",
+                "review_zip": "zip",
+                "publish_ready": "ready",
+            }
+            for artifact_key, label in label_specs.items():
+                button = button_map.get(artifact_key)
+                if button is None:
+                    continue
+                self._configure_optional_widget(
+                    button,
+                    text=label,
+                    state="normal" if bool(path_states.get(artifact_key, False)) else "disabled",
+                )
+        self._update_target_autoloop_policy_card_compact_action_summaries(runtime_snapshot)
+
+    @staticmethod
+    def _target_autoloop_policy_card_artifact_state_text(
+        *,
+        target_id: str,
+        artifact_snapshot: dict[str, object] | None,
+    ) -> str:
+        normalized_target_id = str(target_id or "").strip() or "target"
+        snapshot = artifact_snapshot if isinstance(artifact_snapshot, dict) else {}
+        state_summary = str(snapshot.get("artifact_state_summary", "") or "").strip()
+        if state_summary:
+            return f"산출물 상태: {normalized_target_id} / {state_summary}"
+        return f"산출물 상태: {normalized_target_id} / RunRoot 준비 후 source-outbox / summary / zip / ready 상태를 표시합니다."
+
+    def _update_target_autoloop_policy_card_compact_action_summaries(
+        self,
+        runtime_snapshot: dict[str, object],
+    ) -> None:
+        card_vars = self.__dict__.get("target_autoloop_policy_card_vars", {}) or {}
+        if not isinstance(card_vars, dict):
+            return
+        for target_id in sorted(str(item or "").strip() for item in card_vars if str(item or "").strip()):
+            store = card_vars.get(target_id)
+            if not isinstance(store, dict):
+                continue
+            compact_action_var = store.get("compact_action_var")
+            if compact_action_var is None or not hasattr(compact_action_var, "set"):
+                continue
+            try:
+                compact_action_var.set(
+                    self._target_autoloop_policy_card_compact_action_text(
+                        runtime_snapshot,
+                        target_id=target_id,
+                        store=store,
+                    )
+                )
+            except Exception:
+                pass
+
+    def _target_autoloop_policy_card_compact_action_text(
+        self,
+        runtime_snapshot: dict[str, object],
+        *,
+        target_id: str,
+        store: dict[str, object] | None = None,
+    ) -> str:
+        normalized_target_id = str(target_id or "").strip() or "target"
+        snapshot = runtime_snapshot if isinstance(runtime_snapshot, dict) else {}
+        card_store = store if isinstance(store, dict) else {}
+        artifact_snapshot = self._target_autoloop_selected_target_artifact_snapshot(
+            snapshot,
+            target_id=normalized_target_id,
+        )
+
+        runtime_text = ""
+        runtime_badge_var = card_store.get("runtime_badge_var")
+        if runtime_badge_var is not None and hasattr(runtime_badge_var, "get"):
+            try:
+                runtime_text = str(runtime_badge_var.get() or "").strip()
+            except Exception:
+                runtime_text = ""
+        if not runtime_text or runtime_text in {"IDLE", "STATE 미확인"}:
+            cycle_count = self._target_autoloop_int_or_zero(artifact_snapshot.get("cycle_count", 0))
+            max_cycle_count = self._target_autoloop_int_or_zero(artifact_snapshot.get("max_cycle_count", 0))
+            if max_cycle_count > 0:
+                runtime_text = f"{normalized_target_id} {cycle_count}/{max_cycle_count}"
+            else:
+                runtime_text = f"{normalized_target_id} 진행 대기"
+        runtime_text = self._target_autoloop_compact_text(runtime_text, max_chars=52)
+
+        extend_text = "추가 대기"
+        additional_cycles, extend_cycles_detail = self._target_autoloop_extend_cycles_value(
+            target_id=normalized_target_id
+        )
+        cycle_count = self._target_autoloop_int_or_zero(artifact_snapshot.get("cycle_count", 0))
+        max_cycle_count = self._target_autoloop_int_or_zero(artifact_snapshot.get("max_cycle_count", 0))
+        if additional_cycles <= 0:
+            extend_text = "추가 횟수 확인"
+        else:
+            allowed = False
+            if not extend_cycles_detail:
+                allowed, _detail = self._target_autoloop_extend_cycle_limit_eligibility(
+                    snapshot,
+                    additional_cycles=additional_cycles,
+                    target_id=normalized_target_id,
+                )
+            if allowed:
+                extend_text = f"추가 가능 +{additional_cycles}"
+            elif max_cycle_count > 0:
+                remaining_count = max(0, max_cycle_count - cycle_count)
+                extend_text = f"추가 대기 {cycle_count}/{max_cycle_count}, 남은 {remaining_count}"
+
+        path_states = artifact_snapshot.get("path_states", {})
+        if not isinstance(path_states, dict):
+            path_states = {}
+        artifact_keys = ("source_outbox", "summary", "review_zip", "publish_ready")
+        artifact_labels = {
+            "source_outbox": "outbox",
+            "summary": "summary",
+            "review_zip": "zip",
+            "publish_ready": "ready",
+        }
+        present_count = sum(1 for key in artifact_keys if bool(path_states.get(key, False)))
+        if present_count >= len(artifact_keys):
+            artifact_text = "산출물 완료"
+        elif present_count > 0:
+            missing_labels = [
+                artifact_labels[key]
+                for key in artifact_keys
+                if not bool(path_states.get(key, False))
+            ]
+            artifact_text = f"산출물 {present_count}/{len(artifact_keys)}, 누락 {'/'.join(missing_labels)}"
+        else:
+            artifact_text = "산출물 대기, outbox 없음"
+
+        process_once_allowed, _process_once_detail = self._target_autoloop_process_once_eligibility(
+            snapshot,
+            target_id=normalized_target_id,
+        )
+        process_once_text = "ready 재검사 가능" if process_once_allowed else "ready 재검사 대기"
+
+        return f"요약: {runtime_text} / {extend_text} / {artifact_text} / {process_once_text}"
+
+    def _target_autoloop_process_once_eligibility(
+        self,
+        runtime_snapshot: dict[str, object] | None = None,
+        *,
+        target_id: str | None = None,
+    ) -> tuple[bool, str]:
+        snapshot = runtime_snapshot or self._target_autoloop_runtime_snapshot()
+        normalized_target_id = str(target_id or "").strip()
+        if not normalized_target_id:
+            return self._target_autoloop_start_eligibility(snapshot)
+        run_root_error = str(snapshot.get("run_root_error", "") or "").strip()
+        if run_root_error:
+            return False, f"RunRoot를 읽지 못했습니다: {run_root_error}"
+        run_root = str(snapshot.get("run_root", "") or "").strip()
+        if not run_root:
+            return False, "RunRoot가 필요합니다."
+        manifest_error = str(snapshot.get("manifest_error", "") or "").strip()
+        if manifest_error:
+            return False, f"manifest를 읽지 못했습니다: {manifest_error}"
+        if not bool(snapshot.get("manifest_exists", False)):
+            return False, "target-autoloop manifest가 없습니다."
+        manifest_run_mode = str(snapshot.get("manifest_run_mode", "") or "").strip()
+        if manifest_run_mode != "target-autoloop":
+            return False, f"manifest RunMode가 target-autoloop가 아닙니다: {manifest_run_mode or '(none)'}"
+        manifest_row = self._target_autoloop_row_for_target(
+            snapshot.get("manifest_targets", []),
+            normalized_target_id,
+        )
+        if not manifest_row:
+            return False, f"{normalized_target_id} manifest target이 없습니다."
+        if not bool(manifest_row.get("Enabled", False)):
+            return False, f"{normalized_target_id}가 manifest에서 enabled가 아닙니다."
+        trigger_kinds = [str(item or "").strip() for item in list(manifest_row.get("TriggerKinds", []) or [])]
+        if "publish-ready" not in trigger_kinds:
+            return False, f"{normalized_target_id} publish-ready trigger가 꺼져 있습니다."
+        return True, f"{normalized_target_id} publish.ready 1회 재검사 가능"
+
+    def _update_target_autoloop_policy_card_process_once_buttons(
+        self,
+        runtime_snapshot: dict[str, object],
+    ) -> None:
+        button_map = self.__dict__.get("target_autoloop_policy_card_process_once_buttons", {}) or {}
+        if not isinstance(button_map, dict):
+            return
+        card_vars = self.__dict__.get("target_autoloop_policy_card_vars", {}) or {}
+        if not isinstance(card_vars, dict):
+            card_vars = {}
+        busy = bool(self.__dict__.get("_busy", False))
+        for target_id, button in sorted(button_map.items(), key=lambda item: str(item[0])):
+            normalized_target_id = str(target_id or "").strip()
+            if not normalized_target_id or button is None:
+                continue
+            allowed, detail = self._target_autoloop_process_once_eligibility(
+                runtime_snapshot,
+                target_id=normalized_target_id,
+            )
+            store = card_vars.get(normalized_target_id)
+            if isinstance(store, dict):
+                process_once_state_var = store.get("process_once_state_var")
+                if process_once_state_var is not None and hasattr(process_once_state_var, "set"):
+                    try:
+                        process_once_state_var.set(
+                            self._target_autoloop_policy_card_process_once_state_text(
+                                target_id=normalized_target_id,
+                                allowed=allowed,
+                                detail=detail,
+                                busy=busy,
+                            )
+                        )
+                    except Exception:
+                        pass
+            self._configure_optional_widget(
+                button,
+                text=f"{normalized_target_id} ready 재검사",
+                state="normal" if allowed and not busy else "disabled",
+            )
+        self._update_target_autoloop_policy_card_compact_action_summaries(runtime_snapshot)
+
+    @staticmethod
+    def _target_autoloop_policy_card_process_once_state_text(
+        *,
+        target_id: str,
+        allowed: bool,
+        detail: str,
+        busy: bool,
+    ) -> str:
+        normalized_target_id = str(target_id or "").strip() or "target"
+        normalized_detail = str(detail or "").strip() or "상태 조건을 확인하세요."
+        if allowed and busy:
+            return f"ready 재검사 상태: 대기 - {normalized_target_id} 재검사 가능하지만 다른 작업이 실행 중입니다."
+        if allowed:
+            return f"ready 재검사 상태: 가능 - {normalized_detail}"
+        return f"ready 재검사 상태: 비활성 - {normalized_detail}"
+
+    def _update_target_autoloop_policy_card_runtime_progress(
+        self,
+        runtime_snapshot: dict[str, object],
+    ) -> None:
+        card_vars = self.__dict__.get("target_autoloop_policy_card_vars", {}) or {}
+        if not isinstance(card_vars, dict):
+            return
+        status_targets = runtime_snapshot.get("targets", [])
+        manifest_targets = runtime_snapshot.get("manifest_targets", [])
+        if not isinstance(status_targets, list):
+            status_targets = []
+        if not isinstance(manifest_targets, list):
+            manifest_targets = []
+        if not status_targets and not manifest_targets:
+            return
+        runtime_labels = self.__dict__.get("target_autoloop_policy_card_runtime_badge_labels", {}) or {}
+        if not isinstance(runtime_labels, dict):
+            runtime_labels = {}
+        for target_id in sorted(str(item or "").strip() for item in card_vars if str(item or "").strip()):
+            store = card_vars.get(target_id)
+            if not isinstance(store, dict):
+                continue
+            status_row = self._target_autoloop_row_for_target(status_targets, target_id)
+            manifest_row = self._target_autoloop_row_for_target(manifest_targets, target_id)
+            if not status_row and not manifest_row:
+                continue
+            phase = str(status_row.get("Phase", "") or manifest_row.get("Phase", "") or "").strip()
+            next_action = str(status_row.get("NextAction", "") or manifest_row.get("NextAction", "") or "").strip()
+            dispatch_state = str(status_row.get("LastDispatchState", "") or "").strip()
+            cycle_count = self._target_autoloop_int_or_zero(status_row.get("CycleCount", 0))
+            max_cycle_count = self._target_autoloop_int_or_zero(
+                status_row.get("MaxCycleCount", manifest_row.get("MaxCycleCount", 0))
+            )
+            enabled = bool(manifest_row.get("Enabled", True)) if manifest_row else bool(status_row)
+            runtime_badge_spec = self._target_autoloop_policy_runtime_badge_spec(
+                phase=phase,
+                enabled=enabled,
+            )
+            progress_badge_spec = self._target_autoloop_policy_progress_badge_spec(
+                target_id=target_id,
+                phase=phase,
+                next_action=next_action,
+                dispatch_state=dispatch_state,
+                cycle_count=cycle_count,
+                max_cycle_count=max_cycle_count,
+                enabled=enabled,
+            )
+            runtime_badge_var = store.get("runtime_badge_var")
+            if runtime_badge_var is not None and hasattr(runtime_badge_var, "set"):
+                try:
+                    runtime_badge_var.set(progress_badge_spec["text"])
+                except Exception:
+                    pass
+            runtime_summary_var = store.get("runtime_summary_var")
+            if runtime_summary_var is not None and hasattr(runtime_summary_var, "set"):
+                try:
+                    runtime_summary_var.set(
+                        self._target_autoloop_policy_runtime_summary_text(
+                            runtime_state=runtime_badge_spec["text"],
+                            phase=phase,
+                            next_action=next_action,
+                            dispatch_state=dispatch_state,
+                            cycle_count=cycle_count,
+                            max_cycle_count=max_cycle_count,
+                        )
+                    )
+                except Exception:
+                    pass
+            runtime_badge_label = runtime_labels.get(target_id)
+            if runtime_badge_label is not None:
+                self._configure_optional_widget(
+                    runtime_badge_label,
+                    text=progress_badge_spec["text"],
+                    bg=progress_badge_spec["background"],
+                    fg=progress_badge_spec["foreground"],
+                )
+        self._update_target_autoloop_policy_card_compact_action_summaries(runtime_snapshot)
+
+    def _apply_target_autoloop_selected_artifact_snapshot_vars(
+        self,
+        artifact_snapshot: dict[str, object] | None,
+    ) -> None:
+        snapshot = artifact_snapshot if isinstance(artifact_snapshot, dict) else {}
+        if self._has_ui_attr("target_autoloop_selected_progress_badge_var"):
+            self.target_autoloop_selected_progress_badge_var.set(
+                str(snapshot.get("progress_badge_text", "") or "선택 target 진행: -")
+            )
+        if self._has_ui_attr("target_autoloop_selected_progress_badge_label"):
+            self.target_autoloop_selected_progress_badge_label.configure(
+                bg=str(snapshot.get("progress_badge_color", "") or "#6B7280"),
+                fg=str(snapshot.get("progress_badge_foreground", "") or "#FFFFFF"),
+            )
+        if self._has_ui_attr("target_autoloop_selected_progress_var"):
+            self.target_autoloop_selected_progress_var.set(
+                str(snapshot.get("progress_summary", "") or "선택 target 진행: target 선택 또는 RunRoot 준비 후 표시됩니다.")
+            )
+        if self._has_ui_attr("target_autoloop_selected_artifact_var"):
+            self.target_autoloop_selected_artifact_var.set(
+                str(snapshot.get("artifact_summary", "") or "선택 target 산출물: source-outbox / summary.txt / review.zip 경로를 아직 확인하지 않았습니다.")
+            )
+
+    @staticmethod
+    def _target_autoloop_selected_artifact_snapshot_lines(
+        artifact_snapshot: dict[str, object] | None,
+    ) -> list[str]:
+        snapshot = artifact_snapshot if isinstance(artifact_snapshot, dict) else {}
+        target_id = str(snapshot.get("target_id", "") or "").strip()
+        if not target_id:
+            return []
+        lines = [
+            f"SelectedTargetProgress: {str(snapshot.get('progress_summary', '') or '')}",
+            f"SelectedTargetArtifactState: {str(snapshot.get('artifact_state_summary', '') or '')}",
+        ]
+        for label, key in (
+            ("SelectedTargetSourceOutboxPath", "source_outbox_path"),
+            ("SelectedTargetSummaryPath", "summary_path"),
+            ("SelectedTargetReviewZipPath", "review_zip_path"),
+            ("SelectedTargetPublishReadyPath", "publish_ready_path"),
         ):
-            return (
-                False,
-                (
-                    "현재 RunRoot manifest에 publish-ready 트리거가 꺼진 enabled target이 있습니다 "
-                    f"(publish-ready={manifest_publish_ready_count}/{manifest_enabled_count}). "
-                    "산출물(summary.txt/review.zip/publish.ready.json) 생성 후 다음 동작으로 이어지려면 "
-                    "8 Cell Autoloop 탭에서 publish-ready를 켜고 저장한 뒤 새 RunRoot를 준비하세요."
-                ),
-            )
-        router_session = snapshot.get("router_session", {})
-        if not isinstance(router_session, dict):
-            router_session = {}
-        if bool(snapshot.get("router_session_mismatch", False)):
-            return False, self._target_autoloop_router_session_mismatch_message(router_session)
-        pending_action = str(snapshot.get("control_pending_action", "") or "").strip()
-        if pending_action:
-            return False, f"target-autoloop 제어 요청({pending_action})이 처리 중이라 watcher 시작을 막았습니다."
-        watcher_state = str(snapshot.get("watcher_state", "") or "").strip()
-        if self._target_autoloop_watcher_is_fresh(snapshot):
-            return False, f"현재 target-autoloop watcher가 이미 active 상태입니다: {watcher_state or 'running'}"
-        return True, ""
+            value = str(snapshot.get(key, "") or "").strip()
+            if value:
+                lines.append(f"{label}: {value}")
+        return lines
 
     def _update_target_autoloop_control_buttons(self, runtime_snapshot: dict[str, object] | None = None) -> None:
+        if runtime_snapshot is None and self._target_autoloop_control_buttons_can_defer():
+            self.__dict__["target_autoloop_status_refresh_pending"] = True
+            return
         snapshot = runtime_snapshot or self._target_autoloop_runtime_snapshot()
+        artifact_snapshot = self._target_autoloop_selected_target_artifact_snapshot(snapshot)
+        precheck_allowed, precheck_detail = self._target_autoloop_start_eligibility(snapshot)
+        precheck_badge_spec = self._target_autoloop_start_precheck_badge_spec(
+            snapshot,
+            artifact_snapshot=artifact_snapshot,
+            start_allowed=precheck_allowed,
+            start_detail=precheck_detail,
+        )
         self._apply_target_autoloop_detector_badge(snapshot)
+        self._apply_target_autoloop_runroot_attention(snapshot)
         recommendation_spec = self._target_autoloop_recommendation_spec(snapshot)
         self._target_autoloop_recommendation_action_key = str(recommendation_spec.get("action_key", "") or "").strip()
         if self._has_ui_attr("target_autoloop_recommendation_var"):
@@ -17755,21 +20910,56 @@ class RelayOperatorPanel(tk.Tk):
             )
             self.target_autoloop_recommendation_button.configure(state="normal" if enabled else "disabled")
         if self._has_ui_attr("target_autoloop_start_button"):
-            allowed, _detail = self._target_autoloop_start_eligibility(snapshot)
+            allowed, _detail = precheck_allowed, precheck_detail
+            prepare_spec = self._target_autoloop_prepare_recommendation_from_start_detail(_detail)
+            snapshot_run_root = str(snapshot.get("run_root", "") or "").strip()
+            recommendation_action_key = str(recommendation_spec.get("action_key", "") or "").strip()
+            router_fix_start_allowed = (
+                bool(snapshot_run_root)
+                and self._target_autoloop_run_root_is_canonical(snapshot_run_root)
+                and recommendation_action_key == "restart_router_for_autoloop"
+                and prepare_spec is None
+            )
+            prepare_then_start_allowed = prepare_spec is not None and str(prepare_spec.get("action_key", "") or "") in {
+                "prepare_autoloop_runroot",
+                "fix_publish_ready_prepare_autoloop_runroot",
+            }
             self.target_autoloop_start_button.configure(
-                state="normal" if allowed else "disabled",
+                state="normal" if (allowed or router_fix_start_allowed or prepare_then_start_allowed) and not bool(self.__dict__.get("_busy", False)) else "disabled",
                 text=self._target_autoloop_start_button_label(snapshot),
             )
+        if self._has_ui_attr("target_autoloop_start_precheck_badge_var"):
+            self.target_autoloop_start_precheck_badge_var.set(precheck_badge_spec["text"])
+        if self._has_ui_attr("target_autoloop_start_precheck_badge_label"):
+            self.target_autoloop_start_precheck_badge_label.configure(
+                bg=precheck_badge_spec["background"],
+                fg=precheck_badge_spec["foreground"],
+            )
+        if self._has_ui_attr("target_autoloop_sync_windows_router_button"):
+            config_path = ""
+            try:
+                config_path = str(self.config_path_var.get() or "").strip()
+            except Exception:
+                config_path = ""
+            self.target_autoloop_sync_windows_router_button.configure(
+                state="normal" if config_path and not bool(self.__dict__.get("_busy", False)) else "disabled"
+            )
         if self._has_ui_attr("target_autoloop_start_reason_var"):
-            allowed, detail = self._target_autoloop_start_eligibility(snapshot)
+            allowed, detail = precheck_allowed, precheck_detail
+            start_precheck_text = self._target_autoloop_start_precheck_text(
+                snapshot,
+                artifact_snapshot=artifact_snapshot,
+                start_allowed=allowed,
+                start_detail=detail,
+            )
             if allowed:
                 run_root = str(snapshot.get("run_root", "") or "").strip()
                 self.target_autoloop_start_reason_var.set(
                     "독립셀 감지 시작 가능: 새 RunRoot 준비가 완료됐습니다. "
-                    f"RunRoot={run_root or '(없음)'}"
+                    f"RunRoot={run_root or '(없음)'}\n{start_precheck_text}"
                 )
             else:
-                self.target_autoloop_start_reason_var.set(f"독립셀 감지 시작 차단: {detail}")
+                self.target_autoloop_start_reason_var.set(f"독립셀 감지 시작 차단: {detail}\n{start_precheck_text}")
         if self._has_ui_attr("target_autoloop_prepare_runroot_button"):
             self.target_autoloop_prepare_runroot_button.configure(
                 state="disabled" if bool(self.__dict__.get("_busy", False)) else "normal"
@@ -17784,18 +20974,77 @@ class RelayOperatorPanel(tk.Tk):
             self.target_autoloop_fix_selected_publish_ready_button.configure(
                 state="disabled" if bool(self.__dict__.get("_busy", False)) or not selected_target_ids else "normal"
             )
+        if self._has_ui_attr("target_autoloop_prepare_reason_var"):
+            self.target_autoloop_prepare_reason_var.set(self._target_autoloop_prepare_reason_text())
         if self._has_ui_attr("target_autoloop_process_once_button"):
-            allowed, _detail = self._target_autoloop_start_eligibility(snapshot)
+            allowed, detail = precheck_allowed, precheck_detail
             self.target_autoloop_process_once_button.configure(state="normal" if allowed else "disabled")
+            if self._has_ui_attr("target_autoloop_process_once_reason_var"):
+                if allowed:
+                    self.target_autoloop_process_once_reason_var.set("publish-ready 재검사 가능: 현재 RunRoot에서 1회 sweep을 실행할 수 있습니다.")
+                else:
+                    self.target_autoloop_process_once_reason_var.set(f"publish-ready 재검사 차단 사유: {detail}")
+        extend_cycles, extend_cycles_detail = self._target_autoloop_extend_cycles_value()
+        extend_allowed = False
+        extend_detail = extend_cycles_detail
+        if not extend_cycles_detail:
+            extend_allowed, extend_detail = self._target_autoloop_extend_cycle_limit_eligibility(
+                snapshot,
+                additional_cycles=extend_cycles,
+            )
+        if self._has_ui_attr("target_autoloop_extend_cycle_limit_button"):
+            button_label = f"선택 target 추가 {extend_cycles}회 이어가기" if extend_cycles > 0 else "선택 target 추가 ?회 이어가기"
+            self.target_autoloop_extend_cycle_limit_button.configure(
+                text=button_label,
+                state="normal" if extend_allowed and not bool(self.__dict__.get("_busy", False)) else "disabled",
+            )
+        if self._has_ui_attr("target_autoloop_extend_and_start_button"):
+            button_label = f"선택 target 추가 {extend_cycles}회+감지 시작" if extend_cycles > 0 else "선택 target 추가 ?회+감지 시작"
+            self.target_autoloop_extend_and_start_button.configure(
+                text=button_label,
+                state="normal" if extend_allowed and not bool(self.__dict__.get("_busy", False)) else "disabled",
+            )
+        self._update_target_autoloop_policy_card_extend_buttons(
+            snapshot,
+            extend_cycles=extend_cycles,
+            extend_cycles_detail=extend_cycles_detail,
+        )
+        self._update_target_autoloop_policy_card_runtime_progress(snapshot)
+        self._update_target_autoloop_policy_card_artifact_buttons(snapshot)
+        self._update_target_autoloop_policy_card_process_once_buttons(snapshot)
+        if self._has_ui_attr("target_autoloop_extend_reason_var"):
+            self.target_autoloop_extend_reason_var.set(
+                self._target_autoloop_extend_strategy_text(
+                    artifact_snapshot,
+                    extend_cycles=extend_cycles,
+                    extend_allowed=extend_allowed,
+                    extend_detail=extend_detail,
+                )
+            )
         if self._has_ui_attr("target_autoloop_pause_button"):
-            allowed, _detail = self._target_autoloop_control_eligibility("pause", snapshot)
+            pause_allowed, pause_detail = self._target_autoloop_control_eligibility("pause", snapshot)
+            allowed = pause_allowed
             self.target_autoloop_pause_button.configure(state="normal" if allowed else "disabled")
         if self._has_ui_attr("target_autoloop_resume_button"):
-            allowed, _detail = self._target_autoloop_control_eligibility("resume", snapshot)
+            resume_allowed, resume_detail = self._target_autoloop_control_eligibility("resume", snapshot)
+            allowed = resume_allowed
             self.target_autoloop_resume_button.configure(state="normal" if allowed else "disabled")
         if self._has_ui_attr("target_autoloop_stop_button"):
-            allowed, _detail = self._target_autoloop_control_eligibility("stop", snapshot)
+            stop_allowed, stop_detail = self._target_autoloop_control_eligibility("stop", snapshot)
+            allowed = stop_allowed
             self.target_autoloop_stop_button.configure(state="normal" if allowed else "disabled")
+        if self._has_ui_attr("target_autoloop_control_reason_var"):
+            control_parts = []
+            for label, allowed, detail in (
+                ("pause", locals().get("pause_allowed", False), locals().get("pause_detail", "")),
+                ("resume", locals().get("resume_allowed", False), locals().get("resume_detail", "")),
+                ("stop", locals().get("stop_allowed", False), locals().get("stop_detail", "")),
+            ):
+                if allowed:
+                    control_parts.append(f"{label}=가능")
+                else:
+                    control_parts.append(f"{label}=차단({detail or '상태 조건 미충족'})")
+            self.target_autoloop_control_reason_var.set("전체 감지기 pause/resume/stop 차단 사유: " + " / ".join(control_parts))
         if self._has_ui_attr("target_autoloop_stdout_log_button"):
             self.target_autoloop_stdout_log_button.configure(
                 state="normal" if bool(snapshot.get("watcher_stdout_log_exists", False)) else "disabled"
@@ -17804,6 +21053,31 @@ class RelayOperatorPanel(tk.Tk):
             self.target_autoloop_stderr_log_button.configure(
                 state="normal" if bool(snapshot.get("watcher_stderr_log_exists", False)) else "disabled"
             )
+        self._apply_target_autoloop_selected_artifact_snapshot_vars(artifact_snapshot)
+
+        target_label = str(artifact_snapshot.get("target_id", "") or "선택 target").strip() or "선택 target"
+        path_states = artifact_snapshot.get("path_states", {})
+        if not isinstance(path_states, dict):
+            path_states = {}
+        artifact_button_specs = (
+            ("target_autoloop_open_source_outbox_button", "source-outbox 열기", "source_outbox"),
+            ("target_autoloop_open_summary_button", "summary.txt 열기", "summary"),
+            ("target_autoloop_open_review_zip_button", "review.zip 열기", "review_zip"),
+            ("target_autoloop_open_publish_ready_button", "publish.ready 열기", "publish_ready"),
+        )
+        for attr_name, label, state_key in artifact_button_specs:
+            if not self._has_ui_attr(attr_name):
+                continue
+            button = getattr(self, attr_name)
+            button.configure(
+                text=f"{target_label} {label}",
+                state="normal" if bool(path_states.get(state_key, False)) else "disabled",
+            )
+
+    def _target_autoloop_control_buttons_can_defer(self) -> bool:
+        if not self._has_ui_attr("notebook") or not self._has_ui_attr("target_autoloop_tab"):
+            return False
+        return not self._notebook_tab_is_selected("target_autoloop_tab")
 
     def _target_autoloop_selected_status_target_id(self, targets: list[dict[str, object]] | None = None) -> str:
         candidate = ""
@@ -17851,15 +21125,289 @@ class RelayOperatorPanel(tk.Tk):
             return "input-claimed"
         return "idle"
 
+    @staticmethod
+    def _target_autoloop_row_for_target(rows: object, target_id: str) -> dict[str, object]:
+        if not isinstance(rows, list) or not target_id:
+            return {}
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            if str(row.get("TargetId", "") or "").strip() == target_id:
+                return row
+        return {}
+
+    @staticmethod
+    def _target_autoloop_int_or_zero(value: object) -> int:
+        try:
+            return int(value or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    @staticmethod
+    def _target_autoloop_artifact_path_state(path_value: object, *, kind: str) -> dict[str, object]:
+        path_text = str(path_value or "").strip()
+        if not path_text:
+            return {"available": False, "reason": "경로 없음", "path": ""}
+        path = Path(path_text)
+        try:
+            if kind == "folder":
+                if path.is_dir():
+                    return {"available": True, "reason": "있음", "path": path_text}
+                if path.exists():
+                    return {"available": False, "reason": "폴더 아님", "path": path_text}
+                return {"available": False, "reason": "폴더 없음", "path": path_text}
+            if path.is_file():
+                return {"available": True, "reason": "있음", "path": path_text}
+            if path.exists():
+                return {"available": False, "reason": "파일 아님", "path": path_text}
+            if not path.parent.exists():
+                return {"available": False, "reason": "상위 폴더 없음", "path": path_text}
+            return {"available": False, "reason": "파일 없음", "path": path_text}
+        except OSError as exc:
+            return {"available": False, "reason": f"경로 확인 실패: {exc}", "path": path_text}
+
+    @staticmethod
+    def _target_autoloop_selected_progress_badge_spec(
+        *,
+        target_id: str,
+        phase: str,
+        next_action: str,
+        dispatch_state: str,
+        cycle_count: int,
+        max_cycle_count: int,
+        remaining_count: int,
+    ) -> dict[str, str]:
+        target_label = str(target_id or "선택 target").strip() or "선택 target"
+        normalized_phase = str(phase or "").strip().lower()
+        normalized_next = str(next_action or "").strip().lower()
+        normalized_dispatch = str(dispatch_state or "").strip().lower()
+        progress_text = (
+            f"{cycle_count}/{max_cycle_count} 완료 / 남은 {remaining_count}"
+            if max_cycle_count > 0
+            else f"{cycle_count} 완료 / max 미설정"
+        )
+        active_cycle = min(cycle_count + 1, max_cycle_count) if max_cycle_count > 0 else cycle_count + 1
+        failure_markers = ("failed", "failure", "error", "blocked", "unconfirmed")
+        if (
+            normalized_phase == "failed"
+            or any(marker in normalized_dispatch for marker in failure_markers)
+            or any(marker in normalized_next for marker in failure_markers)
+        ):
+            return {
+                "text": f"{target_label} 실패 / {progress_text}",
+                "background": "#B91C1C",
+                "foreground": "#FFFFFF",
+            }
+        if normalized_phase == "paused":
+            return {
+                "text": f"{target_label} 일시정지 / {progress_text}",
+                "background": "#B45309",
+                "foreground": "#FFFFFF",
+            }
+        if (
+            normalized_phase in {"limit-reached", "output-ready"}
+            or normalized_next == "limit-reached"
+            or (max_cycle_count > 0 and cycle_count >= max_cycle_count)
+        ):
+            return {
+                "text": f"{target_label} 완료 / {progress_text}",
+                "background": "#15803D",
+                "foreground": "#FFFFFF",
+            }
+        if normalized_phase in {"input-detected", "claimed", "waiting-output"}:
+            return {
+                "text": f"{target_label} {active_cycle}번째 진행 중 / {progress_text}",
+                "background": "#2563EB",
+                "foreground": "#FFFFFF",
+            }
+        if normalized_phase in {"queued", "dispatch-delay", "cooldown"}:
+            return {
+                "text": f"{target_label} {active_cycle}번째 대기 / {progress_text}",
+                "background": "#B45309",
+                "foreground": "#FFFFFF",
+            }
+        return {
+            "text": f"{target_label} 대기 / {progress_text}",
+            "background": "#6B7280",
+            "foreground": "#FFFFFF",
+        }
+
+    def _target_autoloop_selected_target_artifact_snapshot(
+        self,
+        runtime_snapshot: dict[str, object] | None = None,
+        *,
+        target_id: str | None = None,
+    ) -> dict[str, object]:
+        runtime_snapshot = runtime_snapshot or self._target_autoloop_runtime_snapshot()
+        run_root = str(runtime_snapshot.get("run_root", "") or "").strip()
+        status_targets = runtime_snapshot.get("targets", [])
+        manifest_targets = runtime_snapshot.get("manifest_targets", [])
+        if not isinstance(status_targets, list):
+            status_targets = []
+        if not isinstance(manifest_targets, list):
+            manifest_targets = []
+
+        requested_target_id = str(target_id or "").strip()
+        resolved_target_id = ""
+        if requested_target_id:
+            if (
+                self._target_autoloop_row_for_target(status_targets, requested_target_id)
+                or self._target_autoloop_row_for_target(manifest_targets, requested_target_id)
+                or run_root
+            ):
+                resolved_target_id = requested_target_id
+        if not resolved_target_id:
+            resolved_target_id = self._target_autoloop_selected_status_target_id(status_targets)
+        if not resolved_target_id:
+            candidate = self._target_autoloop_selected_status_target_id(None)
+            if candidate and (
+                self._target_autoloop_row_for_target(manifest_targets, candidate)
+                or not manifest_targets
+            ):
+                resolved_target_id = candidate
+        if not resolved_target_id:
+            return {
+                "target_id": "",
+                "available": False,
+                "progress_badge_text": "선택 target 진행: -",
+                "progress_badge_color": "#6B7280",
+                "progress_badge_foreground": "#FFFFFF",
+                "progress_summary": "선택 target 진행: target을 선택하면 cycle 진행률을 표시합니다.",
+                "artifact_summary": "선택 target 산출물: target 선택 또는 RunRoot 준비 후 표시됩니다.",
+                "artifact_state_summary": "source-outbox=경로 없음 / summary=경로 없음 / review.zip=경로 없음 / publish.ready=경로 없음",
+            }
+
+        target_id = resolved_target_id
+        status_row = self._target_autoloop_row_for_target(status_targets, target_id)
+        manifest_row = self._target_autoloop_row_for_target(manifest_targets, target_id)
+        target_root = str(manifest_row.get("TargetRoot", "") or "").strip()
+        if not target_root and run_root:
+            target_root = str(Path(run_root) / "targets" / target_id)
+        source_outbox_path = str(manifest_row.get("SourceOutboxPath", "") or "").strip()
+        if not source_outbox_path and target_root:
+            source_outbox_path = str(Path(target_root) / "source-outbox")
+        summary_path = str(manifest_row.get("SourceSummaryPath", "") or "").strip()
+        if not summary_path and source_outbox_path:
+            summary_path = str(Path(source_outbox_path) / "summary.txt")
+        review_zip_path = str(manifest_row.get("SourceReviewZipPath", "") or "").strip()
+        if not review_zip_path and source_outbox_path:
+            review_zip_path = str(Path(source_outbox_path) / "review.zip")
+        publish_ready_path = str(manifest_row.get("PublishReadyPath", "") or "").strip()
+        if not publish_ready_path and source_outbox_path:
+            publish_ready_path = str(Path(source_outbox_path) / "publish.ready.json")
+
+        cycle_count = self._target_autoloop_int_or_zero(status_row.get("CycleCount", 0))
+        max_cycle_count = self._target_autoloop_int_or_zero(
+            status_row.get("MaxCycleCount", manifest_row.get("MaxCycleCount", 0))
+        )
+        phase = str(status_row.get("Phase", "") or "-").strip() or "-"
+        next_action = str(status_row.get("NextAction", "") or "-").strip() or "-"
+        dispatch_state = str(status_row.get("LastDispatchState", "") or "-").strip() or "-"
+        remaining = max(0, max_cycle_count - cycle_count) if max_cycle_count > 0 else 0
+        in_progress_phases = {
+            "input-detected",
+            "claimed",
+            "queued",
+            "waiting-output",
+            "dispatch-delay",
+            "cooldown",
+        }
+        if max_cycle_count > 0:
+            if phase in in_progress_phases and cycle_count < max_cycle_count:
+                cycle_text = f"{cycle_count}/{max_cycle_count} 완료, {cycle_count + 1}번째 진행 중"
+            else:
+                cycle_text = f"{cycle_count}/{max_cycle_count} 완료"
+            remaining_text = f"남은 {remaining}"
+        else:
+            cycle_text = f"{cycle_count} 완료"
+            remaining_text = "max 미설정"
+
+        artifact_path_states = {
+            "source_outbox": self._target_autoloop_artifact_path_state(source_outbox_path, kind="folder"),
+            "summary": self._target_autoloop_artifact_path_state(summary_path, kind="file"),
+            "review_zip": self._target_autoloop_artifact_path_state(review_zip_path, kind="file"),
+            "publish_ready": self._target_autoloop_artifact_path_state(publish_ready_path, kind="file"),
+        }
+        path_states = {
+            key: bool(state.get("available", False))
+            for key, state in artifact_path_states.items()
+        }
+        artifact_state_labels = {
+            "source_outbox": "source-outbox",
+            "summary": "summary",
+            "review_zip": "review.zip",
+            "publish_ready": "publish.ready",
+        }
+        artifact_state_summary = " / ".join(
+            f"{artifact_state_labels[key]}={artifact_path_states[key].get('reason', '상태 미확인')}"
+            for key in ("source_outbox", "summary", "review_zip", "publish_ready")
+        )
+        disabled_reasons = [
+            f"{artifact_state_labels[key]}={artifact_path_states[key].get('reason', '상태 미확인')}"
+            for key in ("source_outbox", "summary", "review_zip", "publish_ready")
+            if not bool(artifact_path_states[key].get("available", False))
+        ]
+        progress_summary = (
+            f"선택 target 진행: {target_id} / {cycle_text} / {remaining_text} "
+            f"/ phase={phase} / next={next_action} / dispatch={dispatch_state}"
+        )
+        progress_badge = self._target_autoloop_selected_progress_badge_spec(
+            target_id=target_id,
+            phase=phase,
+            next_action=next_action,
+            dispatch_state=dispatch_state,
+            cycle_count=cycle_count,
+            max_cycle_count=max_cycle_count,
+            remaining_count=remaining,
+        )
+        artifact_summary = (
+            f"선택 target 산출물: {target_id} / "
+            f"source-outbox={'있음' if path_states['source_outbox'] else '없음'} / "
+            f"summary={'있음' if path_states['summary'] else '없음'} / "
+            f"review.zip={'있음' if path_states['review_zip'] else '없음'} / "
+            f"publish.ready={'있음' if path_states['publish_ready'] else '없음'}"
+        )
+        if disabled_reasons:
+            artifact_summary += " / 비활성 사유: " + "; ".join(disabled_reasons)
+        return {
+            "target_id": target_id,
+            "available": True,
+            "phase": phase,
+            "next_action": next_action,
+            "dispatch_state": dispatch_state,
+            "cycle_count": cycle_count,
+            "max_cycle_count": max_cycle_count,
+            "remaining_count": remaining,
+            "progress_badge_text": progress_badge["text"],
+            "progress_badge_color": progress_badge["background"],
+            "progress_badge_foreground": progress_badge["foreground"],
+            "progress_summary": progress_summary,
+            "artifact_summary": artifact_summary,
+            "artifact_state_summary": artifact_state_summary,
+            "target_root": target_root,
+            "source_outbox_path": source_outbox_path,
+            "summary_path": summary_path,
+            "review_zip_path": review_zip_path,
+            "publish_ready_path": publish_ready_path,
+            "path_states": path_states,
+            "artifact_path_states": artifact_path_states,
+        }
+
     def _target_autoloop_selected_target_runtime_snapshot(
         self,
         *,
         run_root: str,
         targets: list[dict[str, object]] | None = None,
+        runtime_snapshot: dict[str, object] | None = None,
     ) -> dict[str, object] | None:
         target_id = self._target_autoloop_selected_status_target_id(targets)
         if not target_id or not run_root:
             return None
+        artifact_snapshot = (
+            self._target_autoloop_selected_target_artifact_snapshot(runtime_snapshot)
+            if isinstance(runtime_snapshot, dict)
+            else {}
+        )
         target_root = Path(run_root) / "targets" / target_id
         queue_root = Path(run_root) / ".queue" / "target-autoloop" / target_id
         pending_input_count = self._target_autoloop_count_files(target_root / "inbox" / "pending")
@@ -17882,11 +21430,19 @@ class RelayOperatorPanel(tk.Tk):
             "summary": (
                 f"{target_id} / queueState={queue_state} / pendingInput={pending_input_count} / claimedInput={claimed_input_count} "
                 f"/ queued={queued_command_count} / processing={processing_command_count}"
+                + (
+                    f" / cycle={artifact_snapshot.get('cycle_count', 0)}/{artifact_snapshot.get('max_cycle_count', 0)}"
+                    if int(artifact_snapshot.get("max_cycle_count", 0) or 0) > 0
+                    else ""
+                )
             ),
         }
 
-    def _target_autoloop_status_snapshot(self) -> tuple[str, str, str]:
-        runtime_snapshot = self._target_autoloop_runtime_snapshot()
+    def _target_autoloop_status_snapshot(
+        self,
+        runtime_snapshot: dict[str, object] | None = None,
+    ) -> tuple[str, str, str]:
+        runtime_snapshot = runtime_snapshot or self._target_autoloop_runtime_snapshot()
         run_root_error = str(runtime_snapshot.get("run_root_error", "") or "")
         if run_root_error:
             return (
@@ -17983,7 +21539,19 @@ class RelayOperatorPanel(tk.Tk):
             proof_closeout.get("summary", "") or "closeout: pending-proof / mode=not-ready / reason=no-proof"
         )
         closeout_next_step = str(proof_closeout.get("recommended_next_step", "") or "")
-        selected_target_runtime = self._target_autoloop_selected_target_runtime_snapshot(run_root=run_root, targets=targets)
+        selected_target_artifacts = self._target_autoloop_selected_target_artifact_snapshot(runtime_snapshot)
+        start_allowed, start_detail = self._target_autoloop_start_eligibility(runtime_snapshot)
+        start_precheck_text = self._target_autoloop_start_precheck_text(
+            runtime_snapshot,
+            artifact_snapshot=selected_target_artifacts,
+            start_allowed=start_allowed,
+            start_detail=start_detail,
+        )
+        selected_target_runtime = self._target_autoloop_selected_target_runtime_snapshot(
+            run_root=run_root,
+            targets=targets,
+            runtime_snapshot=runtime_snapshot,
+        )
 
         status_text = f"8 Cell Autoloop / source={status_path} / control={control_path}"
         summary_text = (
@@ -18007,14 +21575,40 @@ class RelayOperatorPanel(tk.Tk):
             summary_text += f" / watchAge={watcher_health_detail}"
         if manifest_run_mode:
             summary_text += f" / manifestMode={manifest_run_mode}"
-        if manifest_enabled_count > 0 or manifest_publish_ready_count > 0:
+        if bool(runtime_snapshot.get("manifest_exists", False)) or manifest_enabled_count > 0 or manifest_publish_ready_count > 0:
             summary_text += f" / manifestPublishReady={manifest_publish_ready_count}/{manifest_enabled_count}"
         router_session = runtime_snapshot.get("router_session", {})
         if not isinstance(router_session, dict):
             router_session = {}
+        retry_pending_summary = runtime_snapshot.get("retry_pending_summary", {})
+        if not isinstance(retry_pending_summary, dict):
+            retry_pending_summary = {}
+        retry_pending_count = int(retry_pending_summary.get("count", 0) or 0)
+        retry_pending_targets = retry_pending_summary.get("target_ids", [])
+        if not isinstance(retry_pending_targets, list):
+            retry_pending_targets = []
+        router_inbox_ready_summary = runtime_snapshot.get("router_inbox_ready_summary", {})
+        if not isinstance(router_inbox_ready_summary, dict):
+            router_inbox_ready_summary = {}
+        router_inbox_ready_count = int(router_inbox_ready_summary.get("count", 0) or 0)
+        router_inbox_ready_targets = router_inbox_ready_summary.get("target_ids", [])
+        if not isinstance(router_inbox_ready_targets, list):
+            router_inbox_ready_targets = []
         router_session_state = str(runtime_snapshot.get("router_session_state", "") or "")
         if router_session_state and router_session_state != "not-configured":
             summary_text += f" / routerSession={router_session_state}"
+            if router_session.get("router_pid"):
+                summary_text += f":pid={router_session.get('router_pid')}"
+            if "router_pid_exists" in router_session:
+                summary_text += f":pidLive={bool(router_session.get('router_pid_exists', False))}"
+            if router_session.get("router_mutex_name"):
+                summary_text += f":mutexHeld={bool(router_session.get('router_mutex_held', False))}"
+        if retry_pending_count > 0:
+            retry_pending_target_text = ",".join(str(target_id or "").strip() for target_id in retry_pending_targets if str(target_id or "").strip()) or "(none)"
+            summary_text += f" / retryPending={retry_pending_count}:{retry_pending_target_text}"
+        if router_inbox_ready_count > 0:
+            router_inbox_target_text = ",".join(str(target_id or "").strip() for target_id in router_inbox_ready_targets if str(target_id or "").strip()) or "(none)"
+            summary_text += f" / routerInboxReady={router_inbox_ready_count}:{router_inbox_target_text}"
         if watcher_stop_reason:
             summary_text += f" / watchStop={watcher_stop_reason}"
         if last_handled_action:
@@ -18052,6 +21646,8 @@ class RelayOperatorPanel(tk.Tk):
         if isinstance(selected_target_runtime, dict):
             summary_text += (
                 f" / selectedTarget={selected_target_runtime['target_id']}"
+                f" / targetCycle={selected_target_artifacts.get('cycle_count', 0)}/{selected_target_artifacts.get('max_cycle_count', 0)}"
+                f" / targetRemaining={selected_target_artifacts.get('remaining_count', 0)}"
                 f" / targetQueueState={selected_target_runtime['queue_state']}"
                 f" / targetPendingInput={selected_target_runtime['pending_input_count']}"
                 f" / targetClaimedInput={selected_target_runtime['claimed_input_count']}"
@@ -18069,8 +21665,29 @@ class RelayOperatorPanel(tk.Tk):
             f"RouterSessionState: {router_session_state or '(none)'}",
             f"RouterLauncherSessionId: {str(router_session.get('router_launcher_session_id', '') or '(none)')}",
             f"RuntimeLauncherSessionId: {str(router_session.get('runtime_launcher_session_id', '') or '(none)')}",
+            f"RouterPid: {str(router_session.get('router_pid', '') or '(none)')}",
+            f"RouterPidExists: {bool(router_session.get('router_pid_exists', False))}",
+            f"RouterMutexName: {str(router_session.get('router_mutex_name', '') or '(none)')}",
+            f"RouterMutexHeld: {bool(router_session.get('router_mutex_held', False))}",
+            f"RouterStateAgeSeconds: {router_session.get('router_state_age_seconds', '(none)')}",
+            f"RouterStateUpdatedAt: {str(router_session.get('router_state_updated_at', '') or '(none)')}",
             f"RouterStatePath: {str(router_session.get('router_state_path', '') or '(none)')}",
             f"RuntimeMapPath: {str(router_session.get('runtime_map_path', '') or '(none)')}",
+            "RouterRetryPending: count={0} targets={1} latestTarget={2} latestFailure={3} latestDebugLog={4}".format(
+                retry_pending_count,
+                ",".join(str(target_id or "").strip() for target_id in retry_pending_targets if str(target_id or "").strip()) or "(none)",
+                str(retry_pending_summary.get("latest_target_id", "") or "(none)"),
+                str(retry_pending_summary.get("latest_failure_category", "") or "(none)"),
+                str(retry_pending_summary.get("latest_debug_log_path", "") or "(none)"),
+            ),
+            "RouterInboxReady: count={0} targets={1} latestTarget={2} latestSession={3} latestCreatedAt={4} latestPath={5}".format(
+                router_inbox_ready_count,
+                ",".join(str(target_id or "").strip() for target_id in router_inbox_ready_targets if str(target_id or "").strip()) or "(none)",
+                str(router_inbox_ready_summary.get("latest_target_id", "") or "(none)"),
+                str(router_inbox_ready_summary.get("latest_launcher_session_id", "") or "(none)"),
+                str(router_inbox_ready_summary.get("latest_created_at", "") or "(none)"),
+                str(router_inbox_ready_summary.get("latest_path", "") or "(none)"),
+            ),
             f"StatusPath: {status_path}",
             f"ControlPath: {control_path}",
             f"SmokeReceiptPath: {smoke_receipt_path or '(none)'}",
@@ -18103,8 +21720,15 @@ class RelayOperatorPanel(tk.Tk):
             f"State: {state}",
             "",
         ]
+        lines.insert(25, f"StartPrecheck: {start_precheck_text}")
         if isinstance(selected_target_runtime, dict):
-            lines.insert(25, f"SelectedTargetRuntime: {selected_target_runtime['summary']}")
+            lines.insert(26, f"SelectedTargetRuntime: {selected_target_runtime['summary']}")
+            lines.insert(27, f"SelectedTargetProgress: {selected_target_artifacts.get('progress_summary', '')}")
+            lines.insert(28, f"SelectedTargetArtifactState: {selected_target_artifacts.get('artifact_state_summary', '')}")
+            lines.insert(29, f"SelectedTargetSourceOutboxPath: {selected_target_artifacts.get('source_outbox_path', '') or '(none)'}")
+            lines.insert(30, f"SelectedTargetSummaryPath: {selected_target_artifacts.get('summary_path', '') or '(none)'}")
+            lines.insert(31, f"SelectedTargetReviewZipPath: {selected_target_artifacts.get('review_zip_path', '') or '(none)'}")
+            lines.insert(32, f"SelectedTargetPublishReadyPath: {selected_target_artifacts.get('publish_ready_path', '') or '(none)'}")
         if smoke_receipt_error:
             lines.insert(17, f"SmokeWarning: {smoke_receipt_error}")
         if not targets:
@@ -18160,6 +21784,7 @@ class RelayOperatorPanel(tk.Tk):
         normalized = str(eligible_at_text or "").strip()
         if not normalized:
             return None
+        normalized = re.sub(r"(\.\d{6})\d+(?=Z$|[+-]\d{2}:\d{2}$|$)", r"\1", normalized)
         try:
             eligible_at = datetime.fromisoformat(normalized.replace("Z", "+00:00"))
         except ValueError:
@@ -18610,80 +22235,159 @@ class RelayOperatorPanel(tk.Tk):
         return closeout
 
     def refresh_target_autoloop_status_panel(self) -> None:
-        status_text, summary_text, detail_text = self._target_autoloop_status_snapshot()
-        runtime_snapshot = self._target_autoloop_runtime_snapshot()
-        current_run_root = str(runtime_snapshot.get("run_root", "") or "").strip()
-        self._ensure_target_autoloop_recommendation_history_loaded_for_run_root(current_run_root)
-        recommendation_spec = self._target_autoloop_recommendation_spec(runtime_snapshot)
-        stderr_preview = self._target_autoloop_stderr_preview(runtime_snapshot)
-        history_records = (
-            self._target_autoloop_recommendation_history_records_for_run_root(current_run_root)
-            if current_run_root
-            else []
-        )
-        history_entries = [
-            self._target_autoloop_recommendation_history_entry_text(record)
-            for record in history_records[-3:]
-        ]
-        latest_history = history_records[-1] if history_records else {}
-        watcher_health = str(recommendation_spec.get("watcher_health", "") or "missing")
-        watcher_health_detail = str(recommendation_spec.get("watcher_health_detail", "") or "")
-        stderr_key_line = self._target_autoloop_compact_text(stderr_preview.get("key_line", ""), max_chars=72)
-        recommendation_mode = self._target_autoloop_recommendation_mode(recommendation_spec)
-        recommendation_level = self._target_autoloop_recommendation_level(recommendation_spec)
-        recommendation_action_key = str(recommendation_spec.get("action_key", "") or "none")
-        summary_text += " / recAction={0} / recOutcome={1}".format(
-            str(latest_history.get("action_key", "") or "none"),
-            str(latest_history.get("outcome", "") or "none"),
-        )
-        summary_text += f" / recMode={recommendation_mode} / recLevel={recommendation_level} / recKey={recommendation_action_key}"
-        guidance_lines = [f"watchHealth={watcher_health}"]
-        if watcher_health_detail:
-            guidance_lines[0] += f" / watchAge={watcher_health_detail}"
-        recommendation_detail_sections = [
-            str(section or "").strip()
-            for section in recommendation_spec.get("detail_sections", []) or []
-            if str(section or "").strip()
-        ]
-        recommendation_detail = str(recommendation_spec.get("detail", "") or "").strip()
-        if recommendation_detail_sections:
-            if len(recommendation_detail_sections) == 1:
-                guidance_lines.append(f"권장: {recommendation_detail_sections[0]}")
+        timing_started_at = time.monotonic()
+        timing_steps: list[dict[str, object]] = []
+        timing_outcome = "완료"
+        try:
+            self.__dict__["target_autoloop_status_refresh_pending"] = False
+            runtime_snapshot = self._run_refresh_ui_step(
+                timing_steps,
+                "runtime snapshot",
+                self._target_autoloop_runtime_snapshot,
+            )
+            status_text, summary_text, detail_text = self._run_refresh_ui_step(
+                timing_steps,
+                "status snapshot",
+                lambda: self._target_autoloop_status_snapshot(runtime_snapshot),
+            )
+            current_run_root = str(runtime_snapshot.get("run_root", "") or "").strip()
+            self._run_refresh_ui_step(
+                timing_steps,
+                "history load",
+                lambda: self._ensure_target_autoloop_recommendation_history_loaded_for_run_root(current_run_root),
+            )
+            recommendation_spec = self._run_refresh_ui_step(
+                timing_steps,
+                "recommendation spec",
+                lambda: self._target_autoloop_recommendation_spec(runtime_snapshot),
+            )
+            stderr_preview = self._run_refresh_ui_step(
+                timing_steps,
+                "stderr preview",
+                lambda: self._target_autoloop_stderr_preview(runtime_snapshot),
+            )
+            history_records = (
+                self._run_refresh_ui_step(
+                    timing_steps,
+                    "history records",
+                    lambda: self._target_autoloop_recommendation_history_records_for_run_root(current_run_root),
+                )
+                if current_run_root
+                else []
+            )
+            history_entries = [
+                self._target_autoloop_recommendation_history_entry_text(record)
+                for record in history_records[-3:]
+            ]
+            latest_history = history_records[-1] if history_records else {}
+            watcher_health = str(recommendation_spec.get("watcher_health", "") or "missing")
+            watcher_health_detail = str(recommendation_spec.get("watcher_health_detail", "") or "")
+            stderr_key_line = self._target_autoloop_compact_text(stderr_preview.get("key_line", ""), max_chars=72)
+            recommendation_mode = self._target_autoloop_recommendation_mode(recommendation_spec)
+            recommendation_level = self._target_autoloop_recommendation_level(recommendation_spec)
+            recommendation_action_key = str(recommendation_spec.get("action_key", "") or "none")
+            recommendation_label = str(recommendation_spec.get("label", "") or "권장 조치 없음")
+            summary_text += " / recAction={0} / recOutcome={1}".format(
+                str(latest_history.get("action_key", "") or "none"),
+                str(latest_history.get("outcome", "") or "none"),
+            )
+            summary_text += (
+                f" / recMode={recommendation_mode} / recLevel={recommendation_level} "
+                f"/ recKey={recommendation_action_key} / nextAction={recommendation_label}"
+            )
+            guidance_lines = [
+                f"다음 조치: [{recommendation_label}]",
+                f"watchHealth={watcher_health}",
+            ]
+            if watcher_health_detail:
+                guidance_lines[1] += f" / watchAge={watcher_health_detail}"
+            recommendation_detail_sections = [
+                str(section or "").strip()
+                for section in recommendation_spec.get("detail_sections", []) or []
+                if str(section or "").strip()
+            ]
+            recommendation_detail = str(recommendation_spec.get("detail", "") or "").strip()
+            if recommendation_detail_sections:
+                if len(recommendation_detail_sections) == 1:
+                    guidance_lines.append(f"권장: {recommendation_detail_sections[0]}")
+                else:
+                    guidance_lines.append("권장:")
+                    guidance_lines.extend(recommendation_detail_sections)
+            elif recommendation_detail:
+                guidance_lines.append(f"권장: {recommendation_detail}")
+            if stderr_key_line and watcher_health in {"stale", "failed"}:
+                summary_text += f" / stderrKey={stderr_key_line}"
+                guidance_lines[1] += f" / stderrKey={stderr_key_line}"
+            guidance_text = "\n".join(line for line in guidance_lines if line)
+            if self._target_autoloop_prepare_notice_active(runtime_snapshot):
+                self.__dict__["_target_autoloop_sync_notice_run_root"] = current_run_root
+                status_text = (
+                    "8창/router 동기화 완료: 현재 RunRoot는 아직 독립셀 실행용이 아니라 "
+                    "새 target-autoloop RunRoot 준비 전입니다."
+                )
+                summary_text = (
+                    "sync complete / routerSession=ok / currentRunRootNeedsPrepare=true "
+                    f"/ runroot={current_run_root}"
+                )
+                guidance_text = (
+                    "다음 조치: [선택 target만 새 RunRoot] 또는 [전체 enabled target 새 RunRoot]\n"
+                    "공식 8창과 router 세션은 이미 맞췄습니다. 실행할 target 선택, Enabled, publish-ready를 확인한 뒤 "
+                    "새 RunRoot를 준비하세요."
+                )
+                latest_history = {
+                    "label": "8창 재사용+router 동기화 완료",
+                    "action_key": "sync_windows_router_for_autoloop",
+                    "outcome": "ack",
+                    "detail": "routerSession=ok / prepare-runroot-required",
+                }
+
+            def apply_status_vars() -> None:
+                if self._has_ui_attr("target_autoloop_status_var"):
+                    self.target_autoloop_status_var.set(status_text)
+                if self._has_ui_attr("target_autoloop_summary_var"):
+                    self.target_autoloop_summary_var.set(summary_text)
+                if self._has_ui_attr("target_autoloop_guidance_var"):
+                    self.target_autoloop_guidance_var.set(guidance_text)
+                self._apply_target_autoloop_recent_result_badge(latest_history if latest_history else None)
+                self._apply_target_autoloop_retry_reason_badge(recommendation_spec)
+                self._refresh_target_autoloop_recommendation_history_vars(run_root=current_run_root)
+                if self._has_ui_attr("target_autoloop_stderr_preview_var"):
+                    self.target_autoloop_stderr_preview_var.set(str(stderr_preview.get("summary", "") or "stderr preview: (없음)"))
+
+            self._run_refresh_ui_step(timing_steps, "status vars apply", apply_status_vars)
+            detail_sections = []
+            if history_entries:
+                detail_sections.append("recent recommendation actions:\n" + "\n".join(reversed(history_entries)))
             else:
-                guidance_lines.append("권장:")
-                guidance_lines.extend(recommendation_detail_sections)
-        elif recommendation_detail:
-            guidance_lines.append(f"권장: {recommendation_detail}")
-        if stderr_key_line and watcher_health in {"stale", "failed"}:
-            summary_text += f" / stderrKey={stderr_key_line}"
-            guidance_lines[0] += f" / stderrKey={stderr_key_line}"
-        guidance_text = "\n".join(line for line in guidance_lines if line)
-        if self._has_ui_attr("target_autoloop_status_var"):
-            self.target_autoloop_status_var.set(status_text)
-        if self._has_ui_attr("target_autoloop_summary_var"):
-            self.target_autoloop_summary_var.set(summary_text)
-        if self._has_ui_attr("target_autoloop_guidance_var"):
-            self.target_autoloop_guidance_var.set(guidance_text)
-        self._apply_target_autoloop_recent_result_badge(latest_history if latest_history else None)
-        self._apply_target_autoloop_retry_reason_badge(recommendation_spec)
-        self._refresh_target_autoloop_recommendation_history_vars(run_root=current_run_root)
-        if self._has_ui_attr("target_autoloop_stderr_preview_var"):
-            self.target_autoloop_stderr_preview_var.set(str(stderr_preview.get("summary", "") or "stderr preview: (없음)"))
-        detail_sections = []
-        if history_entries:
-            detail_sections.append("recent recommendation actions:\n" + "\n".join(reversed(history_entries)))
-        else:
-            detail_sections.append("recent recommendation actions:\n(없음)")
-        detail_sections.append(str(stderr_preview.get("detail", "") or "stderr preview: (없음)"))
-        detail_sections.append(detail_text)
-        detail_text = "\n\n".join(section for section in detail_sections if section)
-        widget = self.__dict__.get("target_autoloop_status_text")
-        if widget is not None:
-            try:
-                self.set_text(widget, detail_text)
-            except Exception:
-                pass
-        self._update_target_autoloop_control_buttons(runtime_snapshot)
+                detail_sections.append("recent recommendation actions:\n(없음)")
+            detail_sections.append(str(stderr_preview.get("detail", "") or "stderr preview: (없음)"))
+            detail_sections.append(detail_text)
+            detail_text = "\n\n".join(section for section in detail_sections if section)
+
+            def render_detail_text() -> None:
+                widget = self.__dict__.get("target_autoloop_status_text")
+                if widget is not None:
+                    try:
+                        self.set_text(widget, detail_text)
+                    except Exception:
+                        pass
+
+            self._run_refresh_ui_step(timing_steps, "detail text render", render_detail_text)
+            self._run_refresh_ui_step(
+                timing_steps,
+                "control buttons update",
+                lambda: self._update_target_autoloop_control_buttons(runtime_snapshot),
+            )
+        except Exception:
+            timing_outcome = "실패"
+            raise
+        finally:
+            self._record_refresh_timing(
+                label="target autoloop status refresh",
+                started_at=timing_started_at,
+                steps=timing_steps,
+                outcome=timing_outcome,
+            )
 
     def _wait_for_target_autoloop_watcher_ready(
         self,
@@ -18692,17 +22396,23 @@ class RelayOperatorPanel(tk.Tk):
         baseline_process_started_at: str,
         timeout_sec: float,
         poll_interval_sec: float,
+        require_process_started_at_change: bool = True,
     ) -> dict[str, object]:
         deadline = time.monotonic() + timeout_sec
+        self._clear_target_autoloop_runtime_snapshot_cache()
         last_snapshot = self._target_autoloop_runtime_snapshot(run_root)
         while time.monotonic() <= deadline:
+            self._clear_target_autoloop_runtime_snapshot_cache()
             last_snapshot = self._target_autoloop_runtime_snapshot(run_root)
             watcher_state = str(last_snapshot.get("watcher_state", "") or "")
             process_started_at = str(last_snapshot.get("process_started_at", "") or "")
             if (
                 watcher_state in {"running", "paused"}
                 and process_started_at
-                and process_started_at != baseline_process_started_at
+                and (
+                    not require_process_started_at_change
+                    or process_started_at != baseline_process_started_at
+                )
                 and self._target_autoloop_watcher_is_fresh(last_snapshot)
             ):
                 return last_snapshot
@@ -18710,7 +22420,7 @@ class RelayOperatorPanel(tk.Tk):
 
         raise RuntimeError(
             (
-                "target-autoloop watcher start timeout: watcher={0} controller={1} processStartedAt={2} "
+                "target-autoloop detector start timeout: watcher={0} controller={1} processStartedAt={2} "
                 "heartbeatAt={3} statusPath={4}"
             ).format(
                 str(last_snapshot.get("watcher_state", "") or "-"),
@@ -18732,8 +22442,10 @@ class RelayOperatorPanel(tk.Tk):
         poll_interval_sec: float,
     ) -> dict[str, object]:
         deadline = time.monotonic() + timeout_sec
+        self._clear_target_autoloop_runtime_snapshot_cache()
         last_snapshot = self._target_autoloop_runtime_snapshot(run_root)
         while time.monotonic() <= deadline:
+            self._clear_target_autoloop_runtime_snapshot_cache()
             last_snapshot = self._target_autoloop_runtime_snapshot(run_root)
             pending_action = str(last_snapshot.get("control_pending_action", "") or "")
             controller_state = str(last_snapshot.get("controller_state", "") or "")
@@ -18774,34 +22486,126 @@ class RelayOperatorPanel(tk.Tk):
         if not run_root:
             if history_action_key:
                 self._append_target_autoloop_recommendation_blocked_history(
-                    label=str(history_label or "watch start"),
+                    label=str(history_label or "독립셀 감지 시작"),
                     action_key=str(history_action_key),
                     detail=str(history_detail or ""),
                     blocked_reason="RunRoot가 필요합니다.",
                 )
-            self.set_text(self.output_text, "[8 Cell Autoloop watcher start]\nRunRoot가 없어 watcher 시작을 진행하지 못했습니다.")
-            self.set_operator_status("8 Cell Autoloop watcher 시작 대기", "RunRoot가 필요합니다.")
-            messagebox.showwarning("RunRoot 필요", "8 Cell Autoloop watcher start/restart에는 RunRoot가 필요합니다.")
+            self.set_text(self.output_text, "[8 Cell Autoloop 독립셀 감지 시작]\nRunRoot가 없어 독립셀 감지 시작을 진행하지 못했습니다.")
+            self.set_operator_status("8 Cell Autoloop 독립셀 감지 시작 대기", "RunRoot가 필요합니다.")
+            messagebox.showwarning("RunRoot 필요", "8 Cell Autoloop 독립셀 감지 시작/재시작에는 RunRoot가 필요합니다.")
             return
         if not config_path:
             if history_action_key:
                 self._append_target_autoloop_recommendation_blocked_history(
-                    label=str(history_label or "watch start"),
+                    label=str(history_label or "독립셀 감지 시작"),
                     action_key=str(history_action_key),
                     detail=str(history_detail or ""),
                     blocked_reason="ConfigPath가 필요합니다.",
                 )
-            self.set_text(self.output_text, "[8 Cell Autoloop watcher start]\nConfigPath가 없어 watcher 시작을 진행하지 못했습니다.")
-            self.set_operator_status("8 Cell Autoloop watcher 시작 대기", "ConfigPath가 필요합니다.")
-            messagebox.showwarning("설정 필요", "8 Cell Autoloop watcher start/restart에는 ConfigPath가 필요합니다.")
+            self.set_text(self.output_text, "[8 Cell Autoloop 독립셀 감지 시작]\nConfigPath가 없어 독립셀 감지 시작을 진행하지 못했습니다.")
+            self.set_operator_status("8 Cell Autoloop 독립셀 감지 시작 대기", "ConfigPath가 필요합니다.")
+            messagebox.showwarning("설정 필요", "8 Cell Autoloop 독립셀 감지 시작/재시작에는 ConfigPath가 필요합니다.")
             return
 
         runtime_snapshot = self._target_autoloop_runtime_snapshot(run_root)
+        runtime_snapshot, autoswitch_detail = self._target_autoloop_auto_switch_stale_no_enabled_run_root(runtime_snapshot)
+        if autoswitch_detail:
+            run_root = str(runtime_snapshot.get("run_root", "") or run_root).strip()
+            self.set_text(
+                self.output_text,
+                f"[8 Cell Autoloop RunRoot 자동 전환]\n{autoswitch_detail}\n\n이어서 감지 시작 조건을 다시 확인합니다.",
+            )
+            self.set_operator_status("8 Cell Autoloop RunRoot 자동 전환", autoswitch_detail)
+            if self._has_ui_attr("target_autoloop_guidance_var"):
+                self.target_autoloop_guidance_var.set(
+                    "이전 RunRoot가 stale manifest(enabled=0)라 최신 유효 RunRoot로 자동 전환했습니다. 감지 시작을 이어갑니다."
+                )
         allowed, detail = self._target_autoloop_start_eligibility(runtime_snapshot)
         if not allowed:
             recommendation_spec = self._target_autoloop_recommendation_spec(runtime_snapshot)
             recommendation_label = str(recommendation_spec.get("label", "") or "").strip()
             recommendation_action_key = str(recommendation_spec.get("action_key", "") or "").strip()
+            if recommendation_action_key == "prepare_autoloop_runroot":
+                selected_target_ids = self._target_autoloop_policy_selected_target_ids()
+                selected_only = bool(selected_target_ids)
+                enabled_count, _publish_ready_count = self._target_autoloop_policy_enabled_publish_ready_counts()
+                display_detail = (
+                    f"{detail}\n\n"
+                    "감지 시작 버튼이 새 RunRoot 준비까지 이어서 진행합니다.\n"
+                    "선택 target이 있으면 선택 target만 포함하고, 선택이 없으면 enabled target 전체를 포함합니다.\n"
+                    "새 RunRoot 준비가 끝나면 같은 흐름에서 감지 시작을 자동으로 이어갑니다."
+                )
+                self.set_text(self.output_text, f"[8 Cell Autoloop 독립셀 감지 시작]\nRunRoot: {run_root}\n{display_detail}")
+                self.set_operator_status("8 Cell Autoloop 새 RunRoot 준비 후 감지 시작", detail)
+                if self._has_ui_attr("target_autoloop_guidance_var"):
+                    self.target_autoloop_guidance_var.set(
+                        "현재 RunRoot가 감지 시작 조건을 만족하지 않아 새 RunRoot 준비 후 감지 시작으로 자동 전환합니다."
+                    )
+                self.refresh_target_autoloop_status_panel()
+                self.request_prepare_target_autoloop_run_root(
+                    selected_only=selected_only,
+                    confirm_all_targets=(not selected_only and enabled_count > 1),
+                    continue_with_start=True,
+                    history_label=str(history_label or "새 RunRoot 준비 후 감지 시작"),
+                    history_action_key=str(history_action_key or "prepare_runroot_then_start_watch"),
+                    history_detail=detail,
+                )
+                return
+            if recommendation_action_key == "fix_publish_ready_prepare_autoloop_runroot":
+                selected_target_ids = self._target_autoloop_policy_selected_target_ids()
+                selected_only = bool(selected_target_ids)
+                display_detail = (
+                    f"{detail}\n\n"
+                    "감지 시작 버튼이 publish-ready를 켜고 저장한 뒤 새 RunRoot 준비로 이어집니다.\n"
+                    "새 RunRoot 준비가 끝나면 같은 흐름에서 감지 시작까지 자동으로 이어갑니다."
+                )
+                self.set_text(self.output_text, f"[8 Cell Autoloop 독립셀 감지 시작]\nRunRoot: {run_root}\n{display_detail}")
+                self.set_operator_status("8 Cell Autoloop publish-ready 자동 준비", detail)
+                if self._has_ui_attr("target_autoloop_guidance_var"):
+                    self.target_autoloop_guidance_var.set(
+                        "현재 RunRoot manifest의 publish-ready 설정이 부족해 publish-ready 켜고 새 RunRoot 준비로 자동 전환합니다."
+                    )
+                self.refresh_target_autoloop_status_panel()
+                self.request_fix_publish_ready_and_prepare_target_autoloop_run_root(
+                    history_label=str(history_label or "publish-ready 켜고 새 RunRoot 준비"),
+                    history_action_key=str(history_action_key or "fix_publish_ready_prepare_autoloop_runroot"),
+                    history_detail=detail,
+                    selected_only=selected_only,
+                    continue_with_start=True,
+                )
+                return
+            if recommendation_action_key == "restart_router_for_autoloop":
+                display_detail = (
+                    f"{detail}\n\n"
+                    "공식 8창은 닫거나 새로 띄우지 않습니다. 기존 8창/HWND를 그대로 둔 채 router 프로세스만 현재 8창 세션에 맞춥니다.\n"
+                    "[예]를 누르면 router를 다시 시작한 뒤, 독립셀 감지 시작을 이어서 진행합니다."
+                )
+                self.set_text(self.output_text, f"[8 Cell Autoloop 독립셀 감지 시작]\nRunRoot: {run_root}\n{display_detail}")
+                self.set_operator_status("8 Cell Autoloop router 세션 정렬 필요", detail)
+                if self._has_ui_attr("target_autoloop_guidance_var"):
+                    self.target_autoloop_guidance_var.set(
+                        "감지 시작 전 router 세션 정렬이 필요합니다. 감지 시작 버튼으로 router 세션 맞춤까지 이어갈 수 있습니다."
+                    )
+                self.refresh_target_autoloop_status_panel()
+                proceed = messagebox.askyesno("router만 맞추고 감지 시작", display_detail)
+                if proceed:
+                    self.request_restart_router_for_target_autoloop(
+                        history_label="router만 맞추고 감지 시작",
+                        history_action_key="restart_router_then_start_autoloop",
+                        history_detail=detail,
+                        continue_with_start=True,
+                    )
+                else:
+                    if history_action_key:
+                        self._append_target_autoloop_recommendation_blocked_history(
+                            label=str(history_label or "독립셀 감지 시작"),
+                            action_key=str(history_action_key),
+                            detail=str(history_detail or ""),
+                            blocked_reason=detail,
+                            runtime_snapshot=runtime_snapshot,
+                        )
+                return
             display_detail = detail
             if recommendation_action_key and recommendation_label:
                 display_detail = (
@@ -18810,34 +22614,35 @@ class RelayOperatorPanel(tk.Tk):
                 )
             if history_action_key:
                 self._append_target_autoloop_recommendation_blocked_history(
-                    label=str(history_label or "watch start"),
+                    label=str(history_label or "독립셀 감지 시작"),
                     action_key=str(history_action_key),
                     detail=str(history_detail or ""),
                     blocked_reason=detail,
                     runtime_snapshot=runtime_snapshot,
                 )
-            self.set_text(self.output_text, f"[8 Cell Autoloop watcher start]\nRunRoot: {run_root}\n{display_detail}")
-            self.set_operator_status("8 Cell Autoloop watcher 시작 차단", detail)
+            self.set_text(self.output_text, f"[8 Cell Autoloop 독립셀 감지 시작]\nRunRoot: {run_root}\n{display_detail}")
+            self.set_operator_status("8 Cell Autoloop 독립셀 감지 시작 차단", detail)
             if self._has_ui_attr("target_autoloop_guidance_var") and recommendation_action_key and recommendation_label:
                 self.target_autoloop_guidance_var.set(f"감지 시작 차단: [{recommendation_label}] 권장 조치를 먼저 실행하세요.")
             self.refresh_target_autoloop_status_panel()
-            messagebox.showwarning("watcher 시작 차단", display_detail)
+            messagebox.showwarning("독립셀 감지 시작 차단", display_detail)
             return
 
         baseline_process_started_at = str(runtime_snapshot.get("process_started_at", "") or "")
         controller_state = str(runtime_snapshot.get("controller_state", "") or "")
-        action_title = "8 Cell Autoloop watcher restart" if controller_state == "stopped" else "8 Cell Autoloop watcher start"
+        action_title = "8 Cell Autoloop 독립셀 감지 재시작" if controller_state == "stopped" else "8 Cell Autoloop 독립셀 감지 시작"
         action_label = "감지 재시작" if controller_state == "stopped" else "감지 시작"
         context = self._snapshot_context(run_root=run_root)
+        command_plan = target_autoloop_commands.build_start_watcher_command_plan(run_root=run_root)
 
         status_path = str(runtime_snapshot.get("status_path", "") or "")
         control_path = str(runtime_snapshot.get("control_path", "") or "")
         status_line = (
-            f"{action_label} 요청됨: watcher launch 후 heartbeat 확인 중입니다. "
+            f"{action_label} 요청됨: 독립셀 감지기 launch 후 heartbeat 확인 중입니다. "
             "20초 안에 running/paused 상태가 확인되면 감지 중으로 표시됩니다."
         )
         summary_line = (
-            "start pending / runroot={run_root} / controller={controller} / watcher={watcher} / heartbeat={heartbeat}"
+            "start pending / runroot={run_root} / controller={controller} / detector={watcher} / heartbeat={heartbeat}"
         ).format(
             run_root=run_root,
             controller=controller_state or "-",
@@ -18846,7 +22651,7 @@ class RelayOperatorPanel(tk.Tk):
         )
         guidance_line = (
             "지금은 시작 확인 중입니다. 이 상태에서 pending/source-outbox 파일을 만들기 전에 "
-            "WatcherState가 running으로 바뀌는지 확인하세요."
+            "독립셀 감지기 상태가 running으로 바뀌는지 확인하세요."
         )
         if self._has_ui_attr("target_autoloop_status_var"):
             self.target_autoloop_status_var.set(status_line)
@@ -18878,19 +22683,58 @@ class RelayOperatorPanel(tk.Tk):
 
         def worker() -> dict[str, object]:
             launch_payload = self.status_service.run_json_script(
-                "tests/Start-TargetAutoloopWatcher.ps1",
+                command_plan.script_name,
                 context,
-                run_root_override=run_root,
-                extra=["-RunMode", "target-autoloop", "-Detached", "-AsJson"],
+                run_root_override=command_plan.run_root_override,
+                extra=command_plan.extra_args(),
             )
+            self._clear_target_autoloop_runtime_snapshot_cache()
+            launch_result = str(launch_payload.get("Result", "") or "").strip()
+            reason_codes_value = launch_payload.get("ReasonCodes", [])
+            reason_codes = {
+                str(item or "").strip()
+                for item in reason_codes_value
+                if str(item or "").strip()
+            } if isinstance(reason_codes_value, list) else set()
+            already_running = launch_result == "already-running" or bool(
+                {"watcher_already_active", "watcher_mutex_held"} & reason_codes
+            )
+            if already_running:
+                ready_snapshot = self._target_autoloop_runtime_snapshot(run_root)
+                if self._target_autoloop_watcher_is_fresh(ready_snapshot):
+                    return {
+                        "launch_payload": launch_payload,
+                        "ready_snapshot": ready_snapshot,
+                    }
+                if "watcher_mutex_held" in reason_codes:
+                    ready_snapshot = self._wait_for_target_autoloop_watcher_ready(
+                        run_root,
+                        baseline_process_started_at=baseline_process_started_at,
+                        timeout_sec=8.0,
+                        poll_interval_sec=0.5,
+                        require_process_started_at_change=False,
+                    )
+                    return {
+                        "launch_payload": launch_payload,
+                        "ready_snapshot": ready_snapshot,
+                    }
+                raise RuntimeError(str(launch_payload.get("Message", "") or "target-autoloop watcher is already running but heartbeat is not fresh"))
             if not bool(launch_payload.get("Ok", False)):
-                raise RuntimeError(str(launch_payload.get("Message", "") or "target-autoloop watcher 시작 실패"))
-            ready_snapshot = self._wait_for_target_autoloop_watcher_ready(
-                run_root,
-                baseline_process_started_at=baseline_process_started_at,
-                timeout_sec=20.0,
-                poll_interval_sec=1.0,
-            )
+                raise RuntimeError(str(launch_payload.get("Message", "") or "target-autoloop 독립셀 감지 시작 실패"))
+            try:
+                ready_snapshot = self._wait_for_target_autoloop_watcher_ready(
+                    run_root,
+                    baseline_process_started_at=baseline_process_started_at,
+                    timeout_sec=20.0,
+                    poll_interval_sec=1.0,
+                )
+            except RuntimeError:
+                self._clear_target_autoloop_runtime_snapshot_cache()
+                active_snapshot = self._target_autoloop_runtime_snapshot(run_root)
+                if self._target_autoloop_watcher_is_fresh(active_snapshot):
+                    ready_snapshot = active_snapshot
+                else:
+                    raise
             return {
                 "launch_payload": launch_payload,
                 "ready_snapshot": ready_snapshot,
@@ -18899,36 +22743,14 @@ class RelayOperatorPanel(tk.Tk):
         def on_success(result: dict[str, object]) -> None:
             launch_payload = result.get("launch_payload", {})
             ready_snapshot = result.get("ready_snapshot", {})
-            lines = [
-                action_title,
-                f"RunRoot: {run_root}",
-                f"StatusPath: {launch_payload.get('StatusPath', '') or ready_snapshot.get('status_path', '')}",
-                f"ControlPath: {launch_payload.get('ControlPath', '') or ready_snapshot.get('control_path', '')}",
-                f"Message: {launch_payload.get('Message', '') or '(none)'}",
-                f"PreparedNewRun: {bool(launch_payload.get('PreparedNewRun', False))}",
-                f"ExpectedWatcherState: {launch_payload.get('ExpectedWatcherState', '') or '-'}",
-                f"WatcherProcessId: {launch_payload.get('WatcherProcessId', '(none)')}",
-                f"WatcherStdoutLogPath: {launch_payload.get('WatcherStdoutLogPath', '(none)')}",
-                f"WatcherStderrLogPath: {launch_payload.get('WatcherStderrLogPath', '(none)')}",
-                "",
-                f"{action_title} 확인",
-                f"ControllerState: {ready_snapshot.get('controller_state', '') or '-'}",
-                f"WatcherState: {ready_snapshot.get('watcher_state', '') or '-'}",
-                f"ProcessStartedAt: {ready_snapshot.get('process_started_at', '') or '(none)'}",
-                f"HeartbeatAt: {ready_snapshot.get('heartbeat_at', '') or '(none)'}",
-            ]
-            restored_target_ids = launch_payload.get("RestoredTargetIds", [])
-            if isinstance(restored_target_ids, list) and restored_target_ids:
-                lines.append("RestoredTargetIds: " + ", ".join(str(item) for item in restored_target_ids))
-            prepared_target_ids = launch_payload.get("PreparedTargetIds", [])
-            if isinstance(prepared_target_ids, list) and prepared_target_ids:
-                lines.append("PreparedTargetIds: " + ", ".join(str(item) for item in prepared_target_ids))
+            lines = target_autoloop_outputs.format_start_watcher_success_lines(
+                action_title=action_title,
+                run_root=run_root,
+                launch_payload=launch_payload,
+                ready_snapshot=ready_snapshot,
+            )
             if history_action_key:
-                ack_detail = "ack: controller={0} / watcher={1} / heartbeat={2}".format(
-                    str(ready_snapshot.get("controller_state", "") or "-"),
-                    str(ready_snapshot.get("watcher_state", "") or "-"),
-                    str(ready_snapshot.get("heartbeat_at", "") or "(none)"),
-                )
+                ack_detail = target_autoloop_outputs.format_start_watcher_ack_detail(ready_snapshot)
                 if history_detail:
                     ack_detail = f"{history_detail} / {ack_detail}"
                 self._append_target_autoloop_recommendation_history(
@@ -18942,7 +22764,7 @@ class RelayOperatorPanel(tk.Tk):
             self.refresh_target_autoloop_status_panel()
             if self._has_ui_attr("target_autoloop_status_var"):
                 self.target_autoloop_status_var.set(
-                    "{label} 완료: watcher={watcher} / controller={controller} / heartbeat={heartbeat}".format(
+                    "{label} 완료: 독립셀 감지기={watcher} / controller={controller} / heartbeat={heartbeat}".format(
                         label=action_label,
                         watcher=str(ready_snapshot.get("watcher_state", "") or "-"),
                         controller=str(ready_snapshot.get("controller_state", "") or "-"),
@@ -18958,39 +22780,45 @@ class RelayOperatorPanel(tk.Tk):
                     "label": f"{action_label} 완료",
                     "action_key": str(history_action_key or "start_watch"),
                     "outcome": "ack",
-                    "detail": "controller={0} / watcher={1} / heartbeat={2}".format(
-                        str(ready_snapshot.get("controller_state", "") or "-"),
-                        str(ready_snapshot.get("watcher_state", "") or "-"),
-                        str(ready_snapshot.get("heartbeat_at", "") or "(none)"),
-                    ),
+                    "detail": target_autoloop_outputs.format_start_watcher_recent_detail(ready_snapshot),
                 }
             )
+            self._clear_target_autoloop_runtime_snapshot_cache()
 
-        def on_failure(exc: Exception) -> None:
+        def on_failure(exc: Exception) -> str | None:
+            self._clear_target_autoloop_runtime_snapshot_cache()
             failure_snapshot = self._target_autoloop_runtime_snapshot(run_root)
             formatted_error = self._format_background_exception(exc)
-            failure_summary = (
-                "start failed / runroot={run_root} / controller={controller} / watcher={watcher} / heartbeat={heartbeat}"
-            ).format(
+            failure_summary = target_autoloop_outputs.format_start_watcher_failure_summary(
                 run_root=run_root,
-                controller=str(failure_snapshot.get("controller_state", "") or "-"),
-                watcher=str(failure_snapshot.get("watcher_state", "") or "-"),
-                heartbeat=str(failure_snapshot.get("heartbeat_at", "") or "(none)"),
+                failure_snapshot=failure_snapshot,
             )
+            extension_start_failed = str(history_action_key or "").strip() == "extend_cycle_limit_then_start_watch"
+            if extension_start_failed:
+                status_message = f"추가 진행 완료 / {action_label} 실패: {formatted_error}"
+                guidance_message = (
+                    "MaxCycleCount 추가 진행은 이미 적용됐습니다. 추가 N회를 다시 누르지 말고 "
+                    "[독립셀 감지 시작/재시작]만 다시 시도하세요."
+                )
+                recent_label = f"추가 진행 후 {action_label} 실패"
+                recent_detail = f"extension-applied / start-failed: {formatted_error}"
+            else:
+                status_message = f"{action_label} 실패: {formatted_error}"
+                guidance_message = "감지 시작 실패입니다. stderr 로그와 StatusPath/ControlPath를 확인한 뒤 다시 감지 시작/재시작을 누르세요."
+                recent_label = f"{action_label} 실패"
+                recent_detail = formatted_error
             if self._has_ui_attr("target_autoloop_status_var"):
-                self.target_autoloop_status_var.set(f"{action_label} 실패: {formatted_error}")
+                self.target_autoloop_status_var.set(status_message)
             if self._has_ui_attr("target_autoloop_summary_var"):
                 self.target_autoloop_summary_var.set(failure_summary)
             if self._has_ui_attr("target_autoloop_guidance_var"):
-                self.target_autoloop_guidance_var.set(
-                    "감지 시작 실패입니다. stderr 로그와 StatusPath/ControlPath를 확인한 뒤 다시 감지 시작/재시작을 누르세요."
-                )
+                self.target_autoloop_guidance_var.set(guidance_message)
             self._apply_target_autoloop_recent_result_badge(
                 {
-                    "label": f"{action_label} 실패",
+                    "label": recent_label,
                     "action_key": str(history_action_key or "start_watch"),
                     "outcome": "failed",
-                    "detail": formatted_error,
+                    "detail": recent_detail,
                 }
             )
             if history_action_key:
@@ -19003,31 +22831,414 @@ class RelayOperatorPanel(tk.Tk):
                 )
             self.refresh_target_autoloop_status_panel()
             if self._has_ui_attr("target_autoloop_status_var"):
-                self.target_autoloop_status_var.set(f"{action_label} 실패: {formatted_error}")
+                self.target_autoloop_status_var.set(status_message)
             if self._has_ui_attr("target_autoloop_summary_var"):
                 self.target_autoloop_summary_var.set(failure_summary)
             if self._has_ui_attr("target_autoloop_guidance_var"):
+                self.target_autoloop_guidance_var.set(guidance_message)
+            self._apply_target_autoloop_recent_result_badge(
+                {
+                    "label": recent_label,
+                    "action_key": str(history_action_key or "start_watch"),
+                    "outcome": "failed",
+                    "detail": recent_detail,
+                }
+            )
+            if extension_start_failed:
+                return "\n".join(
+                    [
+                        f"[{action_title} 실패]",
+                        "부분 완료: MaxCycleCount 추가 진행은 이미 적용됐습니다.",
+                        f"추가 진행 결과: {str(history_detail or '(확인 필요)')}",
+                        f"감지 시작 실패: {formatted_error}",
+                        f"RunRoot: {run_root}",
+                        f"StatusSummary: {failure_summary}",
+                        "다음: 추가 N회를 다시 누르지 말고 [독립셀 감지 시작/재시작]만 다시 시도하세요.",
+                    ]
+                )
+            return None
+
+        self.run_background_task(
+            state=f"{action_title} 확인 중",
+            hint="독립셀 감지기 launch 요청 후 status heartbeat와 processStartedAt 갱신을 기다리는 중입니다.",
+            worker=worker,
+            on_success=on_success,
+            success_state=f"{action_title} 완료",
+            success_hint="독립셀 감지기 running/paused 상태와 새 heartbeat를 확인했습니다.",
+            failure_state=f"{action_title} 실패",
+            failure_hint="status/control 파일과 독립셀 감지기 stdout/stderr 로그를 확인하세요.",
+            on_failure=on_failure,
+        )
+
+    def request_sync_target_autoloop_windows_router_session(self) -> None:
+        config_path = self.config_path_var.get().strip()
+        action_title = "8 Cell Autoloop 8창 재사용+router 동기화"
+        if not config_path:
+            self.set_operator_status("8 Cell Autoloop 동기화 대기", "ConfigPath가 필요합니다.")
+            if self._has_ui_attr("target_autoloop_guidance_var"):
+                self.target_autoloop_guidance_var.set("8창 재사용+router 동기화 차단: ConfigPath가 필요합니다.")
+            messagebox.showwarning("설정 필요", "8 Cell Autoloop 8창 재사용+router 동기화에는 ConfigPath가 필요합니다.")
+            return
+
+        if bool(self.__dict__.get("_busy", False)):
+            busy_detail = (
+                "이미 다른 긴 작업이 진행 중입니다. 현재 작업 단계/최근 작업 시간을 확인하고, "
+                "완료 또는 실패 표시가 난 뒤 다시 누르세요."
+            )
+            self.set_operator_status(f"{action_title} 대기", busy_detail, "마지막 결과: 8창 재사용+router 동기화 차단")
+            if self._has_ui_attr("target_autoloop_status_var"):
+                self.target_autoloop_status_var.set(f"8창 재사용+router 동기화 차단: {busy_detail}")
+            if self._has_ui_attr("target_autoloop_summary_var"):
+                self.target_autoloop_summary_var.set("sync blocked: panel busy / duplicate click ignored")
+            if self._has_ui_attr("target_autoloop_guidance_var"):
                 self.target_autoloop_guidance_var.set(
-                    "감지 시작 실패입니다. stderr 로그와 StatusPath/ControlPath를 확인한 뒤 다시 감지 시작/재시작을 누르세요."
+                    "현재 버튼이 먹통처럼 보이면 실제로는 이전 긴 작업이 끝나지 않은 상태일 수 있습니다. "
+                    "최근 작업 단계가 멈춰 있으면 패널 프로세스가 중복 실행 중인지도 확인하세요."
                 )
             self._apply_target_autoloop_recent_result_badge(
                 {
-                    "label": f"{action_label} 실패",
-                    "action_key": str(history_action_key or "start_watch"),
+                    "label": "8창 재사용+router 동기화 차단",
+                    "action_key": "sync_windows_router_for_autoloop",
+                    "outcome": "blocked",
+                    "detail": "panel-busy",
+                }
+            )
+            return
+
+        run_root = self._current_run_root_for_actions().strip()
+        context = self._snapshot_context(run_root=run_root)
+        reuse_anchor_utc = self._utc_now_iso()
+        workflow = self._runtime_workflow()
+        router_command_plan = target_autoloop_commands.build_router_restart_command_plan()
+        self.last_command_var.set(
+            self._reuse_existing_windows_command_preview()
+            + " && router/" + router_command_plan.display_command
+        )
+        if self._has_ui_attr("target_autoloop_status_var"):
+            self.target_autoloop_status_var.set(
+                "8 Cell Autoloop 전용 동기화 중: 공식 8창 binding/attach를 재사용하고 router를 현재 runtime session에 맞춥니다."
+            )
+        if self._has_ui_attr("target_autoloop_guidance_var"):
+            self.target_autoloop_guidance_var.set(
+                "Home/Pair 후속 RunRoot 준비 없이 독립셀 탭 안에서만 8창 재사용과 router 세션 정렬을 진행합니다. 공식 8창은 종료하지 않습니다."
+            )
+        self._apply_target_autoloop_recent_result_badge(
+            {
+                "label": "8창 재사용+router 동기화 요청",
+                "action_key": "sync_windows_router_for_autoloop",
+                "outcome": "requested",
+                "detail": f"runroot={run_root or '(none)'}",
+            }
+        )
+
+        def post_sync_progress(message: str) -> None:
+            progress_message = str(message or "").strip() or "진행 중"
+            self._post_background_progress(action_title, progress_message)
+
+            def apply_autoloop_progress() -> None:
+                if self._has_ui_attr("target_autoloop_status_var"):
+                    self.target_autoloop_status_var.set(
+                        f"8창 재사용+router 동기화 진행 중: {progress_message}"
+                    )
+                if self._has_ui_attr("target_autoloop_summary_var"):
+                    self.target_autoloop_summary_var.set(
+                        "sync progress: "
+                        f"{progress_message} / 단계=binding refresh -> attach -> visibility -> router restart -> session check"
+                    )
+                if self._has_ui_attr("target_autoloop_guidance_var"):
+                    self.target_autoloop_guidance_var.set(
+                        "진행 중에는 버튼이 비활성화됩니다. 공식 8창은 종료하지 않고 기존 HWND/binding을 재사용합니다. "
+                        "10초 이상 걸리면 이 문구의 단계가 바뀌는지 확인하세요."
+                    )
+
+            after_callback = getattr(self, "after", None)
+            if callable(after_callback) and "tk" in self.__dict__:
+                try:
+                    after_callback(0, apply_autoloop_progress)
+                    return
+                except Exception:
+                    pass
+            apply_autoloop_progress()
+
+        def worker() -> dict[str, object]:
+            sync_timing_steps: list[dict[str, object]] = []
+            reuse_result = self._run_timed_refresh_step(
+                sync_timing_steps,
+                "reuse workflow",
+                lambda: workflow.run_reuse(
+                    ReuseWindowsRequest(
+                        context=context,
+                        config_path=config_path,
+                        reuse_anchor_utc=reuse_anchor_utc,
+                        pairs_mode=False,
+                        progress=post_sync_progress,
+                    )
+                ),
+            )
+            post_sync_progress("4/5 router 세션 확인 중")
+            self._clear_target_autoloop_runtime_snapshot_cache()
+            before_session = self._run_timed_refresh_step(
+                sync_timing_steps,
+                "router session precheck",
+                self._target_autoloop_router_session_snapshot,
+            )
+            restart_payload: dict[str, object]
+            if self._target_autoloop_router_session_paths_ready(before_session):
+                restart_payload = {
+                    "SkippedRouterRestart": True,
+                    "SkipReason": "routerSessionAlreadyOk",
+                    "ConfigPath": config_path,
+                }
+                post_sync_progress("4/5 router 세션 이미 일치, 재시작 생략")
+                after_session = before_session
+            else:
+                post_sync_progress("4/5 router 세션 재시작 중 (최대 45초)")
+                try:
+                    restart_payload = self._run_timed_refresh_step(
+                        sync_timing_steps,
+                        "router restart",
+                        lambda: self.status_service.run_json_script(
+                            router_command_plan.script_name,
+                            context,
+                            extra=router_command_plan.extra_args(),
+                            timeout_sec=45.0,
+                        ),
+                    )
+                except Exception as exc:
+                    post_sync_progress("5/5 router 재시작 응답 지연, 상태 파일로 완료 여부 확인 중")
+                    restart_error = self._format_background_exception(exc)
+                    try:
+                        after_session = self._run_timed_refresh_step(
+                            sync_timing_steps,
+                            "router session recovery check",
+                            lambda: self._wait_for_target_autoloop_router_session_paths_ok(
+                                timeout_sec=5.0,
+                                poll_interval_sec=0.25,
+                            ),
+                        )
+                    except Exception as session_exc:
+                        raise RuntimeError(
+                            "router restart did not reach a usable session within the panel timeout. "
+                            f"restartError={restart_error}; "
+                            f"sessionError={self._format_background_exception(session_exc)}"
+                        ) from exc
+                    restart_payload = {
+                        "RecoveredFromRouterRestartError": True,
+                        "RouterRestartError": restart_error,
+                        "ConfigPath": config_path,
+                    }
+                else:
+                    post_sync_progress("5/5 router/runtime 세션 일치 확인 중")
+                    after_session = self._run_timed_refresh_step(
+                        sync_timing_steps,
+                        "router session postcheck",
+                        self._wait_for_target_autoloop_router_session_paths_ok,
+                    )
+            return {
+                "reuse_result": reuse_result,
+                "restart_payload": restart_payload,
+                "before_session": before_session,
+                "after_session": after_session,
+                "sync_timing_steps": tuple(sync_timing_steps),
+            }
+
+        def on_success(result: dict[str, object]) -> None:
+            reuse_result = result.get("reuse_result")
+            restart_payload = result.get("restart_payload", {})
+            if not isinstance(restart_payload, dict):
+                restart_payload = {}
+            before_session = result.get("before_session", {})
+            if not isinstance(before_session, dict):
+                before_session = {}
+            after_session = result.get("after_session", {})
+            if not isinstance(after_session, dict):
+                after_session = {}
+            if reuse_result is not None:
+                self.window_launch_anchor_utc = str(getattr(reuse_result, "reuse_anchor_utc", "") or self.window_launch_anchor_utc)
+                runtime_result = getattr(reuse_result, "runtime_result", None)
+                if runtime_result is not None:
+                    self._apply_runtime_refresh_result(runtime_result)
+                reuse_report = self._format_reuse_existing_windows_report(
+                    getattr(reuse_result, "reuse_payload", {}) or {},
+                    attach_output=str(getattr(reuse_result, "attach_output", "") or ""),
+                    runtime_result=runtime_result,
+                    operation_label="8 Cell Autoloop 8창 재사용+router 동기화",
+                )
+            else:
+                reuse_report = "8 Cell Autoloop 8창 재사용 결과: (없음)"
+            post_sync_run_root = self._current_run_root_for_actions().strip() or run_root
+
+            def list_text(value: object) -> str:
+                if not isinstance(value, list):
+                    return "(none)"
+                return ", ".join(str(item) for item in value if str(item)) or "(none)"
+
+            lines = [
+                f"[{action_title}]",
+                reuse_report,
+                "",
+                "[router 세션 정렬]",
+                f"ConfigPath: {restart_payload.get('ConfigPath', config_path) or config_path}",
+                f"RunRoot: {post_sync_run_root or '(none)'}",
+                "WindowPolicy: 공식 8창은 종료/재기동하지 않음. 기존 binding/HWND를 그대로 사용.",
+                f"MatchedProcessIds: {list_text(restart_payload.get('MatchedProcessIds', []))}",
+                f"StoppedProcessIds: {list_text(restart_payload.get('StoppedProcessIds', []))}",
+                f"StartedProcessId: {restart_payload.get('StartedProcessId', '(none)')}",
+                f"EffectiveRouterPid: {restart_payload.get('EffectiveRouterPid', '(none)')}",
+            ]
+            if bool(restart_payload.get("SkippedRouterRestart", False)):
+                lines.append(f"RouterRestartSkipped: {restart_payload.get('SkipReason', '(none)')}")
+                lines.append("RouterRestartDecision: skipped / precheck routerSession=ok")
+            elif bool(restart_payload.get("RecoveredFromRouterRestartError", False)):
+                lines.append(
+                    "RouterRestartDecision: restarted-with-timeout-recovery / "
+                    f"precheck state={before_session.get('state', '-') or '-'}"
+                )
+            else:
+                lines.append(
+                    "RouterRestartDecision: restarted / "
+                    f"precheck state={before_session.get('state', '-') or '-'}"
+                )
+            if bool(restart_payload.get("RecoveredFromRouterRestartError", False)):
+                lines += [
+                    "RouterRestartRecovered: 상태 파일 기준 routerSession=ok 확인",
+                    f"RouterRestartError: {restart_payload.get('RouterRestartError', '(none)')}",
+                ]
+            lines += [
+                "",
+                "[재시작 전 세션]",
+                f"BeforeRouterSessionState: {before_session.get('state', '-') or '-'}",
+                f"BeforeRouterLauncherSessionId: {before_session.get('router_launcher_session_id', '(none)')}",
+                f"BeforeRuntimeLauncherSessionId: {before_session.get('runtime_launcher_session_id', '(none)')}",
+                f"BeforeRouterPid: {before_session.get('router_pid', '(none)')}",
+                f"BeforeRouterPidExists: {bool(before_session.get('router_pid_exists', False))}",
+                f"BeforeRouterMutexName: {before_session.get('router_mutex_name', '(none)')}",
+                f"BeforeRouterMutexHeld: {bool(before_session.get('router_mutex_held', False))}",
+                f"BeforeRouterStateAgeSeconds: {before_session.get('router_state_age_seconds', '(none)')}",
+                f"BeforeRouterStatePath: {before_session.get('router_state_path', '(none)')}",
+                f"BeforeRuntimeMapPath: {before_session.get('runtime_map_path', '(none)')}",
+            ]
+            timing_steps: list[dict[str, object]] = []
+            self._append_refresh_timing_steps(timing_steps, result.get("sync_timing_steps", ()), prefix="sync: ")
+            if reuse_result is not None:
+                self._append_refresh_timing_steps(
+                    timing_steps,
+                    getattr(reuse_result, "reuse_timing_steps", ()),
+                    prefix="reuse: ",
+                )
+                runtime_result = getattr(reuse_result, "runtime_result", None)
+                if runtime_result is not None:
+                    self._append_refresh_timing_steps(
+                        timing_steps,
+                        getattr(runtime_result, "refresh_timing_steps", ()),
+                        prefix="runtime: ",
+                    )
+            if timing_steps:
+                lines += [
+                    "",
+                    "[소요 시간]",
+                ]
+                for timing_step in timing_steps:
+                    lines.append(
+                        "- {0}: {1}".format(
+                            timing_step.get("label", "step") or "step",
+                            timing_step.get("elapsed_text", "") or self._format_task_elapsed_seconds(
+                                float(timing_step.get("elapsed_seconds", 0.0) or 0.0)
+                            ),
+                        )
+                    )
+            lines += [
+                "",
+                "[세션 확인]",
+                f"RouterSessionState: {after_session.get('state', '-') or '-'}",
+                f"RouterLauncherSessionId: {after_session.get('router_launcher_session_id', '(none)')}",
+                f"RuntimeLauncherSessionId: {after_session.get('runtime_launcher_session_id', '(none)')}",
+                f"RouterPid: {after_session.get('router_pid', '(none)')}",
+                f"RouterPidExists: {bool(after_session.get('router_pid_exists', False))}",
+                f"RouterMutexName: {after_session.get('router_mutex_name', '(none)')}",
+                f"RouterMutexHeld: {bool(after_session.get('router_mutex_held', False))}",
+                f"RouterStateAgeSeconds: {after_session.get('router_state_age_seconds', '(none)')}",
+                f"RouterStateUpdatedAt: {after_session.get('router_state_updated_at', '(none)')}",
+                f"RouterSessionPathSource: {after_session.get('path_source', '(none)')}",
+                f"RouterStatePath: {after_session.get('router_state_path', '(none)')}",
+                f"RuntimeMapPath: {after_session.get('runtime_map_path', '(none)')}",
+            ]
+            if self._target_autoloop_run_root_is_pair_scoped(post_sync_run_root):
+                lines += [
+                    "",
+                    "[RunRoot 주의]",
+                    self._target_autoloop_pair_runroot_block_detail(post_sync_run_root),
+                ]
+            self.set_text(self.output_text, "\n".join(lines))
+            self._clear_target_autoloop_runtime_snapshot_cache()
+            self.__dict__["_target_autoloop_sync_notice_pending"] = True
+            if self._target_autoloop_run_root_needs_prepare(post_sync_run_root):
+                self.__dict__["_target_autoloop_sync_notice_run_root"] = post_sync_run_root
+            elif post_sync_run_root:
+                self.__dict__.pop("_target_autoloop_sync_notice_run_root", None)
+                self.__dict__.pop("_target_autoloop_sync_notice_pending", None)
+            self.refresh_target_autoloop_status_panel()
+            if self._has_ui_attr("target_autoloop_status_var"):
+                self.target_autoloop_status_var.set("8창 재사용+router 동기화 완료: routerSession=ok")
+            if self._has_ui_attr("target_autoloop_guidance_var"):
+                if self._target_autoloop_run_root_is_pair_scoped(post_sync_run_root):
+                    self.target_autoloop_guidance_var.set(
+                        "8창/router 세션은 맞췄지만 현재 RunRoot가 Pair RunRoot입니다. RunRoot Override를 비우고 8 Cell Autoloop 탭에서 새 RunRoot를 준비하세요."
+                    )
+                else:
+                    self.target_autoloop_guidance_var.set(
+                        "8 Cell Autoloop 전용 8창/router 동기화가 완료됐습니다. 이제 새 RunRoot 준비 후 독립셀 감지 시작을 누르세요."
+                    )
+            self._apply_target_autoloop_recent_result_badge(
+                {
+                    "label": "8창 재사용+router 동기화 완료",
+                    "action_key": "sync_windows_router_for_autoloop",
+                    "outcome": "ack",
+                    "detail": "routerSession=ok",
+                }
+            )
+            self.last_result_var.set("마지막 결과: 8 Cell Autoloop 8창 재사용+router 동기화 완료")
+
+        def on_failure(exc: Exception) -> None:
+            formatted_error = self._format_background_exception(exc)
+            self.set_text(
+                self.output_text,
+                "\n".join(
+                    [
+                        f"[{action_title}]",
+                        "8창 재사용+router 동기화 실패",
+                        f"ConfigPath: {config_path}",
+                        f"RunRoot: {run_root or '(none)'}",
+                        formatted_error,
+                    ]
+                ),
+            )
+            self._clear_target_autoloop_runtime_snapshot_cache()
+            self.refresh_target_autoloop_status_panel()
+            if self._has_ui_attr("target_autoloop_status_var"):
+                self.target_autoloop_status_var.set(f"8창 재사용+router 동기화 실패: {formatted_error}")
+            if self._has_ui_attr("target_autoloop_guidance_var"):
+                self.target_autoloop_guidance_var.set(
+                    "독립셀 전용 동기화 실패입니다. 출력의 RuntimeMapPath/RouterStatePath와 router 로그를 먼저 확인하세요."
+                )
+            self._apply_target_autoloop_recent_result_badge(
+                {
+                    "label": "8창 재사용+router 동기화 실패",
+                    "action_key": "sync_windows_router_for_autoloop",
                     "outcome": "failed",
                     "detail": formatted_error,
                 }
             )
 
         self.run_background_task(
-            state=f"{action_title} 확인 중",
-            hint="watcher launch 요청 후 status heartbeat와 processStartedAt 갱신을 기다리는 중입니다.",
+            state=f"{action_title} 중",
+            hint="공식 8창 binding/attach를 재사용한 뒤 router 세션을 현재 runtime map과 맞춥니다.",
             worker=worker,
             on_success=on_success,
             success_state=f"{action_title} 완료",
-            success_hint="watcher running/paused 상태와 새 heartbeat를 확인했습니다.",
+            success_hint="공식 8창 재사용과 router/runtime LauncherSessionId 일치를 확인했습니다.",
             failure_state=f"{action_title} 실패",
-            failure_hint="status/control 파일과 watcher stdout/stderr 로그를 확인하세요.",
+            failure_hint="공식 8창 binding, RuntimeMapPath, RouterStatePath를 확인하세요.",
             on_failure=on_failure,
         )
 
@@ -19036,6 +23247,7 @@ class RelayOperatorPanel(tk.Tk):
         history_label: str | None = None,
         history_action_key: str | None = None,
         history_detail: str | None = None,
+        continue_with_start: bool = False,
     ) -> None:
         run_root = self._current_run_root_for_actions().strip()
         config_path = self.config_path_var.get().strip()
@@ -19055,11 +23267,12 @@ class RelayOperatorPanel(tk.Tk):
 
         baseline_snapshot = self._target_autoloop_runtime_snapshot(run_root)
         context = self._snapshot_context(run_root=run_root)
+        command_plan = target_autoloop_commands.build_router_restart_command_plan()
         router_session = baseline_snapshot.get("router_session", {})
         if not isinstance(router_session, dict):
             router_session = {}
-        mismatch_detail = self._target_autoloop_router_session_mismatch_message(router_session)
-        status_line = "router 세션 재시작 요청됨: 현재 공식 8창 런타임 세션에 맞춰 router를 다시 띄우는 중입니다."
+        mismatch_detail = self._target_autoloop_router_session_not_ready_message(baseline_snapshot)
+        status_line = "router 세션 재시작 요청됨: 공식 8창은 유지하고 router 프로세스만 현재 8창 런타임 세션에 맞추는 중입니다."
         if self._has_ui_attr("target_autoloop_status_var"):
             self.target_autoloop_status_var.set(status_line)
         if self._has_ui_attr("target_autoloop_summary_var"):
@@ -19073,6 +23286,7 @@ class RelayOperatorPanel(tk.Tk):
             self.target_autoloop_guidance_var.set(
                 "router 재시작 중입니다. 완료 후 queued가 남아 있으면 감지 시작/재시작으로 이어가고, 이미 ignored 처리된 ready는 새 RunRoot 준비 후 다시 publish하세요."
             )
+        self._clear_target_autoloop_runtime_snapshot_cache()
         self._apply_target_autoloop_recent_result_badge(
             {
                 "label": "router 세션 재시작 요청",
@@ -19089,8 +23303,9 @@ class RelayOperatorPanel(tk.Tk):
                     status_line,
                     f"ConfigPath: {config_path}",
                     f"RunRoot: {run_root or '(none)'}",
+                    "WindowPolicy: 공식 8창은 종료/재기동하지 않음. 기존 binding/HWND를 그대로 사용.",
                     mismatch_detail,
-                    "완료 후 권장 순서: 공식 8창 재사용/attach 상태 확인 -> queued가 남아 있으면 감지 시작/재시작",
+                    "완료 후 권장 순서: queued가 남아 있으면 감지 시작/재시작",
                     "주의: router에서 이미 ignored 처리된 기존 ready는 동일 marker 재검사로 dedupe될 수 있으므로 새 RunRoot 준비 후 다시 publish하세요.",
                 ]
             ),
@@ -19098,11 +23313,11 @@ class RelayOperatorPanel(tk.Tk):
 
         def worker() -> dict[str, object]:
             restart_payload = self.status_service.run_json_script(
-                "router/Restart-RouterForConfig.ps1",
+                command_plan.script_name,
                 context,
-                extra=["-AsJson"],
+                extra=command_plan.extra_args(),
             )
-            after_snapshot = self._target_autoloop_runtime_snapshot(run_root)
+            after_snapshot = self._wait_for_target_autoloop_router_session_ok(run_root)
             return {
                 "restart_payload": restart_payload,
                 "after_snapshot": after_snapshot,
@@ -19115,35 +23330,15 @@ class RelayOperatorPanel(tk.Tk):
             after_snapshot = result.get("after_snapshot", {})
             if not isinstance(after_snapshot, dict):
                 after_snapshot = {}
-            after_router_session = after_snapshot.get("router_session", {})
-            if not isinstance(after_router_session, dict):
-                after_router_session = {}
+            self._clear_target_autoloop_runtime_snapshot_cache()
             router_state = str(after_snapshot.get("router_session_state", "") or "-")
-            def list_text(value: object) -> str:
-                if not isinstance(value, list):
-                    return "(none)"
-                return ", ".join(str(item) for item in value if str(item)) or "(none)"
-
-            lines = [
-                action_title,
-                f"ConfigPath: {restart_payload.get('ConfigPath', config_path) or config_path}",
-                f"RunRoot: {run_root or '(none)'}",
-                f"RouterMutexName: {restart_payload.get('RouterMutexName', '(none)')}",
-                f"MatchedProcessIds: {list_text(restart_payload.get('MatchedProcessIds', []))}",
-                f"StoppedProcessIds: {list_text(restart_payload.get('StoppedProcessIds', []))}",
-                f"StartedProcessId: {restart_payload.get('StartedProcessId', '(none)')}",
-                f"EffectiveRouterPid: {restart_payload.get('EffectiveRouterPid', '(none)')}",
-                f"MutexHeld: {restart_payload.get('MutexHeld', '(unknown)')}",
-                f"StdoutLogPath: {restart_payload.get('StdoutLogPath', '(none)')}",
-                f"StderrLogPath: {restart_payload.get('StderrLogPath', '(none)')}",
-                "",
-                "재시작 후 세션 확인",
-                f"RouterSessionState: {router_state}",
-                f"RouterLauncherSessionId: {after_router_session.get('router_launcher_session_id', '(none)')}",
-                f"RuntimeLauncherSessionId: {after_router_session.get('runtime_launcher_session_id', '(none)')}",
-                f"RouterStatePath: {after_router_session.get('router_state_path', '(none)')}",
-                f"RuntimeMapPath: {after_router_session.get('runtime_map_path', '(none)')}",
-            ]
+            lines = target_autoloop_outputs.format_router_restart_success_lines(
+                action_title=action_title,
+                config_path=config_path,
+                run_root=run_root,
+                restart_payload=restart_payload,
+                after_snapshot=after_snapshot,
+            )
             self.set_text(self.output_text, "\n".join(lines))
             self.refresh_target_autoloop_status_panel()
             if self._has_ui_attr("target_autoloop_status_var"):
@@ -19154,13 +23349,18 @@ class RelayOperatorPanel(tk.Tk):
                         "router 재시작 후에도 세션 불일치가 남았습니다. 공식 8창 재사용/attach를 다시 확인한 뒤 router를 다시 재시작하세요."
                     )
                 else:
-                    self.target_autoloop_guidance_var.set(
-                        "router 세션이 재정렬되었습니다. queued가 남아 있으면 감지 시작/재시작으로 이어가고, 이미 ignored 처리된 ready는 새 RunRoot 준비 후 다시 publish하세요."
-                    )
+                    if continue_with_start:
+                        self.target_autoloop_guidance_var.set(
+                            "router 세션이 재정렬되었습니다. 이어서 독립셀 감지 시작을 자동으로 진행합니다."
+                        )
+                    else:
+                        self.target_autoloop_guidance_var.set(
+                            "router 세션이 재정렬되었습니다. queued가 남아 있으면 감지 시작/재시작으로 이어가고, 이미 ignored 처리된 ready는 새 RunRoot 준비 후 다시 publish하세요."
+                        )
             if history_action_key:
-                ack_detail = "ack: routerSession={0} / pid={1}".format(
-                    router_state,
-                    str(restart_payload.get("EffectiveRouterPid", "") or restart_payload.get("StartedProcessId", "") or "(none)"),
+                ack_detail = target_autoloop_outputs.format_router_restart_ack_detail(
+                    router_state=router_state,
+                    restart_payload=restart_payload,
                 )
                 if history_detail:
                     ack_detail = f"{history_detail} / {ack_detail}"
@@ -19179,6 +23379,19 @@ class RelayOperatorPanel(tk.Tk):
                     "detail": f"routerSession={router_state}",
                 }
             )
+            if continue_with_start and not bool(after_snapshot.get("router_session_mismatch", False)):
+                def continue_start() -> None:
+                    self.request_start_target_autoloop_watcher(
+                        history_label="router 세션 맞춘 뒤 감지 시작",
+                        history_action_key="start_watch_after_router_restart",
+                        history_detail=f"routerSession={router_state}",
+                    )
+
+                after = getattr(self, "after", None)
+                if callable(after):
+                    after(250, continue_start)
+                else:
+                    continue_start()
 
         def on_failure(exc: Exception) -> None:
             failure_snapshot = self._target_autoloop_runtime_snapshot(run_root)
@@ -19186,13 +23399,12 @@ class RelayOperatorPanel(tk.Tk):
             self.set_text(
                 self.output_text,
                 "\n".join(
-                    [
-                        f"[{action_title}]",
-                        "router 세션 재시작 실패",
-                        f"ConfigPath: {config_path}",
-                        f"RunRoot: {run_root or '(none)'}",
-                        formatted_error,
-                    ]
+                    target_autoloop_outputs.format_router_restart_failure_lines(
+                        action_title=action_title,
+                        config_path=config_path,
+                        run_root=run_root,
+                        formatted_error=formatted_error,
+                    )
                 ),
             )
             self.refresh_target_autoloop_status_panel()
@@ -19234,6 +23446,12 @@ class RelayOperatorPanel(tk.Tk):
     def request_prepare_selected_target_autoloop_run_root(self) -> None:
         self.request_prepare_target_autoloop_run_root(selected_only=True)
 
+    def _set_target_autoloop_prepare_reason(self, detail: str, *, allowed: bool = False) -> None:
+        if not self._has_ui_attr("target_autoloop_prepare_reason_var"):
+            return
+        prefix = "RunRoot 준비 가능" if allowed else "RunRoot 준비 차단 사유"
+        self.target_autoloop_prepare_reason_var.set(f"{prefix}: {detail}")
+
     def _confirm_target_autoloop_global_runroot_prepare(self, target_ids: list[str]) -> bool:
         target_text = ",".join(str(target_id or "").strip() for target_id in target_ids if str(target_id or "").strip())
         if not target_text:
@@ -19251,18 +23469,36 @@ class RelayOperatorPanel(tk.Tk):
             )
         )
 
+    def _target_autoloop_prepare_manifest_summary_lines(
+        self,
+        runtime_snapshot: dict[str, object],
+        *,
+        start_allowed: bool,
+        start_detail: str,
+    ) -> list[str]:
+        return target_autoloop_outputs.format_prepare_manifest_summary_lines(
+            runtime_snapshot,
+            start_allowed=start_allowed,
+            start_detail=start_detail,
+        )
+
     def request_prepare_target_autoloop_run_root(
         self,
         *,
         selected_only: bool = False,
         selected_target_ids_override: list[str] | None = None,
         confirm_all_targets: bool = False,
+        continue_with_start: bool = False,
+        history_label: str | None = None,
+        history_action_key: str | None = None,
+        history_detail: str | None = None,
     ) -> None:
         config_path = self.config_path_var.get().strip()
         action_title = "8 Cell Autoloop 선택 target만 새 RunRoot 준비" if selected_only else "8 Cell Autoloop 전체 enabled target 새 RunRoot 준비"
         if not config_path:
             self.set_text(self.output_text, f"[{action_title}]\nConfigPath가 없어 새 RunRoot를 준비하지 못했습니다.")
             self.set_operator_status("8 Cell Autoloop 새 RunRoot 준비 대기", "ConfigPath가 필요합니다.")
+            self._set_target_autoloop_prepare_reason("ConfigPath가 필요합니다.")
             messagebox.showwarning("설정 필요", "8 Cell Autoloop 새 RunRoot 준비에는 ConfigPath가 필요합니다.")
             return
 
@@ -19277,6 +23513,7 @@ class RelayOperatorPanel(tk.Tk):
             detail = "선택된 target이 없어 선택 target 새 RunRoot를 준비하지 않았습니다. target 카드의 '선택' 체크박스를 먼저 켜세요."
             self.set_text(self.output_text, f"[{action_title}]\n{detail}")
             self.set_operator_status("8 Cell Autoloop 선택 RunRoot 준비 차단", detail)
+            self._set_target_autoloop_prepare_reason(detail)
             messagebox.showwarning("선택 target 없음", detail)
             return
         target_ids = selected_target_ids if selected_only else all_target_ids
@@ -19305,6 +23542,7 @@ class RelayOperatorPanel(tk.Tk):
             ).format(targets=", ".join(dirty_target_ids))
             self.set_text(self.output_text, f"[{action_title}]\n{detail}")
             self.set_operator_status("8 Cell Autoloop 새 RunRoot 준비 차단", detail)
+            self._set_target_autoloop_prepare_reason(detail)
             messagebox.showwarning("target 설정 저장 필요", detail)
             return
         if disabled_selected_target_ids:
@@ -19314,21 +23552,24 @@ class RelayOperatorPanel(tk.Tk):
             ).format(targets=", ".join(disabled_selected_target_ids))
             self.set_text(self.output_text, f"[{action_title}]\n{detail}")
             self.set_operator_status("8 Cell Autoloop 선택 RunRoot 준비 차단", detail)
+            self._set_target_autoloop_prepare_reason(detail)
             messagebox.showwarning("선택 target disabled", detail)
             return
         if not enabled_target_ids:
             detail = "Enabled target이 없어 새 RunRoot를 준비하지 않았습니다. 먼저 target을 enable 하세요."
             self.set_text(self.output_text, f"[{action_title}]\n{detail}")
             self.set_operator_status("8 Cell Autoloop 새 RunRoot 준비 차단", detail)
+            self._set_target_autoloop_prepare_reason(detail)
             messagebox.showwarning("enabled target 없음", detail)
             return
         if publish_ready_missing_target_ids:
             detail = (
                 "publish-ready가 꺼진 enabled target이 있어 새 RunRoot 준비를 막았습니다: {targets}. "
-                "'enabled publish-ready 켜기' 후 저장하세요."
+                "'선택 target 실행 준비' 또는 'enabled publish-ready 켜기' 후 저장하세요."
             ).format(targets=", ".join(publish_ready_missing_target_ids))
             self.set_text(self.output_text, f"[{action_title}]\n{detail}")
             self.set_operator_status("8 Cell Autoloop 새 RunRoot 준비 차단", detail)
+            self._set_target_autoloop_prepare_reason(detail)
             messagebox.showwarning("publish-ready 필요", detail)
             return
 
@@ -19347,11 +23588,30 @@ class RelayOperatorPanel(tk.Tk):
                     ),
                 )
                 self.set_operator_status("8 Cell Autoloop 전체 RunRoot 준비 보류", detail)
+                self._set_target_autoloop_prepare_reason(detail)
                 return
+
+        try:
+            prepare_config_backup_path = self._ensure_target_autoloop_prepare_config_enabled(config_path, target_ids)
+        except Exception as exc:
+            detail = (
+                "TargetAutoloop 상위 Enabled/RunMode를 저장하지 못해 새 RunRoot 준비를 막았습니다: "
+                f"{exc}"
+            )
+            self.set_text(self.output_text, f"[{action_title}]\n{detail}")
+            self.set_operator_status("8 Cell Autoloop 새 RunRoot 준비 차단", detail)
+            self._set_target_autoloop_prepare_reason(detail)
+            messagebox.showerror("TargetAutoloop 설정 저장 실패", detail)
+            return
 
         context = self._current_context()
         target_scope_text = "선택 target만" if selected_only else "enabled target 전체"
+        command_plan = target_autoloop_commands.build_prepare_run_root_command_plan(
+            selected_only=selected_only,
+            enabled_target_ids=enabled_target_ids,
+        )
         status_line = f"새 RunRoot 준비 요청됨: 현재 저장된 TargetAutoloop 설정으로 {target_scope_text} target-autoloop manifest를 새로 만듭니다."
+        self._set_target_autoloop_prepare_reason("대상 " + ",".join(enabled_target_ids), allowed=True)
         if self._has_ui_attr("target_autoloop_status_var"):
             self.target_autoloop_status_var.set(status_line)
         if self._has_ui_attr("target_autoloop_guidance_var"):
@@ -19376,22 +23636,18 @@ class RelayOperatorPanel(tk.Tk):
                     "RunRoot: 새 경로 자동 생성",
                     "TargetScope: " + target_scope_text,
                     "Targets: " + ", ".join(enabled_target_ids),
-                    "실행 방식: Start-TargetAutoloopRun.ps1 -RunMode target-autoloop -AsJson",
+                    "ConfigAutoFix: " + target_autoloop_outputs.format_config_auto_fix_label(prepare_config_backup_path),
+                    "실행 방식: " + command_plan.display_command,
                 ]
             ),
         )
 
         def worker() -> dict[str, object]:
-            extra_args = ["-RunMode", "target-autoloop"]
-            if selected_only:
-                extra_args += ["-Targets"]
-                extra_args += list(enabled_target_ids)
-            extra_args += ["-AsJson"]
             payload = self.status_service.run_json_script(
-                "tests/Start-TargetAutoloopRun.ps1",
+                command_plan.script_name,
                 context,
-                run_root_override="",
-                extra=extra_args,
+                run_root_override=command_plan.run_root_override,
+                extra=command_plan.extra_args(),
             )
             prepared_run_root = str(payload.get("RunRoot", "") or "").strip()
             if not prepared_run_root:
@@ -19401,36 +23657,27 @@ class RelayOperatorPanel(tk.Tk):
         def on_success(payload: dict[str, object]) -> None:
             prepared_run_root = str(payload.get("RunRoot", "") or "").strip()
             if prepared_run_root:
-                self.run_root_var.set(prepared_run_root)
-                current_effective = self.effective_data if isinstance(self.effective_data, dict) else {}
-                next_effective = dict(current_effective)
-                run_context = dict(next_effective.get("RunContext", {}) or {})
-                run_context["SelectedRunRoot"] = prepared_run_root
-                run_context["SelectedRunRootSource"] = "target-autoloop-prepare"
-                run_context["SelectedRunRootIsStale"] = False
-                next_effective["RunContext"] = run_context
-                self.effective_data = next_effective
-            target_ids_payload = [
-                str(item or "").strip()
-                for item in list(payload.get("TargetIds", []) or [])
-                if str(item or "").strip()
-            ]
-            lines = [
-                action_title,
-                f"RunRoot: {prepared_run_root}",
-                f"ManifestPath: {payload.get('ManifestPath', '') or '(none)'}",
-                f"StatePath: {payload.get('StatePath', '') or '(none)'}",
-                f"StatusPath: {payload.get('StatusPath', '') or '(none)'}",
-                f"ControlPath: {payload.get('ControlPath', '') or '(none)'}",
-                f"TargetIds: {', '.join(target_ids_payload) if target_ids_payload else '(none)'}",
-                f"TargetScope: {target_scope_text}",
-                "Next: 독립셀 감지 시작/재시작 -> 초간단 시작문 복사/submit",
-            ]
+                self._apply_prepared_run_root_context(prepared_run_root, source="target-autoloop-prepare")
+            lines = target_autoloop_outputs.format_prepare_runroot_success_lines(
+                action_title=action_title,
+                prepared_run_root=prepared_run_root,
+                payload=payload,
+                target_scope_text=target_scope_text,
+                prepare_config_backup_path=prepare_config_backup_path,
+            )
             self.set_text(self.output_text, "\n".join(lines))
             self.refresh_target_autoloop_status_panel()
             prepared_snapshot = self._target_autoloop_runtime_snapshot(prepared_run_root)
             self._update_target_autoloop_control_buttons(prepared_snapshot)
             start_allowed, start_detail = self._target_autoloop_start_eligibility(prepared_snapshot)
+            prepared_recommendation_spec = self._target_autoloop_recommendation_spec(prepared_snapshot)
+            prepared_recommendation_action_key = str(prepared_recommendation_spec.get("action_key", "") or "").strip()
+            manifest_summary_lines = self._target_autoloop_prepare_manifest_summary_lines(
+                prepared_snapshot,
+                start_allowed=start_allowed,
+                start_detail=start_detail,
+            )
+            self.set_text(self.output_text, "\n".join(lines + manifest_summary_lines))
             if self._has_ui_attr("target_autoloop_status_var"):
                 self.target_autoloop_status_var.set(f"새 RunRoot 준비 완료: {prepared_run_root}")
             if self._has_ui_attr("target_autoloop_guidance_var"):
@@ -19458,6 +23705,43 @@ class RelayOperatorPanel(tk.Tk):
                     "detail": prepared_run_root,
                 }
             )
+            if continue_with_start and start_allowed:
+                if self._has_ui_attr("target_autoloop_guidance_var"):
+                    self.target_autoloop_guidance_var.set(
+                        "새 RunRoot 준비가 끝났습니다. 이어서 독립셀 감지 시작을 자동으로 진행합니다."
+                    )
+
+                def continue_start() -> None:
+                    self.request_start_target_autoloop_watcher(
+                        history_label=str(history_label or "새 RunRoot 준비 후 감지 시작"),
+                        history_action_key=str(history_action_key or "prepare_runroot_then_start_watch"),
+                        history_detail=str(history_detail or f"RunRoot={prepared_run_root}"),
+                    )
+
+                after = getattr(self, "after", None)
+                if callable(after):
+                    after(250, continue_start)
+                else:
+                    continue_start()
+            elif continue_with_start and prepared_recommendation_action_key == "restart_router_for_autoloop":
+                if self._has_ui_attr("target_autoloop_guidance_var"):
+                    self.target_autoloop_guidance_var.set(
+                        "새 RunRoot 준비가 끝났지만 router 세션이 감지 시작 조건을 만족하지 않아 router만 맞춘 뒤 감지 시작을 이어갑니다."
+                    )
+
+                def continue_router_fix() -> None:
+                    self.request_restart_router_for_target_autoloop(
+                        history_label=str(history_label or "새 RunRoot 준비 후 router 동기화하고 감지 시작"),
+                        history_action_key=str(history_action_key or "prepare_runroot_router_restart_then_start_watch"),
+                        history_detail=str(history_detail or f"RunRoot={prepared_run_root}"),
+                        continue_with_start=True,
+                    )
+
+                after = getattr(self, "after", None)
+                if callable(after):
+                    after(250, continue_router_fix)
+                else:
+                    continue_router_fix()
 
         def on_failure(exc: Exception) -> None:
             formatted_error = self._format_background_exception(exc)
@@ -19489,47 +23773,73 @@ class RelayOperatorPanel(tk.Tk):
             on_failure=on_failure,
         )
 
-    def request_target_autoloop_process_once_sweep(self) -> None:
+    def request_target_autoloop_process_once_sweep(self, *, target_id: str | None = None) -> None:
         run_root = self._current_run_root_for_actions().strip()
         config_path = self.config_path_var.get().strip()
-        action_title = "8 Cell Autoloop publish.ready 1회 재검사"
+        requested_target_id = str(target_id or "").strip()
+        process_once_status_label = (
+            f"{requested_target_id} publish.ready 1회 재검사"
+            if requested_target_id
+            else "전체 publish.ready 1회 재검사"
+        )
+        action_title = f"8 Cell Autoloop {process_once_status_label}"
         if not run_root:
             self.set_text(self.output_text, f"[{action_title}]\nRunRoot가 없어 1회 재검사를 진행하지 못했습니다.")
             self.set_operator_status("8 Cell Autoloop 1회 재검사 대기", "RunRoot가 필요합니다.")
+            if self._has_ui_attr("target_autoloop_process_once_reason_var"):
+                self.target_autoloop_process_once_reason_var.set("publish-ready 재검사 차단 사유: RunRoot가 필요합니다.")
             messagebox.showwarning("RunRoot 필요", "publish.ready 1회 재검사에는 RunRoot가 필요합니다.")
             return
         if not config_path:
             self.set_text(self.output_text, f"[{action_title}]\nConfigPath가 없어 1회 재검사를 진행하지 못했습니다.")
             self.set_operator_status("8 Cell Autoloop 1회 재검사 대기", "ConfigPath가 필요합니다.")
+            if self._has_ui_attr("target_autoloop_process_once_reason_var"):
+                self.target_autoloop_process_once_reason_var.set("publish-ready 재검사 차단 사유: ConfigPath가 필요합니다.")
             messagebox.showwarning("설정 필요", "publish.ready 1회 재검사에는 ConfigPath가 필요합니다.")
             return
 
         runtime_snapshot = self._target_autoloop_runtime_snapshot(run_root)
-        allowed, detail = self._target_autoloop_start_eligibility(runtime_snapshot)
+        allowed, detail = self._target_autoloop_process_once_eligibility(
+            runtime_snapshot,
+            target_id=requested_target_id,
+        )
         if not allowed:
             self.set_text(self.output_text, f"[{action_title}]\nRunRoot: {run_root}\n{detail}")
             self.set_operator_status("8 Cell Autoloop 1회 재검사 차단", detail)
+            if self._has_ui_attr("target_autoloop_process_once_reason_var"):
+                self.target_autoloop_process_once_reason_var.set(f"publish-ready 재검사 차단 사유: {detail}")
             self.refresh_target_autoloop_status_panel()
             messagebox.showwarning("1회 재검사 차단", detail)
             return
 
         context = self._snapshot_context(run_root=run_root)
+        command_plan = target_autoloop_commands.build_process_once_command_plan(
+            run_root=run_root,
+            target_id=requested_target_id,
+        )
         status_line = (
-            "publish.ready 1회 재검사 요청됨: 현재 RunRoot의 manifest/target 경로 기준으로 "
-            "한 번만 감지 sweep을 실행합니다."
+            f"{process_once_status_label} 요청됨: "
+            + (f"{requested_target_id} target만 " if requested_target_id else "현재 RunRoot의 manifest/target 경로 기준으로 ")
+            + "한 번만 감지 sweep을 실행합니다."
         )
         if self._has_ui_attr("target_autoloop_status_var"):
             self.target_autoloop_status_var.set(status_line)
         if self._has_ui_attr("target_autoloop_guidance_var"):
             self.target_autoloop_guidance_var.set(
-                "재검사 중입니다. 완료 후 target별 queue/phase/detail에 감지 또는 차단 사유가 표시됩니다."
+                (
+                    f"{requested_target_id} 재검사 중입니다. 완료 후 해당 target queue/phase/detail을 확인하세요."
+                    if requested_target_id
+                    else "재검사 중입니다. 완료 후 target별 queue/phase/detail에 감지 또는 차단 사유가 표시됩니다."
+                )
             )
+        if self._has_ui_attr("target_autoloop_process_once_reason_var"):
+            self.target_autoloop_process_once_reason_var.set("publish-ready 재검사 가능: 1회 sweep 실행 중입니다.")
         self._apply_target_autoloop_recent_result_badge(
             {
-                "label": "publish.ready 1회 재검사 요청",
+                "label": f"{process_once_status_label} 요청",
                 "action_key": "process_once",
                 "outcome": "requested",
-                "detail": f"RunRoot={run_root}",
+                "detail": f"target={requested_target_id or '(all)'} / RunRoot={run_root}",
             }
         )
         self.set_text(
@@ -19539,77 +23849,56 @@ class RelayOperatorPanel(tk.Tk):
                     f"[{action_title}]",
                     status_line,
                     f"RunRoot: {run_root}",
+                    f"TargetId: {requested_target_id or '(all enabled targets)'}",
                     f"ManifestPath: {Path(run_root) / 'manifest.json'}",
-                    "실행 방식: Start-TargetAutoloopWatcher.ps1 -RunMode target-autoloop -ProcessOnce -AsJson",
+                    "실행 방식: " + command_plan.display_command,
                 ]
             ),
         )
 
         def worker() -> dict[str, object]:
             payload = self.status_service.run_json_script(
-                "tests/Start-TargetAutoloopWatcher.ps1",
+                command_plan.script_name,
                 context,
-                run_root_override=run_root,
-                extra=["-RunMode", "target-autoloop", "-ProcessOnce", "-AsJson"],
+                run_root_override=command_plan.run_root_override,
+                extra=command_plan.extra_args(),
             )
             if not bool(payload.get("Ok", False)):
                 raise RuntimeError(str(payload.get("Message", "") or "publish.ready 1회 재검사 실패"))
             return payload
 
         def on_success(payload: dict[str, object]) -> None:
-            watcher_result = payload.get("WatcherResult", {})
-            if not isinstance(watcher_result, dict):
-                watcher_result = {}
-            target_rows = watcher_result.get("Targets", [])
-            if not isinstance(target_rows, list):
-                target_rows = []
-            queued_targets = []
-            waiting_targets = []
-            failed_targets = []
-            for row in target_rows:
-                if not isinstance(row, dict):
-                    continue
-                target_id = str(row.get("TargetId", "") or "").strip()
-                phase = str(row.get("Phase", "") or "").strip()
-                last_dispatch_state = str(row.get("LastDispatchState", "") or "").strip()
-                if phase in {"queued", "dispatch-delay"} or last_dispatch_state in {"queued", "dispatch-delay-waiting"}:
-                    queued_targets.append(target_id or "-")
-                elif phase in {"waiting-output", "idle"}:
-                    waiting_targets.append(target_id or "-")
-                elif phase == "failed":
-                    failed_targets.append(target_id or "-")
-
-            lines = [
-                action_title,
-                f"RunRoot: {payload.get('RunRoot', run_root)}",
-                f"Result: {payload.get('Result', '') or '(none)'}",
-                f"WatcherState: {payload.get('WatcherState', watcher_result.get('WatcherState', '(none)'))}",
-                f"WatcherStopReason: {payload.get('WatcherStopReason', watcher_result.get('WatcherStopReason', '(none)'))}",
-                f"QueuedOrDelayTargets: {', '.join(queued_targets) if queued_targets else '(none)'}",
-                f"WaitingTargets: {', '.join(waiting_targets) if waiting_targets else '(none)'}",
-                f"FailedTargets: {', '.join(failed_targets) if failed_targets else '(none)'}",
-                f"StatusPath: {payload.get('StatusPath', '') or '(none)'}",
-                f"ControlPath: {payload.get('ControlPath', '') or '(none)'}",
-            ]
+            output_summary = target_autoloop_outputs.summarize_process_once_payload(
+                action_title=action_title,
+                run_root=run_root,
+                payload=payload,
+            )
+            lines = output_summary.lines
             self.set_text(self.output_text, "\n".join(lines))
             self.refresh_target_autoloop_status_panel()
-            detail = "queued={0} / waiting={1} / failed={2}".format(
-                len(queued_targets),
-                len(waiting_targets),
-                len(failed_targets),
-            )
+            detail = output_summary.detail
+            status_detail = f"{requested_target_id}: {detail}" if requested_target_id else detail
             if self._has_ui_attr("target_autoloop_status_var"):
-                self.target_autoloop_status_var.set(f"publish.ready 1회 재검사 완료: {detail}")
+                self.target_autoloop_status_var.set(f"{process_once_status_label} 완료: {status_detail}")
             if self._has_ui_attr("target_autoloop_guidance_var"):
-                self.target_autoloop_guidance_var.set(
-                    "재검사가 끝났습니다. queued가 0이면 manifest RunMode/TriggerKinds, publish.ready.json strict path, watcher detail을 확인하세요."
-                )
+                if output_summary.duplicate_count > 0:
+                    self.target_autoloop_guidance_var.set(
+                        "재검사 결과 duplicate marker가 감지됐습니다. 같은 publish.ready fingerprint는 이미 처리되어 "
+                        "새 queue를 만들지 않습니다. summary/review.zip을 갱신하고 helper로 새 "
+                        "publish.ready.json(OutputFingerprint)을 생성한 뒤 다시 진행하세요."
+                    )
+                else:
+                    self.target_autoloop_guidance_var.set(
+                        "재검사가 끝났습니다. queued가 0이면 manifest RunMode/TriggerKinds, publish.ready.json strict path, watcher detail을 확인하세요."
+                    )
+            if self._has_ui_attr("target_autoloop_process_once_reason_var"):
+                self.target_autoloop_process_once_reason_var.set(f"publish-ready 재검사 완료: {status_detail}")
             self._apply_target_autoloop_recent_result_badge(
                 {
-                    "label": "publish.ready 1회 재검사 완료",
+                    "label": f"{process_once_status_label} 완료",
                     "action_key": "process_once",
                     "outcome": "ack",
-                    "detail": detail,
+                    "detail": status_detail,
                 }
             )
 
@@ -19617,14 +23906,16 @@ class RelayOperatorPanel(tk.Tk):
             formatted_error = self._format_background_exception(exc)
             self.refresh_target_autoloop_status_panel()
             if self._has_ui_attr("target_autoloop_status_var"):
-                self.target_autoloop_status_var.set(f"publish.ready 1회 재검사 실패: {formatted_error}")
+                self.target_autoloop_status_var.set(f"{process_once_status_label} 실패: {formatted_error}")
             if self._has_ui_attr("target_autoloop_guidance_var"):
                 self.target_autoloop_guidance_var.set(
                     "재검사 실패입니다. manifest RunMode, publish-ready trigger, StatusPath/ControlPath를 먼저 확인하세요."
                 )
+            if self._has_ui_attr("target_autoloop_process_once_reason_var"):
+                self.target_autoloop_process_once_reason_var.set(f"publish-ready 재검사 차단 사유: {formatted_error}")
             self._apply_target_autoloop_recent_result_badge(
                 {
-                    "label": "publish.ready 1회 재검사 실패",
+                    "label": f"{process_once_status_label} 실패",
                     "action_key": "process_once",
                     "outcome": "failed",
                     "detail": formatted_error,
@@ -19632,14 +23923,246 @@ class RelayOperatorPanel(tk.Tk):
             )
 
         self.run_background_task(
-            state="8 Cell Autoloop publish.ready 1회 재검사 중",
+            state=f"8 Cell Autoloop {process_once_status_label} 중",
             hint="현재 RunRoot 기준으로 감지 sweep을 한 번 실행합니다.",
             worker=worker,
             on_success=on_success,
-            success_state="8 Cell Autoloop publish.ready 1회 재검사 완료",
+            success_state=f"8 Cell Autoloop {process_once_status_label} 완료",
             success_hint="상태 패널에서 queued/phase/trigger 결과를 확인하세요.",
-            failure_state="8 Cell Autoloop publish.ready 1회 재검사 실패",
+            failure_state=f"8 Cell Autoloop {process_once_status_label} 실패",
             failure_hint="manifest RunMode와 publish-ready trigger 설정을 확인하세요.",
+            on_failure=on_failure,
+        )
+
+    def request_extend_target_autoloop_cycle_limit(
+        self,
+        *,
+        continue_with_start: bool = False,
+        target_id: str | None = None,
+    ) -> None:
+        run_root = self._current_run_root_for_actions().strip()
+        config_path = self.config_path_var.get().strip()
+        requested_target_id = str(target_id or "").strip()
+        additional_cycles, additional_detail = self._target_autoloop_extend_cycles_value(target_id=requested_target_id)
+        action_title = (
+            "8 Cell Autoloop 추가 진행 후 감지 시작"
+            if continue_with_start
+            else "8 Cell Autoloop 추가 진행 이어가기"
+        )
+        if not run_root:
+            self.set_text(self.output_text, f"[{action_title}]\nRunRoot가 없어 추가 진행을 준비하지 못했습니다.")
+            self.set_operator_status("8 Cell Autoloop 추가 진행 대기", "RunRoot가 필요합니다.")
+            if self._has_ui_attr("target_autoloop_extend_reason_var"):
+                self.target_autoloop_extend_reason_var.set("추가 진행 차단 사유: RunRoot가 필요합니다.")
+            messagebox.showwarning("RunRoot 필요", "추가 진행에는 RunRoot가 필요합니다.")
+            return
+        if not config_path:
+            self.set_text(self.output_text, f"[{action_title}]\nConfigPath가 없어 추가 진행을 준비하지 못했습니다.")
+            self.set_operator_status("8 Cell Autoloop 추가 진행 대기", "ConfigPath가 필요합니다.")
+            if self._has_ui_attr("target_autoloop_extend_reason_var"):
+                self.target_autoloop_extend_reason_var.set("추가 진행 차단 사유: ConfigPath가 필요합니다.")
+            messagebox.showwarning("설정 필요", "추가 진행에는 ConfigPath가 필요합니다.")
+            return
+        if additional_detail:
+            self.set_text(self.output_text, f"[{action_title}]\n{additional_detail}")
+            self.set_operator_status("8 Cell Autoloop 추가 진행 차단", additional_detail)
+            if self._has_ui_attr("target_autoloop_extend_reason_var"):
+                self.target_autoloop_extend_reason_var.set(f"추가 진행 차단 사유: {additional_detail}")
+            messagebox.showwarning("추가 횟수 확인", additional_detail)
+            return
+
+        runtime_snapshot = self._target_autoloop_runtime_snapshot(run_root)
+        allowed, detail = self._target_autoloop_extend_cycle_limit_eligibility(
+            runtime_snapshot,
+            additional_cycles=additional_cycles,
+            target_id=requested_target_id,
+        )
+        artifact_snapshot = self._target_autoloop_selected_target_artifact_snapshot(
+            runtime_snapshot,
+            target_id=requested_target_id,
+        )
+        target_id = str(artifact_snapshot.get("target_id", "") or requested_target_id).strip()
+        if not allowed:
+            self.set_text(self.output_text, f"[{action_title}]\nRunRoot: {run_root}\n{detail}")
+            self.set_operator_status("8 Cell Autoloop 추가 진행 차단", detail)
+            if self._has_ui_attr("target_autoloop_extend_reason_var"):
+                self.target_autoloop_extend_reason_var.set(f"추가 진행 차단 사유: {detail}")
+            self.refresh_target_autoloop_status_panel()
+            messagebox.showwarning("추가 진행 차단", detail)
+            return
+
+        context = self._snapshot_context(run_root=run_root)
+        command_plan = target_autoloop_commands.build_extend_cycle_limit_command_plan(
+            run_root=run_root,
+            target_id=target_id,
+            additional_cycles=additional_cycles,
+        )
+        status_line = (
+            f"추가 진행 요청됨: {target_id}의 현재 RunRoot MaxCycleCount를 {additional_cycles}회 늘립니다."
+        )
+        if self._has_ui_attr("target_autoloop_status_var"):
+            self.target_autoloop_status_var.set(status_line)
+        if self._has_ui_attr("target_autoloop_guidance_var"):
+            if continue_with_start:
+                self.target_autoloop_guidance_var.set(
+                    "추가 진행 준비 중입니다. 완료되면 같은 RunRoot에서 독립셀 감지 시작을 이어서 요청합니다."
+                )
+            else:
+                self.target_autoloop_guidance_var.set(
+                    "추가 진행 준비 중입니다. 완료 후 [독립셀 감지 시작/재시작] 또는 [publish.ready 1회 재검사]로 다음 cycle을 이어가세요."
+                )
+        if self._has_ui_attr("target_autoloop_extend_reason_var"):
+            self.target_autoloop_extend_reason_var.set(f"추가 진행 요청 중: {detail}")
+        self._apply_target_autoloop_recent_result_badge(
+            {
+                "label": "추가 진행 요청",
+                "action_key": "extend_cycle_limit",
+                "outcome": "requested",
+                "detail": f"target={target_id} / +{additional_cycles} / RunRoot={run_root}",
+            }
+        )
+        self.set_text(
+            self.output_text,
+            "\n".join(
+                [
+                    f"[{action_title}]",
+                    status_line,
+                    f"RunRoot: {run_root}",
+                    f"TargetId: {target_id}",
+                    f"추가 횟수: {additional_cycles}",
+                    "실행 방식: " + command_plan.display_command,
+                ]
+            ),
+        )
+
+        def worker() -> dict[str, object]:
+            payload = self.status_service.run_json_script(
+                command_plan.script_name,
+                context,
+                run_root_override=command_plan.run_root_override,
+                target_id_override=target_id,
+                extra=command_plan.extra_args(),
+            )
+            if not bool(payload.get("Ok", False)):
+                raise RuntimeError(str(payload.get("Message", "") or "추가 진행 준비 실패"))
+            return payload
+
+        def on_success(payload: dict[str, object]) -> None:
+            before_max = self._target_autoloop_int_or_zero(payload.get("BeforeMaxCycleCount", 0))
+            after_max = self._target_autoloop_int_or_zero(payload.get("AfterMaxCycleCount", 0))
+            cycle_count = self._target_autoloop_int_or_zero(payload.get("CycleCount", 0))
+            payload_target_id = str(payload.get("TargetId", target_id) or target_id)
+            extension_path = str(payload.get("ExtensionPath", "") or "")
+            detail_text = (
+                f"{payload_target_id} {cycle_count}/{before_max} -> {cycle_count}/{after_max} "
+                f"(+{additional_cycles})"
+            )
+            self._clear_target_autoloop_runtime_snapshot_cache()
+            self._save_target_autoloop_extend_preferences(additional_cycles)
+            result_run_root = str(payload.get("RunRoot", run_root) or run_root)
+            post_snapshot = self._target_autoloop_runtime_snapshot(result_run_root)
+            post_artifact_snapshot = self._target_autoloop_selected_target_artifact_snapshot(
+                post_snapshot,
+                target_id=payload_target_id,
+            )
+            selected_target_id = self._target_autoloop_selected_status_target_id(
+                list(post_snapshot.get("targets", []) or [])
+                if isinstance(post_snapshot.get("targets", []), list)
+                else None
+            )
+            if payload_target_id == selected_target_id:
+                self._apply_target_autoloop_selected_artifact_snapshot_vars(post_artifact_snapshot)
+            selected_status_lines = self._target_autoloop_selected_artifact_snapshot_lines(post_artifact_snapshot)
+            self.set_text(
+                self.output_text,
+                "\n".join(
+                    [
+                        f"[{action_title}]",
+                        f"완료: {detail_text}",
+                        f"RunRoot: {result_run_root}",
+                        f"StatePath: {str(payload.get('StatePath', '') or '')}",
+                        f"ControlPath: {str(payload.get('ControlPath', '') or '')}",
+                        f"StatusPath: {str(payload.get('StatusPath', '') or '')}",
+                        f"ExtensionPath: {extension_path}",
+                        *selected_status_lines,
+                        (
+                            "다음: 이어서 독립셀 감지 시작을 자동으로 진행합니다. 시작문을 다시 복사하지 말고 새 산출물/queue 진행을 확인하세요."
+                            if continue_with_start
+                            else "다음: 시작문 복사가 아니라 독립셀 감지 시작/재시작 또는 publish.ready 1회 재검사로 다음 cycle을 이어가세요."
+                        ),
+                    ]
+                ),
+            )
+            self.refresh_target_autoloop_status_panel()
+            if self._has_ui_attr("target_autoloop_status_var"):
+                self.target_autoloop_status_var.set(f"추가 진행 준비 완료: {detail_text}")
+            if self._has_ui_attr("target_autoloop_guidance_var"):
+                if continue_with_start:
+                    self.target_autoloop_guidance_var.set(
+                        "MaxCycleCount를 늘렸습니다. 이어서 같은 RunRoot의 독립셀 감지 시작을 자동으로 진행합니다. 시작문을 다시 복사하지 마세요."
+                    )
+                else:
+                    self.target_autoloop_guidance_var.set(
+                        "MaxCycleCount를 늘렸습니다. 같은 RunRoot를 유지하려면 시작문 복사가 아니라 [독립셀 감지 시작/재시작]을 누르거나 "
+                        "이미 publish.ready가 있는 상태라면 [publish.ready 1회 재검사]로 다음 cycle을 확인하세요."
+                    )
+            if self._has_ui_attr("target_autoloop_extend_reason_var"):
+                self.target_autoloop_extend_reason_var.set(f"추가 진행 완료: {detail_text}")
+            self._apply_target_autoloop_recent_result_badge(
+                {
+                    "label": "추가 진행 준비 완료",
+                    "action_key": "extend_cycle_limit",
+                    "outcome": "ack",
+                    "detail": detail_text,
+                }
+            )
+            if continue_with_start:
+                def continue_start() -> None:
+                    self.request_start_target_autoloop_watcher(
+                        history_label="추가 진행 후 감지 시작",
+                        history_action_key="extend_cycle_limit_then_start_watch",
+                        history_detail=detail_text,
+                    )
+
+                after = getattr(self, "after", None)
+                if callable(after):
+                    try:
+                        after(250, continue_start)
+                    except Exception:
+                        continue_start()
+                else:
+                    continue_start()
+
+        def on_failure(exc: Exception) -> None:
+            formatted_error = self._format_background_exception(exc)
+            self._clear_target_autoloop_runtime_snapshot_cache()
+            self.refresh_target_autoloop_status_panel()
+            if self._has_ui_attr("target_autoloop_status_var"):
+                self.target_autoloop_status_var.set(f"추가 진행 준비 실패: {formatted_error}")
+            if self._has_ui_attr("target_autoloop_guidance_var"):
+                self.target_autoloop_guidance_var.set(
+                    "추가 진행 준비 실패입니다. 선택 target, CycleCount/MaxCycleCount, phase=limit-reached 상태를 다시 확인하세요."
+                )
+            if self._has_ui_attr("target_autoloop_extend_reason_var"):
+                self.target_autoloop_extend_reason_var.set(f"추가 진행 차단 사유: {formatted_error}")
+            self._apply_target_autoloop_recent_result_badge(
+                {
+                    "label": "추가 진행 준비 실패",
+                    "action_key": "extend_cycle_limit",
+                    "outcome": "failed",
+                    "detail": formatted_error,
+                }
+            )
+
+        self.run_background_task(
+            state="8 Cell Autoloop 추가 진행 준비 중",
+            hint="현재 RunRoot의 선택 target MaxCycleCount를 늘립니다.",
+            worker=worker,
+            on_success=on_success,
+            success_state="8 Cell Autoloop 추가 진행 준비 완료",
+            success_hint="감지 시작/재시작 또는 1회 재검사로 다음 cycle을 이어가세요.",
+            failure_state="8 Cell Autoloop 추가 진행 준비 실패",
+            failure_hint="선택 target이 limit-reached인지 확인하세요.",
             on_failure=on_failure,
         )
 
@@ -19669,7 +24192,6 @@ class RelayOperatorPanel(tk.Tk):
                 history_action_key=action_key,
                 history_detail=detail,
             )
-            self.refresh_target_autoloop_status_panel()
             return
         if action_key == "start_watch":
             self.request_start_target_autoloop_watcher(
@@ -19677,7 +24199,9 @@ class RelayOperatorPanel(tk.Tk):
                 history_action_key=action_key,
                 history_detail=detail,
             )
-            self.refresh_target_autoloop_status_panel()
+            return
+        if action_key == "extend_cycle_limit_then_start_watch":
+            self.request_extend_target_autoloop_cycle_limit(continue_with_start=True)
             return
         if action_key == "enable_publish_ready":
             self.enable_publish_ready_for_enabled_target_autoloop_policy_cards()
@@ -19689,11 +24213,18 @@ class RelayOperatorPanel(tk.Tk):
                 history_action_key=action_key,
                 history_detail=detail,
             )
-            self.refresh_target_autoloop_status_panel()
             return
         if action_key == "prepare_autoloop_runroot":
-            self.request_prepare_target_autoloop_run_root()
-            self.refresh_target_autoloop_status_panel()
+            selected_target_ids = self._target_autoloop_policy_selected_target_ids()
+            selected_only = bool(selected_target_ids)
+            enabled_count, _publish_ready_count = self._target_autoloop_policy_enabled_publish_ready_counts()
+            self.request_prepare_target_autoloop_run_root(
+                selected_only=selected_only,
+                confirm_all_targets=(not selected_only and enabled_count > 1),
+                history_label=label,
+                history_action_key=action_key,
+                history_detail=detail,
+            )
             return
         if action_key == "restart_router_for_autoloop":
             self.request_restart_router_for_target_autoloop(
@@ -19701,7 +24232,13 @@ class RelayOperatorPanel(tk.Tk):
                 history_action_key=action_key,
                 history_detail=detail,
             )
-            self.refresh_target_autoloop_status_panel()
+            return
+        if action_key == "requeue_retry_pending":
+            self.request_requeue_target_autoloop_retry_pending(
+                history_label=label,
+                history_action_key=action_key,
+                history_detail=detail,
+            )
             return
         self.set_text(
             self.output_text,
@@ -19710,15 +24247,199 @@ class RelayOperatorPanel(tk.Tk):
         self.set_operator_status("8 Cell Autoloop 권장 조치 실패", f"알 수 없는 action_key={action_key}")
         self.refresh_target_autoloop_status_panel()
 
+    def request_requeue_target_autoloop_retry_pending(
+        self,
+        history_label: str | None = None,
+        history_action_key: str | None = None,
+        history_detail: str | None = None,
+    ) -> None:
+        snapshot = self._target_autoloop_runtime_snapshot()
+        retry_pending_summary = snapshot.get("retry_pending_summary", {})
+        if not isinstance(retry_pending_summary, dict):
+            retry_pending_summary = {}
+        retry_pending_count = int(retry_pending_summary.get("count", 0) or 0)
+        target_ids = retry_pending_summary.get("target_ids", [])
+        if not isinstance(target_ids, list):
+            target_ids = []
+        normalized_target_ids = [
+            str(target_id or "").strip()
+            for target_id in target_ids
+            if str(target_id or "").strip()
+        ]
+        if retry_pending_count <= 0:
+            messagebox.showinfo("retry-pending 없음", "현재 router retry-pending에 재큐잉할 target-autoloop ready 파일이 없습니다.")
+            self.refresh_target_autoloop_status_panel()
+            return
+
+        context = self._current_context()
+        display_plan = target_autoloop_commands.build_requeue_retry_pending_command_plan(target_ids=normalized_target_ids)
+        display_command = self.command_service.build_script_command(
+            display_plan.script_name,
+            config_path=context.config_path,
+            extra=display_plan.extra_args(),
+        )
+        self.last_command_var.set(subprocess.list2cmdline(display_command))
+
+        def worker() -> dict[str, object]:
+            outputs: list[str] = []
+            targets_to_requeue = normalized_target_ids or [""]
+            for target_id in targets_to_requeue:
+                command_plan = target_autoloop_commands.build_requeue_retry_pending_command_plan(
+                    target_ids=[target_id] if target_id else []
+                )
+                completed = self.status_service.run_script(
+                    command_plan.script_name,
+                    context,
+                    extra=command_plan.extra_args(),
+                    run_root_override="",
+                    pair_id_override="",
+                    target_id_override="",
+                )
+                output = completed.stdout.strip()
+                if completed.stderr.strip():
+                    output += ("\nSTDERR:\n" + completed.stderr.strip())
+                outputs.append(output or f"(no output for {target_id or 'all targets'})")
+            self._clear_target_autoloop_runtime_snapshot_cache()
+            after_snapshot = self._target_autoloop_runtime_snapshot(str(snapshot.get("run_root", "") or ""))
+            return {
+                "outputs": outputs,
+                "after_snapshot": after_snapshot,
+            }
+
+        def on_success(result: dict[str, object]) -> None:
+            outputs = result.get("outputs", [])
+            if not isinstance(outputs, list):
+                outputs = []
+            after_snapshot = result.get("after_snapshot", {})
+            if not isinstance(after_snapshot, dict):
+                after_snapshot = {}
+            after_retry_summary = after_snapshot.get("retry_pending_summary", {})
+            if not isinstance(after_retry_summary, dict):
+                after_retry_summary = {}
+            remaining_count = int(after_retry_summary.get("count", 0) or 0)
+            self._clear_target_autoloop_runtime_snapshot_cache()
+            self.set_text(
+                self.output_text,
+                "\n".join(
+                    [
+                        "[8 Cell Autoloop retry-pending 재큐잉]",
+                        f"Before: {retry_pending_count}",
+                        f"After: {remaining_count}",
+                        f"Targets: {','.join(normalized_target_ids) if normalized_target_ids else '(all)'}",
+                        "",
+                        "\n".join(str(line) for line in outputs if str(line).strip()) or "(no output)",
+                    ]
+                ),
+            )
+            if self._has_ui_attr("target_autoloop_status_var"):
+                self.target_autoloop_status_var.set(f"retry-pending 재큐잉 완료: remaining={remaining_count}")
+            if self._has_ui_attr("target_autoloop_guidance_var"):
+                self.target_autoloop_guidance_var.set(
+                    "retry-pending ready를 target inbox로 되돌렸습니다. watcher가 running이면 다음 sweep에서 처리하고, stopped면 독립셀 감지 시작/재시작을 누르세요."
+                )
+            if history_action_key:
+                self._append_target_autoloop_recommendation_history(
+                    label=str(history_label or "retry-pending 재큐잉"),
+                    action_key=str(history_action_key),
+                    detail=f"{str(history_detail or '')} / remaining={remaining_count}",
+                    runtime_snapshot=after_snapshot,
+                    outcome="ack",
+                )
+            self._apply_target_autoloop_recent_result_badge(
+                {
+                    "label": "retry-pending 재큐잉 완료",
+                    "action_key": str(history_action_key or "requeue_retry_pending"),
+                    "outcome": "ack",
+                    "detail": f"remaining={remaining_count}",
+                }
+            )
+            self.refresh_target_autoloop_status_panel()
+
+        def on_failure(exc: Exception) -> None:
+            failure_snapshot = self._target_autoloop_runtime_snapshot(str(snapshot.get("run_root", "") or ""))
+            formatted_error = self._format_background_exception(exc)
+            self.set_text(
+                self.output_text,
+                "\n".join(
+                    [
+                        "[8 Cell Autoloop retry-pending 재큐잉 실패]",
+                        f"Targets: {','.join(normalized_target_ids) if normalized_target_ids else '(all)'}",
+                        formatted_error,
+                    ]
+                ),
+            )
+            if history_action_key:
+                self._append_target_autoloop_recommendation_failure_history(
+                    label=str(history_label or "retry-pending 재큐잉"),
+                    action_key=str(history_action_key),
+                    detail=str(history_detail or ""),
+                    error_text=formatted_error,
+                    runtime_snapshot=failure_snapshot,
+                )
+            self._apply_target_autoloop_recent_result_badge(
+                {
+                    "label": "retry-pending 재큐잉 실패",
+                    "action_key": str(history_action_key or "requeue_retry_pending"),
+                    "outcome": "failed",
+                    "detail": formatted_error,
+                }
+            )
+            self.refresh_target_autoloop_status_panel()
+
+        self.run_background_task(
+            state="8 Cell Autoloop retry-pending 재큐잉 중",
+            hint="focus_lost 등으로 retry-pending에 남은 ready 파일을 target inbox로 되돌립니다.",
+            worker=worker,
+            on_success=on_success,
+            success_state="8 Cell Autoloop retry-pending 재큐잉 완료",
+            success_hint="재큐잉 후 watcher running 여부와 다음 sweep 처리 상태를 확인하세요.",
+            failure_state="8 Cell Autoloop retry-pending 재큐잉 실패",
+            failure_hint="router retry-pending root와 target inbox 경로를 확인하세요.",
+            on_failure=on_failure,
+        )
+
     def open_target_autoloop_stdout_log(self) -> None:
         snapshot = self._target_autoloop_runtime_snapshot()
         path_value = str(snapshot.get("watcher_stdout_log_path", "") or "").strip()
-        self._open_path(path_value, kind="target-autoloop watcher stdout 로그")
+        self._open_path(path_value, kind="target-autoloop 독립셀 감지기 stdout 로그")
 
     def open_target_autoloop_stderr_log(self) -> None:
         snapshot = self._target_autoloop_runtime_snapshot()
         path_value = str(snapshot.get("watcher_stderr_log_path", "") or "").strip()
-        self._open_path(path_value, kind="target-autoloop watcher stderr 로그")
+        self._open_path(path_value, kind="target-autoloop 독립셀 감지기 stderr 로그")
+
+    def _open_target_autoloop_artifact_path(
+        self,
+        path_key: str,
+        kind_label: str,
+        *,
+        target_id: str | None = None,
+    ) -> None:
+        snapshot = self._target_autoloop_selected_target_artifact_snapshot(
+            self._target_autoloop_runtime_snapshot(),
+            target_id=target_id,
+        )
+        target_id = str(snapshot.get("target_id", "") or "선택 target").strip() or "선택 target"
+        path_value = str(snapshot.get(path_key, "") or "").strip()
+        self._open_path(path_value, kind=f"{target_id} {kind_label}")
+
+    def _open_target_autoloop_selected_artifact_path(self, path_key: str, kind_label: str) -> None:
+        self._open_target_autoloop_artifact_path(path_key, kind_label)
+
+    def open_target_autoloop_target_artifact_path(self, target_id: str, path_key: str, kind_label: str) -> None:
+        self._open_target_autoloop_artifact_path(path_key, kind_label, target_id=target_id)
+
+    def open_target_autoloop_selected_source_outbox(self) -> None:
+        self._open_target_autoloop_selected_artifact_path("source_outbox_path", "source-outbox")
+
+    def open_target_autoloop_selected_summary(self) -> None:
+        self._open_target_autoloop_selected_artifact_path("summary_path", "summary.txt")
+
+    def open_target_autoloop_selected_review_zip(self) -> None:
+        self._open_target_autoloop_selected_artifact_path("review_zip_path", "review.zip")
+
+    def open_target_autoloop_selected_publish_ready(self) -> None:
+        self._open_target_autoloop_selected_artifact_path("publish_ready_path", "publish.ready.json")
 
     def show_target_autoloop_route_matrix(self) -> None:
         context = self._current_context()
@@ -19735,7 +24456,7 @@ class RelayOperatorPanel(tk.Tk):
                 context,
             )
 
-        def on_success(completed: subprocess.CompletedProcess[str]) -> None:
+        def on_success(completed: subprocess.CompletedProcess[str]) -> object | None:
             output = completed.stdout.strip()
             if completed.stderr.strip():
                 output += ("\n\nSTDERR:\n" + completed.stderr.strip())
@@ -19770,7 +24491,7 @@ class RelayOperatorPanel(tk.Tk):
                 context,
             )
 
-        def on_success(completed: subprocess.CompletedProcess[str]) -> None:
+        def on_success(completed: subprocess.CompletedProcess[str]) -> object | None:
             output = completed.stdout.strip()
             if completed.stderr.strip():
                 output += ("\n\nSTDERR:\n" + completed.stderr.strip())
@@ -19907,6 +24628,8 @@ class RelayOperatorPanel(tk.Tk):
                 )
             self.set_text(self.output_text, f"[{action_title}]\nRunRoot가 없어 target-autoloop 제어를 진행하지 못했습니다.")
             self.set_operator_status(f"{action_title} 대기", "RunRoot가 필요합니다.")
+            if self._has_ui_attr("target_autoloop_control_reason_var"):
+                self.target_autoloop_control_reason_var.set(f"pause/resume/stop 차단 사유: {action}=차단(RunRoot가 필요합니다.)")
             messagebox.showwarning("RunRoot 필요", f"{action_title}에는 RunRoot가 필요합니다.")
             return
 
@@ -19923,6 +24646,8 @@ class RelayOperatorPanel(tk.Tk):
                 )
             self.set_text(self.output_text, f"[{action_title}]\nRunRoot: {run_root}\n{detail}")
             self.set_operator_status(f"{action_title} 차단", detail)
+            if self._has_ui_attr("target_autoloop_control_reason_var"):
+                self.target_autoloop_control_reason_var.set(f"pause/resume/stop 차단 사유: {action}=차단({detail})")
             self.refresh_target_autoloop_status_panel()
             messagebox.showwarning(f"{action_title} 차단", detail)
             return
@@ -19936,16 +24661,57 @@ class RelayOperatorPanel(tk.Tk):
             if not confirmed:
                 self.set_text(self.output_text, f"[{action_title}]\n사용자 확인 취소")
                 self.set_operator_status(f"{action_title} 보류", "사용자 확인이 취소되었습니다.")
+                if self._has_ui_attr("target_autoloop_control_reason_var"):
+                    self.target_autoloop_control_reason_var.set("pause/resume/stop 차단 사유: stop=보류(사용자 확인 취소)")
                 return
 
         context = self._snapshot_context(run_root=run_root)
+        command_plan = target_autoloop_commands.build_control_action_command_plan(
+            action=action,
+            run_root=run_root,
+        )
+        control_path = str(runtime_snapshot.get("control_path", "") or "")
+        self._safe_set_var("last_command_var", command_plan.display_command)
+        self.set_text(
+            self.output_text,
+            "\n".join(
+                target_autoloop_outputs.format_control_action_pending_lines(
+                    action_title=action_title,
+                    action=action,
+                    run_root=run_root,
+                    expected_controller_state=expected_controller_state,
+                    control_path=control_path,
+                )
+            ),
+        )
+        self.set_operator_status(f"{action_title} 요청 기록 중", f"{action} 요청을 기록하고 controller ack를 기다립니다.")
+        if self._has_ui_attr("target_autoloop_status_var"):
+            self.target_autoloop_status_var.set(f"{action_title} 요청 중: control 기록 및 ack 대기")
+        if self._has_ui_attr("target_autoloop_summary_var"):
+            self.target_autoloop_summary_var.set(
+                f"control requested / action={action} / expectedController={expected_controller_state} / runroot={run_root}"
+            )
+        if self._has_ui_attr("target_autoloop_guidance_var"):
+            self.target_autoloop_guidance_var.set(
+                "요청을 기록한 뒤 status의 LastHandledRequestId/Action/Result가 갱신되는지 확인합니다. stop은 완료 뒤 restart가 필요합니다."
+            )
+        if self._has_ui_attr("target_autoloop_control_reason_var"):
+            self.target_autoloop_control_reason_var.set(f"{action} 요청 준비: control 기록 및 ack 대기")
+        self._apply_target_autoloop_recent_result_badge(
+            {
+                "label": action_title,
+                "action_key": action,
+                "outcome": "requested",
+                "detail": f"expectedController={expected_controller_state}",
+            }
+        )
 
         def worker() -> dict[str, object]:
             request_payload = self.status_service.run_json_script(
-                "tests/Request-TargetAutoloopControl.ps1",
+                command_plan.script_name,
                 context,
-                run_root_override=run_root,
-                extra=["-Action", action, "-RequestedBy", "relay_operator_panel", "-AsJson"],
+                run_root_override=command_plan.run_root_override,
+                extra=command_plan.extra_args(),
             )
             if not bool(request_payload.get("Ok", False)):
                 raise RuntimeError(str(request_payload.get("Message", "") or f"target-autoloop {action} 요청 실패"))
@@ -19970,37 +24736,14 @@ class RelayOperatorPanel(tk.Tk):
         def on_success(result: dict[str, object]) -> None:
             request_payload = result.get("request_payload", {})
             ack_snapshot = result.get("ack_snapshot", {})
-            lines = [
-                action_title,
-                f"RunRoot: {run_root}",
-                f"ControlPath: {request_payload.get('ControlPath', '') or ack_snapshot.get('control_path', '')}",
-                f"Message: {request_payload.get('Message', '') or '(none)'}",
-            ]
-            request_id = str(request_payload.get("RequestId", "") or "")
-            if request_id:
-                lines.append(f"RequestId: {request_id}")
-            reason_codes = request_payload.get("ReasonCodes", [])
-            if isinstance(reason_codes, list) and reason_codes:
-                lines.append("Reasons: " + ", ".join(str(item) for item in reason_codes))
-            lines.extend(
-                [
-                    "",
-                    f"{action_title} 확인",
-                    f"ControllerState: {ack_snapshot.get('controller_state', '') or '-'}",
-                    f"State: {ack_snapshot.get('state', '') or '-'}",
-                    f"ControlPendingAction: {ack_snapshot.get('control_pending_action', '') or '(none)'}",
-                    f"LastHandledRequestId: {ack_snapshot.get('last_handled_request_id', '') or '(none)'}",
-                    f"LastHandledAction: {ack_snapshot.get('last_handled_action', '') or '(none)'}",
-                    f"LastHandledResult: {ack_snapshot.get('last_handled_result', '') or '(none)'}",
-                ]
+            lines = target_autoloop_outputs.format_control_action_success_lines(
+                action_title=action_title,
+                run_root=run_root,
+                request_payload=request_payload,
+                ack_snapshot=ack_snapshot,
             )
             if history_action_key:
-                ack_detail = "ack: controller={0} / result={1} / lastHandled={2}:{3}".format(
-                    str(ack_snapshot.get("controller_state", "") or "-"),
-                    str(ack_snapshot.get("last_handled_result", "") or "(none)"),
-                    str(ack_snapshot.get("last_handled_action", "") or "(none)"),
-                    str(ack_snapshot.get("last_handled_request_id", "") or "(none)"),
-                )
+                ack_detail = target_autoloop_outputs.format_control_action_ack_detail(ack_snapshot)
                 if history_detail:
                     ack_detail = f"{history_detail} / {ack_detail}"
                 self._append_target_autoloop_recommendation_history(
@@ -20010,19 +24753,95 @@ class RelayOperatorPanel(tk.Tk):
                     runtime_snapshot=ack_snapshot,
                     outcome="ack",
                 )
+            if self._has_ui_attr("target_autoloop_control_reason_var"):
+                self.target_autoloop_control_reason_var.set(
+                    "{action} 완료: controller={controller} / result={result}".format(
+                        action=action,
+                        controller=str(ack_snapshot.get("controller_state", "") or "-"),
+                        result=str(ack_snapshot.get("last_handled_result", "") or "(none)"),
+                    )
+                )
             self.set_text(self.output_text, "\n".join(lines))
             self.refresh_target_autoloop_status_panel()
 
-        def on_failure(exc: Exception) -> None:
+        def on_failure(exc: Exception) -> str:
+            formatted_error = self._format_background_exception(exc)
+            self._clear_target_autoloop_runtime_snapshot_cache()
+            failure_snapshot: dict[str, object]
+            try:
+                failure_snapshot = self._target_autoloop_runtime_snapshot(run_root)
+            except Exception as snapshot_exc:
+                failure_snapshot = {
+                    "run_root": run_root,
+                    "status_error": "snapshot refresh failed: " + self._format_background_exception(snapshot_exc),
+                }
+            failure_lines = target_autoloop_outputs.format_control_action_failure_lines(
+                action_title=action_title,
+                action=action,
+                run_root=run_root,
+                formatted_error=formatted_error,
+                failure_snapshot=failure_snapshot,
+            )
+            if self._has_ui_attr("target_autoloop_control_reason_var"):
+                self.target_autoloop_control_reason_var.set(f"pause/resume/stop 차단 사유: {action}=실패({formatted_error})")
+            if self._has_ui_attr("target_autoloop_status_var"):
+                self.target_autoloop_status_var.set(f"{action_title} 실패: {formatted_error}")
+            if self._has_ui_attr("target_autoloop_summary_var"):
+                self.target_autoloop_summary_var.set(
+                    "control failed / action={0} / controller={1} / pending={2} / lastHandled={3}:{4}".format(
+                        action,
+                        str(failure_snapshot.get("controller_state", "") or "-"),
+                        str(failure_snapshot.get("control_pending_action", "") or "(none)"),
+                        str(failure_snapshot.get("last_handled_action", "") or "(none)"),
+                        str(failure_snapshot.get("last_handled_request_id", "") or "(none)"),
+                    )
+                )
+            if self._has_ui_attr("target_autoloop_guidance_var"):
+                self.target_autoloop_guidance_var.set(
+                    "제어 요청 실패입니다. 출력 영역의 RequestId/ControlPendingAction/LastHandled 값을 보고 요청 기록과 ack 처리 중 어느 단계에서 멈췄는지 확인하세요."
+                )
+            self._apply_target_autoloop_recent_result_badge(
+                {
+                    "label": f"{action_title} 실패",
+                    "action_key": action,
+                    "outcome": "failed",
+                    "detail": formatted_error,
+                }
+            )
             if history_action_key:
                 self._append_target_autoloop_recommendation_failure_history(
                     label=str(history_label or action_title),
                     action_key=str(history_action_key),
                     detail=str(history_detail or ""),
-                    error_text=self._format_background_exception(exc),
-                    runtime_snapshot=self._target_autoloop_runtime_snapshot(run_root),
+                    error_text=formatted_error,
+                    runtime_snapshot=failure_snapshot,
                 )
-                self.refresh_target_autoloop_status_panel()
+            self.refresh_target_autoloop_status_panel()
+            if self._has_ui_attr("target_autoloop_status_var"):
+                self.target_autoloop_status_var.set(f"{action_title} 실패: {formatted_error}")
+            if self._has_ui_attr("target_autoloop_summary_var"):
+                self.target_autoloop_summary_var.set(
+                    "control failed / action={0} / controller={1} / pending={2} / lastHandled={3}:{4}".format(
+                        action,
+                        str(failure_snapshot.get("controller_state", "") or "-"),
+                        str(failure_snapshot.get("control_pending_action", "") or "(none)"),
+                        str(failure_snapshot.get("last_handled_action", "") or "(none)"),
+                        str(failure_snapshot.get("last_handled_request_id", "") or "(none)"),
+                    )
+                )
+            if self._has_ui_attr("target_autoloop_guidance_var"):
+                self.target_autoloop_guidance_var.set(
+                    "제어 요청 실패입니다. 출력 영역의 RequestId/ControlPendingAction/LastHandled 값을 보고 요청 기록과 ack 처리 중 어느 단계에서 멈췄는지 확인하세요."
+                )
+            self._apply_target_autoloop_recent_result_badge(
+                {
+                    "label": f"{action_title} 실패",
+                    "action_key": action,
+                    "outcome": "failed",
+                    "detail": formatted_error,
+                }
+            )
+            return "\n".join(failure_lines)
 
         self.run_background_task(
             state=f"{action_title} 확인 중",
@@ -20033,7 +24852,7 @@ class RelayOperatorPanel(tk.Tk):
             success_hint=success_hint,
             failure_state=failure_state,
             failure_hint=failure_hint,
-            on_failure=on_failure if history_action_key else None,
+            on_failure=on_failure,
         )
 
     def request_pause_target_autoloop(
@@ -20693,7 +25512,7 @@ class RelayOperatorPanel(tk.Tk):
             if resolved_run_root:
                 self.run_root_var.set(resolved_run_root)
             if not self._apply_paired_status_snapshot_from_payload(payload, refresh_artifacts=True):
-                self.refresh_paired_status_only(refresh_artifacts=True)
+                self.refresh_paired_status_background(label="선택 target submit 후 paired status 갱신")
             target_status = payload.get("PairedTargetStatus", None) if isinstance(payload.get("PairedTargetStatus", None), dict) else self._paired_target_status_row(target_id)
             pair_status = payload.get("PairStatus", None) if isinstance(payload.get("PairStatus", None), dict) else self._paired_pair_status_row(pair_id)
             self._set_visible_acceptance_output(
@@ -20715,7 +25534,10 @@ class RelayOperatorPanel(tk.Tk):
             )
 
         def on_failure(exc: Exception) -> str:
-            self.refresh_paired_status_only(refresh_artifacts=False)
+            self.refresh_paired_status_background(
+                refresh_artifacts=False,
+                label="선택 target submit 실패 후 paired status 갱신",
+            )
             lines = [
                 self._format_background_exception(exc),
                 "",
@@ -20787,7 +25609,7 @@ class RelayOperatorPanel(tk.Tk):
 
         def on_success(payload: dict) -> None:
             if not self._apply_paired_status_snapshot_from_payload(payload, refresh_artifacts=True):
-                self.refresh_paired_status_only(refresh_artifacts=True)
+                self.refresh_paired_status_background(label="publish 확인 후 paired status 갱신")
             visibility_row = self._visibility_target_status_row(target_id)
             target_status = payload.get("PairedTargetStatus", None) if isinstance(payload.get("PairedTargetStatus", None), dict) else self._paired_target_status_row(target_id)
             pair_status = payload.get("PairStatus", None) if isinstance(payload.get("PairStatus", None), dict) else self._paired_pair_status_row(pair_id)
@@ -20868,7 +25690,7 @@ class RelayOperatorPanel(tk.Tk):
 
         def on_success(payload: dict) -> None:
             if not self._apply_paired_status_snapshot_from_payload(payload, refresh_artifacts=True):
-                self.refresh_paired_status_only(refresh_artifacts=True)
+                self.refresh_paired_status_background(label="handoff 확인 후 paired status 갱신")
             current_target_status = (
                 payload.get("PairedTargetStatus", None)
                 if isinstance(payload.get("PairedTargetStatus", None), dict)
@@ -20903,7 +25725,10 @@ class RelayOperatorPanel(tk.Tk):
             )
 
         def on_failure(exc: Exception) -> str:
-            self.refresh_paired_status_only(refresh_artifacts=False)
+            self.refresh_paired_status_background(
+                refresh_artifacts=False,
+                label="handoff 확인 실패 후 paired status 갱신",
+            )
             lines = [
                 self._format_background_exception(exc),
                 "",
@@ -22441,7 +27266,7 @@ class RelayOperatorPanel(tk.Tk):
             return "wrapper_guidance_secondary_action_button", "보조 가이드 버튼"
         if latest_cause == "정상 재사용":
             return "wrapper_guidance_action_button", "가이드 버튼"
-        return "watcher_issue_action_button", "watcher 권장 버튼"
+        return "watcher_issue_action_button", "Pair watcher 권장 버튼"
 
     def _wrapper_guidance_focus_target_spec(self) -> dict[str, object]:
         target_attr, target_label = self._wrapper_guidance_focus_target()
@@ -22522,14 +27347,14 @@ class RelayOperatorPanel(tk.Tk):
                 pass
         target_spec = self._wrapper_guidance_focus_target_spec()
         target_attr = str(target_spec.get("attr", "") or "").strip()
-        target_label = str(target_spec.get("label", "") or "watcher 권장 버튼")
+        target_label = str(target_spec.get("label", "") or "Pair watcher 권장 버튼")
         focused = self._focus_widget_if_possible(target_attr)
         auto_ran = self._auto_run_focus_target_if_safe(target_spec)
-        lines = ["OPS watcher 섹션으로 이동:"]
+        lines = ["OPS Pair watcher 섹션으로 이동:"]
         if self._has_ui_attr("watcher_issue_badge_var"):
             lines.append(str(self.watcher_issue_badge_var.get() or "상태 배지: 준비"))
         if self._has_ui_attr("watcher_issue_stage_var"):
-            lines.append(str(self.watcher_issue_stage_var.get() or "제어 흐름: 아직 watcher 제어 결과가 없습니다."))
+            lines.append(str(self.watcher_issue_stage_var.get() or "제어 흐름: 아직 Pair watcher 제어 결과가 없습니다."))
         if self._has_ui_attr("target_autoloop_summary_var"):
             lines.append(str(self.target_autoloop_summary_var.get() or "mode/controller summary: (없음)"))
         if self._has_ui_attr("target_autoloop_recent_result_var"):
@@ -22747,8 +27572,11 @@ class RelayOperatorPanel(tk.Tk):
                 text=action.label,
                 command=lambda action_key=action.action_key, command_text=action.command_text: self.handle_dashboard_action(action_key, command_text=command_text),
             )
+            read_only = self._dashboard_action_is_read_only(action.action_key)
+            setattr(button, "_relay_dashboard_action_button", True)
+            setattr(button, "_relay_dashboard_action_read_only", read_only)
             button.grid(row=0, column=1, rowspan=2, sticky="e", padx=(8, 0))
-            if self._busy and not self._dashboard_action_is_read_only(action.action_key):
+            if self._busy and not read_only:
                 button.configure(state="disabled")
 
     def _render_issue_frame(self, frame: ttk.LabelFrame, issues: list[IssueModel]) -> None:
@@ -22766,9 +27594,57 @@ class RelayOperatorPanel(tk.Tk):
             ttk.Label(row, text=issue.title, font=("Segoe UI", 9, "bold")).grid(row=0, column=0, sticky="w")
             ttk.Label(row, text=issue.detail, wraplength=520, justify="left").grid(row=1, column=0, sticky="w")
             button = ttk.Button(row, text=issue.action_label, command=lambda action_key=issue.action_key: self.handle_dashboard_action(action_key))
+            read_only = self._dashboard_action_is_read_only(issue.action_key)
+            setattr(button, "_relay_dashboard_action_button", True)
+            setattr(button, "_relay_dashboard_action_read_only", read_only)
             button.grid(row=0, column=1, rowspan=2, sticky="e", padx=(8, 0))
-            if self._busy and not self._dashboard_action_is_read_only(issue.action_key):
+            if self._busy and not read_only:
                 button.configure(state="disabled")
+
+    def _iter_widget_descendants(self, widget) -> Iterator[object]:
+        children_method = getattr(widget, "winfo_children", None)
+        if not callable(children_method):
+            return
+        try:
+            children = list(children_method())
+        except Exception:
+            return
+        for child in children:
+            yield child
+            yield from self._iter_widget_descendants(child)
+
+    def _disable_button_if_mutating(self, button, *, action_key: str = "", read_only: bool | None = None) -> None:
+        if button is None:
+            return
+        resolved_read_only = self._dashboard_action_is_read_only(action_key) if read_only is None else bool(read_only)
+        if resolved_read_only:
+            return
+        configure = getattr(button, "configure", None)
+        if callable(configure):
+            configure(state="disabled")
+
+    def _set_home_dashboard_busy_controls(self) -> None:
+        if self._has_ui_attr("home_primary_action_button"):
+            self._disable_button_if_mutating(
+                self.home_primary_action_button,
+                action_key=str(self.__dict__.get("_home_primary_action_key", "") or ""),
+            )
+        if self._has_ui_attr("home_secondary_action_button"):
+            self._disable_button_if_mutating(
+                self.home_secondary_action_button,
+                action_key=str(self.__dict__.get("_home_secondary_action_key", "") or ""),
+            )
+        for button in dict(self.__dict__.get("home_stage_buttons", {}) or {}).values():
+            self._disable_button_if_mutating(button)
+        for frame_name in ("home_next_actions_frame", "home_issue_frame"):
+            frame = self.__dict__.get(frame_name)
+            for widget in self._iter_widget_descendants(frame):
+                if not bool(getattr(widget, "_relay_dashboard_action_button", False)):
+                    continue
+                self._disable_button_if_mutating(
+                    widget,
+                    read_only=bool(getattr(widget, "_relay_dashboard_action_read_only", False)),
+                )
 
     def _selected_action_pair_summary(self) -> PairSummaryModel | None:
         pair_id = self._selected_pair_id()
@@ -22874,14 +27750,14 @@ class RelayOperatorPanel(tk.Tk):
                 title="현재 RunRoot 요약 보기",
                 action_key="run_paired_summary",
                 button_label="runroot 요약",
-                detail="현재 실행 RunRoot의 manifest, watcher, pair 요약을 읽습니다.",
+                detail="현재 실행 RunRoot의 manifest, Pair watcher, pair 요약을 읽습니다.",
                 read_only=True,
             )
         return PrimaryActionRecommendation(
             title="빠른 새로고침",
             action_key="refresh_quick",
             button_label="빠른 새로고침",
-            detail="현재 lane, pair, watcher 상태를 다시 읽습니다.",
+            detail="현재 lane, pair, Pair watcher 상태를 다시 읽습니다.",
             read_only=True,
         )
 
@@ -22920,10 +27796,10 @@ class RelayOperatorPanel(tk.Tk):
         watcher_recommendation = self._watcher_recommendation() if getattr(self, "watcher_controller", None) is not None else None
         if watcher_recommendation is not None and getattr(watcher_recommendation, "action_key", ""):
             return PrimaryActionRecommendation(
-                title=watcher_recommendation.label or "watch 권장 조치",
+                title=watcher_recommendation.label or "Pair watcher 권장 조치",
                 action_key="watcher_recommended_action",
-                button_label=watcher_recommendation.label or "watch 권장 조치",
-                detail=watcher_recommendation.detail or "현재 watcher 진단 기준 권장 조치입니다.",
+                button_label=watcher_recommendation.label or "Pair watcher 권장 조치",
+                detail=watcher_recommendation.detail or "현재 Pair watcher 진단 기준 권장 조치입니다.",
                 read_only=self._dashboard_action_is_read_only(getattr(watcher_recommendation, "action_key", "")),
             )
         if self.panel_state and self.panel_state.issues:
@@ -22964,7 +27840,7 @@ class RelayOperatorPanel(tk.Tk):
         self._sync_watcher_badge_aux_surfaces(watcher_badge_text or "상태 배지: 준비")
         self.home_execution_badge_var.set(model.badge_text or "문맥 확인")
         self.home_execution_summary_var.set(model.summary or "실행 문맥 정보를 읽는 중입니다.")
-        self.home_execution_detail_var.set(model.detail or "실행 Pair, RunRoot, watcher 상태를 여기서 확인합니다.")
+        self.home_execution_detail_var.set(model.detail or "실행 Pair, RunRoot, Pair watcher 상태를 여기서 확인합니다.")
         self.home_execution_warning_var.set(model.warning or " ")
         if self._has_ui_attr("home_execution_badge_label"):
             try:
@@ -23006,9 +27882,14 @@ class RelayOperatorPanel(tk.Tk):
         enabled = bool(action_key) and bool(recommendation.enabled) and (recommendation.read_only or not self._busy)
         button.configure(state="normal" if enabled else "disabled")
 
-    def _refresh_home_action_area(self) -> None:
-        current_preview = self._build_start_run_preview(START_MODE_CURRENT_RUN)
-        new_preview = self._build_start_run_preview(START_MODE_NEW_RUN)
+    def _refresh_home_action_area(
+        self,
+        *,
+        current_preview: StartRunPreview | None = None,
+        new_preview: StartRunPreview | None = None,
+    ) -> None:
+        current_preview = current_preview or self._build_start_run_preview(START_MODE_CURRENT_RUN)
+        new_preview = new_preview or self._build_start_run_preview(START_MODE_NEW_RUN)
         primary = self._build_home_primary_action_recommendation(
             current_preview=current_preview,
             new_preview=new_preview,
@@ -23112,7 +27993,10 @@ class RelayOperatorPanel(tk.Tk):
                     state="disabled" if self._busy or not stage.enabled else "normal",
                 )
 
-        self._refresh_home_action_area()
+        self._refresh_home_action_area(
+            current_preview=current_preview,
+            new_preview=new_preview,
+        )
         self._render_action_frame(self.home_next_actions_frame, self.panel_state.next_actions)
         self._render_issue_frame(self.home_issue_frame, self.panel_state.issues)
         self.render_home_pair_summaries()
@@ -23181,66 +28065,282 @@ class RelayOperatorPanel(tk.Tk):
         if self.artifact_target_filter_var.get().strip() and self.artifact_target_filter_var.get().strip() not in target_values:
             self.artifact_target_filter_var.set("")
 
-    def refresh_artifacts_tab(self, _event: object | None = None) -> None:
-        if self._artifact_home_browse_pair_scope_enabled():
-            self._sync_artifact_filters_with_home_pair_selection(refresh=False)
-        current_state = self._selected_artifact_state()
-        selected_target = current_state.target_id if current_state else ""
-        if not self.effective_data:
-            self.artifact_states = []
-            self.artifact_pair_summaries = []
-            for item in self.artifact_tree.get_children():
-                self.artifact_tree.delete(item)
-            self.artifact_status_base_text = "결과 / 산출물 데이터를 아직 읽지 못했습니다."
-            self.artifact_status_var.set(self.artifact_status_base_text)
-            self.set_text(self.artifact_summary_text, "")
-            self.set_text(self.artifact_details_text, "")
-            self._refresh_sticky_context_bar()
-            return
+    @staticmethod
+    def _artifact_row_cache_signature(rows: object, fields: tuple[str, ...]) -> tuple[tuple[str, ...], ...]:
+        if not isinstance(rows, list):
+            return ()
+        signature: list[tuple[str, ...]] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            signature.append(tuple(str(row.get(field, "") or "") for field in fields))
+        return tuple(signature)
 
-        query = self._artifact_query()
-        tab_state = self.artifact_controller.build_view_state(
-            effective_data=self.effective_data,
-            paired_status=self.paired_status_data,
-            query=query,
-            selected_target_id=selected_target,
-            watcher_status=self._watcher_status(),
-            paired_status_error=self.paired_status_error,
+    @staticmethod
+    def _artifact_pair_test_cache_signature(pair_test: object) -> tuple[str, ...]:
+        if not isinstance(pair_test, dict):
+            return ()
+        fields = (
+            "SummaryFileName",
+            "RequestFileName",
+            "DoneFileName",
+            "ErrorFileName",
+            "ReviewFolderName",
         )
-        self.artifact_pair_combo.configure(values=tab_state.pair_values)
-        self.artifact_target_combo.configure(values=tab_state.target_values)
-        self.artifact_states = tab_state.states
-        self.artifact_pair_summaries = tab_state.pair_summaries
+        return tuple(str(pair_test.get(field, "") or "") for field in fields)
 
-        for item in self.artifact_tree.get_children():
-            self.artifact_tree.delete(item)
-        for state in tab_state.states:
-            self.artifact_tree.insert(
-                "",
-                "end",
-                iid=state.target_id,
-                values=(
-                    state.pair_id,
-                    state.target_id,
-                    state.role_name,
-                    self.artifact_service.format_target_state_label(state),
-                    "예" if state.summary_present else "아니오",
-                    state.zip_count,
-                    "예" if state.error_present else "아니오",
-                    state.failure_count,
-                    state.latest_modified_at or "-",
+    def _artifact_view_state_cache_key(
+        self,
+        *,
+        query: ArtifactQuery,
+        selected_target_id: str,
+        watcher_status: str,
+    ) -> tuple[object, ...]:
+        effective = self.effective_data if isinstance(self.effective_data, dict) else {}
+        paired_status = self.paired_status_data if isinstance(self.paired_status_data, dict) else {}
+        effective_row_signature = self._artifact_row_cache_signature(
+            effective.get("PreviewRows", []),
+            (
+                "PairId",
+                "RoleName",
+                "TargetId",
+                "PartnerTargetId",
+                "PairTargetFolder",
+                "ReviewFolderPath",
+                "SummaryPath",
+                "RequestPath",
+                "DonePath",
+                "ErrorPath",
+                "ResultPath",
+            ),
+        )
+        paired_row_signature = self._artifact_row_cache_signature(
+            paired_status.get("Targets", []),
+            (
+                "PairId",
+                "RoleName",
+                "TargetId",
+                "PartnerTargetId",
+                "TargetFolder",
+                "LatestState",
+                "SummaryPresent",
+                "DonePresent",
+                "ErrorPresent",
+                "ZipCount",
+                "LatestZipName",
+                "FailureCount",
+                "SourceOutboxContractLatestState",
+                "ContractLatestState",
+                "SourceOutboxNextAction",
+                "NextAction",
+                "DispatchState",
+                "DispatchUpdatedAt",
+                "SeedSendState",
+                "SubmitState",
+                "SubmitReason",
+            ),
+        )
+        return (
+            id(getattr(self, "artifact_controller", None)),
+            id(effective) if effective else 0,
+            id(paired_status) if paired_status else 0,
+            self._artifact_pair_test_cache_signature(paired_status.get("PairTest", {})),
+            effective_row_signature,
+            paired_row_signature,
+            str(query.run_root or ""),
+            str(query.pair_id or ""),
+            str(query.target_id or ""),
+            bool(query.latest_only),
+            bool(query.include_missing),
+            str(selected_target_id or ""),
+            str(watcher_status or ""),
+            str(self.paired_status_error or ""),
+        )
+
+    def _cached_artifact_view_state(self, cache_key: tuple[object, ...]) -> object | None:
+        cache = self.__dict__.get("_artifact_view_state_cache")
+        if not isinstance(cache, dict):
+            return None
+        entries = cache.get("entries")
+        if not isinstance(entries, dict):
+            return None
+        entry = entries.get(cache_key)
+        if not isinstance(entry, tuple) or len(entry) != 2:
+            return None
+        cached_at, tab_state = entry
+        try:
+            age_seconds = time.monotonic() - float(cached_at)
+        except (TypeError, ValueError):
+            return None
+        if age_seconds > ARTIFACT_VIEW_STATE_CACHE_TTL_SECONDS:
+            return None
+        return deepcopy(tab_state)
+
+    def _store_artifact_view_state_cache(self, cache_key: tuple[object, ...], tab_state: object) -> None:
+        now = time.monotonic()
+        cache = self.__dict__.get("_artifact_view_state_cache")
+        existing_entries = cache.get("entries") if isinstance(cache, dict) else {}
+        entries: dict[tuple[object, ...], tuple[float, object]] = {}
+        if isinstance(existing_entries, dict):
+            for key, entry in existing_entries.items():
+                if not isinstance(key, tuple) or not isinstance(entry, tuple) or len(entry) != 2:
+                    continue
+                cached_at, cached_state = entry
+                try:
+                    if (now - float(cached_at)) <= ARTIFACT_VIEW_STATE_CACHE_TTL_SECONDS:
+                        entries[key] = (float(cached_at), cached_state)
+                except (TypeError, ValueError):
+                    continue
+        entries[cache_key] = (now, deepcopy(tab_state))
+        self.__dict__["_artifact_view_state_cache"] = {"entries": entries}
+
+    def _clear_artifact_view_state_cache(self) -> None:
+        self.__dict__.pop("_artifact_view_state_cache", None)
+
+    def refresh_artifacts_tab(self, _event: object | None = None) -> None:
+        started_at = time.monotonic()
+        steps: list[dict[str, object]] = []
+        try:
+            self.__dict__["artifact_refresh_pending"] = False
+            if self._artifact_home_browse_pair_scope_enabled():
+                self._run_timed_refresh_step(
+                    steps,
+                    "home filter sync",
+                    lambda: self._sync_artifact_filters_with_home_pair_selection(refresh=False),
+                )
+            current_state = self._run_timed_refresh_step(steps, "selection resolve", self._selected_artifact_state)
+            selected_target = current_state.target_id if current_state else ""
+            if not self.effective_data:
+                def render_empty_state() -> None:
+                    self._clear_artifact_view_state_cache()
+                    self.artifact_states = []
+                    self.artifact_pair_summaries = []
+                    for item in self.artifact_tree.get_children():
+                        self.artifact_tree.delete(item)
+                    self.artifact_status_base_text = "결과 / 산출물 데이터를 아직 읽지 못했습니다."
+                    self.artifact_status_var.set(self.artifact_status_base_text)
+                    self.set_text(self.artifact_summary_text, "")
+                    self.set_text(self.artifact_details_text, "")
+                    self._refresh_sticky_context_bar()
+
+                self._run_timed_refresh_step(steps, "empty state render", render_empty_state)
+                self._record_refresh_timing(
+                    label="artifact tab refresh",
+                    started_at=started_at,
+                    steps=steps,
+                )
+                return
+
+            query = self._run_timed_refresh_step(steps, "artifact query build", self._artifact_query)
+            watcher_status = self._run_timed_refresh_step(steps, "watcher status read", self._watcher_status)
+            cache_key = self._run_timed_refresh_step(
+                steps,
+                "view state cache key",
+                lambda: self._artifact_view_state_cache_key(
+                    query=query,
+                    selected_target_id=selected_target,
+                    watcher_status=watcher_status,
                 ),
             )
-        self.artifact_status_base_text = tab_state.status_base_text
-        self._apply_artifact_status_text(base_text=self.artifact_status_base_text, preview=tab_state.preview)
+            tab_state = self._run_timed_refresh_step(
+                steps,
+                "view state cache lookup",
+                lambda: self._cached_artifact_view_state(cache_key),
+            )
+            if tab_state is None:
+                tab_state = self._run_timed_refresh_step(
+                    steps,
+                    "view state build",
+                    lambda: self.artifact_controller.build_view_state(
+                        effective_data=self.effective_data,
+                        paired_status=self.paired_status_data,
+                        query=query,
+                        selected_target_id=selected_target,
+                        watcher_status=watcher_status,
+                        paired_status_error=self.paired_status_error,
+                    ),
+                )
 
-        if tab_state.selected_target_id and tab_state.selected_target_id in self.artifact_tree.get_children():
-            self.artifact_tree.selection_set(tab_state.selected_target_id)
-        elif self.artifact_tree.get_children():
-            self.artifact_tree.selection_set(self.artifact_tree.get_children()[0])
+                def store_cache() -> None:
+                    self._store_artifact_view_state_cache(cache_key, tab_state)
+                    resolved_target = str(getattr(tab_state, "selected_target_id", "") or "")
+                    if resolved_target and resolved_target != selected_target:
+                        resolved_cache_key = self._artifact_view_state_cache_key(
+                            query=query,
+                            selected_target_id=resolved_target,
+                            watcher_status=watcher_status,
+                        )
+                        self._store_artifact_view_state_cache(resolved_cache_key, tab_state)
 
-        self.on_artifact_row_selected()
-        self._refresh_sticky_context_bar()
+                self._run_timed_refresh_step(steps, "view state cache store", store_cache)
+            else:
+                steps.append(
+                    {
+                        "label": "view state cache hit",
+                        "elapsed_seconds": 0.0,
+                        "elapsed_text": self._format_task_elapsed_seconds(0.0),
+                    }
+                )
+
+            def apply_models() -> None:
+                self.artifact_pair_combo.configure(values=tab_state.pair_values)
+                self.artifact_target_combo.configure(values=tab_state.target_values)
+                self.artifact_states = tab_state.states
+                self.artifact_pair_summaries = tab_state.pair_summaries
+
+            self._run_timed_refresh_step(steps, "artifact models apply", apply_models)
+
+            def render_tree() -> None:
+                for item in self.artifact_tree.get_children():
+                    self.artifact_tree.delete(item)
+                for state in tab_state.states:
+                    self.artifact_tree.insert(
+                        "",
+                        "end",
+                        iid=state.target_id,
+                        values=(
+                            state.pair_id,
+                            state.target_id,
+                            state.role_name,
+                            self.artifact_service.format_target_state_label(state),
+                            "예" if state.summary_present else "아니오",
+                            state.zip_count,
+                            "예" if state.error_present else "아니오",
+                            state.failure_count,
+                            state.latest_modified_at or "-",
+                        ),
+                    )
+
+            self._run_timed_refresh_step(steps, "artifact tree render", render_tree)
+
+            def render_status() -> None:
+                self.artifact_status_base_text = tab_state.status_base_text
+                self._apply_artifact_status_text(base_text=self.artifact_status_base_text, preview=tab_state.preview)
+
+            self._run_timed_refresh_step(steps, "artifact status render", render_status)
+
+            def sync_selection() -> None:
+                if tab_state.selected_target_id and tab_state.selected_target_id in self.artifact_tree.get_children():
+                    self.artifact_tree.selection_set(tab_state.selected_target_id)
+                elif self.artifact_tree.get_children():
+                    self.artifact_tree.selection_set(self.artifact_tree.get_children()[0])
+
+            self._run_timed_refresh_step(steps, "artifact selection sync", sync_selection)
+            self._run_timed_refresh_step(steps, "artifact details render", self.on_artifact_row_selected)
+            self._run_timed_refresh_step(steps, "sticky context refresh", self._refresh_sticky_context_bar)
+        except Exception:
+            self._record_refresh_timing(
+                label="artifact tab refresh",
+                started_at=started_at,
+                steps=steps,
+                outcome="실패",
+            )
+            raise
+        self._record_refresh_timing(
+            label="artifact tab refresh",
+            started_at=started_at,
+            steps=steps,
+        )
 
     def on_artifact_row_selected(self, _event: object | None = None) -> None:
         state = self._selected_artifact_state()
@@ -23404,6 +28504,195 @@ class RelayOperatorPanel(tk.Tk):
 
     def _artifact_last_sources(self, target_id: str) -> dict[str, str]:
         return dict(self.artifact_last_sources_by_target.get(str(target_id or "").strip(), {}) or {})
+
+    @staticmethod
+    def _target_autoloop_parse_extend_cycles_value(value: object) -> tuple[int, str]:
+        raw_value = str(value or "").strip()
+        if not raw_value:
+            return 0, "추가 횟수를 입력하세요."
+        try:
+            additional_cycles = int(raw_value)
+        except (TypeError, ValueError):
+            return 0, f"추가 횟수는 정수여야 합니다: {raw_value}"
+        if additional_cycles < 1:
+            return 0, "추가 횟수는 1 이상이어야 합니다."
+        if additional_cycles > 1000:
+            return 0, "추가 횟수는 1000 이하로 입력하세요."
+        return additional_cycles, ""
+
+    def _target_autoloop_extend_preferences_file_path(self) -> Path:
+        raw_value = self.__dict__.get(
+            "target_autoloop_extend_preferences_path",
+            SNAPSHOT_DIR / "target-autoloop-extend-preferences.json",
+        )
+        try:
+            return Path(raw_value)
+        except Exception:
+            return SNAPSHOT_DIR / "target-autoloop-extend-preferences.json"
+
+    def _load_target_autoloop_extend_preferences(self) -> None:
+        self.__dict__["target_autoloop_extend_preferences_warning"] = ""
+        preferences_path = self._target_autoloop_extend_preferences_file_path()
+        try:
+            if not preferences_path.exists():
+                return
+            raw = preferences_path.read_text(encoding="utf-8")
+        except OSError as exc:
+            self.__dict__["target_autoloop_extend_preferences_warning"] = f"extend-preferences read failed: {exc}"
+            return
+        if not raw.strip():
+            return
+        try:
+            payload = json.loads(raw)
+        except Exception as exc:
+            self.__dict__["target_autoloop_extend_preferences_warning"] = (
+                f"extend-preferences parse failed; defaults kept ({preferences_path.name}): {exc}"
+            )
+            return
+        if not isinstance(payload, dict):
+            self.__dict__["target_autoloop_extend_preferences_warning"] = (
+                f"extend-preferences payload is not an object; defaults kept ({preferences_path.name})"
+            )
+            return
+        schema_version = payload.get("SchemaVersion", None)
+        if schema_version not in (None, TARGET_AUTOLOOP_EXTEND_PREFERENCES_SCHEMA_VERSION):
+            self.__dict__["target_autoloop_extend_preferences_warning"] = (
+                "extend-preferences schema version is unsupported; defaults kept "
+                f"({preferences_path.name}, version={schema_version})"
+            )
+            return
+        additional_cycles, detail = self._target_autoloop_parse_extend_cycles_value(
+            payload.get("AdditionalCycles", payload.get("LastAdditionalCycles", ""))
+        )
+        if detail:
+            self.__dict__["target_autoloop_extend_preferences_warning"] = (
+                f"extend-preferences AdditionalCycles ignored ({preferences_path.name}): {detail}"
+            )
+            return
+        value_var = self.__dict__.get("target_autoloop_extend_cycles_var")
+        if value_var is not None and hasattr(value_var, "set"):
+            value_var.set(str(additional_cycles))
+        card_vars = self.__dict__.get("target_autoloop_policy_card_vars", {}) or {}
+        if isinstance(card_vars, dict):
+            for store in card_vars.values():
+                if not isinstance(store, dict):
+                    continue
+                card_value_var = store.get("extend_cycles_var")
+                if card_value_var is not None and hasattr(card_value_var, "set"):
+                    card_value_var.set(str(additional_cycles))
+
+    def _save_target_autoloop_extend_preferences(self, additional_cycles: int) -> None:
+        additional_cycles, detail = self._target_autoloop_parse_extend_cycles_value(additional_cycles)
+        if detail:
+            self.__dict__["target_autoloop_extend_preferences_warning"] = f"extend-preferences save skipped: {detail}"
+            return
+        preferences_path = self._target_autoloop_extend_preferences_file_path()
+        temp_path: Path | None = None
+        try:
+            preferences_path.parent.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "SchemaVersion": TARGET_AUTOLOOP_EXTEND_PREFERENCES_SCHEMA_VERSION,
+                "SavedAt": datetime.now().isoformat(timespec="seconds"),
+                "AdditionalCycles": additional_cycles,
+            }
+            temp_path = preferences_path.with_name(
+                preferences_path.name + f".{os.getpid()}.{threading.get_ident()}.tmp"
+            )
+            temp_path.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            os.replace(temp_path, preferences_path)
+            self.__dict__["target_autoloop_extend_preferences_warning"] = ""
+        except Exception as exc:
+            self.__dict__["target_autoloop_extend_preferences_warning"] = f"extend-preferences save failed: {exc}"
+        finally:
+            if temp_path is not None and temp_path.exists():
+                try:
+                    temp_path.unlink()
+                except OSError:
+                    pass
+
+    def _target_autoloop_card_view_preferences_file_path(self) -> Path:
+        raw_value = self.__dict__.get(
+            "target_autoloop_card_view_preferences_path",
+            SNAPSHOT_DIR / "target-autoloop-card-view-preferences.json",
+        )
+        try:
+            return Path(raw_value)
+        except Exception:
+            return SNAPSHOT_DIR / "target-autoloop-card-view-preferences.json"
+
+    def _load_target_autoloop_card_view_preferences(self) -> None:
+        self.__dict__["target_autoloop_card_view_preferences_warning"] = ""
+        preferences_path = self._target_autoloop_card_view_preferences_file_path()
+        try:
+            if not preferences_path.exists():
+                return
+            raw = preferences_path.read_text(encoding="utf-8")
+        except OSError as exc:
+            self.__dict__["target_autoloop_card_view_preferences_warning"] = f"card-view-preferences read failed: {exc}"
+            return
+        if not raw.strip():
+            return
+        try:
+            payload = json.loads(raw)
+        except Exception as exc:
+            self.__dict__["target_autoloop_card_view_preferences_warning"] = (
+                f"card-view-preferences parse failed; defaults kept ({preferences_path.name}): {exc}"
+            )
+            return
+        if not isinstance(payload, dict):
+            self.__dict__["target_autoloop_card_view_preferences_warning"] = (
+                f"card-view-preferences payload is not an object; defaults kept ({preferences_path.name})"
+            )
+            return
+        schema_version = payload.get("SchemaVersion", None)
+        if schema_version not in (None, TARGET_AUTOLOOP_CARD_VIEW_PREFERENCES_SCHEMA_VERSION):
+            self.__dict__["target_autoloop_card_view_preferences_warning"] = (
+                "card-view-preferences schema version is unsupported; defaults kept "
+                f"({preferences_path.name}, version={schema_version})"
+            )
+            return
+        detail_visible = bool(payload.get("CardDetailVisible", False))
+        visible_var = self.__dict__.get("target_autoloop_policy_card_detail_visible_var")
+        if visible_var is not None and hasattr(visible_var, "set"):
+            visible_var.set(detail_visible)
+
+    def _save_target_autoloop_card_view_preferences(self) -> None:
+        visible_var = self.__dict__.get("target_autoloop_policy_card_detail_visible_var")
+        detail_visible = False
+        if visible_var is not None and hasattr(visible_var, "get"):
+            try:
+                detail_visible = bool(visible_var.get())
+            except Exception:
+                detail_visible = False
+        preferences_path = self._target_autoloop_card_view_preferences_file_path()
+        temp_path: Path | None = None
+        try:
+            preferences_path.parent.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "SchemaVersion": TARGET_AUTOLOOP_CARD_VIEW_PREFERENCES_SCHEMA_VERSION,
+                "SavedAt": datetime.now().isoformat(timespec="seconds"),
+                "CardDetailVisible": detail_visible,
+            }
+            temp_path = preferences_path.with_name(
+                preferences_path.name + f".{os.getpid()}.{threading.get_ident()}.tmp"
+            )
+            temp_path.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            os.replace(temp_path, preferences_path)
+            self.__dict__["target_autoloop_card_view_preferences_warning"] = ""
+        except Exception as exc:
+            self.__dict__["target_autoloop_card_view_preferences_warning"] = f"card-view-preferences save failed: {exc}"
+        finally:
+            if temp_path is not None and temp_path.exists():
+                try:
+                    temp_path.unlink()
+                except OSError:
+                    pass
 
     def _load_artifact_source_memory(self) -> None:
         self.artifact_source_memory_warning = ""
@@ -24414,7 +29703,7 @@ class RelayOperatorPanel(tk.Tk):
                     self.output_text,
                     "\n".join(header_lines) + "\n\n" + preflight_text + "\n\nJSON\n" + json.dumps(payload, ensure_ascii=False, indent=2),
                 )
-                self.refresh_paired_status_only()
+                self.refresh_paired_status_background(label="artifact submit 후 paired status 갱신")
                 self.on_artifact_row_selected()
             finally:
                 self._finish_submit_action(context.state.target_id)
@@ -24488,24 +29777,69 @@ class RelayOperatorPanel(tk.Tk):
             ),
         )
 
-    def rebuild_panel_state(self) -> None:
+    def rebuild_panel_state(self, *, timing_steps: list[dict[str, object]] | None = None) -> None:
         if not self.effective_data or not self.relay_status_data or not self.visibility_status_data:
             return
         effective_data = dict(self.effective_data)
-        effective_data["PanelRuntimeHints"] = self._panel_runtime_hints()
-        bundle = DashboardRawBundle(
-            effective_data=effective_data,
-            relay_status=self.relay_status_data,
-            visibility_status=self.visibility_status_data,
-            paired_status=self.paired_status_data,
-            paired_status_error=self.paired_status_error,
+        runtime_hints = self._run_refresh_ui_step(timing_steps, "runtime hints", self._panel_runtime_hints)
+        effective_data["PanelRuntimeHints"] = runtime_hints
+
+        def build_bundle() -> DashboardRawBundle:
+            return DashboardRawBundle(
+                effective_data=effective_data,
+                relay_status=self.relay_status_data,
+                visibility_status=self.visibility_status_data,
+                paired_status=self.paired_status_data,
+                paired_status_error=self.paired_status_error,
+            )
+
+        bundle = self._run_refresh_ui_step(timing_steps, "bundle compose", build_bundle)
+        selected_pair = self._run_refresh_ui_step(timing_steps, "selected pair resolve", self._selected_pair_id)
+
+        aggregator_timing_steps: list[dict[str, object]] | None = [] if timing_steps is not None else None
+
+        def build_aggregated_state():
+            if aggregator_timing_steps is None:
+                return self.dashboard_aggregator.build_panel_state(
+                    bundle=bundle,
+                    selected_pair=selected_pair,
+                )
+            try:
+                return self.dashboard_aggregator.build_panel_state(
+                    bundle=bundle,
+                    selected_pair=selected_pair,
+                    timing_steps=aggregator_timing_steps,
+                )
+            except TypeError as exc:
+                if "timing_steps" not in str(exc):
+                    raise
+                if aggregator_timing_steps is not None:
+                    aggregator_timing_steps.clear()
+                return self.dashboard_aggregator.build_panel_state(
+                    bundle=bundle,
+                    selected_pair=selected_pair,
+                )
+
+        self.panel_state = self._run_refresh_ui_step(
+            timing_steps,
+            "aggregator build",
+            build_aggregated_state,
         )
-        self.panel_state = self.dashboard_aggregator.build_panel_state(
-            bundle=bundle,
-            selected_pair=self._selected_pair_id(),
-        )
-        self.render_home_dashboard()
-        self._refresh_sticky_context_bar()
+        if timing_steps is not None:
+            self._append_refresh_timing_steps(timing_steps, aggregator_timing_steps, prefix="aggregator: ")
+        if self.__dict__.get("_defer_home_dashboard_render_until_idle", False):
+            self.__dict__["_home_dashboard_render_deferred_until_idle"] = True
+            if timing_steps is not None:
+                timing_steps.append(
+                    {
+                        "label": "home dashboard render deferred",
+                        "elapsed_seconds": 0.0,
+                        "elapsed_text": self._format_task_elapsed_seconds(0.0),
+                    }
+                )
+        else:
+            self._run_refresh_ui_step(timing_steps, "home dashboard render", self.render_home_dashboard)
+        self._run_refresh_ui_step(timing_steps, "sticky context refresh", self._refresh_sticky_context_bar)
 
     def run_script(
         self,
@@ -24568,6 +29902,7 @@ class RelayOperatorPanel(tk.Tk):
         bundle,
         *,
         auto_pair_policy_preview: bool,
+        timing_steps: list[dict[str, object]] | None = None,
     ) -> None:
         prior_override_state = self._run_root_override_state()
         effective_payload = bundle.effective_data
@@ -24577,59 +29912,109 @@ class RelayOperatorPanel(tk.Tk):
         paired_error = bundle.paired_status_error
         selected_run_root = effective_payload.get("RunContext", {}).get("SelectedRunRoot", "") or ""
 
-        self.effective_data = effective_payload
-        self.relay_status_data = relay_payload
-        self.visibility_status_data = visibility_payload
-        self.paired_status_data = paired_payload
-        self.paired_status_error = paired_error
-        self.preview_rows = list(effective_payload.get("PreviewRows", []))
-        self._clear_start_run_preview_cache()
-        self._clear_pair_policy_route_snapshot_cache()
-        self._clear_message_editor_saved_preview_seed_payload()
-        self._prime_pair_policy_route_snapshot_cache_from_effective_payload(effective_payload)
-        self._prime_message_editor_saved_preview_seed_payload(effective_payload)
+        def apply_payload() -> None:
+            self.effective_data = effective_payload
+            self.relay_status_data = relay_payload
+            self.visibility_status_data = visibility_payload
+            self.paired_status_data = paired_payload
+            self.paired_status_error = paired_error
+            self.preview_rows = list(effective_payload.get("PreviewRows", []))
+            self._clear_start_run_preview_cache()
+            self._clear_pair_policy_route_snapshot_cache()
+            self._clear_message_editor_saved_preview_seed_payload()
+            self._prime_pair_policy_route_snapshot_cache_from_effective_payload(effective_payload)
+            self._prime_message_editor_saved_preview_seed_payload(effective_payload)
 
-        if prior_override_state != "override-active":
-            run_root_source = effective_payload.get("RunContext", {}).get("SelectedRunRootSource", "") or ""
-            if selected_run_root and run_root_source != "next-preview":
-                self.run_root_var.set(selected_run_root)
-            else:
-                self.run_root_var.set("")
-        self._update_run_root_controls()
+        def update_run_root_controls() -> None:
+            if prior_override_state != "override-active":
+                run_root_source = effective_payload.get("RunContext", {}).get("SelectedRunRootSource", "") or ""
+                if selected_run_root and run_root_source != "next-preview":
+                    self.run_root_var.set(selected_run_root)
+                else:
+                    self.run_root_var.set("")
+            self._update_run_root_controls()
 
-        self.render_summary(effective_payload)
-        self.render_rows(self.preview_rows)
-        self.__dict__["_pair_policy_refresh_auto_preview"] = bool(auto_pair_policy_preview)
-        self._schedule_settings_preview_refresh(auto_pair_policy_preview=auto_pair_policy_preview)
-        self.refresh_target_autoloop_status_panel()
-        self._coerce_selected_pair_into_runtime_scope()
-        self._sync_message_scope_id_from_context()
-        self._apply_watcher_start_defaults_if_pristine()
-        self._refresh_watcher_notes()
-        self.render_target_board()
-        self.rebuild_panel_state()
-        self.refresh_artifacts_tab()
+        def schedule_settings_preview() -> None:
+            self.__dict__["_pair_policy_refresh_auto_preview"] = bool(auto_pair_policy_preview)
+            self._schedule_settings_preview_refresh(auto_pair_policy_preview=auto_pair_policy_preview)
 
-        selected_target = self._selected_inspection_target_id() or self.target_id_var.get().strip()
-        selected_pair = self._selected_inspection_pair_id() or self._selected_pair_id()
-        if self.preview_rows and not self._sync_preview_selection_with_pair(selected_pair, target_id=selected_target):
-            first = self.row_tree.get_children()[0]
-            self.row_tree.selection_set(first)
-            self.on_row_selected()
-        elif not self.preview_rows:
-            self._set_inspection_context(source="")
-            self.clear_details()
+        def sync_context_state() -> None:
+            self._coerce_selected_pair_into_runtime_scope()
+            self._sync_message_scope_id_from_context()
+            self._apply_watcher_start_defaults_if_pristine()
+            self._refresh_watcher_notes()
 
-        self.refresh_snapshot_list()
-        self.update_pair_button_states()
-        result_text = "마지막 결과: 전체 새로고침 완료"
-        if paired_error:
-            result_text += " / pair-status 일부 생략"
-        self.set_operator_status("전체 상태 불러옴", "홈 탭에서 준비 단계와 pair 요약을 바로 확인할 수 있습니다.", result_text)
+        def sync_selection() -> None:
+            selected_target = self._selected_inspection_target_id() or self.target_id_var.get().strip()
+            selected_pair = self._selected_inspection_pair_id() or self._selected_pair_id()
+            if self.preview_rows and not self._sync_preview_selection_with_pair(selected_pair, target_id=selected_target):
+                first = self.row_tree.get_children()[0]
+                self.row_tree.selection_set(first)
+                self.on_row_selected()
+            elif not self.preview_rows:
+                self._set_inspection_context(source="")
+                self.clear_details()
 
-    def load_effective_config(self, *, auto_pair_policy_preview: bool = True) -> None:
-        try:
-            bundle = self.refresh_controller.refresh_full(self._effective_refresh_context())
+        def update_operator_status() -> None:
+            result_text = "마지막 결과: 전체 새로고침 완료"
+            if paired_error:
+                result_text += " / pair-status 일부 생략"
+            self.set_operator_status("전체 상태 불러옴", "홈 탭에서 준비 단계와 pair 요약을 바로 확인할 수 있습니다.", result_text)
+
+        self._run_refresh_ui_step(timing_steps, "dashboard payload 반영", apply_payload)
+        self._run_refresh_ui_step(timing_steps, "runroot controls update", update_run_root_controls)
+        self._run_refresh_ui_step(timing_steps, "summary render", lambda: self.render_summary(effective_payload))
+        self._run_refresh_ui_step(timing_steps, "rows render", lambda: self.render_rows(self.preview_rows))
+        self._run_refresh_ui_step(timing_steps, "settings preview schedule", schedule_settings_preview)
+        self._run_refresh_ui_step(
+            timing_steps,
+            "autoloop status refresh/pending",
+            self._refresh_target_autoloop_status_if_visible_or_mark_pending,
+        )
+        self._run_refresh_ui_step(timing_steps, "context sync", sync_context_state)
+        target_board_steps: list[dict[str, object]] = []
+        self._run_refresh_ui_step(
+            timing_steps,
+            "target board render",
+            lambda: self._render_target_board_with_optional_timing(target_board_steps, update_buttons=False),
+        )
+        if timing_steps is not None:
+            self._append_refresh_timing_steps(timing_steps, target_board_steps, prefix="board: ")
+        panel_state_steps: list[dict[str, object]] = []
+        self._run_refresh_ui_step(
+            timing_steps,
+            "panel state rebuild",
+            lambda: self._rebuild_panel_state_with_optional_timing(panel_state_steps),
+        )
+        if timing_steps is not None:
+            self._append_refresh_timing_steps(timing_steps, panel_state_steps, prefix="panel: ")
+        self._run_refresh_ui_step(timing_steps, "artifact refresh/pending", self._refresh_artifacts_if_visible_or_mark_pending)
+        self._run_refresh_ui_step(timing_steps, "selection sync", sync_selection)
+        self._run_refresh_ui_step(timing_steps, "snapshot list refresh", self.refresh_snapshot_list)
+        self._run_refresh_ui_step(timing_steps, "button state update", self.update_pair_button_states)
+        self._run_refresh_ui_step(timing_steps, "operator status update", update_operator_status)
+
+    def _collect_dashboard_refresh_bundle(
+        self,
+        context: AppContext,
+        steps: list[dict[str, object]],
+        *,
+        report_progress: bool = False,
+    ) -> DashboardRawBundle:
+        if report_progress:
+            self._post_background_progress("전체 새로고침 중", "1/3 전체 상태 수집 중")
+        bundle = self._run_timed_refresh_step(
+            steps,
+            "전체 상태 수집",
+            lambda: self.refresh_controller.refresh_full(context),
+        )
+        self._append_refresh_timing_steps(
+            steps,
+            getattr(bundle, "refresh_timing_steps", []),
+            prefix="수집: ",
+        )
+
+        def enrich_bundle() -> DashboardRawBundle:
             effective_payload = dict(bundle.effective_data or {})
             effective_payload["PanelPairRouteSummaryPayloads"] = self._effective_payload_pair_route_summary_payloads(
                 effective_payload
@@ -24638,13 +30023,115 @@ class RelayOperatorPanel(tk.Tk):
                 effective_payload
             )
             bundle.effective_data = effective_payload
+            return bundle
+
+        if report_progress:
+            self._post_background_progress("전체 새로고침 중", "2/3 payload 보강 중")
+        return self._run_timed_refresh_step(steps, "payload 보강", enrich_bundle)
+
+    def refresh_full_dashboard_status(self, *, auto_pair_policy_preview: bool = True) -> None:
+        if self.__dict__.get("refresh_controller") is None:
+            self.load_effective_config(auto_pair_policy_preview=auto_pair_policy_preview)
+            return
+
+        started_at = time.monotonic()
+        steps: list[dict[str, object]] = []
+        try:
+            context = self._run_timed_refresh_step(steps, "문맥 계산", self._effective_refresh_context)
         except Exception as exc:
+            self._record_refresh_timing(
+                label="전체 새로고침",
+                started_at=started_at,
+                steps=steps,
+                outcome="실패",
+            )
             messagebox.showerror("불러오기 실패", str(exc))
             self.set_operator_status("불러오기 실패", "상태 JSON 수집에 실패했습니다.", f"마지막 결과: 실패 ({exc})")
             return
-        self._apply_dashboard_refresh_bundle(
-            bundle,
-            auto_pair_policy_preview=auto_pair_policy_preview,
+
+        def worker() -> DashboardRawBundle:
+            return self._collect_dashboard_refresh_bundle(
+                context,
+                steps,
+                report_progress=True,
+            )
+
+        def on_success(bundle: DashboardRawBundle):
+            self._set_background_task_step("전체 새로고침 중", "3/3 UI 적용 중")
+            ui_steps: list[dict[str, object]] = []
+            self._run_timed_refresh_step(
+                steps,
+                "UI 적용",
+                lambda: self._apply_dashboard_refresh_bundle(
+                    bundle,
+                    auto_pair_policy_preview=auto_pair_policy_preview,
+                    timing_steps=ui_steps,
+                ),
+            )
+            self._append_refresh_timing_steps(steps, ui_steps, prefix="UI: ")
+            return lambda: self._record_refresh_timing(
+                label="전체 새로고침",
+                started_at=started_at,
+                steps=steps,
+            )
+
+        def on_failure(exc: Exception) -> str:
+            self._record_refresh_timing(
+                label="전체 새로고침",
+                started_at=started_at,
+                steps=steps,
+                outcome="실패",
+            )
+            messagebox.showerror("불러오기 실패", str(exc))
+            return self._format_background_exception(exc)
+
+        self.run_background_task(
+            state="전체 새로고침 중",
+            hint="effective config, runtime, visibility, paired 상태를 백그라운드에서 수집 중입니다.",
+            worker=worker,
+            on_success=on_success,
+            success_state="전체 상태 불러옴",
+            success_hint="홈 탭에서 준비 단계와 pair 요약을 바로 확인할 수 있습니다.",
+            failure_state="불러오기 실패",
+            failure_hint="상태 JSON 수집에 실패했습니다.",
+            on_failure=on_failure,
+        )
+
+    def load_effective_config(self, *, auto_pair_policy_preview: bool = True) -> None:
+        started_at = time.monotonic()
+        steps: list[dict[str, object]] = []
+        try:
+            context = self._run_timed_refresh_step(steps, "문맥 계산", self._effective_refresh_context)
+            bundle = self._collect_dashboard_refresh_bundle(
+                context,
+                steps,
+                report_progress=False,
+            )
+            ui_steps: list[dict[str, object]] = []
+            self._run_timed_refresh_step(
+                steps,
+                "UI 적용",
+                lambda: self._apply_dashboard_refresh_bundle(
+                    bundle,
+                    auto_pair_policy_preview=auto_pair_policy_preview,
+                    timing_steps=ui_steps,
+                ),
+            )
+            self._append_refresh_timing_steps(steps, ui_steps, prefix="UI: ")
+        except Exception as exc:
+            self._record_refresh_timing(
+                label="전체 새로고침",
+                started_at=started_at,
+                steps=steps,
+                outcome="실패",
+            )
+            messagebox.showerror("불러오기 실패", str(exc))
+            self.set_operator_status("불러오기 실패", "상태 JSON 수집에 실패했습니다.", f"마지막 결과: 실패 ({exc})")
+            return
+        self._record_refresh_timing(
+            label="전체 새로고침",
+            started_at=started_at,
+            steps=steps,
         )
 
     def render_summary(self, payload: dict) -> None:
@@ -25269,8 +30756,11 @@ class RelayOperatorPanel(tk.Tk):
             self._copy_to_clipboard(command_text)
 
     def focus_ready_to_forward_artifact(self) -> None:
-        self.refresh_artifacts_tab()
-        target_state = next((item for item in self.artifact_states if self.artifact_service.is_handoff_ready(item)), None)
+        artifact_states = list(self.__dict__.get("artifact_states", []) or [])
+        if self.__dict__.get("artifact_refresh_pending", False) or not artifact_states:
+            self.refresh_artifacts_tab()
+            artifact_states = list(self.__dict__.get("artifact_states", []) or [])
+        target_state = next((item for item in artifact_states if self.artifact_service.is_handoff_ready(item)), None)
         if target_state is None:
             messagebox.showinfo("전달 가능 target 없음", "현재 결과 탭에서 다음 전달 가능 target을 찾지 못했습니다.")
             return
@@ -25340,7 +30830,7 @@ class RelayOperatorPanel(tk.Tk):
                 lines.extend(["[wrapper audit 분리]", audit_archive_notice, ""])
             lines.extend(["[8창 열기 / wrapper]", output])
             self.set_text(self.output_text, "\n".join(lines).strip())
-            self.load_effective_config()
+            self._refresh_after_window_launch()
 
         self.run_background_task(
             state="8창 기동 중",
@@ -25372,7 +30862,10 @@ class RelayOperatorPanel(tk.Tk):
         )
 
         def worker() -> tuple[subprocess.CompletedProcess[str], object]:
+            self._post_background_progress("바인딩 attach 중", "1/2 attach 재실행 중")
             completed = self.command_service.run(command)
+            self._post_background_progress("바인딩 attach 중", "2/2 visibility 확인 중")
+            self._invalidate_visibility_status_cache()
             runtime_result = self.refresh_controller.refresh_runtime(current_context)
             return completed, runtime_result
 
@@ -25403,7 +30896,6 @@ class RelayOperatorPanel(tk.Tk):
                     ).replace("마지막 결과: ", "", 1)
                 )
             )
-            self.load_effective_config()
 
         self.run_background_task(
             state="바인딩 attach 중",
@@ -25448,6 +30940,7 @@ class RelayOperatorPanel(tk.Tk):
                     config_path=config_path,
                     reuse_anchor_utc=reuse_anchor_utc,
                     pairs_mode=pairs_mode,
+                    progress=lambda message: self._post_background_progress(state_label, message),
                 )
             )
 
@@ -25468,7 +30961,6 @@ class RelayOperatorPanel(tk.Tk):
                     operation_label=operation_label,
                 ),
             )
-            self.load_effective_config()
             self.last_result_var.set("마지막 결과: {0}".format(success_label))
             return self._reuse_windows_follow_up_after_success(pairs_mode=pairs_mode)
 
@@ -25544,13 +31036,14 @@ class RelayOperatorPanel(tk.Tk):
                     requested_run_root=requested_run_root,
                     summary_fallback_run_root=current_context.run_root,
                     prepare_config_path=prepare_config_path,
+                    progress=lambda message: self._post_background_progress("RunRoot 준비 중", message),
                 )
             )
 
         def on_success(result) -> None:
             prepared_run_root = result.prepared_run_root
             if prepared_run_root:
-                self.run_root_var.set(prepared_run_root)
+                self._apply_prepared_run_root_context(prepared_run_root, source="runroot-prepare")
             summary_text = result.summary_text
             auto_prepare_text = self._run_root_prepare_reason_text(auto_prepare_reason)
             self.set_text(
@@ -25567,7 +31060,6 @@ class RelayOperatorPanel(tk.Tk):
                     + (f"\n\n{summary_text}" if summary_text else "")
                 ),
             )
-            self.load_effective_config()
             last_result = self._run_root_prepare_last_result(
                 ignored_run_root=ignored_run_root,
                 prepared_run_root=prepared_run_root,
@@ -25644,6 +31136,7 @@ class RelayOperatorPanel(tk.Tk):
                 wrapper_path=wrapper_path,
                 launch_windows_needed=launch_windows_needed,
                 attach_windows_needed=attach_windows_needed,
+                progress=lambda message: self._post_background_progress("창/Attach/입력/RunRoot 준비 중", message),
             )
             if launch_windows_needed and wrapper_path:
                 return self._run_with_panel_window_launch_arm(
@@ -25661,7 +31154,7 @@ class RelayOperatorPanel(tk.Tk):
             if runtime_result is not None:
                 self._apply_runtime_refresh_result(runtime_result)
             if prepared_run_root:
-                self.run_root_var.set(prepared_run_root)
+                self._apply_prepared_run_root_context(prepared_run_root, source="prepare-all")
             lines: list[str] = []
             if result.launcher_output:
                 launch_label = "[8창 열기 / {0}]".format(result.window_launch_mode or "wrapper")
@@ -25704,7 +31197,6 @@ class RelayOperatorPanel(tk.Tk):
                 last_result += " / seed review input 경고"
             self.last_result_var.set(last_result)
             self.set_text(self.output_text, "\n".join(lines).strip() or "창/Attach/입력/RunRoot 준비 완료")
-            self.load_effective_config()
 
         self.run_background_task(
             state="창/Attach/입력/RunRoot 준비 중",
@@ -26458,13 +31950,13 @@ class RelayOperatorPanel(tk.Tk):
         self._refresh_wrapper_audit_compare_summary()
         self._refresh_wrapper_guidance_action()
         if self._has_ui_attr("watcher_issue_meta_var") and not str(self.watcher_issue_meta_var.get() or "").strip():
-            self._set_watcher_issue_meta_text("최근 제어 카드: 아직 watcher 제어 결과가 없습니다.")
+            self._set_watcher_issue_meta_text("최근 제어 카드: 아직 Pair watcher 제어 결과가 없습니다.")
         if self._has_ui_attr("watcher_issue_badge_var") and not str(self.watcher_issue_badge_var.get() or "").strip():
             self._set_watcher_issue_badge_text("상태 배지: 준비")
         if self._has_ui_attr("watcher_issue_stage_var") and not str(self.watcher_issue_stage_var.get() or "").strip():
-            self._set_watcher_issue_stage_text("제어 흐름: [준비] 아직 watcher 제어 결과가 없습니다.")
+            self._set_watcher_issue_stage_text("제어 흐름: [준비] 아직 Pair watcher 제어 결과가 없습니다.")
         if self._has_ui_attr("watcher_issue_step_var") and not str(self.watcher_issue_step_var.get() or "").strip():
-            self._set_watcher_issue_step_text("단계 요약: 준비 (현재=watcher 제어 전)")
+            self._set_watcher_issue_step_text("단계 요약: 준비 (현재=Pair watcher 제어 전)")
         return state
 
     def _refresh_visible_focus_recovery_card(self, visible_state: VisibleAcceptanceState | None = None) -> dict[str, object]:
@@ -27136,7 +32628,7 @@ class RelayOperatorPanel(tk.Tk):
                         )
                 except Exception:
                     pass
-            return self.refresh_paired_status_only
+            return lambda: self.refresh_paired_status_background(label="visible acceptance paired status 갱신")
 
         def on_failure(exc: Exception) -> str:
             if recovery_context:
@@ -27146,7 +32638,10 @@ class RelayOperatorPanel(tk.Tk):
                     result="failed",
                     detail=self._format_background_exception(exc),
                 )
-            self.refresh_paired_status_only(refresh_artifacts=False)
+            self.refresh_paired_status_background(
+                refresh_artifacts=False,
+                label="visible acceptance 실패 후 paired status 갱신",
+            )
             text = self._format_live_acceptance_failure_output(exc, run_root=run_root)
             if self._has_ui_attr("visible_acceptance_text"):
                 self.set_text(self.visible_acceptance_text, text)
@@ -27415,7 +32910,7 @@ class RelayOperatorPanel(tk.Tk):
                     title="receipt confirm" if require_visible_receipt else "shared visible confirm",
                 )
             )
-            return self.refresh_paired_status_only
+            return lambda: self.refresh_paired_status_background(label="visible confirm paired status 갱신")
 
         self.run_background_task(
             state="receipt confirm 실행 중" if require_visible_receipt else "shared visible confirm 실행 중",
@@ -27443,9 +32938,17 @@ class RelayOperatorPanel(tk.Tk):
         self.command_service.spawn_detached(command)
         self.set_text(self.output_text, "router.ps1를 별도 프로세스로 시작했습니다.\n\n" + subprocess.list2cmdline(command))
         self.set_operator_status("라우터 시작 요청", "수 초 뒤 빠른 새로고침으로 router/runtime 상태를 다시 확인합니다.", "마지막 결과: router 시작 요청")
-        self.after(1500, self.refresh_runtime_status_only)
+        self.after(1500, self._refresh_runtime_status_after_router_start)
 
-    def _start_watcher_detached(self, *, request: WatcherStartRequest | None = None, action_title: str = "watcher 시작") -> None:
+    def _refresh_runtime_status_after_router_start(self) -> None:
+        self.refresh_runtime_status_background(
+            label="router 시작 후 runtime 상태 갱신",
+            state="router 시작 후 runtime 갱신 중",
+            hint="router 시작 요청 후 runtime 상태를 백그라운드에서 다시 확인합니다.",
+            read_only=True,
+        )
+
+    def _start_watcher_detached(self, *, request: WatcherStartRequest | None = None, action_title: str = "Pair watcher 시작") -> None:
         run_root = self._current_run_root_for_actions()
         config_path = self._resolve_watcher_start_config_path(
             config_path=self.config_path_var.get().strip(),
@@ -27587,7 +33090,7 @@ class RelayOperatorPanel(tk.Tk):
                 worker=worker,
                 on_success=on_success,
                 success_state=f"{action_title} 전 typed-window 준비 완료",
-                success_hint="target 창 세션을 정리했고 watcher 시작을 이어서 진행합니다.",
+                success_hint="target 창 세션을 정리했고 Pair watcher 시작을 이어서 진행합니다.",
                 failure_state=f"{action_title} 전 typed-window 준비 실패",
                 failure_hint="공식 창 상태와 typed-window session reset reason을 확인하세요.",
             )
@@ -27631,7 +33134,7 @@ class RelayOperatorPanel(tk.Tk):
         lines: list[str] = []
         immediate_stop_risk = False
         if stop_category == "expected-limit":
-            lines.append("현재 RunRoot watcher가 정상 제한 종료 상태입니다.")
+            lines.append("현재 RunRoot Pair watcher가 정상 제한 종료 상태입니다.")
             immediate_stop_risk = True
         elif status_reason:
             lines.append(f"현재 RunRoot 마지막 종료 사유: {status_reason}")
@@ -27795,8 +33298,7 @@ class RelayOperatorPanel(tk.Tk):
             prepared_run_root = str(result.prepared_run_root or "").strip()
             if not prepared_run_root:
                 raise RuntimeError("새 RunRoot를 준비했지만 prepared_run_root를 확인하지 못했습니다.")
-            self.run_root_var.set(prepared_run_root)
-            self.load_effective_config()
+            self._apply_prepared_run_root_context(prepared_run_root, source="new-watcher-start")
             effective_request = self._watcher_request_with_context(
                 start_request,
                 config_path=config_path,
@@ -27823,7 +33325,7 @@ class RelayOperatorPanel(tk.Tk):
             if result.summary_text:
                 lines.extend(["", result.summary_text])
             self.set_text(self.output_text, "\n".join(lines))
-            self.last_result_var.set("마지막 결과: 새 RunRoot 준비 완료 / watcher 시작 이어서 진행")
+            self.last_result_var.set("마지막 결과: 새 RunRoot 준비 완료 / Pair watcher 시작 이어서 진행")
             return lambda: self._start_watcher_detached(
                 request=effective_request,
                 action_title=action_title,
@@ -27831,11 +33333,11 @@ class RelayOperatorPanel(tk.Tk):
 
         self.run_background_task(
             state=f"{action_title} 전 RunRoot 준비 중",
-            hint=f"{pair_id} 기준 새 RunRoot를 준비한 뒤 watcher 시작을 이어갑니다.",
+            hint=f"{pair_id} 기준 새 RunRoot를 준비한 뒤 Pair watcher 시작을 이어갑니다.",
             worker=worker,
             on_success=on_success,
             success_state=f"{action_title} 전 RunRoot 준비 완료",
-            success_hint="새 RunRoot를 준비했고 watcher 시작을 이어갑니다.",
+            success_hint="새 RunRoot를 준비했고 Pair watcher 시작을 이어갑니다.",
             failure_state=f"{action_title} 전 RunRoot 준비 실패",
             failure_hint="출력과 run prepare 오류를 확인하세요.",
         )
@@ -27934,7 +33436,7 @@ class RelayOperatorPanel(tk.Tk):
 
         confirmed = messagebox.askyesno(
             "watch stale 정리",
-            "오래된 watcher stop/control 흔적을 정리합니다.\nwatcher가 stopped 상태일 때만 안전합니다.\n\n정리할까요?",
+            "오래된 Pair watcher stop/control 흔적을 정리합니다.\nPair watcher가 stopped 상태일 때만 안전합니다.\n\n정리할까요?",
             parent=self,
         )
         if not confirmed:
@@ -27963,7 +33465,7 @@ class RelayOperatorPanel(tk.Tk):
             update=panel_update,
             issue_prefix="watch 제어 결과",
         )
-        self.after(300, self.refresh_paired_status_only)
+        self.after(300, lambda: self.refresh_paired_status_background(label="watch stale 정리 후 paired status 갱신"))
 
     def recover_selected_pair_typed_window_sessions(self) -> None:
         pair_id = self._selected_pair_id()
@@ -28027,7 +33529,10 @@ class RelayOperatorPanel(tk.Tk):
                 if last_command and self._has_ui_attr("last_command_var"):
                     self.last_command_var.set(last_command)
             self.last_result_var.set(f"마지막 결과: {pair_id} typed-window 복구 완료")
-            return lambda: self.refresh_paired_status_only(refresh_artifacts=False)
+            return lambda: self.refresh_paired_status_background(
+                refresh_artifacts=False,
+                label="typed-window 복구 후 paired status 갱신",
+            )
 
         def on_failure(exc: Exception) -> str:
             lines = [
@@ -28118,7 +33623,7 @@ class RelayOperatorPanel(tk.Tk):
                 update=result,
                 issue_prefix="watch 제어 결과",
             )
-            return self.refresh_paired_status_only
+            return lambda: self.refresh_paired_status_background(label="watcher 종료 후 paired status 갱신")
 
         def on_failure(exc: Exception) -> str | None:
             if isinstance(exc, WatcherControlFailure):
@@ -28195,7 +33700,7 @@ class RelayOperatorPanel(tk.Tk):
                 update=result,
                 issue_prefix="watch 제어 결과",
             )
-            return self.refresh_paired_status_only
+            return lambda: self.refresh_paired_status_background(label="watch pause 후 paired status 갱신")
 
         def on_failure(exc: Exception) -> str | None:
             if isinstance(exc, WatcherControlFailure):
@@ -28272,7 +33777,7 @@ class RelayOperatorPanel(tk.Tk):
                 update=result,
                 issue_prefix="watch 제어 결과",
             )
-            return self.refresh_paired_status_only
+            return lambda: self.refresh_paired_status_background(label="watch resume 후 paired status 갱신")
 
         def on_failure(exc: Exception) -> str | None:
             if isinstance(exc, WatcherControlFailure):
@@ -28385,7 +33890,7 @@ class RelayOperatorPanel(tk.Tk):
                 update=result.panel_update,
                 issue_prefix="watch 제어 결과",
             )
-            return self.refresh_paired_status_only
+            return lambda: self.refresh_paired_status_background(label="watch 재시작 후 paired status 갱신")
 
         def on_failure(exc: Exception) -> str | None:
             if isinstance(exc, WatcherRestartFailure):
@@ -28461,7 +33966,7 @@ class RelayOperatorPanel(tk.Tk):
 
     def open_watcher_status_file(self) -> None:
         status = self._watcher_runtime_status()
-        self._open_path(status.status_path, kind="watch status 파일")
+        self._open_path(status.status_path, kind="Pair watcher status 파일")
 
     def open_binding_profile_file(self) -> None:
         self._open_path(self._binding_profile_path(), kind="binding JSON")
@@ -28492,7 +33997,9 @@ class RelayOperatorPanel(tk.Tk):
         def on_success(completed: subprocess.CompletedProcess[str]) -> None:
             payload = json.loads(completed.stdout)
             self.set_text(self.output_text, json.dumps(payload, ensure_ascii=False, indent=2))
-            self.load_effective_config()
+            if not self._apply_pair_activation_payload(payload):
+                return lambda: self.refresh_full_dashboard_status(auto_pair_policy_preview=False)
+            return None
 
         self.run_background_task(
             state="pair 활성화 중",
@@ -28525,7 +34032,9 @@ class RelayOperatorPanel(tk.Tk):
         def on_success(completed: subprocess.CompletedProcess[str]) -> None:
             payload = json.loads(completed.stdout)
             self.set_text(self.output_text, json.dumps(payload, ensure_ascii=False, indent=2))
-            self.load_effective_config()
+            if not self._apply_pair_activation_payload(payload):
+                return lambda: self.refresh_full_dashboard_status(auto_pair_policy_preview=False)
+            return None
 
         self.run_background_task(
             state="pair 비활성화 중",
@@ -28672,7 +34181,7 @@ class RelayOperatorPanel(tk.Tk):
 
         def on_success(completed: subprocess.CompletedProcess[str]) -> None:
             payload = json.loads(completed.stdout)
-            self.run_root_var.set(payload.get("RunRoot", ""))
+            self._apply_prepared_run_root_context(str(payload.get("RunRoot", "") or ""), source="selected-pair-drill")
             observed = payload.get("ObservedCounts", {})
             lines = [
                 "선택 Pair Headless Drill 완료",
@@ -28684,7 +34193,7 @@ class RelayOperatorPanel(tk.Tk):
                 f"done 개수: {observed.get('DonePresentCount', '')}",
                 f"error 개수: {observed.get('ErrorPresentCount', '')}",
                 f"forwarded 개수: {observed.get('ForwardedStateCount', '')}",
-                f"watcher 상태: {observed.get('WatcherStatus', '')}",
+                f"Pair watcher 상태: {observed.get('WatcherStatus', '')}",
                 "",
                 "시작 명령:",
                 payload.get("Commands", {}).get("Start", ""),
@@ -28702,7 +34211,6 @@ class RelayOperatorPanel(tk.Tk):
                     ]
                 )
             self.set_text(self.output_text, "\n".join(lines))
-            self.load_effective_config()
 
             self.last_result_var.set(
                 "마지막 결과: pair={0} done={1} error={2} forwarded={3}".format(
@@ -28790,12 +34298,8 @@ class RelayOperatorPanel(tk.Tk):
             payload = json.loads(completed.stdout)
             coordinator_run_root = str(payload.get("CoordinatorRunRoot", "") or "").strip()
             if coordinator_run_root:
-                self.run_root_var.set(coordinator_run_root)
-                self._set_action_context(
-                    pair_id=selected_pair_ids[0],
-                    run_root=coordinator_run_root,
-                    source="parallel-pair-drill",
-                )
+                self._set_action_context(pair_id=selected_pair_ids[0], source="parallel-pair-drill")
+                self._apply_prepared_run_root_context(coordinator_run_root, source="parallel-pair-drill")
             if selected_pair_ids:
                 self.pair_id_var.set(selected_pair_ids[0])
                 self._sync_preview_selection_with_pair(selected_pair_ids[0])
@@ -28828,7 +34332,6 @@ class RelayOperatorPanel(tk.Tk):
                 lines.extend(["wrapper-status:", wrapper_status_path])
             self.set_text(self.output_text, "\n".join(lines).rstrip())
             self.refresh_pair_policy_editor()
-            self.load_effective_config()
             self.last_result_var.set(
                 "마지막 결과: parallel drill pairs={0} coordinator={1}".format(
                     ",".join(selected_pair_ids),
@@ -28855,66 +34358,19 @@ class RelayOperatorPanel(tk.Tk):
         )
 
     def run_fixed_pair01_drill(self) -> None:
-        block_reason = self._shared_visible_typed_window_headless_block_reason()
-        if block_reason:
-            messagebox.showwarning("Headless Drill 차단", block_reason)
-            return
-        self._set_mode_banner("MODE: Headless Drill", "pair01 preset shortcut 기준 headless drill을 실행합니다.")
-        activation = self.get_pair_activation_state("pair01")
-        if activation and not activation.get("EffectiveEnabled", True):
-            messagebox.showwarning("Pair 비활성", f"pair01은 현재 비활성 상태입니다.\n사유: {activation.get('DisableReason', '') or '(none)'}")
-            return
-
-        config_path = str(ROOT / "config" / "settings.bottest-live-visible.psd1")
-        command = self.command_service.build_powershell_file_command(
-            str(ROOT / "run-preset-headless-pair-drill.ps1"),
-            extra=["-PairId", "pair01", "-AsJson"],
+        messagebox.showwarning(
+            "pair01 preset 차단",
+            "pair01 preset은 target01을 포함합니다. 현재 target01 작업을 보호하기 위해 이 shortcut은 실행하지 않습니다.\n"
+            + TARGET_AUTOLOOP_DIAGNOSTIC_TARGET_HINT,
         )
-
-        self.last_command_var.set(subprocess.list2cmdline(command))
-
-        def worker() -> subprocess.CompletedProcess[str]:
-            return run_command(command)
-
-        def on_success(completed: subprocess.CompletedProcess[str]) -> None:
-            payload = json.loads(completed.stdout)
-            drill = payload.get("Drill", {})
-            observed = drill.get("ObservedCounts", {})
-            self.config_path_var.set(config_path)
-            self._set_action_context(pair_id="pair01", run_root=payload.get("RunRoot", ""), source="pair01-preset-drill")
-            lines = [
-                "pair01 Preset Drill 완료",
-                f"Config: {payload.get('ConfigPath', '')}",
-                f"RunRoot: {payload.get('RunRoot', '')}",
-                f"done 개수: {observed.get('DonePresentCount', '')}",
-                f"error 개수: {observed.get('ErrorPresentCount', '')}",
-                f"forwarded 개수: {observed.get('ForwardedStateCount', '')}",
-                "",
-                "preview 저장:",
-            ]
-            for item in payload.get("RenderedMessages", []):
-                lines.append(f"- {item.get('TargetId', '')}: {item.get('OutputRoot', '')}")
-            self.set_text(self.output_text, "\n".join(lines))
-            self.load_effective_config()
-            self.last_result_var.set(
-                "마지막 결과: pair01 done={0} error={1} forwarded={2}".format(
-                    observed.get("DonePresentCount", ""),
-                    observed.get("ErrorPresentCount", ""),
-                    observed.get("ForwardedStateCount", ""),
-                )
-            )
-
-        self.set_text(self.output_text, "pair01 Preset Drill 실행 중...")
-        self.run_background_task(
-            state="pair01 Preset Drill 실행 중",
-            hint="preset shortcut이 generic preset runner를 통해 pair01 한 번 왕복 드릴을 실행 중입니다.",
-            worker=worker,
-            on_success=on_success,
-            success_state="pair01 Preset Drill 완료",
-            success_hint="RunRoot와 preview 출력이 자동 반영됐습니다.",
-            failure_state="pair01 Preset Drill 실패",
-            failure_hint="출력 영역과 마지막 명령을 확인하세요.",
+        self.last_result_var.set("마지막 결과: pair01 preset 차단 / target01 보호")
+        self.set_text(
+            self.output_text,
+            "pair01 preset 차단\n"
+            "사유: pair01 preset은 target01을 포함합니다.\n"
+            + TARGET_AUTOLOOP_DIAGNOSTIC_TARGET_HINT,
         )
+        return
 
     def run_paired_status(self) -> None:
         self.run_to_output("show-paired-exchange-status.ps1", allow_when_busy=True)
@@ -28947,7 +34403,19 @@ class RelayOperatorPanel(tk.Tk):
         self.last_command_var.set(self._runtime_refresh_command_preview(current_context))
 
         def worker():
-            return self.refresh_controller.refresh_runtime(current_context)
+            self._post_background_progress("입력 점검 실행 중", "1/2 runtime map 확인 중")
+            try:
+                self._post_background_progress("입력 점검 실행 중", "2/2 visibility 강제 확인 중")
+                return self.refresh_controller.refresh_runtime(
+                    current_context,
+                    force_visibility_refresh=True,
+                )
+            except TypeError as exc:
+                if "force_visibility_refresh" not in str(exc):
+                    raise
+                self._post_background_progress("입력 점검 실행 중", "2/2 visibility 캐시 무효화 후 확인 중")
+                self._invalidate_visibility_status_cache()
+                return self.refresh_controller.refresh_runtime(current_context)
 
         def on_success(runtime_result) -> None:
             self._apply_runtime_refresh_result(runtime_result)
@@ -29031,7 +34499,7 @@ class RelayOperatorPanel(tk.Tk):
         )
         self.last_command_var.set(subprocess.list2cmdline(preview_command))
 
-        def on_success(completed: subprocess.CompletedProcess[str]) -> None:
+        def on_success(completed: subprocess.CompletedProcess[str]):
             output = completed.stdout.strip()
             if completed.stderr.strip():
                 output += ("\n\nSTDERR:\n" + completed.stderr.strip())
@@ -29046,11 +34514,15 @@ class RelayOperatorPanel(tk.Tk):
                 self.last_result_var.set(f"마지막 결과: {script_name} 실행 완료")
             if refresh_after:
                 if refresh_scope == "runtime":
-                    self.refresh_runtime_status_only()
+                    self.refresh_runtime_status_background(label=f"{script_name} 후 runtime 상태 갱신")
                 elif refresh_scope == "paired":
-                    self.refresh_paired_status_only()
+                    self.refresh_paired_status_background(label=f"{script_name} 후 paired status 갱신")
                 else:
-                    self.load_effective_config()
+                    if allow_when_busy:
+                        self.refresh_full_dashboard_status()
+                        return None
+                    return self.refresh_full_dashboard_status
+            return None
 
         if allow_when_busy:
             self.set_query_result(

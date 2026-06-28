@@ -24,21 +24,29 @@ if (Test-Path -LiteralPath $runRoot) {
     Remove-Item -LiteralPath $runRoot -Recurse -Force
 }
 
-$output = @(
-    & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Run-LiveVisiblePairAcceptance.ps1') `
-        -ConfigPath $configPath `
-        -RunRoot $runRoot `
-        -PairId pair01 `
-        -SeedTargetId target01 `
-        -SeedWorkRepoRoot $externalWorkRepoRoot `
-        -SeedReviewInputPath $externalReviewInputPath `
-        -PreflightOnly `
-        -AsJson 2>&1
-)
-$exitCode = $LASTEXITCODE
+$previousErrorActionPreference = $ErrorActionPreference
+$ErrorActionPreference = 'Continue'
+$Error.Clear()
+try {
+    $output = @(
+        & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Run-LiveVisiblePairAcceptance.ps1') `
+            -ConfigPath $configPath `
+            -RunRoot $runRoot `
+            -PairId pair01 `
+            -SeedTargetId target01 `
+            -SeedWorkRepoRoot $externalWorkRepoRoot `
+            -SeedReviewInputPath $externalReviewInputPath `
+            -PreflightOnly `
+            -AsJson 2>&1
+    )
+    $exitCode = $LASTEXITCODE
+    $capturedNativeErrors = @($Error | ForEach-Object { $_ | Out-String -Width 4096 })
+} finally {
+    $ErrorActionPreference = $previousErrorActionPreference
+}
 
 Assert-True ($exitCode -ne 0) 'Run-LiveVisiblePairAcceptance should reject automation repo as run root before preflight.'
-$detail = ($output | Out-String)
+$detail = ((@($output) | ForEach-Object { $_ | Out-String -Width 4096 }) + @($capturedNativeErrors)) -join [Environment]::NewLine
 Assert-True ($detail.Contains('automation-repo-runroot-disallowed')) 'failure output should mention automation-repo-runroot-disallowed.'
 
 Write-Host 'run-live-visible-pair-acceptance external run root guard ok'

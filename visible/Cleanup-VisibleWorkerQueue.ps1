@@ -18,6 +18,26 @@ function Test-NonEmptyString {
     return ($Value -is [string] -and -not [string]::IsNullOrWhiteSpace($Value))
 }
 
+function ConvertTo-TargetIdList {
+    param([string[]]$Values)
+
+    $items = New-Object System.Collections.Generic.List[string]
+    foreach ($value in @($Values)) {
+        if (-not (Test-NonEmptyString $value)) {
+            continue
+        }
+
+        foreach ($part in ([string]$value -split ',')) {
+            $trimmed = [string]$part.Trim()
+            if (Test-NonEmptyString $trimmed) {
+                [void]$items.Add($trimmed)
+            }
+        }
+    }
+
+    return @($items.ToArray() | Sort-Object -Unique)
+}
+
 function Ensure-Directory {
     param([Parameter(Mandatory)][string]$Path)
 
@@ -681,7 +701,7 @@ if (-not [bool]$pairTest.VisibleWorker.Enabled) {
 
 $resolvedKeepRunRoot = if (Test-NonEmptyString $KeepRunRoot) { (Resolve-Path -LiteralPath $KeepRunRoot).Path } else { '' }
 $targetIds = if ($null -ne $TargetId -and @($TargetId).Count -gt 0) {
-    @($TargetId | Where-Object { Test-NonEmptyString $_ } | Sort-Object -Unique)
+    @(ConvertTo-TargetIdList -Values $TargetId)
 }
 else {
     @($config.Targets | ForEach-Object { [string]$_.Id } | Where-Object { Test-NonEmptyString $_ } | Sort-Object -Unique)

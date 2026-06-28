@@ -54,45 +54,17 @@ function Get-TargetAutoloopDoctorContractSnapshot {
     $summaryState = Get-TargetAutoloopDoctorPathState -Path ([string]$Paths.SourceSummaryPath)
     $reviewState = Get-TargetAutoloopDoctorPathState -Path ([string]$Paths.SourceReviewZipPath)
     $publishState = Get-TargetAutoloopDoctorPathState -Path ([string]$Paths.PublishReadyPath)
-
-    $publishValid = $false
-    try {
-        $publishValid = Test-TargetAutoloopPublishReadyValid -Paths $Paths -ExpectedTargetId $TargetId
-    }
-    catch {
-        $publishValid = $false
-    }
-
-    $contractState = 'missing'
-    $reason = 'no-contract-files'
-    if ($publishValid) {
-        $contractState = 'ready'
-        $reason = 'publish-ready-valid'
-    }
-    elseif ($publishState.Exists) {
-        $contractState = 'invalid'
-        $reason = 'publish-ready-invalid'
-    }
-    elseif ($summaryState.Exists -or $reviewState.Exists) {
-        $contractState = 'partial'
-        if ($summaryState.Exists -and $reviewState.Exists) {
-            $reason = 'summary-review-without-marker'
-        }
-        elseif ($summaryState.Exists) {
-            $reason = 'summary-only'
-        }
-        else {
-            $reason = 'review-only'
-        }
-    }
+    $core = Get-TargetAutoloopContractSnapshotCore -Paths $Paths -TargetId $TargetId -SummaryState $summaryState -ReviewZipState $reviewState -PublishReadyState $publishState
 
     return [pscustomobject]@{
-        State = $contractState
-        Reason = $reason
-        PublishReadyValid = [bool]$publishValid
+        State = [string]$core.State
+        Reason = [string]$core.Reason
+        PublishReadyValid = [bool]$core.PublishReadyValid
         Summary = $summaryState
         ReviewZip = $reviewState
         PublishReady = $publishState
+        OutputFingerprint = [string]$core.OutputFingerprint
+        PublishedAt = [string]$core.PublishedAt
     }
 }
 
@@ -134,6 +106,20 @@ $resolvedConfigPath = if (Test-NonEmptyString $ConfigPath) { (Resolve-Path -Lite
 $config = Resolve-TargetAutoloopConfig -Root $root -ConfigPath $resolvedConfigPath
 $resolvedRunRoot = Resolve-TargetAutoloopRunRoot -Config $config -RequestedRunRoot $RunRoot
 $statePaths = Get-TargetAutoloopStatePaths -RunRoot $resolvedRunRoot -Config $config
+$manifestSummary = Get-TargetAutoloopManifestRouteSummary -Config $config -RunRoot $resolvedRunRoot -Mode ProofDoctor
+$manifestPath = [string]$manifestSummary.ManifestPath
+$manifestExists = [bool]$manifestSummary.ManifestExists
+$manifestRunMode = [string]$manifestSummary.ManifestRunMode
+$manifestTargetMap = $manifestSummary.ManifestTargetMap
+$configEnabledTargetIds = @($manifestSummary.ConfigEnabledTargetIds)
+$sortedManifestTargetIds = @($manifestSummary.SortedManifestTargetIds)
+$sortedManifestEnabledTargetIds = @($manifestSummary.SortedManifestEnabledTargetIds)
+$manifestPublishReadyTargetIds = @($manifestSummary.SortedManifestPublishReadyTargetIds)
+$manifestPublishReadyMissingTargetIds = @($manifestSummary.SortedManifestPublishReadyMissingTargetIds)
+$manifestScope = [string]$manifestSummary.ManifestScope
+$manifestMismatch = [bool]$manifestSummary.ManifestMismatch
+$manifestMismatchReason = [string]$manifestSummary.ManifestMismatchReason
+$operationalRecommendation = [string]$manifestSummary.OperationalRecommendation
 
 $stateDocument = if (Test-Path -LiteralPath $statePaths.StatePath -PathType Leaf) { Read-JsonObject -Path $statePaths.StatePath } else { [pscustomobject]@{} }
 $statusDocument = if (Test-Path -LiteralPath $statePaths.StatusPath -PathType Leaf) { Read-JsonObject -Path $statePaths.StatusPath } else { [pscustomobject]@{} }
@@ -162,10 +148,16 @@ foreach ($target in @($config.Targets | Sort-Object TargetId)) {
     $stateRecord = if ($stateTargetMap.Contains($targetId)) { $stateTargetMap[$targetId] } else { $null }
     $statusRow = if ($statusRowMap.ContainsKey($targetId)) { $statusRowMap[$targetId] } else { $null }
     $contract = Get-TargetAutoloopDoctorContractSnapshot -Paths $paths -TargetId $targetId
+    $delivery = Get-TargetAutoloopDeliverySnapshot -Contract $contract -StateRecord $stateRecord -StatusRow $statusRow
+    $inManifest = [bool]$manifestTargetMap.ContainsKey($targetId)
+    $manifestTargetRecord = if ($inManifest) { $manifestTargetMap[$targetId] } else { $null }
+    $manifestEnabled = if ($inManifest) { [bool](Get-ConfigValue -Object $manifestTargetRecord -Name 'Enabled' -DefaultValue $false) } else { $false }
 
     $row = [pscustomobject]@{
         TargetId = $targetId
         Enabled = [bool](Get-ConfigValue -Object $target -Name 'Enabled' -DefaultValue $false)
+        InManifest = [bool]$inManifest
+        ManifestEnabled = [bool]$manifestEnabled
         Phase = [string](Get-ConfigValue -Object $stateRecord -Name 'Phase' -DefaultValue ([string](Get-ConfigValue -Object $statusRow -Name 'Phase' -DefaultValue '')))
         CycleCount = [int](Get-ConfigValue -Object $stateRecord -Name 'CycleCount' -DefaultValue ([int](Get-ConfigValue -Object $statusRow -Name 'CycleCount' -DefaultValue 0)))
         MaxCycleCount = [int](Get-ConfigValue -Object $stateRecord -Name 'MaxCycleCount' -DefaultValue ([int](Get-ConfigValue -Object $statusRow -Name 'MaxCycleCount' -DefaultValue 0)))
@@ -180,6 +172,11 @@ foreach ($target in @($config.Targets | Sort-Object TargetId)) {
         SourceReviewZipPath = [string]$paths.SourceReviewZipPath
         PublishReadyPath = [string]$paths.PublishReadyPath
         Contract = $contract
+        Delivery = $delivery
+        DeliverySummary = [string](Get-ConfigValue -Object $delivery -Name 'Summary' -DefaultValue '')
+        DeliveryNextAction = [string](Get-ConfigValue -Object $delivery -Name 'NextAction' -DefaultValue '')
+        DeliveryNextActionCode = [string](Get-ConfigValue -Object $delivery -Name 'NextActionCode' -DefaultValue '')
+        DeliveryNextActionLabel = [string](Get-ConfigValue -Object $delivery -Name 'NextActionLabel' -DefaultValue '')
         InboxPendingCount = Get-TargetAutoloopDoctorDirectoryCount -Path ([string]$paths.InboxPendingRoot)
         QueueQueuedCount = Get-TargetAutoloopDoctorDirectoryCount -Path ([string]$queuePaths.QueuedRoot)
         QueueProcessingCount = Get-TargetAutoloopDoctorDirectoryCount -Path ([string]$queuePaths.ProcessingRoot)
@@ -231,6 +228,20 @@ $payload = [ordered]@{
     SchemaVersion = $script:TargetAutoloopSchemaVersion
     RunRoot = $resolvedRunRoot
     ConfigPath = $resolvedConfigPath
+    ManifestPath = [string]$manifestPath
+    ManifestExists = [bool]$manifestExists
+    ManifestRunMode = [string]$manifestRunMode
+    ManifestTargetIds = @($sortedManifestTargetIds)
+    ManifestEnabledTargetIds = @($sortedManifestEnabledTargetIds)
+    ManifestPublishReadyTargetIds = @($manifestPublishReadyTargetIds | Sort-Object)
+    ManifestPublishReadyMissingTargetIds = @($manifestPublishReadyMissingTargetIds | Sort-Object)
+    ConfigEnabledTargetIds = @($configEnabledTargetIds)
+    ManifestScope = [string]$manifestScope
+    ManifestMismatch = [bool]$manifestMismatch
+    ManifestMismatchReason = $(if ($manifestMismatch) { $manifestMismatchReason } else { '' })
+    ManifestReasonCodes = @($manifestSummary.ReasonCodes)
+    BlockingReasonCodes = @($manifestSummary.BlockingReasonCodes)
+    OperationalRecommendation = [string]$operationalRecommendation
     ControllerState = [string](Get-ConfigValue -Object $statusDocument -Name 'ControllerState' -DefaultValue ([string](Get-ConfigValue -Object $controlDocument -Name 'State' -DefaultValue 'unknown')))
     WatcherState = [string](Get-ConfigValue -Object $statusDocument -Name 'WatcherState' -DefaultValue '')
     WatcherStopReason = [string](Get-ConfigValue -Object $statusDocument -Name 'WatcherStopReason' -DefaultValue '')
@@ -250,6 +261,9 @@ $lines = @(
     'Target Autoloop Route/Proof Doctor'
     ('RunRoot: ' + [string]$payload.RunRoot)
     ('ConfigPath: ' + [string]$payload.ConfigPath)
+)
+$lines += @(Get-TargetAutoloopManifestRouteTextLines -Payload $payload -IncludeScope -IncludeOperationalRecommendation)
+$lines += @(
     ('ControllerState: ' + [string]$payload.ControllerState)
     ('WatcherState: ' + $(if (Test-NonEmptyString ([string]$payload.WatcherState)) { [string]$payload.WatcherState } else { '(none)' }))
     ('WatcherStopReason: ' + $(if (Test-NonEmptyString ([string]$payload.WatcherStopReason)) { [string]$payload.WatcherStopReason } else { '(none)' }))
@@ -286,6 +300,8 @@ foreach ($row in @($targetRows)) {
     $lines += ('  summary.txt: {0} [{1}]' -f [string]$row.SourceSummaryPath, $(if ([bool]$row.Contract.Summary.Exists) { 'exists' } else { 'missing' }))
     $lines += ('  review.zip: {0} [{1}]' -f [string]$row.SourceReviewZipPath, $(if ([bool]$row.Contract.ReviewZip.Exists) { 'exists' } else { 'missing' }))
     $lines += ('  publish.ready.json: {0} [{1}]' -f [string]$row.PublishReadyPath, $(if ([bool]$row.Contract.PublishReady.Exists) { 'exists' } else { 'missing' }))
+    $lines += @(Get-TargetAutoloopDeliveryTextLines -Row $row)
+    $lines += (Get-TargetAutoloopRouteRowManifestTextLine -Row $row)
     if (Test-NonEmptyString ([string]$row.LastDispatchState)) {
         $lines += ('  lastDispatch: ' + [string]$row.LastDispatchState)
     }

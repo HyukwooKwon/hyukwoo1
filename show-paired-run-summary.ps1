@@ -1962,7 +1962,7 @@ function Get-OperatorFocusSummary {
         $nextStep = 'summary.txt, review.zip, and publish.ready.json must all exist under each target source-outbox path'
         $recommendedAction = 'open the affected target block in important-summary.txt and verify the explicit source-outbox paths'
     }
-    elseif ($pairNextAction -eq 'await-partner-output' -or [int]$CountsSummary.ForwardedCount -gt 0) {
+    elseif ($pairNextAction -eq 'await-partner-output' -or [int]$CountsSummary.ForwardedStateCount -gt 0) {
         $attentionLevel = 'watch'
         $bottleneckCode = 'await-partner-output'
         $bottleneck = 'partner output has not been published yet'
@@ -2328,7 +2328,7 @@ function Format-ImportantSummaryText {
     $lines.Add(('Seed: final={0} submit={1} outboxPublished={2}' -f [string]$ImportantSummary.Acceptance.SeedFinalState, [string]$ImportantSummary.Acceptance.SeedSubmitState, [bool]$ImportantSummary.Acceptance.SeedOutboxPublished))
     $lines.Add(('AcceptanceRelayIssues: relayMismatch={0} relayMissing={1} relayConfigMissing={2} source={3}' -f [int]$ImportantSummary.Acceptance.RelayFolderMismatchCount, [int]$ImportantSummary.Acceptance.RelayFolderMissingCount, [int]$ImportantSummary.Acceptance.RelayFolderConfigMissingCount, [string]$ImportantSummary.Acceptance.RelayIssuesSource))
     $lines.Add(('Watcher: status={0} reason={1} lastHandled={2}' -f [string]$ImportantSummary.Watcher.Status, [string]$ImportantSummary.Watcher.Reason, [string]$ImportantSummary.Watcher.LastHandled))
-    $lines.Add(('Counts: forwarded={0} summaries={1} zips={2} failures={3} relayMismatch={4} relayMissing={5} relayConfigMissing={6}' -f [int]$ImportantSummary.Counts.ForwardedCount, [int]$ImportantSummary.Counts.SummaryPresentCount, [int]$ImportantSummary.Counts.ZipPresentCount, [int]$ImportantSummary.Counts.FailureLineCount, [int]$ImportantSummary.Counts.RelayFolderMismatchCount, [int]$ImportantSummary.Counts.RelayFolderMissingCount, [int]$ImportantSummary.Counts.RelayFolderConfigMissingCount))
+    $lines.Add(('Counts: forwarded={0} summaries={1} zips={2} failures={3} relayMismatch={4} relayMissing={5} relayConfigMissing={6}' -f [int]$ImportantSummary.Counts.ForwardedStateCount, [int]$ImportantSummary.Counts.SummaryPresentCount, [int]$ImportantSummary.Counts.ZipPresentCount, [int]$ImportantSummary.Counts.FailureLineCount, [int]$ImportantSummary.Counts.RelayFolderMismatchCount, [int]$ImportantSummary.Counts.RelayFolderMissingCount, [int]$ImportantSummary.Counts.RelayFolderConfigMissingCount))
     $lines.Add('')
     $lines.Add('[operator-focus]')
     $lines.Add(('AttentionLevel: {0}' -f [string]$ImportantSummary.OperatorFocus.AttentionLevel))
@@ -2649,6 +2649,7 @@ $watcherSummary = [pscustomobject]@{
 $countsSummary = [pscustomobject]@{
     MessageFiles             = [int]$status.Counts.MessageFiles
     ForwardedCount           = [int]$status.Counts.ForwardedCount
+    ForwardedStateCount      = [int](Get-ObjectPropertyValue -Object $status.Counts -Name 'ForwardedStateCount' -DefaultValue ([int]$status.Counts.ForwardedCount))
     SummaryPresentCount      = [int]$status.Counts.SummaryPresentCount
     ZipPresentCount          = [int]$status.Counts.ZipPresentCount
     DonePresentCount         = [int]$status.Counts.DonePresentCount
@@ -2673,7 +2674,7 @@ $summaryLine = '{0} overall={1} acceptance={2} stage={3} watcher={4} forwarded={
     $acceptanceSummary.AcceptanceState,
     $acceptanceSummary.Stage,
     $watcherSummary.Status,
-    $countsSummary.ForwardedCount,
+    $countsSummary.ForwardedStateCount,
     $countsSummary.SummaryPresentCount,
     $countsSummary.ZipPresentCount,
     $countsSummary.FailureLineCount,
@@ -2719,7 +2720,7 @@ Write-Output ('Acceptance: stage={0} state={1} reason={2}' -f $acceptanceSummary
 Write-Output ('Seed: final={0} submit={1} outboxPublished={2}' -f $acceptanceSummary.SeedFinalState, $acceptanceSummary.SeedSubmitState, $acceptanceSummary.SeedOutboxPublished)
 Write-Output ('AcceptanceRelayIssues: relayMismatch={0} relayMissing={1} relayConfigMissing={2} source={3}' -f $acceptanceSummary.RelayFolderMismatchCount, $acceptanceSummary.RelayFolderMissingCount, $acceptanceSummary.RelayFolderConfigMissingCount, $acceptanceSummary.RelayIssuesSource)
 Write-Output ('Watcher: status={0} reason={1} lastHandled={2}' -f $watcherSummary.Status, $watcherSummary.Reason, $watcherSummary.LastHandled)
-Write-Output ('Counts: messages={0} forwarded={1} summaries={2} zips={3} failures={4} relayMismatch={5} relayMissing={6} relayConfigMissing={7}' -f $countsSummary.MessageFiles, $countsSummary.ForwardedCount, $countsSummary.SummaryPresentCount, $countsSummary.ZipPresentCount, $countsSummary.FailureLineCount, $countsSummary.RelayFolderMismatchCount, $countsSummary.RelayFolderMissingCount, $countsSummary.RelayFolderConfigMissingCount)
+Write-Output ('Counts: messages={0} forwarded={1} summaries={2} zips={3} failures={4} relayMismatch={5} relayMissing={6} relayConfigMissing={7}' -f $countsSummary.MessageFiles, $countsSummary.ForwardedStateCount, $countsSummary.SummaryPresentCount, $countsSummary.ZipPresentCount, $countsSummary.FailureLineCount, $countsSummary.RelayFolderMismatchCount, $countsSummary.RelayFolderMissingCount, $countsSummary.RelayFolderConfigMissingCount)
 Write-Output ('FocusLost: observedTargets={0} recoveredTargets={1}' -f $countsSummary.FocusLostObservedCount, $countsSummary.FocusLostRecoveredCount)
 Write-Output ('Freshness: stale={0} reason={1} newestSignalAt={2} signalAgeSec={3}' -f [bool]$importantSummary.Freshness.StaleSummary, [string]$importantSummary.Freshness.StaleReason, [string]$importantSummary.Freshness.NewestObservedSignalAt, [string]$importantSummary.Freshness.SignalAgeSeconds)
 Write-Output ('ProgressFreshness: stale={0} reason={1} newestProgressSignalAt={2} progressSignalAgeSec={3}' -f [bool]$importantSummary.Freshness.ProgressStale, [string]$importantSummary.Freshness.ProgressStaleReason, [string]$importantSummary.Freshness.NewestProgressSignalAt, [string]$importantSummary.Freshness.ProgressSignalAgeSeconds)

@@ -32,7 +32,7 @@ $root = Split-Path -Parent $PSScriptRoot
 . (Join-Path $PSScriptRoot 'PairedExchangeConfig.ps1')
 
 function Resolve-PowerShellExecutable {
-    foreach ($name in @('pwsh.exe', 'powershell.exe')) {
+    foreach ($name in @('pwsh.exe', 'pwsh')) {
         $command = Get-Command -Name $name -ErrorAction SilentlyContinue | Select-Object -First 1
         if ($null -eq $command) {
             continue
@@ -47,7 +47,7 @@ function Resolve-PowerShellExecutable {
         return [string]$name
     }
 
-    throw 'pwsh.exe 또는 powershell.exe를 찾지 못했습니다.'
+    throw 'pwsh (PowerShell 7+)를 찾지 못했습니다.'
 }
 
 function Ensure-Directory {
@@ -568,8 +568,7 @@ $stepOrder = 1
 
 $cleanupArguments = @(
     '-ConfigPath', $resolvedConfigPath,
-    '-TargetId'
-) + @($targetIds) + @(
+    '-TargetId', (@($targetIds) -join ','),
     '-KeepRunRoot', $resolvedRunRoot,
     '-Apply',
     '-AsJson'

@@ -49,7 +49,7 @@ New-Item -ItemType Directory -Path $routerInboxRoot -Force | Out-Null
 }
 "@, (New-Utf8NoBomEncoding))
 
-$startJson = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Start-TargetAutoloopRun.ps1') `
+$startJson = & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Start-TargetAutoloopRun.ps1') `
     -ConfigPath $configPath `
     -RunRoot $runRoot `
     -Targets target01 `
@@ -62,7 +62,7 @@ $target01 = @($manifest.Targets | Where-Object { [string]$_.TargetId -eq 'target
 $inputPath = Join-Path $target01.InboxPendingRoot 'task_stop_restart_001.txt'
 Set-Content -LiteralPath $inputPath -Encoding UTF8 -Value 'stop then restart should continue the queued command without replaying stale control'
 
-$watchQueueJson = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Watch-TargetAutoloop.ps1') `
+$watchQueueJson = & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Watch-TargetAutoloop.ps1') `
     -ConfigPath $configPath `
     -RunRoot $runRoot `
     -ProcessOnce `
@@ -75,7 +75,7 @@ Assert-True (@($queuedFilesBeforeStop).Count -eq 1) 'queued command should exist
 $queuedCommandBeforeStop = Get-Content -LiteralPath $queuedFilesBeforeStop[0].FullName -Raw -Encoding UTF8 | ConvertFrom-Json
 $queuedCommandId = [string]$queuedCommandBeforeStop.CommandId
 
-$stopRequest = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Request-TargetAutoloopControl.ps1') `
+$stopRequest = & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Request-TargetAutoloopControl.ps1') `
     -ConfigPath $configPath `
     -RunRoot $runRoot `
     -Action stop `
@@ -84,7 +84,7 @@ $stopRequest = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path 
 Assert-True ([bool]$stopRequest.Ok) 'stop request should succeed.'
 Assert-True (([string]$stopRequest.RequestId).Length -gt 0) 'stop request should allocate request id.'
 
-$stopWatchJson = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Watch-TargetAutoloop.ps1') `
+$stopWatchJson = & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Watch-TargetAutoloop.ps1') `
     -ConfigPath $configPath `
     -RunRoot $runRoot `
     -ProcessOnce `
@@ -92,7 +92,7 @@ $stopWatchJson = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Pat
 $stopWatch = $stopWatchJson | ConvertFrom-Json
 Assert-True ([string]$stopWatch.WatcherStopReason -eq 'control-stop-request') 'watcher should stop because of the explicit stop request.'
 
-$stoppedStatus = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Show-TargetAutoloopStatus.ps1') `
+$stoppedStatus = & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Show-TargetAutoloopStatus.ps1') `
     -ConfigPath $configPath `
     -RunRoot $runRoot `
     -AsJson | ConvertFrom-Json
@@ -111,7 +111,7 @@ $completedFilesWhileStopped = @(Get-ChildItem -LiteralPath $target01.QueueComple
 Assert-True (@($queuedFilesWhileStopped).Count -eq 1) 'queued command should remain queued across stop.'
 Assert-True (@($completedFilesWhileStopped).Count -eq 0) 'completed archive should remain empty before restart.'
 
-$watcherJson = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Start-TargetAutoloopWatcher.ps1') `
+$watcherJson = & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Start-TargetAutoloopWatcher.ps1') `
     -ConfigPath $configPath `
     -RunRoot $runRoot `
     -ProcessOnce `
@@ -120,7 +120,7 @@ $watcher = $watcherJson | ConvertFrom-Json
 Assert-True ([bool]$watcher.Ok) 'restart watcher should succeed after stop.'
 Assert-True (@($watcher.RestoredTargetIds) -contains 'target01') 'restart should restore stopped target state bookkeeping.'
 
-$restartedStatus = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Show-TargetAutoloopStatus.ps1') `
+$restartedStatus = & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Show-TargetAutoloopStatus.ps1') `
     -ConfigPath $configPath `
     -RunRoot $runRoot `
     -AsJson | ConvertFrom-Json
@@ -140,7 +140,7 @@ Assert-True (@($queuedFilesAfterRestart).Count -eq 1) 'restart should keep the o
 $queuedCommandAfterRestart = Get-Content -LiteralPath $queuedFilesAfterRestart[0].FullName -Raw -Encoding UTF8 | ConvertFrom-Json
 Assert-True ([string]$queuedCommandAfterRestart.CommandId -eq $queuedCommandId) 'restart should preserve the original queued command identity.'
 
-$workerJson = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'visible\Start-TargetAutoloopWorker.ps1') `
+$workerJson = & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'visible\Start-TargetAutoloopWorker.ps1') `
     -ConfigPath $configPath `
     -RunRoot $runRoot `
     -TargetId target01 `

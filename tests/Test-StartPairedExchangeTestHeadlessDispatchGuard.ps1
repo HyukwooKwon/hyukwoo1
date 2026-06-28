@@ -27,6 +27,8 @@ $config = Import-PowerShellDataFile -Path $configPath
 $runRootBase = [string]$config.PairTest.RunRootBase
 $blockedRunRoot = Join-Path $runRootBase ('run_headless_dispatch_guard_block_' + (Get-Date -Format 'yyyyMMdd_HHmmss_fff'))
 $allowedRunRoot = Join-Path $runRootBase ('run_headless_dispatch_guard_allow_' + (Get-Date -Format 'yyyyMMdd_HHmmss_fff'))
+$logRoot = Join-Path 'C:\dev\python\_relay-test-fixtures' 'Test-StartPairedExchangeTestHeadlessDispatchGuard'
+New-Item -ItemType Directory -Path $logRoot -Force | Out-Null
 
 foreach ($path in @($blockedRunRoot, $allowedRunRoot)) {
     if (Test-Path -LiteralPath $path) {
@@ -34,30 +36,62 @@ foreach ($path in @($blockedRunRoot, $allowedRunRoot)) {
     }
 }
 
-$blockedOutput = @(
-    & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Start-PairedExchangeTest.ps1') `
-        -ConfigPath $configPath `
-        -RunRoot $blockedRunRoot `
-        -IncludePairId pair01 `
-        -UseHeadlessDispatch 2>&1
-)
-$blockedExitCode = $LASTEXITCODE
-$blockedDetail = ($blockedOutput | Out-String)
+function Invoke-StartPairedExchangeForGuard {
+    param(
+        [Parameter(Mandatory)][string]$RunRoot,
+        [Parameter(Mandatory)][string]$Name,
+        [switch]$AllowHeadlessDispatchInTypedWindowLane
+    )
+
+    $stdoutPath = Join-Path $logRoot ($Name + '.stdout.txt')
+    $stderrPath = Join-Path $logRoot ($Name + '.stderr.txt')
+    $arguments = @(
+        '-NoProfile',
+        '-ExecutionPolicy', 'Bypass',
+        '-File', (Join-Path $root 'tests\Start-PairedExchangeTest.ps1'),
+        '-ConfigPath', $configPath,
+        '-RunRoot', $RunRoot,
+        '-IncludePairId', 'pair01',
+        '-UseHeadlessDispatch'
+    )
+    if ($AllowHeadlessDispatchInTypedWindowLane) {
+        $arguments += '-AllowHeadlessDispatchInTypedWindowLane'
+    }
+    $process = Start-Process `
+        -FilePath 'pwsh.exe' `
+        -ArgumentList $arguments `
+        -Wait `
+        -NoNewWindow `
+        -PassThru `
+        -RedirectStandardOutput $stdoutPath `
+        -RedirectStandardError $stderrPath
+    $detail = ''
+    if (Test-Path -LiteralPath $stdoutPath) {
+        $detail += (Get-Content -LiteralPath $stdoutPath -Raw -Encoding UTF8)
+    }
+    if (Test-Path -LiteralPath $stderrPath) {
+        $detail += (Get-Content -LiteralPath $stderrPath -Raw -Encoding UTF8)
+    }
+    return [pscustomobject]@{
+        ExitCode = [int]$process.ExitCode
+        Detail   = $detail
+    }
+}
+
+$blockedResult = Invoke-StartPairedExchangeForGuard -RunRoot $blockedRunRoot -Name 'blocked'
+$blockedExitCode = [int]$blockedResult.ExitCode
+$blockedDetail = [string]$blockedResult.Detail
 
 Assert-True ($blockedExitCode -ne 0) 'Start-PairedExchangeTest should reject headless dispatch in the shared visible typed-window lane.'
 Assert-True ($blockedDetail.Contains('headless-dispatch-disallowed-in-shared-visible-typed-window')) 'failure output should mention the typed-window headless guard.'
 Assert-True ($blockedDetail.Contains('-AllowHeadlessDispatchInTypedWindowLane')) 'failure output should explain the explicit override switch.'
 
-$allowedOutput = @(
-    & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Start-PairedExchangeTest.ps1') `
-        -ConfigPath $configPath `
-        -RunRoot $allowedRunRoot `
-        -IncludePairId pair01 `
-        -UseHeadlessDispatch `
-        -AllowHeadlessDispatchInTypedWindowLane 2>&1
-)
-$allowedExitCode = $LASTEXITCODE
-$allowedDetail = ($allowedOutput | Out-String)
+$allowedResult = Invoke-StartPairedExchangeForGuard `
+    -RunRoot $allowedRunRoot `
+    -Name 'allowed' `
+    -AllowHeadlessDispatchInTypedWindowLane
+$allowedExitCode = [int]$allowedResult.ExitCode
+$allowedDetail = [string]$allowedResult.Detail
 
 Assert-True ($allowedExitCode -eq 0) 'explicit override should allow intentional headless dispatch setup in the shared visible lane.'
 Assert-True ((Test-Path -LiteralPath (Join-Path $allowedRunRoot 'manifest.json') -PathType Leaf)) 'override path should still prepare the run root manifest.'

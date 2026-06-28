@@ -46,7 +46,7 @@ New-Item -ItemType Directory -Path $tmpRoot -Force | Out-Null
 }
 "@, (New-Utf8NoBomEncoding))
 
-$startJson = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Start-TargetAutoloopRun.ps1') `
+$startJson = & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Start-TargetAutoloopRun.ps1') `
     -ConfigPath $configPath `
     -RunRoot $runRoot `
     -Targets target01 `
@@ -64,7 +64,7 @@ $state.Targets.target01.PendingDispatchEligibleAt = (Get-Date).AddSeconds(18).To
 $state.LastUpdatedAt = (Get-Date).ToString('o')
 $state | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $start.StatePath -Encoding UTF8
 
-$pauseRequest = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Request-TargetAutoloopControl.ps1') `
+$pauseRequest = & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Request-TargetAutoloopControl.ps1') `
     -ConfigPath $configPath `
     -RunRoot $runRoot `
     -Action pause `
@@ -74,13 +74,13 @@ Assert-True ([bool]$pauseRequest.Ok) 'pause request should succeed.'
 Assert-True ([string]$pauseRequest.ControlPendingAction -eq 'pause') 'pause request should write pending action.'
 Assert-True (([string]$pauseRequest.RequestId).Length -gt 0) 'pause request should allocate request id.'
 
-$null = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Watch-TargetAutoloop.ps1') `
+$null = & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Watch-TargetAutoloop.ps1') `
     -ConfigPath $configPath `
     -RunRoot $runRoot `
     -ProcessOnce `
     -AsJson
 
-$pausedStatus = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Show-TargetAutoloopStatus.ps1') `
+$pausedStatus = & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Show-TargetAutoloopStatus.ps1') `
     -ConfigPath $configPath `
     -RunRoot $runRoot `
     -AsJson | ConvertFrom-Json
@@ -96,7 +96,7 @@ Assert-True ([string]$pausedTarget.NextAction -eq 'resume') 'paused target shoul
 Assert-True ([string]$pausedTarget.PausedPhase -eq 'dispatch-delay') 'paused target should preserve the original phase.'
 Assert-True ([string]$pausedTarget.PausedNextAction -eq 'wait-dispatch-delay') 'paused target should preserve the original next action.'
 
-$resumeRequest = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Request-TargetAutoloopControl.ps1') `
+$resumeRequest = & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Request-TargetAutoloopControl.ps1') `
     -ConfigPath $configPath `
     -RunRoot $runRoot `
     -Action resume `
@@ -106,13 +106,13 @@ Assert-True ([bool]$resumeRequest.Ok) 'resume request should succeed.'
 Assert-True ([string]$resumeRequest.ControlPendingAction -eq 'resume') 'resume request should write pending action.'
 Assert-True (([string]$resumeRequest.RequestId).Length -gt 0) 'resume request should allocate request id.'
 
-$null = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Watch-TargetAutoloop.ps1') `
+$null = & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Watch-TargetAutoloop.ps1') `
     -ConfigPath $configPath `
     -RunRoot $runRoot `
     -ProcessOnce `
     -AsJson
 
-$resumedStatus = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Show-TargetAutoloopStatus.ps1') `
+$resumedStatus = & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Show-TargetAutoloopStatus.ps1') `
     -ConfigPath $configPath `
     -RunRoot $runRoot `
     -AsJson | ConvertFrom-Json
@@ -128,7 +128,7 @@ Assert-True ([string]$resumedTarget.NextAction -eq 'wait-dispatch-delay') 'resum
 Assert-True ([string]$resumedTarget.PausedPhase -eq '') 'resume should clear paused phase bookkeeping.'
 Assert-True ([string]$resumedTarget.PausedNextAction -eq '') 'resume should clear paused next action bookkeeping.'
 
-$stopRequest = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Request-TargetAutoloopControl.ps1') `
+$stopRequest = & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Request-TargetAutoloopControl.ps1') `
     -ConfigPath $configPath `
     -RunRoot $runRoot `
     -Action stop `
@@ -138,13 +138,13 @@ Assert-True ([bool]$stopRequest.Ok) 'stop request should succeed.'
 Assert-True ([string]$stopRequest.ControlPendingAction -eq 'stop') 'stop request should write pending action.'
 Assert-True (([string]$stopRequest.RequestId).Length -gt 0) 'stop request should allocate request id.'
 
-$null = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Watch-TargetAutoloop.ps1') `
+$null = & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Watch-TargetAutoloop.ps1') `
     -ConfigPath $configPath `
     -RunRoot $runRoot `
     -ProcessOnce `
     -AsJson
 
-$stoppedStatus = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Show-TargetAutoloopStatus.ps1') `
+$stoppedStatus = & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Show-TargetAutoloopStatus.ps1') `
     -ConfigPath $configPath `
     -RunRoot $runRoot `
     -AsJson | ConvertFrom-Json

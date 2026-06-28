@@ -60,6 +60,21 @@ function Ensure-Directory {
     }
 }
 
+function Write-Utf8BomFile {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Content
+    )
+
+    $directory = Split-Path -Parent $Path
+    if (-not [string]::IsNullOrWhiteSpace($directory)) {
+        Ensure-Directory -Path $directory
+    }
+
+    $encoding = New-Object -TypeName System.Text.UTF8Encoding -ArgumentList $true
+    [System.IO.File]::WriteAllText($Path, $Content, $encoding)
+}
+
 function Resolve-FullPath {
     param(
         [Parameter(Mandatory)][string]$PathValue,
@@ -144,6 +159,66 @@ function Replace-QuotedAssignment {
         return ($match.Groups[1].Value + "'" + $escapedValue + "'")
     }
     return [regex]::Replace($Text, $pattern, $evaluator)
+}
+
+function Replace-QuotedAssignmentsAtIndent {
+    param(
+        [Parameter(Mandatory)][string]$Text,
+        [Parameter(Mandatory)][string]$Indent,
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Value,
+        [switch]$All,
+        [switch]$IfPresent
+    )
+
+    $escapedValue = $Value.Replace("'", "''")
+    $pattern = ("(?m)^({0}{1}\s*=\s*)'.*?'" -f [regex]::Escape($Indent), [regex]::Escape($Name))
+    $match = [regex]::Match($Text, $pattern)
+    if (-not $match.Success) {
+        if ($IfPresent) {
+            return $Text
+        }
+        throw ("assignment not found at expected indent: {0}" -f $Name)
+    }
+
+    $evaluator = {
+        param($capture)
+        return ($capture.Groups[1].Value + "'" + $escapedValue + "'")
+    }
+    if ($All) {
+        return [regex]::Replace($Text, $pattern, $evaluator)
+    }
+    return [regex]::Replace($Text, $pattern, $evaluator, 1)
+}
+
+function Replace-BooleanAssignmentsAtIndent {
+    param(
+        [Parameter(Mandatory)][string]$Text,
+        [Parameter(Mandatory)][string]$Indent,
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)][bool]$Value,
+        [switch]$All,
+        [switch]$IfPresent
+    )
+
+    $boolLiteral = if ($Value) { '$true' } else { '$false' }
+    $pattern = ('(?m)^({0}{1}\s*=\s*)\$(?:true|false)' -f [regex]::Escape($Indent), [regex]::Escape($Name))
+    $match = [regex]::Match($Text, $pattern)
+    if (-not $match.Success) {
+        if ($IfPresent) {
+            return $Text
+        }
+        throw ("boolean assignment not found at expected indent: {0}" -f $Name)
+    }
+
+    $evaluator = {
+        param($capture)
+        return ($capture.Groups[1].Value + $boolLiteral)
+    }
+    if ($All) {
+        return [regex]::Replace($Text, $pattern, $evaluator)
+    }
+    return [regex]::Replace($Text, $pattern, $evaluator, 1)
 }
 
 function Replace-QuotedAssignmentAfterAnchor {
@@ -346,24 +421,29 @@ foreach ($path in @(
 }
 
 $configText = Get-Content -LiteralPath $resolvedBaseConfigPath -Raw -Encoding UTF8
-$configText = Replace-QuotedAssignmentAfterAnchor -Text $configText -AnchorPattern $pairTestAnchorPattern -Name 'DefaultSeedWorkRepoRoot' -Value $resolvedWorkRepoRoot
-if (-not [string]::IsNullOrWhiteSpace($pairPolicyAnchorPattern)) {
+$pairTestTopLevelIndent = '        '
+$pairPolicyValueIndent = '                '
+$configText = Replace-QuotedAssignmentsAtIndent -Text $configText -Indent $pairTestTopLevelIndent -Name 'DefaultSeedWorkRepoRoot' -Value $resolvedWorkRepoRoot -IfPresent
+if ([string]::IsNullOrWhiteSpace($pairPolicyAnchorPattern)) {
+    $configText = Replace-QuotedAssignmentsAtIndent -Text $configText -Indent $pairPolicyValueIndent -Name 'DefaultSeedWorkRepoRoot' -Value $resolvedWorkRepoRoot -All -IfPresent
+}
+else {
     $configText = Replace-QuotedAssignmentAfterAnchorIfPresent -Text $configText -AnchorPattern $pairPolicyAnchorPattern -Name 'DefaultSeedWorkRepoRoot' -Value $resolvedWorkRepoRoot
 }
 if ($reviewInputPathSpecified) {
-    $configText = Replace-QuotedAssignmentAfterAnchor -Text $configText -AnchorPattern $pairTestAnchorPattern -Name 'DefaultSeedReviewInputPath' -Value $resolvedReviewInputPath
+    $configText = Replace-QuotedAssignmentsAtIndent -Text $configText -Indent $pairTestTopLevelIndent -Name 'DefaultSeedReviewInputPath' -Value $resolvedReviewInputPath -IfPresent
     if (-not [string]::IsNullOrWhiteSpace($pairPolicyAnchorPattern)) {
         $configText = Replace-QuotedAssignmentAfterAnchorIfPresent -Text $configText -AnchorPattern $pairPolicyAnchorPattern -Name 'DefaultSeedReviewInputPath' -Value $resolvedReviewInputPath
     }
 }
 if ($externalContractRelativeRootSpecified) {
-    $configText = Replace-QuotedAssignmentAfterAnchor -Text $configText -AnchorPattern $pairTestAnchorPattern -Name 'ExternalWorkRepoContractRelativeRoot' -Value ([string]$ExternalWorkRepoContractRelativeRoot)
+    $configText = Replace-QuotedAssignmentsAtIndent -Text $configText -Indent $pairTestTopLevelIndent -Name 'ExternalWorkRepoContractRelativeRoot' -Value ([string]$ExternalWorkRepoContractRelativeRoot) -IfPresent
     if (-not [string]::IsNullOrWhiteSpace($pairPolicyAnchorPattern)) {
         $configText = Replace-QuotedAssignmentAfterAnchorIfPresent -Text $configText -AnchorPattern $pairPolicyAnchorPattern -Name 'ExternalWorkRepoContractRelativeRoot' -Value ([string]$ExternalWorkRepoContractRelativeRoot)
     }
 }
 if ($requireSingleReviewCandidateSpecified) {
-    $configText = Replace-BooleanAssignmentAfterAnchor -Text $configText -AnchorPattern $pairTestAnchorPattern -Name 'DefaultSeedReviewInputRequireSingleCandidate' -Value ([bool]$DefaultSeedReviewInputRequireSingleCandidate)
+    $configText = Replace-BooleanAssignmentsAtIndent -Text $configText -Indent $pairTestTopLevelIndent -Name 'DefaultSeedReviewInputRequireSingleCandidate' -Value ([bool]$DefaultSeedReviewInputRequireSingleCandidate) -IfPresent
     if (-not [string]::IsNullOrWhiteSpace($pairPolicyAnchorPattern)) {
         $configText = Replace-BooleanAssignmentAfterAnchorIfPresent -Text $configText -AnchorPattern $pairPolicyAnchorPattern -Name 'DefaultSeedReviewInputRequireSingleCandidate' -Value ([bool]$DefaultSeedReviewInputRequireSingleCandidate)
     }
@@ -409,7 +489,7 @@ foreach ($targetId in @('target01','target02','target03','target04','target05','
         })
 }
 
-Set-Content -LiteralPath $resolvedOutputConfigPath -Value $configText -Encoding UTF8
+Write-Utf8BomFile -Path $resolvedOutputConfigPath -Content $configText
 
 $sourceBindingProfilePath = [string](Get-ConfigValue -Object $config -Name 'BindingProfilePath' -DefaultValue '')
 $sourceRuntimeMapPath = [string](Get-ConfigValue -Object $config -Name 'RuntimeMapPath' -DefaultValue '')

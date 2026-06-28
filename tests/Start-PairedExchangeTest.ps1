@@ -247,7 +247,7 @@ function Assert-RelayPayloadBudget {
 }
 
 function Resolve-PowerShellExecutable {
-    foreach ($name in @('pwsh.exe', 'powershell.exe')) {
+    foreach ($name in @('pwsh.exe', 'pwsh')) {
         $command = Get-Command -Name $name -ErrorAction SilentlyContinue | Select-Object -First 1
         if ($null -eq $command) {
             continue
@@ -262,7 +262,7 @@ function Resolve-PowerShellExecutable {
         return [string]$name
     }
 
-    throw 'pwsh.exe 또는 powershell.exe를 찾지 못했습니다.'
+    throw 'pwsh (PowerShell 7+)를 찾지 못했습니다.'
 }
 
 function Invoke-InitialHeadlessTurn {
@@ -421,7 +421,10 @@ function New-TargetCmdLauncherContent {
         '@echo off',
         'set "PSBIN=pwsh"',
         'where pwsh >nul 2>nul',
-        'if errorlevel 1 set "PSBIN=powershell"',
+        'if errorlevel 1 (',
+        '  echo pwsh not found. Install PowerShell 7+ and retry.',
+        '  exit /b 1',
+        ')',
         ('%PSBIN% -NoProfile -ExecutionPolicy Bypass -File "%~dp0{0}" %*' -f $Ps1FileName)
     ) -join "`r`n")
 }
@@ -1224,6 +1227,21 @@ foreach ($pair in @($selectedPairs)) {
     $pairId = [string]$pair.PairId
     $pairPolicy = Get-PairPolicyForPair -PairTest $pairTest -PairId $pairId
     $pairWorkRepoRoot = Resolve-PairWorkRepoRoot -PairPolicy $pairPolicy -ExplicitSeedWorkRepoRoot $SeedWorkRepoRoot
+    $pairSeedReviewInputPath = if (
+        (Test-NonEmptyString $seedTargetId) -and
+        (([string]$pair.TopTargetId -eq $seedTargetId) -or ([string]$pair.BottomTargetId -eq $seedTargetId))
+    ) {
+        $resolvedSeedReviewInputPath
+    }
+    else {
+        ''
+    }
+    Assert-SeedWorkRepoPolicy `
+        -PairTest $pairTest `
+        -PairPolicy $pairPolicy `
+        -AutomationRoot $root `
+        -WorkRepoRoot $pairWorkRepoRoot `
+        -ReviewInputPath $pairSeedReviewInputPath
     $pairUsesExternalContractPaths = Test-UseExternalWorkRepoContractPaths -PairTest $pairTest -PairPolicy $pairPolicy -PairWorkRepoRoot $pairWorkRepoRoot
     $pairUsesExternalRunRoot = Test-UseExternalWorkRepoRunRoot -PairTest $pairTest -PairPolicy $pairPolicy -WorkRepoRoot $pairWorkRepoRoot
     $pairRows += [pscustomobject]@{

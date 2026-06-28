@@ -47,13 +47,13 @@ New-Item -ItemType Directory -Path $targetWorkRepoRoot -Force | Out-Null
         RunRootBase = '$($tmpRoot.Replace("'", "''"))'
         Targets = @(
             @{ TargetId = 'target01'; Enabled = `$true; TriggerKinds = @('input-file'); WorkRepoRoot = '$($targetWorkRepoRoot.Replace("'", "''"))' }
-            @{ TargetId = 'target02'; Enabled = `$false; TriggerKinds = @('input-file') }
+            @{ TargetId = 'target02'; Enabled = `$true; TriggerKinds = @('input-file') }
         )
     }
 }
 "@, (New-Utf8NoBomEncoding))
 
-$startJson = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Start-TargetAutoloopRun.ps1') `
+$startJson = & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Start-TargetAutoloopRun.ps1') `
     -ConfigPath $configPath `
     -RunRoot $runRoot `
     -Targets target01 `
@@ -82,5 +82,44 @@ Assert-True ([string]$targetState.Phase -eq 'idle') 'target01 initial phase shou
 Assert-True ([string]$targetState.NextAction -eq 'wait-for-input') 'target01 next action should be wait-for-input.'
 Assert-True ([int]$targetState.CycleCount -eq 0) 'target01 cycle count should start at zero.'
 Assert-True (-not [bool]$start.QueueDispatchIntegrated) 'dispatch should remain disabled in the isolated groundwork.'
+
+$multiRunRoot = Join-Path $tmpRoot 'run_target_autoloop_multi'
+$multiStartJson = & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Start-TargetAutoloopRun.ps1') `
+    -ConfigPath $configPath `
+    -RunRoot $multiRunRoot `
+    -Targets target01 target02 `
+    -AsJson
+$multiStart = $multiStartJson | ConvertFrom-Json
+$multiManifest = Get-Content -LiteralPath $multiStart.ManifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
+$multiTargetIds = @($multiManifest.Targets | ForEach-Object { [string]$_.TargetId } | Sort-Object)
+Assert-True (($multiTargetIds -join ',') -eq 'target01,target02') 'space-separated multi -Targets should include target01,target02.'
+
+$commaRunRoot = Join-Path $tmpRoot 'run_target_autoloop_comma'
+$commaStartJson = & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Start-TargetAutoloopRun.ps1') `
+    -ConfigPath $configPath `
+    -RunRoot $commaRunRoot `
+    -Targets target01,target02 `
+    -AsJson
+$commaStart = $commaStartJson | ConvertFrom-Json
+$commaManifest = Get-Content -LiteralPath $commaStart.ManifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
+$commaTargetIds = @($commaManifest.Targets | ForEach-Object { [string]$_.TargetId } | Sort-Object)
+Assert-True (($commaTargetIds -join ',') -eq 'target01,target02') 'comma-separated multi -Targets should include target01,target02.'
+
+$unknownRunRoot = Join-Path $tmpRoot 'run_target_autoloop_unknown'
+$previousErrorActionPreference = $ErrorActionPreference
+$ErrorActionPreference = 'Continue'
+try {
+    $unknownOutput = & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Start-TargetAutoloopRun.ps1') `
+        -ConfigPath $configPath `
+        -RunRoot $unknownRunRoot `
+        -Targets target99 `
+        -AsJson 2>&1
+    $unknownExitCode = $LASTEXITCODE
+}
+finally {
+    $ErrorActionPreference = $previousErrorActionPreference
+}
+Assert-True ($unknownExitCode -ne 0) 'unknown -Targets should fail.'
+Assert-True ((($unknownOutput | Out-String) -match 'selected target was not found in TargetAutoloop\.Targets: target99')) 'unknown target failure should explain missing TargetAutoloop target.'
 
 Write-Host 'start target autoloop run ok'

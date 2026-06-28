@@ -48,7 +48,7 @@ New-Item -ItemType Directory -Path $routerInboxRoot -Force | Out-Null
 }
 "@, (New-Utf8NoBomEncoding))
 
-$startJson = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Start-TargetAutoloopRun.ps1') `
+$startJson = & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Start-TargetAutoloopRun.ps1') `
     -ConfigPath $configPath `
     -RunRoot $runRoot `
     -Targets target01 `
@@ -58,7 +58,7 @@ $start = $startJson | ConvertFrom-Json
 $manifest = Get-Content -LiteralPath $start.ManifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
 $target01 = @($manifest.Targets | Where-Object { [string]$_.TargetId -eq 'target01' } | Select-Object -First 1)[0]
 
-$pauseRequest = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Request-TargetAutoloopControl.ps1') `
+$pauseRequest = & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Request-TargetAutoloopControl.ps1') `
     -ConfigPath $configPath `
     -RunRoot $runRoot `
     -Action pause `
@@ -66,13 +66,13 @@ $pauseRequest = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path
     -AsJson | ConvertFrom-Json
 Assert-True ([bool]$pauseRequest.Ok) 'pause request should succeed before paused input queueing.'
 
-$null = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Watch-TargetAutoloop.ps1') `
+$null = & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Watch-TargetAutoloop.ps1') `
     -ConfigPath $configPath `
     -RunRoot $runRoot `
     -ProcessOnce `
     -AsJson
 
-$pausedStatus = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Show-TargetAutoloopStatus.ps1') `
+$pausedStatus = & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Show-TargetAutoloopStatus.ps1') `
     -ConfigPath $configPath `
     -RunRoot $runRoot `
     -AsJson | ConvertFrom-Json
@@ -84,7 +84,7 @@ Set-Content -LiteralPath $inputPath1 -Encoding UTF8 -Value 'first paused input s
 Start-Sleep -Milliseconds 50
 Set-Content -LiteralPath $inputPath2 -Encoding UTF8 -Value 'second paused input should not overwrite the first command prompt'
 
-$watchFirstJson = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Watch-TargetAutoloop.ps1') `
+$watchFirstJson = & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Watch-TargetAutoloop.ps1') `
     -ConfigPath $configPath `
     -RunRoot $runRoot `
     -ProcessOnce `
@@ -92,7 +92,7 @@ $watchFirstJson = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Pa
 $watchFirst = $watchFirstJson | ConvertFrom-Json
 Assert-True ([int]$watchFirst.QueuedCount -eq 1) 'first paused sweep should queue one input command.'
 
-$watchSecondJson = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Watch-TargetAutoloop.ps1') `
+$watchSecondJson = & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Watch-TargetAutoloop.ps1') `
     -ConfigPath $configPath `
     -RunRoot $runRoot `
     -ProcessOnce `
@@ -121,7 +121,7 @@ Assert-True ($prompt2 -match 'second paused input') 'second snapshot should keep
 Assert-True ($latestPrompt -match 'second paused input') 'mutable last prompt should reflect only the latest queued input.'
 Assert-True (-not ($latestPrompt -match 'first paused input')) 'mutable last prompt overwrite should not affect the first snapshot.'
 
-$blockedWorkerJson = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'visible\Start-TargetAutoloopWorker.ps1') `
+$blockedWorkerJson = & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'visible\Start-TargetAutoloopWorker.ps1') `
     -ConfigPath $configPath `
     -RunRoot $runRoot `
     -TargetId target01 `
@@ -131,7 +131,7 @@ $blockedWorker = $blockedWorkerJson | ConvertFrom-Json
 Assert-True ([int]$blockedWorker.ProcessedCount -eq 0) 'paused controller should block queued input dispatch.'
 Assert-True ([string]$blockedWorker.LastResult.State -eq 'blocked-by-controller') 'paused input queue should report blocked-by-controller.'
 
-$resumeRequest = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Request-TargetAutoloopControl.ps1') `
+$resumeRequest = & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Request-TargetAutoloopControl.ps1') `
     -ConfigPath $configPath `
     -RunRoot $runRoot `
     -Action resume `
@@ -139,13 +139,13 @@ $resumeRequest = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Pat
     -AsJson | ConvertFrom-Json
 Assert-True ([bool]$resumeRequest.Ok) 'resume request should succeed after paused input queueing.'
 
-$null = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Watch-TargetAutoloop.ps1') `
+$null = & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Watch-TargetAutoloop.ps1') `
     -ConfigPath $configPath `
     -RunRoot $runRoot `
     -ProcessOnce `
     -AsJson
 
-$workerOneJson = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'visible\Start-TargetAutoloopWorker.ps1') `
+$workerOneJson = & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'visible\Start-TargetAutoloopWorker.ps1') `
     -ConfigPath $configPath `
     -RunRoot $runRoot `
     -TargetId target01 `
@@ -154,7 +154,7 @@ $workerOneJson = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Pat
 $workerOne = $workerOneJson | ConvertFrom-Json
 Assert-True ([int]$workerOne.ProcessedCount -eq 1) 'resumed worker should dispatch the first queued input command.'
 
-$workerTwoJson = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'visible\Start-TargetAutoloopWorker.ps1') `
+$workerTwoJson = & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'visible\Start-TargetAutoloopWorker.ps1') `
     -ConfigPath $configPath `
     -RunRoot $runRoot `
     -TargetId target01 `

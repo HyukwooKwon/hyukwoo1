@@ -267,7 +267,11 @@ if ($RunRouter) {
 
         $mixedRuntimeJson = $mixedRuntimeSeed | ConvertTo-Json -Depth 6
         [System.IO.File]::WriteAllText([string]$config.RuntimeMapPath, $mixedRuntimeJson, [System.Text.UTF8Encoding]::new($false))
-        $routerShell = if (Get-Command 'pwsh.exe' -ErrorAction SilentlyContinue) { 'pwsh.exe' } else { 'powershell.exe' }
+        $routerShellCommand = Get-Command 'pwsh.exe' -ErrorAction SilentlyContinue
+        if ($null -eq $routerShellCommand) {
+            throw 'pwsh (PowerShell 7+)를 찾지 못했습니다.'
+        }
+        $routerShell = 'pwsh.exe'
         $mixedRun = Start-Process -FilePath $routerShell -ArgumentList @(
             '-NoProfile',
             '-ExecutionPolicy', 'Bypass',

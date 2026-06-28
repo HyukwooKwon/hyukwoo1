@@ -47,6 +47,18 @@ $targetUnresponsiveRow = [pscustomobject]@{
 Assert-True (-not (Test-PairedSourceOutboxObservedRow -Row $targetUnresponsiveRow)) 'target-unresponsive-after-send should not count as observed publish.'
 Assert-True (-not (Test-PairedSourceOutboxStrictReadyRow -Row $targetUnresponsiveRow)) 'target-unresponsive-after-send should not count as strict-ready publish.'
 
+$limitReachedRow = [pscustomobject]@{
+    SourceOutboxState = 'duplicate-marker-archived'
+    SourceOutboxNextAction = 'limit-reached'
+    LatestState = 'limit-reached'
+    PublishReadyPath = ''
+}
+Assert-True (Test-PairedSourceOutboxObservedRow -Row $limitReachedRow) 'limit-reached row should still count as observed terminal output.'
+Assert-True (-not (Test-PairedSourceOutboxAcceptedRow -Row $limitReachedRow)) 'limit-reached row should not count as accepted publish.'
+Assert-True (-not (Test-PairedSourceOutboxStrictReadyRow -Row $limitReachedRow)) 'limit-reached row should not count as strict-ready publish.'
+Assert-True (-not (Test-PairedHandoffTransitionReadyRow -Row $limitReachedRow)) 'limit-reached row should not count as handoff transition-ready.'
+Assert-True (-not (Test-PairedHandoffAcceptedRow -Row $limitReachedRow)) 'limit-reached row should not count as accepted handoff.'
+
 $partnerActiveRow = [pscustomobject]@{
     SubmitState = 'confirmed'
     SourceOutboxState = ''

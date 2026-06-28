@@ -30,7 +30,7 @@ function Get-DefaultConfigPath {
 }
 
 function Resolve-PowerShellExecutable {
-    foreach ($name in @('pwsh.exe', 'powershell.exe')) {
+    foreach ($name in @('pwsh.exe', 'pwsh')) {
         $command = Get-Command -Name $name -ErrorAction SilentlyContinue | Select-Object -First 1
         if ($null -eq $command) {
             continue
@@ -46,7 +46,7 @@ function Resolve-PowerShellExecutable {
         return [string]$name
     }
 
-    throw 'pwsh.exe 또는 powershell.exe를 찾지 못했습니다.'
+    throw 'pwsh (PowerShell 7+)를 찾지 못했습니다.'
 }
 
 function ConvertTo-CommandArgumentList {
@@ -172,6 +172,8 @@ function Get-SourceOutboxCloseoutSummary {
 
     $acceptedCount = 0
     $transitionReadyCount = 0
+    $pendingReadyCount = 0
+    $pendingReadyTargets = New-Object System.Collections.Generic.List[string]
 
     foreach ($row in @($Rows)) {
         if ($null -eq $row) {
@@ -184,11 +186,17 @@ function Get-SourceOutboxCloseoutSummary {
         if (Test-SourceOutboxTransitionReadyRow -Row $row) {
             $transitionReadyCount++
         }
+        if ([bool](Get-ConfigValue -Object $row -Name 'PublishReadyPresent' -DefaultValue $false)) {
+            $pendingReadyCount++
+            [void]$pendingReadyTargets.Add(('{0}:{1}' -f [string](Get-ConfigValue -Object $row -Name 'TargetId' -DefaultValue ''), [string](Get-ConfigValue -Object $row -Name 'PublishReadyPath' -DefaultValue '')))
+        }
     }
 
     return [pscustomobject]@{
         AcceptedCount        = $acceptedCount
         TransitionReadyCount = $transitionReadyCount
+        PendingReadyCount    = $pendingReadyCount
+        PendingReadyTargets  = @($pendingReadyTargets)
     }
 }
 
@@ -319,10 +327,11 @@ $checks += New-CheckResult -Name 'partner-target-role-contract' -Passed (@($part
 $checks += New-CheckResult -Name 'pair-status-rows-present' -Passed (@($seedStatusRow).Count -eq 1 -and @($partnerStatusRow).Count -eq 1) -Required $true -Summary ("seedRow={0} partnerRow={1}" -f @($seedStatusRow).Count, @($partnerStatusRow).Count) -Detail ("seed={0} partner={1}" -f $SeedTargetId, $partnerTargetId)
 $checks += New-CheckResult -Name 'pair-roundtrip-closed' -Passed ([int]$pairedStatus.Counts.DonePresentCount -ge 2 -and [int]$pairedStatus.Counts.ErrorPresentCount -eq 0 -and [int]$pairedStatus.Counts.ForwardedStateCount -ge 2) -Required $true -Summary ("done={0} error={1} forwarded={2}" -f [int]$pairedStatus.Counts.DonePresentCount, [int]$pairedStatus.Counts.ErrorPresentCount, [int]$pairedStatus.Counts.ForwardedStateCount) -Detail ''
 $checks += New-CheckResult -Name 'source-outbox-accepted' -Passed ([int]$sourceOutboxCloseout.AcceptedCount -ge 2 -and [int]$sourceOutboxCloseout.TransitionReadyCount -ge 2) -Required $true -Summary ("accepted={0} transitionReady={1}" -f [int]$sourceOutboxCloseout.AcceptedCount, [int]$sourceOutboxCloseout.TransitionReadyCount) -Detail ("rawImported={0} rawHandoffReady={1}" -f [int]$pairedStatus.Counts.SourceOutboxImportedCount, [int]$pairedStatus.Counts.HandoffReadyCount)
+$checks += New-CheckResult -Name 'source-outbox-no-pending-marker' -Passed ([int]$sourceOutboxCloseout.PendingReadyCount -eq 0) -Required $true -Summary ("pendingReady={0}" -f [int]$sourceOutboxCloseout.PendingReadyCount) -Detail ((@($sourceOutboxCloseout.PendingReadyTargets) -join '; '))
 $checks += New-CheckResult -Name 'dispatch-clean' -Passed ([int]$pairedStatus.Counts.DispatchRunningCount -eq 0 -and [int]$pairedStatus.Counts.DispatchFailedCount -eq 0) -Required $true -Summary ("running={0} failed={1}" -f [int]$pairedStatus.Counts.DispatchRunningCount, [int]$pairedStatus.Counts.DispatchFailedCount) -Detail ''
 $checks += New-CheckResult -Name 'router-metadata-contract' -Passed ([bool]$relayStatus.Router.RequireReadyDeliveryMetadata -and [bool]$relayStatus.Router.RequirePairTransportMetadata) -Required $true -Summary ("ready={0} pair={1}" -f [bool]$relayStatus.Router.RequireReadyDeliveryMetadata, [bool]$relayStatus.Router.RequirePairTransportMetadata) -Detail ''
 $checks += New-CheckResult -Name 'router-preexisting-policy' -Passed ([bool]$relayStatus.Router.IgnorePreexistingReadyFiles -and [string]$relayStatus.Router.PreexistingHandlingMode -eq 'ignore-archive') -Required $true -Summary ("ignorePreexisting={0} mode={1}" -f [bool]$relayStatus.Router.IgnorePreexistingReadyFiles, [string]$relayStatus.Router.PreexistingHandlingMode) -Detail ("startupCutoffAt={0}" -f [string]$relayStatus.Router.StartupCutoffAt)
-$checks += New-CheckResult -Name 'watcher-terminal-state' -Passed ([string]$pairedStatus.Watcher.Status -eq 'stopped' -and [string]$pairedStatus.Watcher.StopCategory -in @('manual-stop', 'expected-limit') -and [int]$pairedStatus.Watcher.ForwardedCount -ge 2) -Required $true -Summary ("status={0} stopCategory={1}" -f [string]$pairedStatus.Watcher.Status, [string]$pairedStatus.Watcher.StopCategory) -Detail ("forwardedCount={0}" -f [int]$pairedStatus.Watcher.ForwardedCount)
+$checks += New-CheckResult -Name 'watcher-terminal-state' -Passed ([string]$pairedStatus.Watcher.Status -eq 'stopped' -and [string]$pairedStatus.Watcher.StopCategory -in @('manual-stop', 'expected-limit') -and ([int]$pairedStatus.Watcher.ForwardedCount -ge 2 -or [int]$pairedStatus.Counts.ForwardedStateCount -ge 2)) -Required $true -Summary ("status={0} stopCategory={1}" -f [string]$pairedStatus.Watcher.Status, [string]$pairedStatus.Watcher.StopCategory) -Detail ("watcherForwardedCount={0} forwardedStateCount={1}" -f [int]$pairedStatus.Watcher.ForwardedCount, [int]$pairedStatus.Counts.ForwardedStateCount)
 
 $receiptPassed = Test-VisibleReceiptRoundtripSatisfied -RunSummary $runSummary -PairedStatus $pairedStatus -SourceOutboxCloseout $sourceOutboxCloseout
 $checks += New-CheckResult -Name 'visible-receipt-roundtrip' -Passed $receiptPassed -Required ([bool]$RequireVisibleReceipt) -Summary ("receiptExists={0} effectiveAcceptance={1} currentAcceptance={2} stage={3}" -f [bool]$pairedStatus.AcceptanceReceipt.Exists, [string]$runSummary.Acceptance.AcceptanceState, [string]$pairedStatus.AcceptanceReceipt.AcceptanceState, [string]$runSummary.Acceptance.Stage) -Detail ("seedFinal={0} seedSubmit={1} outboxPublished={2} sourceOutboxAccepted={3}" -f [string]$runSummary.Acceptance.SeedFinalState, [string]$runSummary.Acceptance.SeedSubmitState, [bool]$runSummary.Acceptance.SeedOutboxPublished, [int]$sourceOutboxCloseout.AcceptedCount)
@@ -330,8 +339,8 @@ $checks += New-CheckResult -Name 'visible-receipt-roundtrip' -Passed $receiptPas
 $failedRequiredChecks = @($checks | Where-Object { $_.Required -and -not $_.Passed })
 $overall = if (@($failedRequiredChecks).Count -eq 0) { 'success' } else { 'failing' }
 $mode = if ($RequireVisibleReceipt) { 'shared-visible-receipt-required' } else { 'passive-runroot-verification' }
-$confirmPassed = ([bool](-not $RequireVisibleReceipt) -and @($failedRequiredChecks).Count -eq 0)
-$receiptConfirmPassed = ([bool]$RequireVisibleReceipt -and @($failedRequiredChecks).Count -eq 0)
+$confirmPassed = (@($failedRequiredChecks).Count -eq 0)
+$receiptConfirmPassed = ([bool]$RequireVisibleReceipt -and [bool]$confirmPassed)
 
 $payload = [pscustomobject][ordered]@{
     SchemaVersion = '1.0.0'

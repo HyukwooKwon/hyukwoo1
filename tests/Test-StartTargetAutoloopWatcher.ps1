@@ -47,7 +47,7 @@ New-Item -ItemType Directory -Path $tmpRoot -Force | Out-Null
 }
 "@, (New-Utf8NoBomEncoding))
 
-$startJson = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Start-TargetAutoloopRun.ps1') `
+$startJson = & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Start-TargetAutoloopRun.ps1') `
     -ConfigPath $configPath `
     -RunRoot $runRoot `
     -Targets target01 `
@@ -85,7 +85,7 @@ $status.ProcessStartedAt = (Get-Date).AddSeconds(-60).ToString('o')
 $status.LastUpdatedAt = (Get-Date).ToString('o')
 $status | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $start.StatusPath -Encoding UTF8
 
-$watcherJson = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Start-TargetAutoloopWatcher.ps1') `
+$watcherJson = & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Start-TargetAutoloopWatcher.ps1') `
     -ConfigPath $configPath `
     -RunRoot $runRoot `
     -RunDurationSec 1 `
@@ -96,7 +96,7 @@ Assert-True ([bool]$watcher.Ok) 'watcher start should succeed.'
 Assert-True ([string]$watcher.Result -eq 'completed-inline') 'inline watcher start should finish synchronously.'
 Assert-True (@($watcher.RestoredTargetIds) -contains 'target01') 'restart should restore stopped target state bookkeeping.'
 
-$finalStatus = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Show-TargetAutoloopStatus.ps1') `
+$finalStatus = & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Show-TargetAutoloopStatus.ps1') `
     -ConfigPath $configPath `
     -RunRoot $runRoot `
     -AsJson | ConvertFrom-Json
@@ -110,7 +110,33 @@ Assert-True (([string]$finalStatus.WatcherRecommendation).Contains('watcher가 s
 Assert-True ([string]$finalState.Targets.target01.Phase -ne 'stopped') 'restart should restore target phase from stopped.'
 Assert-True ([string]$finalState.Targets.target01.NextAction -eq 'wait-for-input') 'restored input target should return to wait-for-input.'
 
-$mismatchJson = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Start-TargetAutoloopWatcher.ps1') `
+$activeStatus = Get-Content -LiteralPath $start.StatusPath -Raw -Encoding UTF8 | ConvertFrom-Json
+$activeStatus.ControllerState = 'running'
+$activeStatus.WatcherState = 'running'
+$activeStatus.WatcherStopReason = ''
+$activeStatus.HeartbeatAt = (Get-Date).ToString('o')
+$activeStatus.ProcessStartedAt = (Get-Date).AddMinutes(-5).ToString('o')
+$activeStatus.LastUpdatedAt = (Get-Date).ToString('o')
+$activeStatus | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $start.StatusPath -Encoding UTF8
+
+$alreadyRunningJson = & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Start-TargetAutoloopWatcher.ps1') `
+    -ConfigPath $configPath `
+    -RunRoot $runRoot `
+    -RunMode target-inbox-submit `
+    -ProcessOnce `
+    -AsJson
+$alreadyRunning = $alreadyRunningJson | ConvertFrom-Json
+
+Assert-True ([bool]$alreadyRunning.Ok) 'fresh active watcher start should return an idempotent successful already-running payload.'
+Assert-True ([string]$alreadyRunning.Result -eq 'already-running') 'fresh active watcher start should not launch another watcher.'
+Assert-True (@($alreadyRunning.ReasonCodes) -contains 'watcher_already_active') 'fresh active watcher start should include watcher_already_active.'
+Assert-True ([bool]$alreadyRunning.Idempotent) 'fresh active watcher start should mark the response idempotent.'
+Assert-True ([bool]$alreadyRunning.ActiveConfirmed) 'fresh active watcher start should mark active confirmation.'
+Assert-True (-not [bool]$alreadyRunning.WatcherMutexHeld) 'fresh active watcher start should not report mutex-only handling.'
+Assert-True ([string]$alreadyRunning.WatcherState -eq 'running') 'fresh active watcher start should report running state.'
+Assert-True ([string]$alreadyRunning.WatcherMutexName) 'already-running payload should include watcher mutex name.'
+
+$mismatchJson = & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Start-TargetAutoloopWatcher.ps1') `
     -ConfigPath $configPath `
     -RunRoot $runRoot `
     -RunMode target-autoloop `
@@ -142,13 +168,13 @@ $publishRunRoot = Join-Path $tmpRoot 'run_target_autoloop_publish_missing'
 }
 "@, (New-Utf8NoBomEncoding))
 
-& powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Start-TargetAutoloopRun.ps1') `
+& pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Start-TargetAutoloopRun.ps1') `
     -ConfigPath $publishConfigPath `
     -RunRoot $publishRunRoot `
     -Targets target02 `
     -RunMode target-autoloop `
     -AsJson | Out-Null
-$publishMissingJson = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Start-TargetAutoloopWatcher.ps1') `
+$publishMissingJson = & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Start-TargetAutoloopWatcher.ps1') `
     -ConfigPath $publishConfigPath `
     -RunRoot $publishRunRoot `
     -RunMode target-autoloop `
@@ -172,7 +198,7 @@ $sessionRouterStatePath = Join-Path $tmpRoot 'router-state.session-mismatch.json
 [ordered]@{
     Status = 'running'
     LauncherSessionId = 'router-session-old'
-    RouterPid = 1234
+    RouterPid = $PID
 } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $sessionRouterStatePath -Encoding UTF8
 [System.IO.File]::WriteAllText($sessionConfigPath, @"
 @{
@@ -195,13 +221,13 @@ $sessionRouterStatePath = Join-Path $tmpRoot 'router-state.session-mismatch.json
 }
 "@, (New-Utf8NoBomEncoding))
 
-& powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Start-TargetAutoloopRun.ps1') `
+& pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Start-TargetAutoloopRun.ps1') `
     -ConfigPath $sessionConfigPath `
     -RunRoot $sessionRunRoot `
     -Targets target03 `
     -RunMode target-autoloop `
     -AsJson | Out-Null
-$sessionMismatchJson = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Start-TargetAutoloopWatcher.ps1') `
+$sessionMismatchJson = & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Start-TargetAutoloopWatcher.ps1') `
     -ConfigPath $sessionConfigPath `
     -RunRoot $sessionRunRoot `
     -RunMode target-autoloop `

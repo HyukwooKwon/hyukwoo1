@@ -15,13 +15,53 @@ function Assert-True {
     }
 }
 
+function New-Utf8NoBomEncoding {
+    return [System.Text.UTF8Encoding]::new($false)
+}
+
 $root = Split-Path -Parent $PSScriptRoot
 $tmpRoot = Join-Path $root '_tmp\Test-ShowPairedExchangeStatusPairSummary'
 $runRoot = Join-Path $tmpRoot ('run_' + (Get-Date -Format 'yyyyMMdd_HHmmss_fff'))
-$configPath = Join-Path $root 'config\settings.bottest-live-visible.psd1'
+$configPath = Join-Path $tmpRoot 'settings.test.psd1'
 $stateRoot = Join-Path $runRoot '.state'
 
+if (Test-Path -LiteralPath $tmpRoot) {
+    Remove-Item -LiteralPath $tmpRoot -Recurse -Force
+}
 New-Item -ItemType Directory -Path $stateRoot -Force | Out-Null
+
+$runtimeRoot = Join-Path $tmpRoot 'runtime'
+$logsRoot = Join-Path $tmpRoot 'logs'
+$processedRoot = Join-Path $tmpRoot 'processed'
+$failedRoot = Join-Path $tmpRoot 'failed'
+$retryPendingRoot = Join-Path $tmpRoot 'retry-pending'
+$target01Folder = Join-Path $tmpRoot 'inbox\target01'
+$target05Folder = Join-Path $tmpRoot 'inbox\target05'
+foreach ($path in @($runtimeRoot, $logsRoot, $processedRoot, $failedRoot, $retryPendingRoot, $target01Folder, $target05Folder)) {
+    New-Item -ItemType Directory -Path $path -Force | Out-Null
+}
+
+$configText = @"
+@{
+    MaxPayloadChars = 4000
+    MaxPayloadBytes = 12000
+    RuntimeRoot = '$($runtimeRoot.Replace("'", "''"))'
+    LogsRoot = '$($logsRoot.Replace("'", "''"))'
+    ProcessedRoot = '$($processedRoot.Replace("'", "''"))'
+    FailedRoot = '$($failedRoot.Replace("'", "''"))'
+    RetryPendingRoot = '$($retryPendingRoot.Replace("'", "''"))'
+    Targets = @(
+        @{ Id = 'target01'; Folder = '$($target01Folder.Replace("'", "''"))'; EnterCount = 1; WindowTitle = 'TestWindow01'; FixedSuffix = `$null }
+        @{ Id = 'target05'; Folder = '$($target05Folder.Replace("'", "''"))'; EnterCount = 1; WindowTitle = 'TestWindow05'; FixedSuffix = `$null }
+    )
+    PairTest = @{
+        RunRootBase = '$($tmpRoot.Replace("'", "''"))'
+        ExecutionPathMode = 'typed-window'
+        DefaultPublishContractMode = 'strict'
+    }
+}
+"@
+[System.IO.File]::WriteAllText($configPath, $configText, (New-Utf8NoBomEncoding))
 
 & (Join-Path $root 'tests\Start-PairedExchangeTest.ps1') `
     -ConfigPath $configPath `

@@ -50,8 +50,13 @@ $root = Split-Path -Parent $PSScriptRoot
 $scriptPath = Join-Path $root 'tests\Run-LiveVisiblePairAcceptance.ps1'
 $functions = Load-FunctionText -ScriptPath $scriptPath -Names @(
     'Test-NonEmptyString',
+    'Get-ResultPropertyValue',
     'Get-IsoTimestampAgeSeconds',
-    'Test-VisibleWorkerTargetProgress'
+    'Test-VisibleWorkerTargetProgress',
+    'Test-LiveAcceptanceTargetProgress',
+    'Resolve-AcceptanceWatcherMaxForwardCount',
+    'Get-SourceOutboxPendingReadySummary',
+    'Test-PublishPrimitiveLateGraceCandidate'
 )
 
 function Get-ConfigValue {
@@ -87,7 +92,7 @@ function Get-ConfigValue {
     return $DefaultValue
 }
 
-foreach ($name in @('Test-NonEmptyString', 'Get-IsoTimestampAgeSeconds', 'Test-VisibleWorkerTargetProgress')) {
+foreach ($name in @('Test-NonEmptyString', 'Get-ResultPropertyValue', 'Get-IsoTimestampAgeSeconds', 'Test-VisibleWorkerTargetProgress', 'Test-LiveAcceptanceTargetProgress', 'Resolve-AcceptanceWatcherMaxForwardCount', 'Get-SourceOutboxPendingReadySummary', 'Test-PublishPrimitiveLateGraceCandidate')) {
     Invoke-Expression $functions[$name]
 }
 
@@ -152,5 +157,75 @@ $outboxProgress = [pscustomobject]@{
     DispatchUpdatedAt = ''
 }
 Assert-True (Test-VisibleWorkerTargetProgress -Row $outboxProgress -PairTest $pairTest) 'source-outbox publish-started should still count as progress.'
+
+$typedWindowReadyToForward = [pscustomobject]@{
+    LatestState = 'ready-to-forward'
+    SourceOutboxState = 'imported'
+    SourceOutboxContractLatestState = 'ready-to-forward'
+    SourceOutboxNextAction = 'handoff-ready'
+    DispatchState = ''
+    DispatchHeartbeatAt = ''
+    DispatchUpdatedAt = ''
+}
+Assert-True (Test-LiveAcceptanceTargetProgress -Row $typedWindowReadyToForward -PairTest $pairTest) 'typed-window imported handoff-ready target should extend acceptance grace.'
+
+$acceptanceCap = Resolve-AcceptanceWatcherMaxForwardCount -ConfiguredMaxForwardCount 0 -TargetForwardedStateCount 2 -KeepRunning:$false
+Assert-True ($acceptanceCap -eq 2) 'acceptance watcher should default to the target forward count when not kept running.'
+
+$explicitCap = Resolve-AcceptanceWatcherMaxForwardCount -ConfiguredMaxForwardCount 4 -TargetForwardedStateCount 2 -KeepRunning:$false
+Assert-True ($explicitCap -eq 4) 'explicit watcher max forward count should be preserved.'
+
+$keepRunningCap = Resolve-AcceptanceWatcherMaxForwardCount -ConfiguredMaxForwardCount 0 -TargetForwardedStateCount 2 -KeepRunning:$true
+Assert-True ($keepRunningCap -eq 0) 'keep-running acceptance should not add an implicit max forward count.'
+
+$pendingReadySummary = Get-SourceOutboxPendingReadySummary -Status ([pscustomobject]@{
+        Counts = [pscustomobject]@{
+            SourceOutboxPendingReadyCount = 1
+        }
+        Targets = @(
+            [pscustomobject]@{
+                TargetId = 'target04'
+                PublishReadyPresent = $true
+                PublishReadyPath = 'C:\repo\.relay-runs\run\target04\publish.ready.json'
+            },
+            [pscustomobject]@{
+                TargetId = 'target08'
+                PublishReadyPresent = $false
+                PublishReadyPath = 'C:\repo\.relay-runs\run\target08\publish.ready.json'
+            }
+        )
+    })
+Assert-True ([int]$pendingReadySummary.PendingReadyCount -eq 1) 'source-outbox closeout summary should preserve pending-ready count.'
+Assert-True (@($pendingReadySummary.PendingReadyTargets).Count -eq 1) 'source-outbox closeout summary should list pending-ready targets.'
+
+$publishStartedPrimitive = [pscustomobject]@{
+    PrimitiveSuccess = $false
+    PrimitiveState = 'missing'
+    PrimitiveReason = 'publish-started/(none)/no-zip'
+    SourceOutboxState = 'publish-started'
+    PairedTargetStatus = [pscustomobject]@{
+        SourceOutboxState = 'publish-started'
+    }
+}
+Assert-True (Test-PublishPrimitiveLateGraceCandidate -PublishPrimitive $publishStartedPrimitive) 'publish-started primitive should get a late-marker grace window.'
+
+$missingPrimitive = [pscustomobject]@{
+    PrimitiveSuccess = $false
+    PrimitiveState = 'missing'
+    PrimitiveReason = '(none)/(none)/(none)'
+    SourceOutboxState = ''
+    PairedTargetStatus = [pscustomobject]@{
+        SourceOutboxState = ''
+    }
+}
+Assert-True (-not (Test-PublishPrimitiveLateGraceCandidate -PublishPrimitive $missingPrimitive)) 'empty missing primitive should not wait in late-marker grace.'
+
+$alreadyObservedPrimitive = [pscustomobject]@{
+    PrimitiveSuccess = $true
+    PrimitiveState = 'observed'
+    PrimitiveReason = 'publish-started/(none)/ready-to-forward'
+    SourceOutboxState = 'publish-started'
+}
+Assert-True (-not (Test-PublishPrimitiveLateGraceCandidate -PublishPrimitive $alreadyObservedPrimitive)) 'already observed primitive should not enter late-marker grace.'
 
 Write-Host 'run-live-visible-pair-acceptance visible worker progress freshness ok'

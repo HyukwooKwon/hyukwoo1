@@ -31,7 +31,7 @@ function Invoke-ScriptJson {
         [Parameter(Mandatory)][string[]]$Arguments
     )
 
-    $powershellPath = (Get-Command -Name 'powershell.exe' -ErrorAction Stop | Select-Object -First 1).Source
+    $powershellPath = (Get-Command -Name 'pwsh.exe' -ErrorAction Stop | Select-Object -First 1).Source
     $result = & $powershellPath '-NoProfile' '-ExecutionPolicy' 'Bypass' '-File' (Join-Path $Root $ScriptName) @Arguments
     if ($LASTEXITCODE -ne 0) {
         throw (($result | Out-String).Trim())

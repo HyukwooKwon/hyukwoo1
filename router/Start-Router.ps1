@@ -529,7 +529,7 @@ function Get-RootCommandText {
     )
 
     $tokens = @(
-        'powershell',
+        'pwsh',
         '-NoProfile',
         '-ExecutionPolicy',
         'Bypass',

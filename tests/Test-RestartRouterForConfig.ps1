@@ -20,7 +20,7 @@ function New-Utf8NoBomEncoding {
 }
 
 function Resolve-PowerShellExecutable {
-    foreach ($name in @('pwsh.exe', 'powershell.exe')) {
+    foreach ($name in @('pwsh.exe', 'pwsh')) {
         $command = Get-Command -Name $name -ErrorAction SilentlyContinue | Select-Object -First 1
         if ($null -eq $command) {
             continue
@@ -36,7 +36,7 @@ function Resolve-PowerShellExecutable {
         return [string]$name
     }
 
-    throw 'pwsh.exe 또는 powershell.exe를 찾지 못했습니다.'
+    throw 'pwsh (PowerShell 7+)를 찾지 못했습니다.'
 }
 
 $root = Split-Path -Parent $PSScriptRoot
@@ -170,6 +170,10 @@ try {
     Assert-True ([int]$restart.StartedProcessId -gt 0) 'restart helper should start a fresh router launcher process.'
     Assert-True ([int]$restart.EffectiveRouterPid -gt 0) 'restart helper should report the effective router pid.'
     Assert-True ([bool]$restart.MutexHeld) 'restart helper should return with router mutex held.'
+    Assert-True (Test-Path -LiteralPath ([string]$restart.StdoutLogPath) -PathType Leaf) 'restart helper should create stdout redirect log.'
+    Assert-True (Test-Path -LiteralPath ([string]$restart.StderrLogPath) -PathType Leaf) 'restart helper should create stderr redirect log.'
+    $restartStdout = Get-Content -LiteralPath ([string]$restart.StdoutLogPath) -Raw -Encoding UTF8
+    Assert-True ($restartStdout.Contains('router started')) 'restart helper stdout log should capture router startup output.'
 }
 finally {
     $startedRouterPid = if ($null -ne $restart) { [int]$restart.StartedProcessId } else { 0 }
