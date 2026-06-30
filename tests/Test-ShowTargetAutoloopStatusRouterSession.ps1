@@ -37,6 +37,10 @@ New-Item -ItemType Directory -Path $runtimeRoot -Force | Out-Null
     LaneName = 'bottest-live-visible'
     RuntimeMapPath = '$($runtimeMapPath.Replace("'", "''"))'
     RouterStatePath = '$($routerStatePath.Replace("'", "''"))'
+    RequireUserIdleBeforeSend = `$true
+    MinUserIdleBeforeSendMs = 1000
+    UserIdleWaitTimeoutMs = 15000
+    UserIdleWaitPollMs = 250
     Targets = @(
         @{ Id = 'target01'; Folder = 'C:\tmp\target01'; WindowTitle = 'Target01'; FixedSuffix = 'suffix-01' }
     )
@@ -138,5 +142,22 @@ Assert-True ([string]$deadPidJson.RouterSessionState -eq 'router-pid-not-running
 Assert-True (-not [bool]$deadPidJson.RouterPidExists) 'status json should surface that stale RouterPid is not alive.'
 Assert-True ([string]$deadPidJson.RecommendationActionKey -eq 'restart_router_for_autoloop') 'status json should recommend router restart when router pid is stale.'
 Assert-True ([string]$deadPidJson.RecommendationDetail -match 'router-pid-not-running') 'status json should explain the stale router pid state.'
+
+[ordered]@{
+    Status = 'running'
+    RouterPid = $PID
+    LauncherSessionId = 'runtime-session-current'
+} | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $routerStatePath -Encoding UTF8
+
+$driftJson = & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Show-TargetAutoloopStatus.ps1') `
+    -ConfigPath $configPath `
+    -RunRoot $runRoot `
+    -AsJson | ConvertFrom-Json
+
+Assert-True ([string]$driftJson.RouterSessionState -eq 'ok') 'router config drift test requires an otherwise ok router session.'
+Assert-True ([bool]$driftJson.RouterConfigDrift) 'status json should detect router config drift when effective send settings are missing.'
+Assert-True ([string]$driftJson.RecommendationActionKey -eq 'restart_router_for_autoloop') 'status json should recommend router restart for config drift.'
+Assert-True ([string]$driftJson.RecommendationLabel -eq 'router 설정 재시작') 'status json should surface router config restart label.'
+Assert-True ([string]$driftJson.RecommendationDetail -match 'router-state-missing-effective-send-settings') 'status json should explain router config drift.'
 
 Write-Host 'show target autoloop status router session ok'

@@ -2,6 +2,8 @@
 param(
     [string]$ConfigPath,
     [string]$BindingsPath,
+    [Alias('TargetId')]
+    [string[]]$AttachTargetId,
     [switch]$DiagnosticOnly
 )
 
@@ -195,6 +197,29 @@ if ([string]::IsNullOrWhiteSpace($BindingsPath)) {
 $bindingDoc = Read-BindingDocument -Path $BindingsPath
 $sessionScope = Get-BindingSessionScope -BindingDocument $bindingDoc -Config $config
 $bindingTargets = @($sessionScope.ScopedBindingWindows)
+$requestedTargetIds = @()
+foreach ($requestedTargetId in (Get-StringList -Value $AttachTargetId)) {
+    if ($requestedTargetIds -notcontains $requestedTargetId) {
+        $requestedTargetIds += $requestedTargetId
+    }
+}
+$targetScopedAttach = ($requestedTargetIds.Count -gt 0)
+$activeTargetIds = @($sessionScope.ActiveTargetIds | ForEach-Object { [string]$_ })
+if ($targetScopedAttach) {
+    $unknownRequestedTargetIds = @($requestedTargetIds | Where-Object { $activeTargetIds -notcontains $_ })
+    if ($unknownRequestedTargetIds.Count -gt 0) {
+        throw ("Requested TargetId is not active in this binding session: " + ($unknownRequestedTargetIds -join ', '))
+    }
+    $attachTargetIds = @($requestedTargetIds)
+}
+else {
+    $attachTargetIds = @($activeTargetIds)
+}
+$runtimeMapPath = [string]$config.RuntimeMapPath
+$existingRuntimeEntriesForTargetScope = @()
+if ($targetScopedAttach -and (Test-Path -LiteralPath $runtimeMapPath)) {
+    $existingRuntimeEntriesForTargetScope = @(Read-RuntimeMap -Path $runtimeMapPath)
+}
 $bindingByTargetId = @{}
 $runtimeEntries = @()
 $failures = @()
@@ -202,6 +227,57 @@ $visibleWindows = Get-VisibleWindows
 $launcherSessionId = [guid]::NewGuid().ToString('N')
 $attachedAt = (Get-Date).ToString('o')
 $launcherPid = $PID
+
+if ($targetScopedAttach -and $existingRuntimeEntriesForTargetScope.Count -gt 0) {
+    $preservedRuntimeEntries = @(
+        $existingRuntimeEntriesForTargetScope |
+            Where-Object { $attachTargetIds -notcontains [string]$_.TargetId }
+    )
+    $sessionSourceEntries = if ($preservedRuntimeEntries.Count -gt 0) {
+        $preservedRuntimeEntries
+    }
+    else {
+        $existingRuntimeEntriesForTargetScope
+    }
+    $existingSessionIds = @(
+        $sessionSourceEntries |
+            ForEach-Object { [string]$_.LauncherSessionId } |
+            Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+            Sort-Object |
+            Select-Object -Unique
+    )
+    if ($existingSessionIds.Count -eq 1) {
+        $launcherSessionId = [string]$existingSessionIds[0]
+    }
+    elseif ($existingSessionIds.Count -gt 1) {
+        throw ("Cannot target-scope attach with mixed preserved LauncherSessionId values: " + ($existingSessionIds -join ', '))
+    }
+
+    $existingLaunchedAtValues = @(
+        $sessionSourceEntries |
+            ForEach-Object { [string]$_.LaunchedAt } |
+            Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+            Sort-Object |
+            Select-Object -Unique
+    )
+    if ($existingLaunchedAtValues.Count -ge 1) {
+        $attachedAt = [string]$existingLaunchedAtValues[0]
+    }
+
+    $existingLauncherPids = @(
+        $sessionSourceEntries |
+            ForEach-Object {
+                if ($null -ne $_.LauncherPid -and [int]$_.LauncherPid -gt 0) {
+                    [int]$_.LauncherPid
+                }
+            } |
+            Sort-Object |
+            Select-Object -Unique
+    )
+    if ($existingLauncherPids.Count -eq 1) {
+        $launcherPid = [int]$existingLauncherPids[0]
+    }
+}
 
 foreach ($path in @($config.RuntimeRoot, $config.LogsRoot)) {
     Ensure-Directory -Path ([string]$path)
@@ -224,7 +300,7 @@ foreach ($binding in $bindingTargets) {
     $bindingByTargetId[$targetId] = $binding
 }
 
-foreach ($target in ($config.Targets | Where-Object { [string]$_.Id -in $sessionScope.ActiveTargetIds } | Sort-Object Id)) {
+foreach ($target in ($config.Targets | Where-Object { [string]$_.Id -in $attachTargetIds } | Sort-Object Id)) {
     $targetId = [string]$target.Id
     if (-not $bindingByTargetId.ContainsKey($targetId)) {
         $failures += ("missing-binding:{0}" -f $targetId)
@@ -343,10 +419,52 @@ foreach ($extraTargetId in $extraBindingTargetIds) {
 }
 
 if ($DiagnosticOnly) {
-    Write-Host ("binding diagnostic summary matched={0} failures={1} runtimeWrite=skipped" -f $runtimeEntries.Count, $failures.Count)
+    $diagnosticScope = if ($targetScopedAttach) { "target-scoped:{0}" -f ($attachTargetIds -join ',') } else { 'session' }
+    Write-Host ("binding diagnostic summary matched={0} failures={1} runtimeWrite=skipped scope={2}" -f $runtimeEntries.Count, $failures.Count, $diagnosticScope)
 }
 else {
-    Write-RuntimeMap -Path ([string]$config.RuntimeMapPath) -Items $runtimeEntries
+    if ($targetScopedAttach) {
+        $replacementByTargetId = Get-RuntimeMapByTargetId -Items $runtimeEntries
+        $mergedRuntimeEntries = @()
+        $seenReplacementTargetIds = @{}
+        foreach ($existingEntry in $existingRuntimeEntriesForTargetScope) {
+            $existingTargetId = [string]$existingEntry.TargetId
+            if ($replacementByTargetId.ContainsKey($existingTargetId)) {
+                $mergedRuntimeEntries += $replacementByTargetId[$existingTargetId]
+                $seenReplacementTargetIds[$existingTargetId] = $true
+            }
+            else {
+                $mergedRuntimeEntries += $existingEntry
+            }
+        }
+
+        foreach ($replacementEntry in $runtimeEntries) {
+            $replacementTargetId = [string]$replacementEntry.TargetId
+            if (-not $seenReplacementTargetIds.ContainsKey($replacementTargetId)) {
+                $mergedRuntimeEntries += $replacementEntry
+            }
+        }
+
+        $mergedTargetIds = @(
+            $mergedRuntimeEntries |
+                ForEach-Object { [string]$_.TargetId } |
+                Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+                Sort-Object -Unique
+        )
+        $missingMergedTargetIds = @($activeTargetIds | Where-Object { $mergedTargetIds -notcontains $_ })
+        if ($missingMergedTargetIds.Count -gt 0) {
+            throw ("Target-scoped attach would leave runtime map without active targets: " + ($missingMergedTargetIds -join ', '))
+        }
+
+        Write-RuntimeMap -Path $runtimeMapPath -Items $mergedRuntimeEntries
+        Write-Host ("runtime map target-scoped write: targets={0} preserved={1} total={2}" -f `
+            ($attachTargetIds -join ','),
+            [Math]::Max(0, $mergedRuntimeEntries.Count - $runtimeEntries.Count),
+            $mergedRuntimeEntries.Count)
+    }
+    else {
+        Write-RuntimeMap -Path ([string]$config.RuntimeMapPath) -Items $runtimeEntries
+    }
 }
 
 if ($failures.Count -gt 0) {

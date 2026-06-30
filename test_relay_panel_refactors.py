@@ -83,11 +83,14 @@ from relay_operator_panel import (
     ARTIFACT_SOURCE_MEMORY_SCHEMA_VERSION,
     BOARD_TARGET_FALLBACK,
     MESSAGE_EDITOR_TAB_METADATA,
+    PAIR_VISIBLE_ACCEPTANCE_SCOPE_WARNING_TEXT,
     PAIR_ID_OPTIONS,
     PANEL_WINDOW_LAUNCH_ARM_ENV,
     PANEL_WINDOW_BINDINGS_OUTPUT_ENV,
     PANEL_WINDOW_LAUNCH_GUARD_PATH_ENV,
     RelayOperatorPanel,
+    TARGET_AUTOLOOP_CARD_ACTION_AUTO_REFRESH_MS,
+    TARGET_AUTOLOOP_SCOPE_WARNING_TEXT,
 )
 from relay_test_temp import (
     ExternalTemporaryDirectory,
@@ -248,6 +251,14 @@ class RecordingCommandService:
 
     def spawn_detached(self, command: list[str]) -> None:
         self.spawned_commands.append(list(command))
+
+
+class WorkflowScopeLabelTests(unittest.TestCase):
+    def test_target_autoloop_scope_warning_distinguishes_pair_acceptance(self) -> None:
+        self.assertIn("TargetAutoloop", TARGET_AUTOLOOP_SCOPE_WARNING_TEXT)
+        self.assertIn("Run-LiveVisiblePairAcceptance.ps1", TARGET_AUTOLOOP_SCOPE_WARNING_TEXT)
+        self.assertIn("Pair visible acceptance", PAIR_VISIBLE_ACCEPTANCE_SCOPE_WARNING_TEXT)
+        self.assertIn("독립셀 자동화(TargetAutoloop) 테스트가 아닙니다", PAIR_VISIBLE_ACCEPTANCE_SCOPE_WARNING_TEXT)
 
 
 class VarStub:
@@ -6219,6 +6230,363 @@ class RelayOperatorPanelRuntimeCommandTests(unittest.TestCase):
         self.assertIn("중복 실행", panel.target_autoloop_guidance_var.get())
         self.assertIn("최근 결과: 차단", panel.target_autoloop_recent_result_var.get())
 
+    def test_target_autoloop_cwd_state_reads_binding_target_dir(self) -> None:
+        panel = self._make_panel()
+        with ExternalTemporaryDirectory(prefix="target-cwd-state-") as tmp:
+            tmp_path = Path(tmp)
+            work_repo = tmp_path / "work-repo"
+            work_repo.mkdir()
+            binding_path = tmp_path / "bindings.json"
+            binding_path.write_text(
+                json.dumps(
+                    {
+                        "target_dir": r"C:\old-root",
+                        "windows": [
+                            {
+                                "target_id": "target02",
+                                "target_dir": r"C:\old-root",
+                                "hwnd": "3002",
+                                "rect": [0, 0, 640, 696],
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            panel.effective_data = {"Config": {"BindingProfilePath": str(binding_path)}}
+            panel.target_autoloop_policy_card_vars = {
+                "target02": {
+                    "work_repo_root_var": VarStub(str(work_repo)),
+                    "policy_state_var": VarStub("LOADED"),
+                    "cwd_badge_var": VarStub(""),
+                    "cwd_state_var": VarStub(""),
+                }
+            }
+
+            state = panel._target_autoloop_policy_cwd_state("target02")
+
+            self.assertEqual("mismatch", state["State"])
+            self.assertEqual(r"C:\old-root", state["CurrentTargetDir"])
+            self.assertEqual(str(work_repo), state["DesiredWorkRepoRoot"])
+            panel._apply_target_autoloop_policy_cwd_feedback("target02")
+            self.assertEqual("CWD MISMATCH", panel.target_autoloop_policy_card_vars["target02"]["cwd_badge_var"].get())
+            self.assertIn("current=C:\\old-root", panel.target_autoloop_policy_card_vars["target02"]["cwd_state_var"].get())
+
+    def test_target_autoloop_restart_bound_visible_target_runs_helper_then_target_scoped_attach_followup(self) -> None:
+        panel = self._make_panel()
+        with ExternalTemporaryDirectory(prefix="target-cwd-restart-") as tmp:
+            tmp_path = Path(tmp)
+            work_repo = tmp_path / "work-repo"
+            work_repo.mkdir()
+            binding_path = tmp_path / "bindings.json"
+            binding_path.write_text(
+                json.dumps(
+                    {
+                        "target_dir": r"C:\old-root",
+                        "launch_command": "codex -a never -s danger-full-access",
+                        "windows": [
+                            {
+                                "target_id": "target02",
+                                "pair_id": "pair02",
+                                "role_name": "top",
+                                "target_dir": r"C:\old-root",
+                                "hwnd": "3002",
+                                "rect": [0, 0, 640, 696],
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            panel.effective_data = {
+                "Config": {"BindingProfilePath": str(binding_path)},
+                "RunContext": {"SelectedRunRoot": r"C:\runs\target-autoloop\run_current"},
+            }
+            panel.message_config_doc = {}
+            panel.target_autoloop_status_var = VarStub("")
+            panel.target_autoloop_guidance_var = VarStub("")
+            panel.target_autoloop_policy_card_cwd_badge_labels = {}
+            panel.target_autoloop_policy_card_vars = {
+                "target02": {
+                    "work_repo_root_var": VarStub(str(work_repo)),
+                    "policy_state_var": VarStub("LOADED"),
+                    "enabled_var": VarStub(True),
+                    "cwd_badge_var": VarStub(""),
+                    "cwd_state_var": VarStub(""),
+                }
+            }
+            calls: list[tuple[str, tuple[str, ...], float | None]] = []
+            attach_calls: list[tuple[str, tuple[str, ...], float | None]] = []
+
+            class StatusServiceStub:
+                def invalidate_visibility_cache(self) -> None:
+                    pass
+
+                def run_json_script(self, script_name: str, context: AppContext, **kwargs) -> dict:
+                    calls.append((script_name, tuple(kwargs.get("extra") or []), kwargs.get("timeout_sec")))
+                    return {
+                        "Success": True,
+                        "TargetId": "target02",
+                        "OldHwnd": "3002",
+                        "NewHwnd": "4002",
+                        "OldTargetDir": r"C:\old-root",
+                        "NewTargetDir": str(work_repo),
+                        "BindingUpdated": True,
+                        "Moved": True,
+                    }
+
+                def run_script(self, script_name: str, context: AppContext, **kwargs) -> subprocess.CompletedProcess[str]:
+                    attach_calls.append((script_name, tuple(kwargs.get("extra") or []), kwargs.get("timeout_sec")))
+                    return subprocess.CompletedProcess(
+                        args=[script_name],
+                        returncode=0,
+                        stdout="attached from binding: target=target02 shellPid=4002 hwnd=4002",
+                        stderr="",
+                    )
+
+            class CommandServiceStub:
+                def build_script_command(self, script_name: str, **kwargs) -> list[str]:
+                    return [script_name, *(kwargs.get("extra") or [])]
+
+            def run_background_task(**kwargs) -> None:
+                follow_up = kwargs["on_success"](kwargs["worker"]())
+                if callable(follow_up):
+                    follow_up()
+
+            panel.status_service = StatusServiceStub()
+            panel.command_service = CommandServiceStub()
+            panel.run_background_task = run_background_task
+            panel._reuse_existing_windows_command_preview = lambda: "reuse-preview"
+
+            with mock.patch("relay_operator_panel.messagebox.askyesno", return_value=True):
+                panel.request_restart_bound_visible_target_for_autoloop("target02")
+
+            self.assertEqual(
+                [
+                    (
+                        "launcher/Restart-BoundVisibleTarget.ps1",
+                        (
+                            "-TargetId",
+                            "target02",
+                            "-WorkRepoRoot",
+                            str(work_repo),
+                            "-AutoloopStatusPath",
+                            r"C:\runs\target-autoloop\run_current\.state\target-autoloop-status.json",
+                            "-Apply",
+                            "-AsJson",
+                        ),
+                        75.0,
+                    )
+                ],
+                calls,
+            )
+            self.assertEqual(
+                [
+                    (
+                        "launcher/Attach-TargetsFromBindings.ps1",
+                        ("-TargetId", "target02"),
+                        35.0,
+                    )
+                ],
+                attach_calls,
+            )
+            self.assertIn("Attach-TargetsFromBindings.ps1", panel.last_command_var.get())
+            self.assertIn("-TargetId target02", panel.last_command_var.get())
+            self.assertIn("target-scoped runtime attach 완료 targets=target02", panel.last_result_var.get())
+            self.assertIn("선택 target runtime attach 완료", panel._captured_output)
+            self.assertIn("attached from binding: target=target02", panel._captured_output)
+
+    def test_target_autoloop_restart_bound_visible_target_blocks_active_target(self) -> None:
+        panel = self._make_panel()
+        with ExternalTemporaryDirectory(prefix="target-cwd-restart-active-") as tmp:
+            tmp_path = Path(tmp)
+            work_repo = tmp_path / "work-repo"
+            work_repo.mkdir()
+            binding_path = tmp_path / "bindings.json"
+            binding_path.write_text(
+                json.dumps(
+                    {
+                        "windows": [
+                            {
+                                "target_id": "target02",
+                                "target_dir": r"C:\old-root",
+                                "hwnd": "3002",
+                                "rect": [0, 0, 640, 696],
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            panel.config_path_var = VarStub("cfg.psd1")
+            panel.effective_data = {
+                "Config": {"BindingProfilePath": str(binding_path)},
+                "RunContext": {"SelectedRunRoot": r"C:\runs\target-autoloop\run_current"},
+            }
+            panel.message_config_doc = {}
+            panel.target_autoloop_status_var = VarStub("")
+            panel.target_autoloop_guidance_var = VarStub("")
+            panel.target_autoloop_policy_card_vars = {
+                "target02": {
+                    "work_repo_root_var": VarStub(str(work_repo)),
+                    "policy_state_var": VarStub("LOADED"),
+                    "enabled_var": VarStub(True),
+                }
+            }
+            panel._target_autoloop_runtime_snapshot = lambda _run_root=None: {
+                "targets": [
+                    {
+                        "TargetId": "target02",
+                        "Phase": "waiting-output",
+                        "LastDispatchState": "router-ready-file-created",
+                    }
+                ],
+                "manifest_targets": [{"TargetId": "target02", "Enabled": True}],
+                "retry_pending_summary": {},
+                "router_inbox_ready_summary": {},
+            }
+            calls: list[str] = []
+            panel.status_service = SimpleNamespace(
+                run_json_script=lambda *_args, **_kwargs: calls.append("run") or {}
+            )
+
+            with mock.patch("relay_operator_panel.messagebox.askyesno") as askyesno, mock.patch(
+                "relay_operator_panel.messagebox.showwarning"
+            ) as showwarning:
+                panel.request_restart_bound_visible_target_for_autoloop("target02")
+
+            self.assertEqual([], calls)
+            askyesno.assert_not_called()
+            showwarning.assert_called_once()
+            self.assertIn("phase=waiting-output", panel._captured_output)
+            self.assertEqual("8 Cell Autoloop cwd 재기동 차단", panel.operator_status_var.get())
+            self.assertIn("queued/pending", panel.target_autoloop_guidance_var.get())
+
+    def test_target_autoloop_restart_bound_visible_target_blocks_retry_pending(self) -> None:
+        panel = self._make_panel()
+        with ExternalTemporaryDirectory(prefix="target-cwd-restart-pending-") as tmp:
+            tmp_path = Path(tmp)
+            work_repo = tmp_path / "work-repo"
+            work_repo.mkdir()
+            binding_path = tmp_path / "bindings.json"
+            binding_path.write_text(
+                json.dumps(
+                    {
+                        "windows": [
+                            {
+                                "target_id": "target02",
+                                "target_dir": r"C:\old-root",
+                                "hwnd": "3002",
+                                "rect": [0, 0, 640, 696],
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            panel.config_path_var = VarStub("cfg.psd1")
+            panel.effective_data = {
+                "Config": {"BindingProfilePath": str(binding_path)},
+                "RunContext": {"SelectedRunRoot": r"C:\runs\target-autoloop\run_current"},
+            }
+            panel.message_config_doc = {}
+            panel.target_autoloop_status_var = VarStub("")
+            panel.target_autoloop_guidance_var = VarStub("")
+            panel.target_autoloop_policy_card_vars = {
+                "target02": {
+                    "work_repo_root_var": VarStub(str(work_repo)),
+                    "policy_state_var": VarStub("LOADED"),
+                    "enabled_var": VarStub(True),
+                }
+            }
+            panel._target_autoloop_runtime_snapshot = lambda _run_root=None: {
+                "targets": [{"TargetId": "target02", "Phase": "stopped", "LastDispatchState": ""}],
+                "manifest_targets": [{"TargetId": "target02", "Enabled": True}],
+                "retry_pending_summary": {
+                    "current_items": [{"target_id": "target02", "path": r"C:\runs\target02.ready.json"}],
+                },
+                "router_inbox_ready_summary": {},
+            }
+            calls: list[str] = []
+            panel.status_service = SimpleNamespace(
+                run_json_script=lambda *_args, **_kwargs: calls.append("run") or {}
+            )
+
+            with mock.patch("relay_operator_panel.messagebox.askyesno") as askyesno, mock.patch(
+                "relay_operator_panel.messagebox.showwarning"
+            ) as showwarning:
+                panel.request_restart_bound_visible_target_for_autoloop("target02")
+
+            self.assertEqual([], calls)
+            askyesno.assert_not_called()
+            showwarning.assert_called_once()
+            self.assertIn("submit retry pending 1건", panel._captured_output)
+            self.assertEqual("8 Cell Autoloop cwd 재기동 차단", panel.operator_status_var.get())
+
+    def test_target_autoloop_restart_bound_visible_target_blocks_fresh_watcher_unknown_scope(self) -> None:
+        panel = self._make_panel()
+        with ExternalTemporaryDirectory(prefix="target-cwd-restart-watcher-") as tmp:
+            tmp_path = Path(tmp)
+            work_repo = tmp_path / "work-repo"
+            work_repo.mkdir()
+            binding_path = tmp_path / "bindings.json"
+            binding_path.write_text(
+                json.dumps(
+                    {
+                        "windows": [
+                            {
+                                "target_id": "target02",
+                                "target_dir": r"C:\old-root",
+                                "hwnd": "3002",
+                                "rect": [0, 0, 640, 696],
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            panel.config_path_var = VarStub("cfg.psd1")
+            panel.effective_data = {
+                "Config": {"BindingProfilePath": str(binding_path)},
+                "RunContext": {"SelectedRunRoot": r"C:\runs\target-autoloop\run_current"},
+            }
+            panel.message_config_doc = {}
+            panel.target_autoloop_status_var = VarStub("")
+            panel.target_autoloop_guidance_var = VarStub("")
+            panel.target_autoloop_policy_card_vars = {
+                "target02": {
+                    "work_repo_root_var": VarStub(str(work_repo)),
+                    "policy_state_var": VarStub("LOADED"),
+                    "enabled_var": VarStub(True),
+                }
+            }
+            panel._target_autoloop_runtime_snapshot = lambda _run_root=None: {
+                "watcher_state": "running",
+                "watcher_target_ids": [],
+                "watcher_target_scope": "unknown",
+                "targets": [{"TargetId": "target02", "Phase": "idle", "LastDispatchState": ""}],
+                "manifest_targets": [{"TargetId": "target02", "Enabled": True}],
+                "retry_pending_summary": {},
+                "router_inbox_ready_summary": {},
+            }
+            panel._target_autoloop_watcher_is_fresh = lambda _snapshot=None: True
+            calls: list[str] = []
+            panel.status_service = SimpleNamespace(
+                run_json_script=lambda *_args, **_kwargs: calls.append("run") or {}
+            )
+
+            with mock.patch("relay_operator_panel.messagebox.askyesno") as askyesno, mock.patch(
+                "relay_operator_panel.messagebox.showwarning"
+            ) as showwarning:
+                panel.request_restart_bound_visible_target_for_autoloop("target02")
+
+            self.assertEqual([], calls)
+            askyesno.assert_not_called()
+            showwarning.assert_called_once()
+            self.assertIn("fresh running watcher의 target scope", panel._captured_output)
+            self.assertEqual("8 Cell Autoloop cwd 재기동 watcher guard", panel.operator_status_var.get())
+            self.assertIn("fresh running watcher", panel.target_autoloop_guidance_var.get())
+
     def test_reuse_existing_windows_auto_prepares_run_root_when_current_run_root_is_stale(self) -> None:
         panel = self._make_panel()
         panel.effective_data = {
@@ -8714,8 +9082,8 @@ class RelayOperatorPanelRuntimeCommandTests(unittest.TestCase):
         self.assertEqual("disabled", panel.fixed_pair01_button.state)
         self.assertEqual("disabled", panel.parallel_pair_drill_button.state)
         self.assertEqual("선택 Pair 실행 (shared visible 차단)", panel.selected_pair_button.text)
-        self.assertEqual("pair01 preset 실행 (shared visible 차단)", panel.fixed_pair01_button.text)
-        self.assertEqual("선택 pair 병렬 실테스트 (shared visible 차단)", panel.parallel_pair_drill_button.text)
+        self.assertEqual("pair01 preset 차단(target01 보호)", panel.fixed_pair01_button.text)
+        self.assertEqual("선택 pair 병렬 실테스트(Pair 전용, shared visible 차단)", panel.parallel_pair_drill_button.text)
 
     def test_update_pair_button_states_enables_selected_pair_typed_window_recovery_button_for_shared_visible_lane(self) -> None:
         panel = self._make_panel()
@@ -8838,7 +9206,7 @@ class RelayOperatorPanelRuntimeCommandTests(unittest.TestCase):
         panel._refresh_sticky_context_bar()
 
         self.assertIn("headless=차단(shared visible typed-window)", panel.sticky_runtime_context_var.get())
-        self.assertIn("Visible Acceptance 경로 사용", panel.sticky_next_step_var.get())
+        self.assertIn("Pair Acceptance 경로 사용", panel.sticky_next_step_var.get())
         self.assertEqual("상태 배지: 준비", panel.sticky_watcher_badge_var.get())
         self.assertEqual("상태 배지: 준비", panel.home_watcher_badge_var.get())
         self.assertEqual("#6B7280", panel.sticky_watcher_badge_label.bg)
@@ -8945,7 +9313,7 @@ class RelayOperatorPanelRuntimeCommandTests(unittest.TestCase):
         panel.on_notebook_tab_changed = RelayOperatorPanel.on_notebook_tab_changed.__get__(panel, RelayOperatorPanel)
         panel.visible_acceptance_tab = "visible-tab"
         panel.notebook = SimpleNamespace(select=lambda: "visible-tab")
-        panel._last_visible_mode_label = "MODE: Visible Acceptance"
+        panel._last_visible_mode_label = "MODE: Pair Acceptance"
         panel._last_visible_mode_detail = "visible detail"
         panel.__dict__["visible_acceptance_refresh_pending"] = True
         calls: list[str] = []
@@ -9255,7 +9623,7 @@ class RelayOperatorPanelRuntimeCommandTests(unittest.TestCase):
             shutil.rmtree(run_root, ignore_errors=True)
 
         self.assertEqual("", panel.last_command_var.get())
-        self.assertEqual("Visible Acceptance 대기", warnings[0][0])
+        self.assertEqual("Pair Acceptance 대기", warnings[0][0])
         self.assertIn("queue cleanup apply", warnings[0][1])
 
     def test_run_visible_post_cleanup_requires_active_history(self) -> None:
@@ -9279,7 +9647,7 @@ class RelayOperatorPanelRuntimeCommandTests(unittest.TestCase):
             shutil.rmtree(run_root, ignore_errors=True)
 
         self.assertEqual("", panel.last_command_var.get())
-        self.assertEqual("Visible Acceptance 대기", warnings[0][0])
+        self.assertEqual("Pair Acceptance 대기", warnings[0][0])
         self.assertIn("active visible acceptance", warnings[0][1])
 
     def test_refresh_visible_acceptance_summary_surfaces_start_previews_and_wrapper_audit(self) -> None:
@@ -9644,10 +10012,10 @@ class RelayOperatorPanelRuntimeCommandTests(unittest.TestCase):
             state = panel._require_visible_acceptance_step("visible_active_acceptance")
 
         self.assertIsNone(state)
-        self.assertEqual("Visible Acceptance 대기", warnings[0][0])
+        self.assertEqual("Pair Acceptance 대기", warnings[0][0])
         self.assertIn("[visible_active_acceptance]", panel._captured_output)
         self.assertIn("queue cleanup apply", panel._captured_output)
-        self.assertEqual("Visible Acceptance 대기", panel.operator_status_var.get())
+        self.assertEqual("Pair Acceptance 대기", panel.operator_status_var.get())
 
     def test_focus_ops_watcher_section_selects_ops_tab_and_publishes_summary(self) -> None:
         panel = self._make_panel()
@@ -11241,6 +11609,63 @@ class RelayOperatorPanelRuntimeCommandTests(unittest.TestCase):
             [step["label"] for step in timing_steps],
         )
 
+    def test_apply_dashboard_refresh_bundle_preserves_current_target_autoloop_runroot(self) -> None:
+        panel = self._make_panel()
+        calls: list[tuple[str, dict[str, object]]] = []
+        prior_run_root = r"C:\repo\.relay-runs\bottest-live-visible\target-autoloop\run_20260628_010101"
+        refreshed_pair_run_root = r"C:\repo\.relay-runs\bottest-live-visible\pairs\pair01\run_20260628_020202"
+        panel.run_root_var.set(prior_run_root)
+        panel.effective_data = {
+            "RunContext": {
+                "SelectedRunRoot": prior_run_root,
+                "SelectedRunRootSource": "target-autoloop-prepare",
+            }
+        }
+        panel.preview_tab = "preview"
+        panel.target_autoloop_tab = "target-autoloop"
+        panel.notebook = SimpleNamespace(select=lambda: "target-autoloop")
+        panel.target_autoloop_status_var = VarStub("")
+        panel.render_summary = lambda _payload: None
+        panel.render_rows = lambda _rows: None
+        panel.refresh_target_autoloop_status_panel = lambda: calls.append(("autoloop", {}))
+        panel._coerce_selected_pair_into_runtime_scope = lambda: None
+        panel._sync_message_scope_id_from_context = lambda: None
+        panel._apply_watcher_start_defaults_if_pristine = lambda: None
+        panel._refresh_watcher_notes = lambda: None
+        panel.render_target_board = lambda: None
+        panel.rebuild_panel_state = lambda: None
+        panel.refresh_artifacts_tab = lambda: None
+        panel.refresh_snapshot_list = lambda: None
+        panel.update_pair_button_states = lambda: None
+        panel.set_operator_status = lambda *_args, **_kwargs: None
+        panel.clear_details = lambda: None
+        panel._selected_inspection_target_id = lambda: ""
+        panel._selected_inspection_pair_id = lambda: ""
+        panel._selected_pair_id = lambda: "pair01"
+        panel._schedule_settings_preview_refresh = lambda **kwargs: calls.append(("settings", kwargs))
+        panel.load_message_editor_document = lambda **kwargs: calls.append(("message", kwargs))
+        panel.refresh_pair_policy_editor = lambda **kwargs: calls.append(("pair", kwargs))
+        bundle = SimpleNamespace(
+            effective_data={
+                "RunContext": {
+                    "SelectedRunRoot": refreshed_pair_run_root,
+                    "SelectedRunRootSource": "latest-existing",
+                },
+                "PreviewRows": [],
+            },
+            relay_status={},
+            visibility_status={},
+            paired_status={},
+            paired_status_error="",
+        )
+
+        panel._apply_dashboard_refresh_bundle(bundle, auto_pair_policy_preview=False, timing_steps=[])
+
+        self.assertEqual(prior_run_root, panel.run_root_var.get())
+        self.assertEqual(prior_run_root, panel._current_run_root_for_actions())
+        self.assertEqual(prior_run_root, panel.__dict__.get("_target_autoloop_runroot_preserved_after_full_refresh"))
+        self.assertIn(("autoloop", {}), calls)
+
     def test_on_notebook_tab_changed_loads_settings_preview_when_preview_tab_selected(self) -> None:
         panel = self._make_panel()
         calls: list[dict[str, object]] = []
@@ -11311,6 +11736,166 @@ class RelayOperatorPanelRuntimeCommandTests(unittest.TestCase):
         self.assertEqual(["banner", "settings-refresh", "autoloop-status"], calls)
         self.assertFalse(panel.__dict__.get("target_autoloop_status_refresh_pending", False))
 
+    def test_target_autoloop_card_action_auto_refresh_schedules_only_when_tab_visible(self) -> None:
+        panel = self._make_panel()
+        panel.target_autoloop_tab = "target-autoloop"
+        panel.notebook = SimpleNamespace(select=lambda: "target-autoloop")
+        panel.tk = object()
+        scheduled: list[tuple[int, str]] = []
+        cancelled: list[str] = []
+        panel.after = lambda delay_ms, callback: scheduled.append((delay_ms, callback.__name__)) or "after-id"
+        panel.after_cancel = lambda after_id: cancelled.append(str(after_id))
+
+        panel._schedule_target_autoloop_card_action_auto_refresh(delay_ms=900)
+
+        self.assertEqual([(900, "_run_target_autoloop_card_action_auto_refresh")], scheduled)
+        self.assertEqual("after-id", panel.target_autoloop_card_action_auto_refresh_after_id)
+
+        panel.notebook = SimpleNamespace(select=lambda: "home")
+        panel._schedule_target_autoloop_card_action_auto_refresh(delay_ms=900)
+
+        self.assertEqual(["after-id"], cancelled)
+        self.assertIsNone(panel.target_autoloop_card_action_auto_refresh_after_id)
+
+    def test_target_autoloop_card_action_auto_refresh_updates_retry_button_from_snapshot(self) -> None:
+        panel = self._make_panel()
+        panel.target_autoloop_tab = "target-autoloop"
+        panel.notebook = SimpleNamespace(select=lambda: "target-autoloop")
+        panel.target_autoloop_status_var = VarStub("")
+        panel.target_autoloop_extend_cycles_var = VarStub("3")
+        panel.target_autoloop_policy_card_retry_pending_buttons = {"target02": ButtonStub()}
+        panel._target_autoloop_runtime_snapshot = lambda _run_root=None: {
+            "retry_pending_summary": {
+                "current_items": [
+                    {"target_id": "target02", "path": r"C:\runs\target02.ready.json"},
+                ],
+            },
+        }
+        panel._clear_target_autoloop_runtime_snapshot_cache = lambda: setattr(panel, "_auto_refresh_cache_cleared", True)
+        panel._update_target_autoloop_policy_card_extend_buttons = lambda *_args, **_kwargs: None
+        panel._update_target_autoloop_policy_card_runtime_progress = lambda *_args, **_kwargs: None
+        panel._update_target_autoloop_policy_card_process_once_buttons = lambda *_args, **_kwargs: None
+        panel._update_target_autoloop_policy_card_primary_actions = lambda *_args, **_kwargs: None
+
+        panel._refresh_target_autoloop_card_action_buttons_silent()
+
+        self.assertTrue(panel.__dict__.get("_auto_refresh_cache_cleared", False))
+        self.assertEqual("target02 전송보류 재시도 1", panel.target_autoloop_policy_card_retry_pending_buttons["target02"].text)
+        self.assertEqual("normal", panel.target_autoloop_policy_card_retry_pending_buttons["target02"].state)
+
+    def test_target_autoloop_card_action_auto_refresh_updates_status_when_signature_changes(self) -> None:
+        panel = self._make_panel()
+        panel.target_autoloop_tab = "target-autoloop"
+        panel.notebook = SimpleNamespace(select=lambda: "target-autoloop")
+        panel.tk = object()
+        panel.target_autoloop_status_var = VarStub("")
+        panel.target_autoloop_extend_cycles_var = VarStub("3")
+        scheduled: list[tuple[int, str]] = []
+        status_refresh_calls: list[str] = []
+        previous_snapshot = {
+            "run_root": r"C:\runs\autoloop",
+            "targets": [{"TargetId": "target02", "CycleCount": 6, "MaxCycleCount": 10, "Phase": "queued"}],
+            "retry_pending_summary": {"count": 0, "current_count": 0, "stale_count": 0},
+        }
+        changed_snapshot = {
+            "run_root": r"C:\runs\autoloop",
+            "targets": [{"TargetId": "target02", "CycleCount": 7, "MaxCycleCount": 10, "Phase": "queued"}],
+            "retry_pending_summary": {"count": 1, "current_count": 1, "stale_count": 0},
+        }
+        panel.__dict__["_target_autoloop_last_status_auto_refresh_signature"] = (
+            panel._target_autoloop_status_auto_refresh_signature(previous_snapshot)
+        )
+        panel.after = lambda delay_ms, callback: scheduled.append((delay_ms, callback.__name__)) or "after-id"
+        panel._target_autoloop_runtime_snapshot = lambda _run_root=None: changed_snapshot
+        panel._clear_target_autoloop_runtime_snapshot_cache = lambda: None
+        panel._target_autoloop_extend_cycles_value = lambda **_kwargs: (3, "")
+        panel._update_target_autoloop_policy_card_extend_buttons = lambda *_args, **_kwargs: None
+        panel._update_target_autoloop_policy_card_runtime_progress = lambda *_args, **_kwargs: None
+        panel._update_target_autoloop_policy_card_process_once_buttons = lambda *_args, **_kwargs: None
+        panel._update_target_autoloop_policy_card_primary_actions = lambda *_args, **_kwargs: None
+        panel._update_target_autoloop_policy_card_retry_pending_buttons = lambda *_args, **_kwargs: None
+        panel.refresh_target_autoloop_status_panel = lambda: status_refresh_calls.append("status")
+
+        panel._run_target_autoloop_card_action_auto_refresh()
+
+        self.assertEqual(["status"], status_refresh_calls)
+        self.assertEqual([(TARGET_AUTOLOOP_CARD_ACTION_AUTO_REFRESH_MS, "_run_target_autoloop_card_action_auto_refresh")], scheduled)
+
+    def test_target_autoloop_card_action_auto_refresh_updates_status_when_retry_metadata_changes(self) -> None:
+        panel = self._make_panel()
+        panel.target_autoloop_tab = "target-autoloop"
+        panel.notebook = SimpleNamespace(select=lambda: "target-autoloop")
+        panel.tk = object()
+        panel.target_autoloop_status_var = VarStub("")
+        panel.target_autoloop_extend_cycles_var = VarStub("3")
+        scheduled: list[tuple[int, str]] = []
+        status_refresh_calls: list[str] = []
+        retry_path = r"C:\runs\target08.retry-pending.json"
+        previous_snapshot = {
+            "run_root": r"C:\runs\autoloop",
+            "targets": [{"TargetId": "target08", "CycleCount": 8, "MaxCycleCount": 10, "Phase": "waiting-output"}],
+            "retry_pending_summary": {
+                "count": 1,
+                "current_count": 1,
+                "stale_count": 0,
+                "latest_current_path": retry_path,
+                "latest_current_send_stage": "pre-input",
+                "latest_current_send_retry_policy": "auto-retry-once",
+                "current_items": [
+                    {
+                        "target_id": "target08",
+                        "path": retry_path,
+                        "send_stage": "pre-input",
+                        "send_retry_policy": "auto-retry-once",
+                    },
+                ],
+            },
+        }
+        changed_snapshot = {
+            "run_root": r"C:\runs\autoloop",
+            "targets": [{"TargetId": "target08", "CycleCount": 8, "MaxCycleCount": 10, "Phase": "waiting-output"}],
+            "retry_pending_summary": {
+                "count": 1,
+                "current_count": 1,
+                "stale_count": 0,
+                "latest_current_path": retry_path,
+                "latest_current_send_stage": "post-submit-dispatch",
+                "latest_current_send_retry_policy": "manual-review-duplicate-risk",
+                "latest_current_operator_retry_hint": "submit outcome is ambiguous",
+                "current_items": [
+                    {
+                        "target_id": "target08",
+                        "path": retry_path,
+                        "send_stage": "post-submit-dispatch",
+                        "send_retry_policy": "manual-review-duplicate-risk",
+                        "operator_retry_hint": "submit outcome is ambiguous",
+                    },
+                ],
+            },
+        }
+        panel.__dict__["_target_autoloop_last_status_auto_refresh_signature"] = (
+            panel._target_autoloop_status_auto_refresh_signature(previous_snapshot)
+        )
+        self.assertNotEqual(
+            panel.__dict__["_target_autoloop_last_status_auto_refresh_signature"],
+            panel._target_autoloop_status_auto_refresh_signature(changed_snapshot),
+        )
+        panel.after = lambda delay_ms, callback: scheduled.append((delay_ms, callback.__name__)) or "after-id"
+        panel._target_autoloop_runtime_snapshot = lambda _run_root=None: changed_snapshot
+        panel._clear_target_autoloop_runtime_snapshot_cache = lambda: None
+        panel._target_autoloop_extend_cycles_value = lambda **_kwargs: (3, "")
+        panel._update_target_autoloop_policy_card_extend_buttons = lambda *_args, **_kwargs: None
+        panel._update_target_autoloop_policy_card_runtime_progress = lambda *_args, **_kwargs: None
+        panel._update_target_autoloop_policy_card_process_once_buttons = lambda *_args, **_kwargs: None
+        panel._update_target_autoloop_policy_card_primary_actions = lambda *_args, **_kwargs: None
+        panel._update_target_autoloop_policy_card_retry_pending_buttons = lambda *_args, **_kwargs: None
+        panel.refresh_target_autoloop_status_panel = lambda: status_refresh_calls.append("status")
+
+        panel._run_target_autoloop_card_action_auto_refresh()
+
+        self.assertEqual(["status"], status_refresh_calls)
+        self.assertEqual([(TARGET_AUTOLOOP_CARD_ACTION_AUTO_REFRESH_MS, "_run_target_autoloop_card_action_auto_refresh")], scheduled)
+
     def test_target_autoloop_button_update_defers_snapshot_when_tab_hidden(self) -> None:
         panel = self._make_panel()
         panel._update_target_autoloop_control_buttons = RelayOperatorPanel._update_target_autoloop_control_buttons.__get__(panel, RelayOperatorPanel)
@@ -11351,6 +11936,75 @@ class RelayOperatorPanelRuntimeCommandTests(unittest.TestCase):
 
         self.assertEqual(["render"], calls)
         self.assertFalse(panel.__dict__.get("_settings_preview_message_render_pending", False))
+
+
+    def test_codex_cli_update_status_report_surfaces_lock_and_side_by_side_command(self) -> None:
+        lines = RelayOperatorPanel._format_codex_cli_update_status_lines(
+            {
+                "GlobalInstalledVersion": "0.142.3",
+                "LatestVersion": "0.142.4",
+                "CliReportedVersion": "0.142.3",
+                "UpdateState": "update-available",
+                "GlobalUpdateBlocked": True,
+                "GlobalPackageProcessCount": 8,
+                "SideBySideLatestAvailable": True,
+                "RecommendedTargetLaunchCommand": "& 'C:\\codex\\0.142.4\\codex.ps1' -a never -s danger-full-access",
+                "Recommendation": "global-update-locked-use-side-by-side",
+                "CommandSources": [{"Source": "C:\\Users\\USER\\AppData\\Roaming\\npm\\codex.ps1"}],
+                "SideBySideInstalls": [{"Version": "0.142.4", "Root": "C:\\codex\\0.142.4"}],
+            }
+        )
+        report = "\n".join(lines)
+        self.assertIn("global=0.142.3 / latest=0.142.4 / cli=0.142.3", report)
+        self.assertIn("globalUpdateBlocked=True", report)
+        self.assertIn("global-update-locked-use-side-by-side", report)
+        self.assertIn("codex.ps1", report)
+        self.assertIn("side-by-side 최신 Codex", report)
+
+    def test_codex_cli_update_status_display_payload_compacts_processes(self) -> None:
+        payload = {
+            "Processes": [
+                {
+                    "ProcessId": index,
+                    "ParentProcessId": 1,
+                    "Name": "codex.exe",
+                    "ExecutablePath": f"C:\\codex\\{index}\\codex.exe",
+                    "CommandLine": "x" * 2000,
+                    "UsesGlobalPackage": index % 2 == 0,
+                }
+                for index in range(15)
+            ]
+        }
+
+        compact = RelayOperatorPanel._compact_codex_cli_update_status_payload_for_display(payload)
+
+        self.assertEqual(12, len(compact["Processes"]))
+        self.assertEqual(3, compact["ProcessesOmittedCount"])
+        self.assertNotIn("CommandLine", compact["Processes"][0])
+
+    def test_restart_bound_visible_target_extra_args_include_optional_launch_command(self) -> None:
+        extra_args = RelayOperatorPanel._restart_bound_visible_target_extra_args(
+            target_id="target06",
+            work_repo_root=r"C:\work",
+            autoloop_status_path=r"C:\runs\.state\target-autoloop-status.json",
+            launch_command=r"& 'C:\codex\0.142.4\codex.ps1' -a never -s danger-full-access",
+        )
+
+        self.assertEqual(
+            [
+                "-TargetId",
+                "target06",
+                "-WorkRepoRoot",
+                r"C:\work",
+                "-AutoloopStatusPath",
+                r"C:\runs\.state\target-autoloop-status.json",
+                "-LaunchCommand",
+                r"& 'C:\codex\0.142.4\codex.ps1' -a never -s danger-full-access",
+                "-Apply",
+                "-AsJson",
+            ],
+            extra_args,
+        )
 
 
 class PanelRuntimeWorkflowServiceTests(unittest.TestCase):
@@ -12014,7 +12668,9 @@ class RelayOperatorPanelMessageSlotTests(unittest.TestCase):
         panel.target_autoloop_policy_editor_status_var = VarStub("")
         panel.target_autoloop_policy_closeout_var = VarStub("")
         panel.target_autoloop_policy_filter_var = VarStub("all")
-        panel.target_autoloop_policy_filter_status_var = VarStub("filter=all / visible=8 / hidden=0 / selected=0 / dirty=0 / attention=0")
+        panel.target_autoloop_policy_filter_status_var = VarStub(
+            "filter=all / visible=8 / hidden=0 / selected=0 / dirty=0 / attention=0 / cwdMismatch=0"
+        )
         panel.target_autoloop_policy_selection_warning_var = VarStub("")
         panel.target_autoloop_policy_card_vars = {
             target_id: {
@@ -13295,6 +13951,20 @@ class RelayOperatorPanelMessageSlotTests(unittest.TestCase):
         self.assertEqual("disabled", panel.seed_kickoff_target_combo.state)
         self.assertIn("구성된 pair가 없어", panel.seed_kickoff_status_var.get())
 
+    def test_seed_kickoff_publish_helper_script_fallback_uses_pwsh(self) -> None:
+        panel = self._make_panel()
+
+        commands = panel._seed_kickoff_publish_helper_commands(
+            publish_cmd_path="",
+            publish_script_path=r"C:\repo-a\.relay-runs\bottest-live-visible\pairs\pair01\run_preview\target01\publish-artifact.ps1",
+        )
+
+        self.assertIn("pwsh", commands["ScriptCommand"])
+        self.assertIn("-NoProfile", commands["ScriptCommand"])
+        self.assertIn("-ExecutionPolicy Bypass", commands["ScriptCommand"])
+        self.assertNotIn("powershell.exe", commands["ScriptCommand"].lower())
+        self.assertEqual(commands["ScriptCommand"], commands["PreferredCommand"])
+
     def test_preview_seed_kickoff_message_builds_contract_helper_and_full_preview(self) -> None:
         panel = self._make_panel()
         panel.message_config_service.load_config_document = lambda _path: panel.message_config_service.clone_document(panel.message_config_doc)
@@ -14315,7 +14985,436 @@ class RelayOperatorPanelMessageSlotTests(unittest.TestCase):
         self.assertTrue(panel.target_autoloop_policy_card_frames["target01"].visible)
         self.assertTrue(panel.target_autoloop_policy_card_frames["target02"].visible)
         self.assertFalse(panel.target_autoloop_policy_card_frames["target03"].visible)
-        self.assertEqual("filter=attention-only / visible=2 / hidden=6 / selected=0 / dirty=1 / attention=2", panel.target_autoloop_policy_filter_status_var.get())
+        self.assertEqual(
+            "filter=attention-only / visible=2 / hidden=6 / selected=0 / dirty=1 / attention=2 / cwdMismatch=0",
+            panel.target_autoloop_policy_filter_status_var.get(),
+        )
+
+    def test_target_autoloop_policy_filter_cwd_mismatch_only_hides_aligned_cards(self) -> None:
+        panel = self._make_panel()
+        with ExternalTemporaryDirectory(prefix="target-cwd-filter-") as tmp:
+            tmp_path = Path(tmp)
+            target02_repo = tmp_path / "target02-workrepo"
+            target03_repo = tmp_path / "target03-workrepo"
+            target02_repo.mkdir()
+            target03_repo.mkdir()
+            binding_path = tmp_path / "bindings.json"
+            binding_path.write_text(
+                json.dumps(
+                    {
+                        "windows": [
+                            {"target_id": "target02", "target_dir": r"C:\old-root", "hwnd": "3002"},
+                            {"target_id": "target03", "target_dir": str(target03_repo), "hwnd": "3003"},
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            panel.effective_data = {"Config": {"BindingProfilePath": str(binding_path)}}
+            panel.target_autoloop_policy_card_vars["target02"]["work_repo_root_var"].set(str(target02_repo))
+            panel.target_autoloop_policy_card_vars["target03"]["work_repo_root_var"].set(str(target03_repo))
+            panel.target_autoloop_policy_filter_var.set("cwd-mismatch-only")
+
+            panel._apply_target_autoloop_policy_filter_layout(document=panel.message_config_doc)
+
+            self.assertFalse(panel.target_autoloop_policy_card_frames["target01"].visible)
+            self.assertTrue(panel.target_autoloop_policy_card_frames["target02"].visible)
+            self.assertFalse(panel.target_autoloop_policy_card_frames["target03"].visible)
+            self.assertIn("filter=cwd-mismatch-only / visible=1 / hidden=7", panel.target_autoloop_policy_filter_status_var.get())
+            self.assertIn("/ cwdMismatch=1", panel.target_autoloop_policy_filter_status_var.get())
+
+    def test_select_cwd_mismatch_target_autoloop_policy_cards_marks_only_cwd_mismatch_targets(self) -> None:
+        panel = self._make_panel()
+        with ExternalTemporaryDirectory(prefix="target-cwd-select-") as tmp:
+            tmp_path = Path(tmp)
+            target02_repo = tmp_path / "target02-workrepo"
+            target03_repo = tmp_path / "target03-workrepo"
+            target02_repo.mkdir()
+            target03_repo.mkdir()
+            binding_path = tmp_path / "bindings.json"
+            binding_path.write_text(
+                json.dumps(
+                    {
+                        "windows": [
+                            {"target_id": "target02", "target_dir": r"C:\old-root", "hwnd": "3002"},
+                            {"target_id": "target03", "target_dir": str(target03_repo), "hwnd": "3003"},
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            panel.effective_data = {"Config": {"BindingProfilePath": str(binding_path)}}
+            panel.target_autoloop_policy_card_vars["target02"]["work_repo_root_var"].set(str(target02_repo))
+            panel.target_autoloop_policy_card_vars["target03"]["work_repo_root_var"].set(str(target03_repo))
+
+            panel.select_cwd_mismatch_target_autoloop_policy_cards()
+
+            self.assertFalse(panel.target_autoloop_policy_card_vars["target01"]["bulk_selected_var"].get())
+            self.assertTrue(panel.target_autoloop_policy_card_vars["target02"]["bulk_selected_var"].get())
+            self.assertFalse(panel.target_autoloop_policy_card_vars["target03"]["bulk_selected_var"].get())
+            self.assertIn("cwd mismatch target 1개를 선택", panel.target_autoloop_policy_editor_status_var.get())
+            self.assertIn("/ selected=1 ", panel.target_autoloop_policy_filter_status_var.get())
+            self.assertIn("/ cwdMismatch=1", panel.target_autoloop_policy_filter_status_var.get())
+
+    def test_preview_selected_cwd_restart_target_autoloop_plan_reports_ready_and_blocked_targets(self) -> None:
+        panel = self._make_panel()
+        panel.output_text = object()
+        panel.set_text = lambda _widget, value: setattr(panel, "_captured_output", value)
+        with ExternalTemporaryDirectory(prefix="target-cwd-plan-") as tmp:
+            tmp_path = Path(tmp)
+            target02_repo = tmp_path / "target02-workrepo"
+            target03_repo = tmp_path / "target03-workrepo"
+            target02_repo.mkdir()
+            target03_repo.mkdir()
+            binding_path = tmp_path / "bindings.json"
+            binding_path.write_text(
+                json.dumps(
+                    {
+                        "windows": [
+                            {"target_id": "target02", "target_dir": r"C:\old-root", "hwnd": "3002"},
+                            {"target_id": "target03", "target_dir": str(target03_repo), "hwnd": "3003"},
+                            {"target_id": "target04", "target_dir": r"C:\old-root", "hwnd": "3004"},
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            panel.effective_data = {"Config": {"BindingProfilePath": str(binding_path)}}
+            panel.target_autoloop_policy_card_vars["target02"]["work_repo_root_var"].set(str(target02_repo))
+            panel.target_autoloop_policy_card_vars["target02"]["bulk_selected_var"].set(True)
+            panel.target_autoloop_policy_card_vars["target03"]["work_repo_root_var"].set(str(target03_repo))
+            panel.target_autoloop_policy_card_vars["target03"]["bulk_selected_var"].set(True)
+            panel.target_autoloop_policy_card_vars["target04"]["work_repo_root_var"].set(str(tmp_path / "missing-repo"))
+            panel.target_autoloop_policy_card_vars["target04"]["bulk_selected_var"].set(True)
+            panel._target_autoloop_restart_cwd_block_reason = lambda _target_id: ""
+            panel.command_service = SimpleNamespace(
+                build_script_command=lambda script_name, **kwargs: [script_name, *(kwargs.get("extra") or [])]
+            )
+
+            panel.preview_selected_cwd_restart_target_autoloop_plan()
+
+            self.assertIn("cwd 재기동 계획: target 3개 / ready=1 / blocked=1 / skipped=1", panel.target_autoloop_policy_editor_status_var.get())
+            self.assertIn("source=selected", panel._captured_output)
+            self.assertIn("[target02] READY", panel._captured_output)
+            self.assertIn("Restart-BoundVisibleTarget.ps1", panel._captured_output)
+            self.assertIn("[target03] SKIP", panel._captured_output)
+            self.assertIn("[target04] BLOCKED", panel._captured_output)
+            self.assertIn("WorkRepoRoot 경로가 없습니다", panel._captured_output)
+
+    def test_preview_selected_cwd_restart_plan_includes_latest_codex_launch_command_when_enabled(self) -> None:
+        panel = self._make_panel()
+        panel.output_text = object()
+        panel.set_text = lambda _widget, value: setattr(panel, "_captured_output", value)
+        with ExternalTemporaryDirectory(prefix="target-cwd-plan-codex-launch-") as tmp:
+            tmp_path = Path(tmp)
+            target02_repo = tmp_path / "target02-workrepo"
+            target02_repo.mkdir()
+            binding_path = tmp_path / "bindings.json"
+            binding_path.write_text(
+                json.dumps(
+                    {
+                        "windows": [
+                            {"target_id": "target02", "target_dir": r"C:\old-root", "hwnd": "3002"},
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            launch_command = r"& 'C:\codex\0.142.4\codex.ps1' -a never -s danger-full-access"
+            panel.effective_data = {"Config": {"BindingProfilePath": str(binding_path)}}
+            panel.target_autoloop_policy_card_vars["target02"]["work_repo_root_var"].set(str(target02_repo))
+            panel.target_autoloop_policy_card_vars["target02"]["bulk_selected_var"].set(True)
+            panel.target_autoloop_restart_use_latest_codex_var = VarStub(True)
+            panel.__dict__["_last_codex_cli_update_status_payload"] = {
+                "RecommendedTargetLaunchCommand": launch_command,
+                "Recommendation": "global-update-locked-use-side-by-side",
+            }
+            panel._target_autoloop_restart_cwd_block_reason = lambda _target_id: ""
+            panel.command_service = SimpleNamespace(
+                build_script_command=lambda script_name, **kwargs: [script_name, *(kwargs.get("extra") or [])]
+            )
+
+            panel.preview_selected_cwd_restart_target_autoloop_plan()
+
+            self.assertIn("launchCommandMode=side-by-side", panel._captured_output)
+            self.assertIn("launchCommand: " + launch_command, panel._captured_output)
+            self.assertIn("-LaunchCommand", panel._captured_output)
+            self.assertIn(launch_command, panel._captured_output)
+
+    def test_preview_selected_cwd_restart_target_autoloop_plan_falls_back_to_mismatch_targets(self) -> None:
+        panel = self._make_panel()
+        panel.output_text = object()
+        panel.set_text = lambda _widget, value: setattr(panel, "_captured_output", value)
+        with ExternalTemporaryDirectory(prefix="target-cwd-plan-fallback-") as tmp:
+            tmp_path = Path(tmp)
+            target02_repo = tmp_path / "target02-workrepo"
+            target03_repo = tmp_path / "target03-workrepo"
+            target02_repo.mkdir()
+            target03_repo.mkdir()
+            binding_path = tmp_path / "bindings.json"
+            binding_path.write_text(
+                json.dumps(
+                    {
+                        "windows": [
+                            {"target_id": "target02", "target_dir": r"C:\old-root", "hwnd": "3002"},
+                            {"target_id": "target03", "target_dir": str(target03_repo), "hwnd": "3003"},
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            panel.effective_data = {"Config": {"BindingProfilePath": str(binding_path)}}
+            panel.target_autoloop_policy_card_vars["target02"]["work_repo_root_var"].set(str(target02_repo))
+            panel.target_autoloop_policy_card_vars["target03"]["work_repo_root_var"].set(str(target03_repo))
+            panel._target_autoloop_restart_cwd_block_reason = lambda _target_id: ""
+            panel.command_service = SimpleNamespace(
+                build_script_command=lambda script_name, **kwargs: [script_name, *(kwargs.get("extra") or [])]
+            )
+
+            panel.preview_selected_cwd_restart_target_autoloop_plan()
+
+            self.assertIn("cwd 재기동 계획: target 1개 / ready=1 / blocked=0 / skipped=0", panel.target_autoloop_policy_editor_status_var.get())
+            self.assertIn("source=cwd-mismatch", panel._captured_output)
+            self.assertIn("watcherGuard=OK", panel._captured_output)
+            self.assertIn("targets=target02", panel._captured_output)
+            self.assertIn("[target02] READY", panel._captured_output)
+            self.assertNotIn("[target03]", panel._captured_output)
+
+    def test_request_restart_selected_cwd_targets_runs_ready_targets_then_syncs(self) -> None:
+        panel = self._make_panel()
+        panel.output_text = object()
+        panel.set_text = lambda _widget, value: setattr(panel, "_captured_output", value)
+        panel.operator_status_var = VarStub("")
+        panel.operator_hint_var = VarStub("")
+        panel.target_autoloop_status_var = VarStub("")
+        panel.target_autoloop_guidance_var = VarStub("")
+        panel._refresh_sticky_context_bar = lambda: None
+        panel._invalidate_visibility_status_cache = lambda: setattr(panel, "_visibility_cache_invalidated", True)
+        panel._reuse_existing_windows_command_preview = lambda: "reuse-preview"
+        with ExternalTemporaryDirectory(prefix="target-cwd-batch-") as tmp:
+            tmp_path = Path(tmp)
+            target02_repo = tmp_path / "target02-workrepo"
+            target04_repo = tmp_path / "target04-workrepo"
+            target02_repo.mkdir()
+            target04_repo.mkdir()
+            binding_path = tmp_path / "bindings.json"
+            binding_path.write_text(
+                json.dumps(
+                    {
+                        "windows": [
+                            {"target_id": "target02", "target_dir": r"C:\old-root", "hwnd": "3002"},
+                            {"target_id": "target04", "target_dir": r"C:\old-root", "hwnd": "3004"},
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            panel.effective_data = {
+                "Config": {"BindingProfilePath": str(binding_path)},
+                "RunContext": {"SelectedRunRoot": r"C:\runs\target-autoloop\run_current"},
+            }
+            panel.target_autoloop_policy_card_vars["target02"]["work_repo_root_var"].set(str(target02_repo))
+            panel.target_autoloop_policy_card_vars["target02"]["bulk_selected_var"].set(True)
+            panel.target_autoloop_policy_card_vars["target04"]["work_repo_root_var"].set(str(target04_repo))
+            panel.target_autoloop_policy_card_vars["target04"]["bulk_selected_var"].set(True)
+            panel._target_autoloop_restart_cwd_block_reason = lambda _target_id: ""
+            calls: list[tuple[str, tuple[str, ...], float | None]] = []
+            attach_calls: list[tuple[str, tuple[str, ...], float | None]] = []
+
+            class CommandServiceStub:
+                def build_script_command(self, script_name: str, **kwargs) -> list[str]:
+                    return [script_name, *(kwargs.get("extra") or [])]
+
+            class StatusServiceStub:
+                def run_json_script(self, script_name: str, context: AppContext, **kwargs) -> dict:
+                    extra = tuple(kwargs.get("extra") or [])
+                    calls.append((script_name, extra, kwargs.get("timeout_sec")))
+                    target_id = extra[extra.index("-TargetId") + 1]
+                    work_repo_root = extra[extra.index("-WorkRepoRoot") + 1]
+                    return {
+                        "Success": True,
+                        "TargetId": target_id,
+                        "OldHwnd": "old-" + target_id,
+                        "NewHwnd": "new-" + target_id,
+                        "OldTargetDir": r"C:\old-root",
+                        "NewTargetDir": work_repo_root,
+                        "BindingUpdated": True,
+                        "Moved": True,
+                    }
+
+                def run_script(self, script_name: str, context: AppContext, **kwargs) -> subprocess.CompletedProcess[str]:
+                    extra = tuple(kwargs.get("extra") or [])
+                    attach_calls.append((script_name, extra, kwargs.get("timeout_sec")))
+                    return subprocess.CompletedProcess(
+                        args=[script_name],
+                        returncode=0,
+                        stdout="attached from binding: targets=target02,target04",
+                        stderr="",
+                    )
+
+            def run_background_task(**kwargs) -> None:
+                follow_up = kwargs["on_success"](kwargs["worker"]())
+                if callable(follow_up):
+                    follow_up()
+
+            panel.command_service = CommandServiceStub()
+            panel.status_service = StatusServiceStub()
+            panel.run_background_task = run_background_task
+
+            with mock.patch("relay_operator_panel.messagebox.askyesno", return_value=True):
+                panel.request_restart_selected_cwd_targets_for_autoloop()
+
+            self.assertEqual(
+                [
+                    (
+                        "launcher/Restart-BoundVisibleTarget.ps1",
+                        (
+                            "-TargetId",
+                            "target02",
+                            "-WorkRepoRoot",
+                            str(target02_repo),
+                            "-AutoloopStatusPath",
+                            r"C:\runs\target-autoloop\run_current\.state\target-autoloop-status.json",
+                            "-Apply",
+                            "-AsJson",
+                        ),
+                        75.0,
+                    ),
+                    (
+                        "launcher/Restart-BoundVisibleTarget.ps1",
+                        (
+                            "-TargetId",
+                            "target04",
+                            "-WorkRepoRoot",
+                            str(target04_repo),
+                            "-AutoloopStatusPath",
+                            r"C:\runs\target-autoloop\run_current\.state\target-autoloop-status.json",
+                            "-Apply",
+                            "-AsJson",
+                        ),
+                        75.0,
+                    ),
+                ],
+                calls,
+            )
+            self.assertEqual(
+                [
+                    (
+                        "launcher/Attach-TargetsFromBindings.ps1",
+                        ("-TargetId", "target02", "target04"),
+                        35.0,
+                    )
+                ],
+                attach_calls,
+            )
+            self.assertIn("target-scoped runtime attach 완료", panel.last_result_var.get())
+            self.assertIn("선택 target runtime attach 완료", panel._captured_output)
+            self.assertIn("attached from binding: targets=target02,target04", panel._captured_output)
+
+    def test_request_restart_selected_cwd_targets_blocks_when_plan_has_blocked_target(self) -> None:
+        panel = self._make_panel()
+        panel.output_text = object()
+        panel.set_text = lambda _widget, value: setattr(panel, "_captured_output", value)
+        panel.operator_status_var = VarStub("")
+        panel.operator_hint_var = VarStub("")
+        panel._refresh_sticky_context_bar = lambda: None
+        with ExternalTemporaryDirectory(prefix="target-cwd-batch-blocked-") as tmp:
+            tmp_path = Path(tmp)
+            target02_repo = tmp_path / "target02-workrepo"
+            target02_repo.mkdir()
+            binding_path = tmp_path / "bindings.json"
+            binding_path.write_text(
+                json.dumps(
+                    {
+                        "windows": [
+                            {"target_id": "target02", "target_dir": r"C:\old-root", "hwnd": "3002"},
+                            {"target_id": "target04", "target_dir": r"C:\old-root", "hwnd": "3004"},
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            panel.effective_data = {
+                "Config": {"BindingProfilePath": str(binding_path)},
+                "RunContext": {"SelectedRunRoot": r"C:\runs\target-autoloop\run_current"},
+            }
+            panel.target_autoloop_policy_card_vars["target02"]["work_repo_root_var"].set(str(target02_repo))
+            panel.target_autoloop_policy_card_vars["target02"]["bulk_selected_var"].set(True)
+            panel.target_autoloop_policy_card_vars["target04"]["work_repo_root_var"].set(str(tmp_path / "missing-repo"))
+            panel.target_autoloop_policy_card_vars["target04"]["bulk_selected_var"].set(True)
+            panel._target_autoloop_restart_cwd_block_reason = lambda _target_id: ""
+            calls: list[str] = []
+            panel.command_service = SimpleNamespace(
+                build_script_command=lambda script_name, **kwargs: [script_name, *(kwargs.get("extra") or [])]
+            )
+            panel.status_service = SimpleNamespace(run_json_script=lambda *_args, **_kwargs: calls.append("run") or {})
+
+            with mock.patch("relay_operator_panel.messagebox.askyesno") as askyesno, mock.patch(
+                "relay_operator_panel.messagebox.showwarning"
+            ) as showwarning:
+                panel.request_restart_selected_cwd_targets_for_autoloop()
+
+            self.assertEqual([], calls)
+            askyesno.assert_not_called()
+            showwarning.assert_called_once()
+            self.assertEqual("8 Cell Autoloop cwd 순차재기동 차단", panel.operator_status_var.get())
+            self.assertIn("BLOCKED target", panel._captured_output)
+            self.assertIn("[target04] BLOCKED", panel._captured_output)
+
+    def test_request_restart_selected_cwd_targets_blocks_when_fresh_watcher_covers_target(self) -> None:
+        panel = self._make_panel()
+        panel.output_text = object()
+        panel.set_text = lambda _widget, value: setattr(panel, "_captured_output", value)
+        panel.operator_status_var = VarStub("")
+        panel.operator_hint_var = VarStub("")
+        panel._refresh_sticky_context_bar = lambda: None
+        with ExternalTemporaryDirectory(prefix="target-cwd-batch-watcher-") as tmp:
+            tmp_path = Path(tmp)
+            target02_repo = tmp_path / "target02-workrepo"
+            target02_repo.mkdir()
+            binding_path = tmp_path / "bindings.json"
+            binding_path.write_text(
+                json.dumps(
+                    {
+                        "windows": [
+                            {"target_id": "target02", "target_dir": r"C:\old-root", "hwnd": "3002"},
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            panel.effective_data = {
+                "Config": {"BindingProfilePath": str(binding_path)},
+                "RunContext": {"SelectedRunRoot": r"C:\runs\target-autoloop\run_current"},
+            }
+            panel.target_autoloop_policy_card_vars["target02"]["work_repo_root_var"].set(str(target02_repo))
+            panel.target_autoloop_policy_card_vars["target02"]["bulk_selected_var"].set(True)
+            panel._target_autoloop_restart_cwd_block_reason = lambda _target_id: ""
+            panel._target_autoloop_runtime_snapshot = lambda _run_root=None: {
+                "watcher_state": "running",
+                "controller_state": "running",
+                "watcher_target_ids": ["target02"],
+                "watcher_target_scope": "scoped",
+                "heartbeat_at": datetime.now(timezone.utc).isoformat(),
+            }
+            calls: list[str] = []
+            panel.command_service = SimpleNamespace(
+                build_script_command=lambda script_name, **kwargs: [script_name, *(kwargs.get("extra") or [])]
+            )
+            panel.status_service = SimpleNamespace(run_json_script=lambda *_args, **_kwargs: calls.append("run") or {})
+
+            with mock.patch("relay_operator_panel.messagebox.askyesno") as askyesno, mock.patch(
+                "relay_operator_panel.messagebox.showwarning"
+            ) as showwarning:
+                panel.request_restart_selected_cwd_targets_for_autoloop()
+
+            self.assertEqual([], calls)
+            askyesno.assert_not_called()
+            showwarning.assert_called_once()
+            self.assertEqual("8 Cell Autoloop cwd 순차재기동 차단", panel.operator_status_var.get())
+            self.assertIn("active watcher guard", panel._captured_output)
+            self.assertIn("fresh running watcher", panel._captured_output)
+            self.assertIn("watcherGuard=fresh running watcher", panel._captured_output)
 
     def test_target_autoloop_policy_card_detail_visibility_toggles_detail_widgets(self) -> None:
         panel = self._make_panel()
@@ -14370,7 +15469,10 @@ class RelayOperatorPanelMessageSlotTests(unittest.TestCase):
             self.assertEqual("SAVE REQUIRED", target_store["policy_state_var"].get(), target_id)
         self.assertIn("현재 보이는 target 7개에 일괄 적용", panel.target_autoloop_policy_editor_status_var.get())
         self.assertGreaterEqual(len(seed_refresh_calls), 2)
-        self.assertEqual("filter=disabled-only / visible=0 / hidden=8 / selected=0 / dirty=8 / attention=8", panel.target_autoloop_policy_filter_status_var.get())
+        self.assertEqual(
+            "filter=disabled-only / visible=0 / hidden=8 / selected=0 / dirty=8 / attention=8 / cwdMismatch=0",
+            panel.target_autoloop_policy_filter_status_var.get(),
+        )
 
     def test_clear_target_autoloop_policy_filter_restores_all_targets(self) -> None:
         panel = self._make_panel()
@@ -14382,7 +15484,10 @@ class RelayOperatorPanelMessageSlotTests(unittest.TestCase):
 
         self.assertEqual("all", panel.target_autoloop_policy_filter_var.get())
         self.assertTrue(all(frame.visible for frame in panel.target_autoloop_policy_card_frames.values()))
-        self.assertEqual("filter=all / visible=8 / hidden=0 / selected=0 / dirty=1 / attention=1", panel.target_autoloop_policy_filter_status_var.get())
+        self.assertEqual(
+            "filter=all / visible=8 / hidden=0 / selected=0 / dirty=1 / attention=1 / cwdMismatch=0",
+            panel.target_autoloop_policy_filter_status_var.get(),
+        )
 
     def test_select_visible_target_autoloop_policy_cards_marks_only_filtered_targets(self) -> None:
         panel = self._make_panel()
@@ -14397,7 +15502,10 @@ class RelayOperatorPanelMessageSlotTests(unittest.TestCase):
         self.assertFalse(panel.target_autoloop_policy_card_vars["target02"]["bulk_selected_var"].get())
         self.assertTrue(panel.target_autoloop_policy_card_vars["target03"]["bulk_selected_var"].get())
         self.assertIn("보이는 target 2개를 선택", panel.target_autoloop_policy_editor_status_var.get())
-        self.assertEqual("filter=enabled-only / visible=2 / hidden=6 / selected=2 / dirty=0 / attention=0", panel.target_autoloop_policy_filter_status_var.get())
+        self.assertEqual(
+            "filter=enabled-only / visible=2 / hidden=6 / selected=2 / dirty=0 / attention=0 / cwdMismatch=0",
+            panel.target_autoloop_policy_filter_status_var.get(),
+        )
 
     def test_select_all_target_autoloop_policy_cards_marks_every_target(self) -> None:
         panel = self._make_panel()
@@ -14408,7 +15516,10 @@ class RelayOperatorPanelMessageSlotTests(unittest.TestCase):
         for target_id in BOARD_TARGET_FALLBACK:
             self.assertTrue(panel.target_autoloop_policy_card_vars[target_id]["bulk_selected_var"].get(), target_id)
         self.assertIn("전체 target 8개를 선택", panel.target_autoloop_policy_editor_status_var.get())
-        self.assertEqual("filter=all / visible=8 / hidden=0 / selected=8 / dirty=0 / attention=0", panel.target_autoloop_policy_filter_status_var.get())
+        self.assertEqual(
+            "filter=all / visible=8 / hidden=0 / selected=8 / dirty=0 / attention=0 / cwdMismatch=0",
+            panel.target_autoloop_policy_filter_status_var.get(),
+        )
 
     def test_target_autoloop_policy_filter_selected_only_shows_selected_cards(self) -> None:
         panel = self._make_panel()
@@ -14421,7 +15532,10 @@ class RelayOperatorPanelMessageSlotTests(unittest.TestCase):
         self.assertFalse(panel.target_autoloop_policy_card_frames["target01"].visible)
         self.assertTrue(panel.target_autoloop_policy_card_frames["target02"].visible)
         self.assertTrue(panel.target_autoloop_policy_card_frames["target05"].visible)
-        self.assertEqual("filter=selected-only / visible=2 / hidden=6 / selected=2 / dirty=0 / attention=0", panel.target_autoloop_policy_filter_status_var.get())
+        self.assertEqual(
+            "filter=selected-only / visible=2 / hidden=6 / selected=2 / dirty=0 / attention=0 / cwdMismatch=0",
+            panel.target_autoloop_policy_filter_status_var.get(),
+        )
 
     def test_select_dirty_target_autoloop_policy_cards_marks_only_dirty_targets(self) -> None:
         panel = self._make_panel()
@@ -14434,7 +15548,10 @@ class RelayOperatorPanelMessageSlotTests(unittest.TestCase):
         self.assertTrue(panel.target_autoloop_policy_card_vars["target04"]["bulk_selected_var"].get())
         self.assertFalse(panel.target_autoloop_policy_card_vars["target02"]["bulk_selected_var"].get())
         self.assertIn("dirty target 2개를 선택", panel.target_autoloop_policy_editor_status_var.get())
-        self.assertEqual("filter=all / visible=8 / hidden=0 / selected=2 / dirty=2 / attention=2", panel.target_autoloop_policy_filter_status_var.get())
+        self.assertEqual(
+            "filter=all / visible=8 / hidden=0 / selected=2 / dirty=2 / attention=2 / cwdMismatch=0",
+            panel.target_autoloop_policy_filter_status_var.get(),
+        )
 
     def test_select_attention_target_autoloop_policy_cards_marks_attention_targets(self) -> None:
         panel = self._make_panel()
@@ -14447,7 +15564,10 @@ class RelayOperatorPanelMessageSlotTests(unittest.TestCase):
         self.assertTrue(panel.target_autoloop_policy_card_vars["target06"]["bulk_selected_var"].get())
         self.assertFalse(panel.target_autoloop_policy_card_vars["target01"]["bulk_selected_var"].get())
         self.assertIn("attention target 2개를 선택", panel.target_autoloop_policy_editor_status_var.get())
-        self.assertEqual("filter=all / visible=8 / hidden=0 / selected=2 / dirty=0 / attention=2", panel.target_autoloop_policy_filter_status_var.get())
+        self.assertEqual(
+            "filter=all / visible=8 / hidden=0 / selected=2 / dirty=0 / attention=2 / cwdMismatch=0",
+            panel.target_autoloop_policy_filter_status_var.get(),
+        )
 
     def test_select_enabled_target_autoloop_policy_cards_marks_enabled_targets(self) -> None:
         panel = self._make_panel()
@@ -14461,7 +15581,10 @@ class RelayOperatorPanelMessageSlotTests(unittest.TestCase):
         self.assertFalse(panel.target_autoloop_policy_card_vars["target02"]["bulk_selected_var"].get())
         self.assertTrue(panel.target_autoloop_policy_card_vars["target05"]["bulk_selected_var"].get())
         self.assertIn("enabled target 2개를 선택", panel.target_autoloop_policy_editor_status_var.get())
-        self.assertEqual("filter=all / visible=8 / hidden=0 / selected=2 / dirty=0 / attention=0", panel.target_autoloop_policy_filter_status_var.get())
+        self.assertEqual(
+            "filter=all / visible=8 / hidden=0 / selected=2 / dirty=0 / attention=0 / cwdMismatch=0",
+            panel.target_autoloop_policy_filter_status_var.get(),
+        )
 
     def test_prepare_selected_target_autoloop_policy_cards_for_run_enables_selected_targets_only(self) -> None:
         panel = self._make_panel()
@@ -14494,7 +15617,10 @@ class RelayOperatorPanelMessageSlotTests(unittest.TestCase):
         self.assertIn("저장 후 새 RunRoot", panel.target_autoloop_guidance_var.get())
         self.assertIn("PreparedTargets: target02, target04", panel.output_text.value)
         self.assertIn("PublishReadyChanged: target02, target04", panel.output_text.value)
-        self.assertEqual("filter=all / visible=8 / hidden=0 / selected=2 / dirty=2 / attention=2", panel.target_autoloop_policy_filter_status_var.get())
+        self.assertEqual(
+            "filter=all / visible=8 / hidden=0 / selected=2 / dirty=2 / attention=2 / cwdMismatch=0",
+            panel.target_autoloop_policy_filter_status_var.get(),
+        )
 
     def test_select_attention_dirty_target_autoloop_policy_cards_marks_intersection(self) -> None:
         panel = self._make_panel()
@@ -14510,7 +15636,10 @@ class RelayOperatorPanelMessageSlotTests(unittest.TestCase):
         self.assertTrue(panel.target_autoloop_policy_card_vars["target05"]["bulk_selected_var"].get())
         self.assertFalse(panel.target_autoloop_policy_card_vars["target06"]["bulk_selected_var"].get())
         self.assertIn("attention+dirty target 2개를 선택", panel.target_autoloop_policy_editor_status_var.get())
-        self.assertEqual("filter=all / visible=8 / hidden=0 / selected=2 / dirty=2 / attention=3", panel.target_autoloop_policy_filter_status_var.get())
+        self.assertEqual(
+            "filter=all / visible=8 / hidden=0 / selected=2 / dirty=2 / attention=3 / cwdMismatch=0",
+            panel.target_autoloop_policy_filter_status_var.get(),
+        )
 
     def test_target_autoloop_policy_selection_state_roundtrip_restores_filter_and_selected_targets(self) -> None:
         panel = self._make_panel()
@@ -14535,7 +15664,10 @@ class RelayOperatorPanelMessageSlotTests(unittest.TestCase):
         self.assertTrue(restored_panel.target_autoloop_policy_card_vars["target02"]["bulk_selected_var"].get())
         self.assertTrue(restored_panel.target_autoloop_policy_card_vars["target06"]["bulk_selected_var"].get())
         self.assertFalse(restored_panel.target_autoloop_policy_card_vars["target01"]["bulk_selected_var"].get())
-        self.assertEqual("filter=selected-only / visible=2 / hidden=6 / selected=2 / dirty=0 / attention=0", restored_panel.target_autoloop_policy_filter_status_var.get())
+        self.assertEqual(
+            "filter=selected-only / visible=2 / hidden=6 / selected=2 / dirty=0 / attention=0 / cwdMismatch=0",
+            restored_panel.target_autoloop_policy_filter_status_var.get(),
+        )
         self.assertEqual("", restored_panel.target_autoloop_policy_selection_warning_var.get())
 
     def test_target_autoloop_policy_selection_file_path_defaults_to_scoped_snapshot(self) -> None:
@@ -14636,7 +15768,10 @@ class RelayOperatorPanelMessageSlotTests(unittest.TestCase):
         self.assertIn("unknown targets=target99", panel.target_autoloop_policy_selection_warning_var.get())
         self.assertTrue(panel.target_autoloop_policy_card_vars["target02"]["bulk_selected_var"].get())
         self.assertFalse(panel.target_autoloop_policy_card_vars["target01"]["bulk_selected_var"].get())
-        self.assertEqual("filter=selected-only / visible=1 / hidden=7 / selected=1 / dirty=0 / attention=0", panel.target_autoloop_policy_filter_status_var.get())
+        self.assertEqual(
+            "filter=selected-only / visible=1 / hidden=7 / selected=1 / dirty=0 / attention=0 / cwdMismatch=0",
+            panel.target_autoloop_policy_filter_status_var.get(),
+        )
 
     def test_target_autoloop_policy_selection_changed_updates_filter_status(self) -> None:
         panel = self._make_panel()
@@ -14644,7 +15779,10 @@ class RelayOperatorPanelMessageSlotTests(unittest.TestCase):
 
         panel._on_target_autoloop_policy_selection_changed("target03")
 
-        self.assertEqual("filter=all / visible=8 / hidden=0 / selected=1 / dirty=0 / attention=0", panel.target_autoloop_policy_filter_status_var.get())
+        self.assertEqual(
+            "filter=all / visible=8 / hidden=0 / selected=1 / dirty=0 / attention=0 / cwdMismatch=0",
+            panel.target_autoloop_policy_filter_status_var.get(),
+        )
 
     def test_export_target_autoloop_policy_selection_snapshot_writes_payload(self) -> None:
         panel = self._make_panel()
@@ -15231,6 +16369,27 @@ class RelayOperatorPanelMessageSlotTests(unittest.TestCase):
 
         self.assertEqual(r"C:\repo-picked", panel.pair_policy_card_vars["pair01"]["repo_root_var"].get())
         self.assertIn(r"C:\repo-picked", panel.pair_policy_editor_status_var.get())
+
+    def test_browse_target_autoloop_work_repo_root_marks_card_dirty_and_refreshes_seed(self) -> None:
+        panel = self._make_panel()
+        panel.message_config_service.render_target_autoloop_route_matrix = lambda *_args, **_kwargs: {"Targets": []}
+        panel.refresh_target_autoloop_policy_editor(document=panel.message_config_doc)
+        seed_refresh_calls: list[str] = []
+        panel.refresh_target_autoloop_seed_composer = lambda: seed_refresh_calls.append("refresh")
+
+        with ExternalTemporaryDirectory(prefix="target-workrepo-pick-") as tmp:
+            picked_repo = Path(tmp) / "target01-workrepo"
+            picked_repo.mkdir()
+            with mock.patch("relay_operator_panel.filedialog.askdirectory", return_value=str(picked_repo)):
+                panel.browse_target_autoloop_work_repo_root("target01")
+
+            self.assertEqual(str(picked_repo), panel.target_autoloop_policy_card_vars["target01"]["work_repo_root_var"].get())
+
+        self.assertEqual("SAVE REQUIRED", panel.target_autoloop_policy_card_vars["target01"]["policy_state_var"].get())
+        self.assertEqual("#B91C1C", panel.target_autoloop_policy_card_state_badge_labels["target01"].bg)
+        self.assertIn("WorkRepoRoot 선택 완료", panel.target_autoloop_policy_editor_status_var.get())
+        self.assertEqual(["refresh"], seed_refresh_calls)
+        self.assertIn("dirty=1", panel.target_autoloop_policy_filter_status_var.get())
 
     def test_open_pair_policy_repo_root_uses_current_card_value(self) -> None:
         panel = self._make_panel()
@@ -19428,6 +20587,88 @@ class RelayOperatorPanelWatcherOptionTests(unittest.TestCase):
             self.assertEqual(1, third["output_block_summary"]["limit_reached_ready_unaccepted_count"])
             self.assertEqual(["target01"], third["output_block_summary"]["limit_reached_ready_unaccepted_target_ids"])
 
+    def test_target_autoloop_runtime_snapshot_overlays_fresh_target_status_sidecar(self) -> None:
+        panel = self._make_panel()
+        panel._target_autoloop_router_session_snapshot = lambda: {
+            "state": "not-configured",
+            "mismatch": False,
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            run_root = Path(tmp) / "run_target_autoloop_sidecar_overlay"
+            state_root = run_root / ".state"
+            target_state_root = run_root / "targets" / "target01" / ".state"
+            state_root.mkdir(parents=True, exist_ok=True)
+            target_state_root.mkdir(parents=True, exist_ok=True)
+            status_path = state_root / "target-autoloop-status.json"
+            target_status_path = target_state_root / "target-autoloop-status.json"
+            (run_root / "manifest.json").write_text(
+                json.dumps(
+                    {
+                        "RunMode": "target-autoloop",
+                        "Targets": [
+                            {
+                                "TargetId": "target01",
+                                "Enabled": True,
+                                "TargetStateRoot": str(target_state_root),
+                                "TargetStatusPath": str(target_status_path),
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            status_path.write_text(
+                json.dumps(
+                    {
+                        "RunMode": "target-autoloop",
+                        "ControllerState": "running",
+                        "State": "running",
+                        "WatcherState": "running",
+                        "Targets": [
+                            {
+                                "TargetId": "target01",
+                                "Enabled": True,
+                                "Phase": "idle",
+                                "NextAction": "wait-for-output",
+                                "CycleCount": 0,
+                                "MaxCycleCount": 5,
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            target_status_path.write_text(
+                json.dumps(
+                    {
+                        "SidecarKind": "target-status",
+                        "TargetId": "target01",
+                        "ControllerState": "running",
+                        "TargetStatusPath": str(target_status_path),
+                        "Target": {
+                            "TargetId": "target01",
+                            "Enabled": True,
+                            "Phase": "queued",
+                            "NextAction": "dispatch-command",
+                            "CycleCount": 3,
+                            "MaxCycleCount": 5,
+                            "LastDispatchState": "router-ready-file-created",
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            os.utime(status_path, (1_700_000_000, 1_700_000_000))
+            os.utime(target_status_path, (1_700_000_010, 1_700_000_010))
+
+            snapshot = panel._target_autoloop_runtime_snapshot(str(run_root))
+
+        self.assertEqual(1, snapshot["target_status_sidecar_count"])
+        self.assertEqual("queued", snapshot["targets"][0]["Phase"])
+        self.assertEqual(3, snapshot["targets"][0]["CycleCount"])
+        self.assertTrue(snapshot["targets"][0]["TargetStatusSidecarLoaded"])
+
     def test_target_autoloop_latest_valid_sibling_run_root_ignores_nested_empty_manifests(self) -> None:
         panel = self._make_panel()
         with tempfile.TemporaryDirectory() as tmp:
@@ -19985,9 +21226,54 @@ class RelayOperatorPanelWatcherOptionTests(unittest.TestCase):
         )
 
         self.assertEqual("requeue_retry_pending", spec["action_key"])
-        self.assertEqual("retry-pending 재큐잉", spec["label"])
+        self.assertEqual("현재 전송보류 재시도", spec["label"])
+        self.assertIn("current=1", spec["detail"])
         self.assertIn("focus_lost", spec["detail"])
         self.assertEqual("normal", panel._target_autoloop_recommendation_level(spec))
+
+    def test_target_autoloop_recommendation_prioritizes_router_config_drift(self) -> None:
+        panel = self._make_panel()
+        spec = panel._target_autoloop_recommendation_spec(
+            {
+                "run_root": self._canonical_target_autoloop_run_root(),
+                "run_root_error": "",
+                "status_error": "",
+                "control_error": "",
+                "manifest_exists": True,
+                "manifest_error": "",
+                "manifest_run_mode": "target-autoloop",
+                "manifest_enabled_count": 1,
+                "manifest_publish_ready_count": 1,
+                "control_pending_action": "",
+                "watcher_state": "stopped",
+                "controller_state": "running",
+                "heartbeat_at": "",
+                "status_last_updated_at": "",
+                "watcher_stderr_log_exists": False,
+                "watcher_stderr_log_path": "",
+                "router_session_mismatch": False,
+                "router_session_state": "ok",
+                "router_session": {
+                    "router_launcher_session_id": "session-current",
+                    "runtime_launcher_session_id": "session-current",
+                    "router_config_drift": True,
+                    "router_config_drift_reasons": ["router-state-missing-effective-send-settings"],
+                    "configured_user_idle_wait_timeout_ms": 15000,
+                    "router_user_idle_wait_timeout_ms": None,
+                },
+                "retry_pending_summary": {
+                    "count": 1,
+                    "current_count": 1,
+                    "target_ids": ["target08"],
+                    "current_target_ids": ["target08"],
+                    "latest_current_failure_category": "user_active_hold",
+                },
+            }
+        )
+
+        self.assertEqual("restart_router_for_autoloop", spec["action_key"])
+        self.assertEqual("router 설정 재시작", spec["label"])
+        self.assertIn("router-state-missing-effective-send-settings", spec["detail"])
 
     def test_target_autoloop_recommendation_suggests_extend_and_start_for_limit_reached_selected_target(self) -> None:
         panel = self._make_panel()
@@ -20034,10 +21320,56 @@ class RelayOperatorPanelWatcherOptionTests(unittest.TestCase):
         )
 
         self.assertEqual("extend_cycle_limit_then_start_watch", spec["action_key"])
-        self.assertEqual("추가 3회+감지 시작", spec["label"])
+        self.assertEqual("target01 추가 3회+감지 시작", spec["label"])
+        self.assertEqual("target01", spec["target_id"])
         self.assertIn("target01 5/5 -> 5/8 (+3)", spec["detail"])
         self.assertIn("새 RunRoot를 만들지 않습니다", spec["detail"])
         self.assertEqual("normal", panel._target_autoloop_recommendation_level(spec))
+
+    def test_target_autoloop_recommendation_suggests_extend_for_limit_reached_nonselected_target(self) -> None:
+        panel = self._make_panel()
+        panel.target_id_var.set("target01")
+        panel.target_autoloop_extend_cycles_var.set("3")
+        spec = panel._target_autoloop_recommendation_spec(
+            {
+                "run_root": self._canonical_target_autoloop_run_root(),
+                "run_root_error": "",
+                "status_error": "",
+                "control_error": "",
+                "manifest_exists": True,
+                "manifest_error": "",
+                "manifest_run_mode": "target-autoloop",
+                "manifest_enabled_count": 2,
+                "manifest_publish_ready_count": 2,
+                "manifest_targets": [
+                    {"TargetId": "target01", "Enabled": True, "TriggerKinds": ["publish-ready"], "MaxCycleCount": 5},
+                    {"TargetId": "target02", "Enabled": True, "TriggerKinds": ["publish-ready"], "MaxCycleCount": 5},
+                ],
+                "targets": [
+                    {"TargetId": "target01", "Enabled": True, "Phase": "queued", "CycleCount": 2, "MaxCycleCount": 5},
+                    {
+                        "TargetId": "target02",
+                        "Enabled": True,
+                        "Phase": "limit-reached",
+                        "CycleCount": 5,
+                        "MaxCycleCount": 5,
+                    },
+                ],
+                "control_pending_action": "",
+                "watcher_state": "stopped",
+                "controller_state": "stopped",
+                "heartbeat_at": "",
+                "status_last_updated_at": "",
+                "watcher_stderr_log_exists": False,
+                "watcher_stderr_log_path": "",
+                **self._router_ok_snapshot(),
+            }
+        )
+
+        self.assertEqual("extend_cycle_limit_then_start_watch", spec["action_key"])
+        self.assertEqual("target02 추가 3회+감지 시작", spec["label"])
+        self.assertEqual("target02", spec["target_id"])
+        self.assertIn("target02 5/5 -> 5/8 (+3)", spec["detail"])
 
     def test_target_autoloop_start_button_allows_session_fix_when_router_mismatch(self) -> None:
         panel = self._make_panel()
@@ -20556,6 +21888,163 @@ class RelayOperatorPanelWatcherOptionTests(unittest.TestCase):
         self.assertIn("다음 확인: router 전달 확인", panel.target_autoloop_seed_readiness_var.get())
         self.assertNotIn("accepted 처리했지만", panel.target_autoloop_seed_readiness_var.get())
         self.assertIn("target04 manual seed", panel.output_text.value)
+
+    def test_copy_target_autoloop_seed_resume_missing_artifacts_text_copies_recovery_prompt(self) -> None:
+        panel = self._make_panel()
+        panel.copy_target_autoloop_seed_resume_missing_artifacts_text = (
+            RelayOperatorPanel.copy_target_autoloop_seed_resume_missing_artifacts_text.__get__(panel, RelayOperatorPanel)
+        )
+        panel._target_autoloop_seed_copy_issue = RelayOperatorPanel._target_autoloop_seed_copy_issue.__get__(panel, RelayOperatorPanel)
+        copied: list[str] = []
+        payload = {
+            "TargetId": "target05",
+            "RunRoot": r"C:\runs\current",
+            "WorkRepoRoot": r"C:\repo-b",
+            "TargetRunRoot": r"C:\repo-b\.relay-runs\bottest-live-visible\target05",
+            "CycleCount": 2,
+            "MaxCycleCount": 10,
+            "Phase": "waiting-output",
+            "DeliverySummary": "artifact=missing / watcher=waiting",
+            "DeliveryNextAction": "summary.txt, review.zip 생성 후 publish helper 실행 필요",
+            "ResolvedOutputPaths": {
+                "WorkRepoRoot": r"C:\repo-b",
+                "TargetRunRoot": r"C:\repo-b\.relay-runs\bottest-live-visible\target05",
+                "SourceOutboxPath": r"C:\repo-b\.relay-contract\target05\source-outbox",
+                "SourceSummaryPath": r"C:\repo-b\.relay-contract\target05\source-outbox\summary.txt",
+                "SourceReviewZipPath": r"C:\repo-b\.relay-contract\target05\source-outbox\review.zip",
+                "PublishReadyPath": r"C:\repo-b\.relay-contract\target05\source-outbox\publish.ready.json",
+            },
+            "PublishHelperCommand": r"pwsh -NoProfile -File C:\tools\Publish-TargetAutoloopArtifact.ps1 -TargetId target05",
+            "SeedRuntimeSummary": "runtime: pendingInput=0 / claimed=0 / queued=0 / processing=0",
+            "InputRecommendation": {"Action": "browse-input", "Label": "입력 파일 선택"},
+        }
+        panel.config_path_var = VarStub("cfg.psd1")
+        panel.target_autoloop_seed_target_var = VarStub("target05")
+        panel.target_autoloop_seed_status_var = VarStub("")
+        panel.target_autoloop_seed_readiness_var = VarStub("")
+        panel.target_autoloop_seed_path_proof_var = VarStub("")
+        panel.target_autoloop_seed_runtime_var = VarStub("")
+        panel.target_autoloop_seed_guidance_var = VarStub("")
+        panel.target_autoloop_seed_action_button_var = VarStub("")
+        panel.target_autoloop_seed_copy_reason_var = VarStub("")
+        panel.target_autoloop_policy_card_vars = {}
+        panel.output_text = TextWidgetStub("")
+        panel._copy_to_clipboard = copied.append
+        panel.set_text = lambda widget, value: setattr(widget, "value", value)
+        panel._current_run_root_for_actions = lambda: r"C:\runs\current"
+        panel._target_autoloop_seed_preview_payload = lambda: payload
+
+        panel.copy_target_autoloop_seed_resume_missing_artifacts_text()
+
+        self.assertEqual(1, len(copied))
+        text = copied[0]
+        self.assertIn("누락 산출물 복구", text)
+        self.assertIn("새 시작문이 아닙니다", text)
+        self.assertIn("같은 RunRoot", text)
+        self.assertIn("파일 생성하지마시오", text)
+        self.assertIn("반드시 생성", text)
+        self.assertIn("TargetId: target05", text)
+        self.assertIn(r"summary.txt -> C:\repo-b\.relay-contract\target05\source-outbox\summary.txt", text)
+        self.assertIn(r"review.zip -> C:\repo-b\.relay-contract\target05\source-outbox\review.zip", text)
+        self.assertIn(r"publish.ready.json -> C:\repo-b\.relay-contract\target05\source-outbox\publish.ready.json", text)
+        self.assertIn(r"pwsh -NoProfile -File C:\tools\Publish-TargetAutoloopArtifact.ps1 -TargetId target05", text)
+        self.assertIn("MaxCycleCount를 늘리는 작업이 아닙니다", text)
+        self.assertIn("이어쓰기 문구 복사 완료: target05", panel.target_autoloop_seed_copy_reason_var.get())
+        self.assertIn("누락된 summary.txt/review.zip", panel.target_autoloop_seed_readiness_var.get())
+        self.assertEqual("runtime: pendingInput=0 / claimed=0 / queued=0 / processing=0", panel.target_autoloop_seed_runtime_var.get())
+        self.assertIn("입력 파일 선택", panel.target_autoloop_seed_guidance_var.get())
+        self.assertIn("target-autoloop 이어쓰기/누락 산출물 복구 문구 복사 완료", panel.output_text.value)
+
+    def test_copy_target_autoloop_seed_resume_for_target_sets_target_and_copies_recovery_prompt(self) -> None:
+        panel = self._make_panel()
+        panel.copy_target_autoloop_seed_resume_for_target = RelayOperatorPanel.copy_target_autoloop_seed_resume_for_target.__get__(panel, RelayOperatorPanel)
+        panel.copy_target_autoloop_seed_resume_missing_artifacts_text = (
+            RelayOperatorPanel.copy_target_autoloop_seed_resume_missing_artifacts_text.__get__(panel, RelayOperatorPanel)
+        )
+        panel._target_autoloop_seed_copy_issue = RelayOperatorPanel._target_autoloop_seed_copy_issue.__get__(panel, RelayOperatorPanel)
+        panel._refresh_target_autoloop_seed_copy_reason = RelayOperatorPanel._refresh_target_autoloop_seed_copy_reason.__get__(panel, RelayOperatorPanel)
+        copied: list[str] = []
+
+        def _payload() -> dict[str, object]:
+            target_id = str(panel.target_autoloop_seed_target_var.get() or "")
+            return {
+                "TargetId": target_id,
+                "RunRoot": r"C:\runs\current",
+                "WorkRepoRoot": r"C:\repo-b",
+                "TargetRunRoot": rf"C:\repo-b\.relay-runs\bottest-live-visible\{target_id}",
+                "CycleCount": 2,
+                "MaxCycleCount": 10,
+                "Phase": "waiting-output",
+                "ResolvedOutputPaths": {
+                    "SourceSummaryPath": rf"C:\repo-b\.relay-contract\{target_id}\source-outbox\summary.txt",
+                    "SourceReviewZipPath": rf"C:\repo-b\.relay-contract\{target_id}\source-outbox\review.zip",
+                    "PublishReadyPath": rf"C:\repo-b\.relay-contract\{target_id}\source-outbox\publish.ready.json",
+                },
+                "PublishHelperCommand": rf"pwsh -NoProfile -File C:\tools\Publish-TargetAutoloopArtifact.ps1 -TargetId {target_id}",
+            }
+
+        panel.config_path_var = VarStub("cfg.psd1")
+        panel.target_autoloop_seed_target_var = VarStub("target01")
+        panel.target_autoloop_seed_status_var = VarStub("")
+        panel.target_autoloop_seed_readiness_var = VarStub("")
+        panel.target_autoloop_seed_path_proof_var = VarStub("")
+        panel.target_autoloop_seed_runtime_var = VarStub("")
+        panel.target_autoloop_seed_guidance_var = VarStub("")
+        panel.target_autoloop_seed_action_button_var = VarStub("")
+        panel.target_autoloop_seed_copy_reason_var = VarStub("")
+        panel.target_autoloop_policy_card_vars = {}
+        panel.output_text = TextWidgetStub("")
+        panel._copy_to_clipboard = copied.append
+        panel.set_text = lambda widget, value: setattr(widget, "value", value)
+        panel._current_run_root_for_actions = lambda: r"C:\runs\current"
+        panel._target_autoloop_seed_preview_payload = _payload
+
+        panel.copy_target_autoloop_seed_resume_for_target("target04")
+
+        self.assertEqual("target04", panel.target_autoloop_seed_target_var.get())
+        self.assertEqual(1, len(copied))
+        self.assertIn("TargetId: target04", copied[0])
+        self.assertIn(r"C:\repo-b\.relay-contract\target04\source-outbox\summary.txt", copied[0])
+        self.assertIn("이어쓰기 문구 복사 완료: target04", panel.target_autoloop_seed_copy_reason_var.get())
+
+    def test_copy_target_autoloop_seed_resume_blocks_when_max_cycle_reached(self) -> None:
+        panel = self._make_panel()
+        panel.copy_target_autoloop_seed_resume_missing_artifacts_text = (
+            RelayOperatorPanel.copy_target_autoloop_seed_resume_missing_artifacts_text.__get__(panel, RelayOperatorPanel)
+        )
+        panel._target_autoloop_seed_copy_issue = RelayOperatorPanel._target_autoloop_seed_copy_issue.__get__(panel, RelayOperatorPanel)
+        copied: list[str] = []
+        payload = {
+            "TargetId": "target05",
+            "OperationalReason": "max-cycle-reached",
+            "ResolvedOutputPaths": {
+                "SourceSummaryPath": r"C:\repo-b\.relay-contract\target05\source-outbox\summary.txt",
+                "SourceReviewZipPath": r"C:\repo-b\.relay-contract\target05\source-outbox\review.zip",
+                "PublishReadyPath": r"C:\repo-b\.relay-contract\target05\source-outbox\publish.ready.json",
+            },
+            "PublishHelperCommand": r"pwsh -NoProfile -File C:\tools\Publish-TargetAutoloopArtifact.ps1 -TargetId target05",
+        }
+        panel.config_path_var = VarStub("cfg.psd1")
+        panel.target_autoloop_seed_target_var = VarStub("target05")
+        panel.target_autoloop_seed_status_var = VarStub("")
+        panel.target_autoloop_seed_readiness_var = VarStub("")
+        panel.target_autoloop_seed_path_proof_var = VarStub("")
+        panel.target_autoloop_seed_runtime_var = VarStub("")
+        panel.target_autoloop_seed_guidance_var = VarStub("")
+        panel.target_autoloop_seed_action_button_var = VarStub("")
+        panel.target_autoloop_seed_copy_reason_var = VarStub("")
+        panel.target_autoloop_policy_card_vars = {}
+        panel._copy_to_clipboard = copied.append
+        panel._current_run_root_for_actions = lambda: r"C:\runs\current"
+        panel._target_autoloop_seed_preview_payload = lambda: payload
+
+        with mock.patch("relay_operator_panel.messagebox.showwarning") as showwarning_mock:
+            panel.copy_target_autoloop_seed_resume_missing_artifacts_text()
+
+        self.assertEqual([], copied)
+        showwarning_mock.assert_called_once()
+        self.assertIn("MaxCycleCount", panel.target_autoloop_seed_status_var.get())
+        self.assertIn("추가 N회+감지", panel.target_autoloop_seed_copy_reason_var.get())
 
     def test_copy_target_autoloop_seed_text_blocks_before_preview_when_copy_issue_exists(self) -> None:
         panel = self._make_panel()
@@ -21581,7 +23070,7 @@ class RelayOperatorPanelWatcherOptionTests(unittest.TestCase):
         self.assertIn("watchHealth=stopped", panel.target_autoloop_summary_var.get())
         self.assertIn("감지 상태: 일시정지", panel.target_autoloop_detector_badge_var.get())
         self.assertIn("마지막 sweep:", panel.target_autoloop_detector_badge_var.get())
-        self.assertIn("포함 target: target01", panel.target_autoloop_detector_badge_var.get())
+        self.assertIn("감지 target: target01", panel.target_autoloop_detector_badge_var.get())
         self.assertEqual("#B45309", panel.target_autoloop_detector_badge_label.bg)
         self.assertIn("다음 조치: [resume 요청]", panel.target_autoloop_guidance_var.get())
         self.assertIn("watchHealth=stopped", panel.target_autoloop_guidance_var.get())
@@ -21603,6 +23092,10 @@ class RelayOperatorPanelWatcherOptionTests(unittest.TestCase):
         self.assertIn("SelectedTargetSourceOutboxPath:", panel.target_autoloop_status_text.value)
         self.assertIn("SelectedTargetSummaryPath:", panel.target_autoloop_status_text.value)
         self.assertIn("SelectedTargetReviewZipPath:", panel.target_autoloop_status_text.value)
+        self.assertIn("SelectedTargetStatusPath:", panel.target_autoloop_status_text.value)
+        self.assertIn("SelectedTargetControlPath:", panel.target_autoloop_status_text.value)
+        self.assertIn("SelectedTargetEventsPath:", panel.target_autoloop_status_text.value)
+        self.assertIn("SelectedTargetWatcherMutexName:", panel.target_autoloop_status_text.value)
         self.assertEqual("normal", panel.target_autoloop_start_button.state)
         self.assertEqual("독립셀 감지 시작", panel.target_autoloop_start_button.text)
         self.assertIn("감지 시작 가능", panel.target_autoloop_start_reason_var.get())
@@ -21621,11 +23114,12 @@ class RelayOperatorPanelWatcherOptionTests(unittest.TestCase):
         self.assertEqual("disabled", panel.target_autoloop_pause_button.state)
         self.assertEqual("normal", panel.target_autoloop_resume_button.state)
         self.assertEqual("normal", panel.target_autoloop_stop_button.state)
-        self.assertEqual("disabled", panel.target_autoloop_extend_cycle_limit_button.state)
+        self.assertEqual("normal", panel.target_autoloop_extend_cycle_limit_button.state)
         self.assertEqual("선택 target 추가 3회 이어가기", panel.target_autoloop_extend_cycle_limit_button.text)
-        self.assertEqual("disabled", panel.target_autoloop_extend_and_start_button.state)
+        self.assertEqual("normal", panel.target_autoloop_extend_and_start_button.state)
         self.assertEqual("선택 target 추가 3회+감지 시작", panel.target_autoloop_extend_and_start_button.text)
-        self.assertIn("아직 limit-reached가 아닙니다", panel.target_autoloop_extend_reason_var.get())
+        self.assertIn("조기 추가 가능", panel.target_autoloop_extend_reason_var.get())
+        self.assertIn("현재 phase를 유지", panel.target_autoloop_extend_reason_var.get())
         self.assertEqual("normal", panel.target_autoloop_open_source_outbox_button.state)
         self.assertEqual("target01 source-outbox 열기", panel.target_autoloop_open_source_outbox_button.text)
         self.assertEqual("normal", panel.target_autoloop_open_summary_button.state)
@@ -21679,6 +23173,65 @@ class RelayOperatorPanelWatcherOptionTests(unittest.TestCase):
         self.assertIn("review.zip=파일 없음", snapshot["artifact_state_summary"])
         self.assertIn("publish.ready=파일 없음", snapshot["artifact_state_summary"])
         self.assertIn("비활성 사유: summary=파일 없음; review.zip=파일 없음; publish.ready=파일 없음", snapshot["artifact_summary"])
+        self.assertEqual(str(run_root / "targets" / "target01" / ".state" / "target-autoloop-status.json"), snapshot["target_status_path"])
+        self.assertEqual(str(run_root / "targets" / "target01" / ".state" / "target-autoloop-control.json"), snapshot["target_control_path"])
+        self.assertEqual(str(run_root / "targets" / "target01" / ".state" / "target-events.jsonl"), snapshot["target_events_path"])
+
+    def test_target_autoloop_invalid_publish_ready_marker_recommends_helper_regeneration(self) -> None:
+        panel = self._make_panel()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            run_root = Path(tmp) / "run_target_autoloop_invalid_marker"
+            source_outbox = run_root / "targets" / "target01" / "source-outbox"
+            source_outbox.mkdir(parents=True, exist_ok=True)
+            summary_path = source_outbox / "summary.txt"
+            review_zip_path = source_outbox / "review.zip"
+            publish_ready_path = source_outbox / "publish.ready.json"
+            summary_path.write_text("summary\n", encoding="utf-8")
+            with zipfile.ZipFile(review_zip_path, "w") as archive:
+                archive.writestr("review.txt", "review\n")
+            publish_ready_path.write_text(json.dumps({"target_id": "target01"}), encoding="utf-8")
+            runtime_snapshot = {
+                "run_root": str(run_root),
+                "run_root_error": "",
+                "manifest_exists": True,
+                "manifest_error": "",
+                "manifest_run_mode": "target-autoloop",
+                "targets": [
+                    {
+                        "TargetId": "target01",
+                        "Phase": "waiting-output",
+                        "CycleCount": 1,
+                        "MaxCycleCount": 5,
+                    }
+                ],
+                "manifest_targets": [
+                    {
+                        "TargetId": "target01",
+                        "Enabled": True,
+                        "TriggerKinds": ["publish-ready"],
+                        "MaxCycleCount": 5,
+                        "SourceOutboxPath": str(source_outbox),
+                        "SourceSummaryPath": str(summary_path),
+                        "SourceReviewZipPath": str(review_zip_path),
+                        "PublishReadyPath": str(publish_ready_path),
+                    }
+                ],
+            }
+
+            snapshot = panel._target_autoloop_selected_target_artifact_snapshot(
+                runtime_snapshot,
+                target_id="target01",
+            )
+            spec = panel._target_autoloop_policy_card_primary_action_spec(runtime_snapshot, "target01")
+
+        self.assertFalse(snapshot["publish_ready_marker_valid"])
+        self.assertEqual("missing-SchemaVersion", snapshot["publish_ready_marker_reason"])
+        self.assertIn("publish.ready=invalid-marker:missing-SchemaVersion", snapshot["artifact_state_summary"])
+        self.assertEqual("rebuild_publish_ready_marker", spec["action_key"])
+        self.assertEqual("target01 ready marker 재생성", spec["label"])
+        self.assertTrue(spec["enabled"])
+        self.assertIn("helper로 재생성", spec["detail"])
 
     def test_target_autoloop_extend_cycle_limit_eligibility_allows_limit_reached_target(self) -> None:
         panel = self._make_panel()
@@ -21739,6 +23292,32 @@ class RelayOperatorPanelWatcherOptionTests(unittest.TestCase):
         self.assertTrue(allowed)
         self.assertIn("target02 5/5 -> 5/7 (+2)", detail)
 
+    def test_target_autoloop_extend_cycle_limit_eligibility_allows_early_extension(self) -> None:
+        panel = self._make_panel()
+
+        allowed, detail = panel._target_autoloop_extend_cycle_limit_eligibility(
+            {
+                "run_root": self._canonical_target_autoloop_run_root(),
+                "run_root_error": "",
+                "manifest_exists": True,
+                "manifest_error": "",
+                "manifest_run_mode": "target-autoloop",
+                "manifest_targets": [
+                    {"TargetId": "target01", "MaxCycleCount": 5},
+                ],
+                "targets": [
+                    {"TargetId": "target01", "Phase": "queued", "CycleCount": 2, "MaxCycleCount": 5},
+                ],
+            },
+            additional_cycles=3,
+            target_id="target01",
+        )
+
+        self.assertTrue(allowed)
+        self.assertIn("조기 추가 가능", detail)
+        self.assertIn("target01 2/5 -> 2/8 (+3)", detail)
+        self.assertIn("phase=queued 유지", detail)
+
     def test_target_autoloop_policy_card_extend_buttons_are_target_scoped(self) -> None:
         panel = self._make_panel()
         panel.target_id_var.set("target01")
@@ -21751,6 +23330,10 @@ class RelayOperatorPanelWatcherOptionTests(unittest.TestCase):
             "target02": ButtonStub(),
         }
         panel.target_autoloop_policy_card_extend_and_start_buttons = {
+            "target01": ButtonStub(),
+            "target02": ButtonStub(),
+        }
+        panel.target_autoloop_policy_card_quick_extend_and_start_buttons = {
             "target01": ButtonStub(),
             "target02": ButtonStub(),
         }
@@ -21776,14 +23359,16 @@ class RelayOperatorPanelWatcherOptionTests(unittest.TestCase):
         )
 
         self.assertEqual("target01 추가 4회", panel.target_autoloop_policy_card_extend_cycle_limit_buttons["target01"].text)
-        self.assertEqual("disabled", panel.target_autoloop_policy_card_extend_cycle_limit_buttons["target01"].state)
+        self.assertEqual("normal", panel.target_autoloop_policy_card_extend_cycle_limit_buttons["target01"].state)
+        self.assertEqual("target01 추가 4회+감지", panel.target_autoloop_policy_card_quick_extend_and_start_buttons["target01"].text)
+        self.assertEqual("normal", panel.target_autoloop_policy_card_quick_extend_and_start_buttons["target01"].state)
         self.assertEqual("target02 추가 4회", panel.target_autoloop_policy_card_extend_cycle_limit_buttons["target02"].text)
         self.assertEqual("normal", panel.target_autoloop_policy_card_extend_cycle_limit_buttons["target02"].state)
         self.assertEqual("target02 추가 4회+감지", panel.target_autoloop_policy_card_extend_and_start_buttons["target02"].text)
         self.assertEqual("normal", panel.target_autoloop_policy_card_extend_and_start_buttons["target02"].state)
-        self.assertIn("비활성", panel.target_autoloop_policy_card_vars["target01"]["extend_state_var"].get())
-        self.assertIn("현재 2/5", panel.target_autoloop_policy_card_vars["target01"]["extend_state_var"].get())
-        self.assertIn("남은 3", panel.target_autoloop_policy_card_vars["target01"]["extend_state_var"].get())
+        self.assertIn("가능", panel.target_autoloop_policy_card_vars["target01"]["extend_state_var"].get())
+        self.assertIn("현재 phase=queued 상태를 유지", panel.target_autoloop_policy_card_vars["target01"]["extend_state_var"].get())
+        self.assertIn("2/5 -> 2/9", panel.target_autoloop_policy_card_vars["target01"]["extend_state_var"].get())
         self.assertIn("권장", panel.target_autoloop_policy_card_vars["target02"]["extend_state_var"].get())
         self.assertIn("target02 추가 4회+감지", panel.target_autoloop_policy_card_vars["target02"]["extend_state_var"].get())
         self.assertIn("5/5 -> 5/9", panel.target_autoloop_policy_card_vars["target02"]["extend_state_var"].get())
@@ -21949,14 +23534,20 @@ class RelayOperatorPanelWatcherOptionTests(unittest.TestCase):
                             "PublishReadyPath": str(target_outbox / "publish.ready.json"),
                         },
                     ],
+                    "watcher_state": "running",
+                    "watcher_target_ids": ["target01"],
+                    "heartbeat_at": datetime.now(timezone.utc).isoformat(),
                 }
             )
 
         compact_summary = panel.target_autoloop_policy_card_vars["target01"]["compact_action_var"].get()
+        self.assertIn("다음 조치: 바로 실행 - target01 추가 4회+감지", compact_summary)
         self.assertIn("target01 5/5 완료", compact_summary)
         self.assertIn("추가 가능 +4", compact_summary)
         self.assertIn("산출물 완료", compact_summary)
-        self.assertIn("ready 재검사 가능", compact_summary)
+        self.assertIn("ready 재검사 대기", compact_summary)
+        self.assertIn("전송보류 없음", compact_summary)
+        self.assertIn("감지범위 포함(target01)", compact_summary)
 
     def test_target_autoloop_policy_card_compact_action_summary_lists_missing_artifacts(self) -> None:
         panel = self._make_panel()
@@ -21996,14 +23587,21 @@ class RelayOperatorPanelWatcherOptionTests(unittest.TestCase):
                             "PublishReadyPath": str(target_outbox / "publish.ready.json"),
                         },
                     ],
+                    "watcher_state": "running",
+                    "watcher_target_ids": ["target03"],
+                    "heartbeat_at": datetime.now(timezone.utc).isoformat(),
                 }
             )
 
         compact_summary = panel.target_autoloop_policy_card_vars["target02"]["compact_action_var"].get()
+        self.assertIn("다음 조치: 바로 실행 - target02 포함 감지 재시작", compact_summary)
         self.assertIn("target02 2번째 진행 중", compact_summary)
-        self.assertIn("추가 대기 1/5, 남은 4", compact_summary)
+        self.assertIn("추가 가능 +3", compact_summary)
         self.assertIn("산출물 1/4, 누락 summary/zip/ready", compact_summary)
-        self.assertIn("ready 재검사 가능", compact_summary)
+        self.assertIn("ready 재검사 대기", compact_summary)
+        self.assertIn("전송보류 없음", compact_summary)
+        self.assertIn("감지범위 누락", compact_summary)
+        self.assertIn("현재 감지 target=target03", compact_summary)
 
     def test_target_autoloop_policy_card_artifact_button_tooltip_text_names_target_and_path_kind(self) -> None:
         tooltip_text = RelayOperatorPanel._target_autoloop_policy_card_artifact_button_tooltip_text(
@@ -22050,6 +23648,946 @@ class RelayOperatorPanelWatcherOptionTests(unittest.TestCase):
         self.assertIn("가능", panel.target_autoloop_policy_card_vars["target04"]["process_once_state_var"].get())
         self.assertIn("target04 publish.ready 1회 재검사 가능", panel.target_autoloop_policy_card_vars["target04"]["process_once_state_var"].get())
 
+    def test_target_autoloop_policy_card_primary_action_prioritizes_router_config_drift(self) -> None:
+        panel = self._make_panel()
+
+        spec = panel._target_autoloop_policy_card_primary_action_spec(
+            {
+                "router_config_drift": True,
+                "router_session": {"router_config_drift": True},
+                "retry_pending_summary": {
+                    "current_items": [{"target_id": "target01", "path": r"C:\runs\ready01.json"}],
+                },
+            },
+            "target01",
+        )
+
+        self.assertEqual("restart_router_for_autoloop", spec["action_key"])
+        self.assertEqual("router 설정 재시작", spec["label"])
+        self.assertTrue(spec["enabled"])
+
+    def test_target_autoloop_policy_card_primary_action_requeues_current_target_only(self) -> None:
+        panel = self._make_panel()
+
+        spec = panel._target_autoloop_policy_card_primary_action_spec(
+            {
+                "retry_pending_summary": {
+                    "current_items": [
+                        {"target_id": "target02", "path": r"C:\runs\target02.ready.json"},
+                        {"target_id": "target04", "path": r"C:\runs\target04.ready.json"},
+                    ],
+                },
+            },
+            "target02",
+        )
+
+        self.assertEqual("requeue_retry_pending", spec["action_key"])
+        self.assertEqual("target02 전송보류 재시도", spec["label"])
+        self.assertTrue(spec["enabled"])
+        self.assertIn("1개", spec["detail"])
+
+    def test_target_autoloop_policy_card_primary_action_uses_submit_only_for_submit_ready_retry(self) -> None:
+        panel = self._make_panel()
+
+        spec = panel._target_autoloop_policy_card_primary_action_spec(
+            {
+                "retry_pending_summary": {
+                    "current_items": [
+                        {
+                            "target_id": "target08",
+                            "path": r"C:\runs\target08.ready.txt",
+                            "send_stage": "submit-ready-no-dispatch",
+                            "send_retry_policy": "manual-submit-only-retry",
+                            "operator_retry_hint": "재붙여넣기하지 말고 submit-only로 1회 제출하세요.",
+                        },
+                    ],
+                },
+            },
+            "target08",
+        )
+
+        self.assertEqual("submit_only_retry", spec["action_key"])
+        self.assertEqual("target08 Enter만 제출", spec["label"])
+        self.assertTrue(spec["enabled"])
+        self.assertIn("재붙여넣기하지 않고", spec["detail"])
+        self.assertIn("submit-ready-no-dispatch", spec["detail"])
+
+    def test_target_autoloop_policy_card_primary_action_blocks_already_submitted_target(self) -> None:
+        panel = self._make_panel()
+
+        spec = panel._target_autoloop_policy_card_primary_action_spec(
+            {
+                "targets": [
+                    {
+                        "TargetId": "target01",
+                        "Phase": "waiting-output",
+                        "CycleCount": 2,
+                        "MaxCycleCount": 5,
+                        "LastDispatchState": "router-ready-file-created",
+                        "LastRouterReadyPath": r"C:\runs\target01.ready.json",
+                    },
+                ],
+                "manifest_targets": [
+                    {"TargetId": "target01", "Enabled": True, "MaxCycleCount": 5},
+                ],
+            },
+            "target01",
+        )
+
+        self.assertEqual("", spec["action_key"])
+        self.assertEqual("결과 대기", spec["label"])
+        self.assertFalse(spec["enabled"])
+        self.assertIn("이미 전송", spec["detail"])
+
+    def test_target_autoloop_policy_card_primary_action_reports_uncovered_ready_marker(self) -> None:
+        panel = self._make_panel()
+
+        spec = panel._target_autoloop_policy_card_primary_action_spec(
+            {
+                "watcher_state": "running",
+                "heartbeat_at": datetime.now(timezone.utc).isoformat(),
+                "watcher_target_ids": ["target03"],
+                "watcher_target_scope": "scoped",
+                "output_block_summary": {
+                    "items": [
+                        {
+                            "target_id": "target02",
+                            "ready_unaccepted": True,
+                            "publish_ready_path": r"C:\runs\target02\source-outbox\publish.ready.json",
+                        },
+                    ],
+                },
+                "targets": [
+                    {
+                        "TargetId": "target02",
+                        "Phase": "waiting-output",
+                        "CycleCount": 12,
+                        "MaxCycleCount": 20,
+                        "LastDispatchState": "router-ready-file-created",
+                        "LastRouterReadyPath": r"C:\runs\target02.ready.json",
+                    },
+                ],
+                "manifest_targets": [
+                    {
+                        "TargetId": "target02",
+                        "Enabled": True,
+                        "TriggerKinds": ["publish-ready"],
+                        "MaxCycleCount": 20,
+                    },
+                ],
+            },
+            "target02",
+        )
+
+        self.assertEqual("restart_watch_with_target_scope", spec["action_key"])
+        self.assertEqual("target02 포함 감지 재시작", spec["label"])
+        self.assertTrue(spec["enabled"])
+        self.assertIn("publish.ready는 생성됐지만 watcher accepted가 없습니다", spec["detail"])
+        self.assertIn("target03", spec["detail"])
+        self.assertIn("전송보류 재시도가 아니라 감지 범위 문제", spec["detail"])
+        self.assertIn("target03,target02", spec["detail"])
+
+    def test_target_autoloop_policy_card_primary_action_explains_stale_retry_only(self) -> None:
+        panel = self._make_panel()
+
+        spec = panel._target_autoloop_policy_card_primary_action_spec(
+            {
+                "retry_pending_summary": {
+                    "stale_items": [
+                        {"target_id": "target02", "path": r"C:\runs\target02.old.ready.json"},
+                    ],
+                },
+                "targets": [
+                    {
+                        "TargetId": "target02",
+                        "Phase": "idle",
+                        "CycleCount": 2,
+                        "MaxCycleCount": 5,
+                    },
+                ],
+                "manifest_targets": [
+                    {"TargetId": "target02", "Enabled": True, "TriggerKinds": ["publish-ready"], "MaxCycleCount": 5},
+                ],
+            },
+            "target02",
+        )
+
+        self.assertEqual("stale 보류 확인", spec["label"])
+        self.assertEqual("", spec["action_key"])
+        self.assertFalse(spec["enabled"])
+        self.assertIn("stale retry-pending 1개만", spec["detail"])
+        self.assertIn("current 항목이 아니라", spec["detail"])
+
+    def test_target_autoloop_policy_card_primary_action_explains_disabled_manifest_target(self) -> None:
+        panel = self._make_panel()
+
+        spec = panel._target_autoloop_policy_card_primary_action_spec(
+            {
+                "targets": [
+                    {"TargetId": "target06", "Phase": "idle", "CycleCount": 0, "MaxCycleCount": 5},
+                ],
+                "manifest_targets": [
+                    {"TargetId": "target06", "Enabled": False, "TriggerKinds": ["publish-ready"], "MaxCycleCount": 5},
+                ],
+            },
+            "target06",
+        )
+
+        self.assertEqual("target 활성화 확인", spec["label"])
+        self.assertEqual("", spec["action_key"])
+        self.assertFalse(spec["enabled"])
+        self.assertIn("manifest에서 disabled", spec["detail"])
+
+    def test_target_autoloop_policy_card_primary_action_explains_publish_ready_disabled(self) -> None:
+        panel = self._make_panel()
+
+        spec = panel._target_autoloop_policy_card_primary_action_spec(
+            {
+                "targets": [
+                    {"TargetId": "target07", "Phase": "idle", "CycleCount": 0, "MaxCycleCount": 5},
+                ],
+                "manifest_targets": [
+                    {"TargetId": "target07", "Enabled": True, "TriggerKinds": ["input-file"], "MaxCycleCount": 5},
+                ],
+            },
+            "target07",
+        )
+
+        self.assertEqual("publish-ready 설정 확인", spec["label"])
+        self.assertEqual("", spec["action_key"])
+        self.assertFalse(spec["enabled"])
+        self.assertIn("publish-ready trigger가 꺼져", spec["detail"])
+
+    def test_target_autoloop_policy_card_primary_action_updates_button_and_reason(self) -> None:
+        panel = self._make_panel()
+        panel.target_autoloop_policy_card_vars["target01"]["primary_action_var"] = VarStub("")
+        panel.target_autoloop_policy_card_vars["target01"]["next_step_badge_var"] = VarStub("")
+        panel.target_autoloop_policy_card_vars["target01"]["next_step_tooltip_var"] = VarStub("")
+        panel.target_autoloop_policy_card_primary_action_buttons = {"target01": ButtonStub()}
+        panel.target_autoloop_policy_card_next_step_badge_labels = {"target01": LabelStub()}
+        panel.target_autoloop_extend_cycles_var.set("3")
+
+        panel._update_target_autoloop_policy_card_primary_actions(
+            {
+                "run_root": self._canonical_target_autoloop_run_root(),
+                "run_root_error": "",
+                "manifest_exists": True,
+                "manifest_error": "",
+                "manifest_run_mode": "target-autoloop",
+                "watcher_state": "stopped",
+                "controller_state": "stopped",
+                "targets": [
+                    {"TargetId": "target01", "Phase": "limit-reached", "CycleCount": 5, "MaxCycleCount": 5},
+                ],
+                "manifest_targets": [
+                    {"TargetId": "target01", "Enabled": True, "TriggerKinds": ["publish-ready"], "MaxCycleCount": 5},
+                ],
+            }
+        )
+
+        button = panel.target_autoloop_policy_card_primary_action_buttons["target01"]
+        self.assertEqual("바로 실행: target01 추가 3회+감지", button.text)
+        self.assertEqual("normal", button.state)
+        self.assertEqual("NEXT 실행", panel.target_autoloop_policy_card_vars["target01"]["next_step_badge_var"].get())
+        self.assertEqual("#15803D", panel.target_autoloop_policy_card_next_step_badge_labels["target01"].bg)
+        next_step_tooltip = panel.target_autoloop_policy_card_vars["target01"]["next_step_tooltip_var"].get()
+        self.assertIn("target01 NEXT: target01 추가 3회+감지", next_step_tooltip)
+        self.assertIn("상태: 가능", next_step_tooltip)
+        self.assertIn("범위: 이 target 카드 전용", next_step_tooltip)
+        self.assertIn("이 target 전용 권장 액션", panel.target_autoloop_policy_card_vars["target01"]["primary_action_var"].get())
+        self.assertIn("가능", panel.target_autoloop_policy_card_vars["target01"]["primary_action_var"].get())
+        self.assertIn("추가 진행 가능", panel.target_autoloop_policy_card_vars["target01"]["primary_action_var"].get())
+
+    def test_run_target_autoloop_policy_card_primary_action_routes_requeue_with_target_scope(self) -> None:
+        panel = self._make_panel()
+        panel.run_target_autoloop_policy_card_primary_action = (
+            RelayOperatorPanel.run_target_autoloop_policy_card_primary_action.__get__(panel, RelayOperatorPanel)
+        )
+        calls: list[tuple[str, dict[str, object]]] = []
+        panel._target_autoloop_runtime_snapshot = lambda _run_root=None: {
+            "retry_pending_summary": {
+                "current_items": [{"target_id": "target02", "path": r"C:\runs\target02.ready.json"}],
+            },
+        }
+        panel._append_target_autoloop_recommendation_history = lambda **kwargs: calls.append(("history", kwargs))
+        panel.request_requeue_target_autoloop_retry_pending = lambda **kwargs: calls.append(("requeue", kwargs))
+
+        panel.run_target_autoloop_policy_card_primary_action("target02")
+
+        self.assertEqual("target02", panel.target_id_var.get())
+        self.assertEqual("history", calls[0][0])
+        self.assertEqual("requeue", calls[1][0])
+        self.assertEqual("target02", calls[1][1]["target_id"])
+        self.assertEqual("requeue_retry_pending", calls[1][1]["history_action_key"])
+
+    def test_run_target_autoloop_policy_card_primary_action_routes_scope_restart(self) -> None:
+        panel = self._make_panel()
+        panel.run_target_autoloop_policy_card_primary_action = (
+            RelayOperatorPanel.run_target_autoloop_policy_card_primary_action.__get__(panel, RelayOperatorPanel)
+        )
+        calls: list[tuple[str, dict[str, object]]] = []
+        panel._target_autoloop_runtime_snapshot = lambda _run_root=None: {
+            "watcher_state": "running",
+            "heartbeat_at": datetime.now(timezone.utc).isoformat(),
+            "watcher_target_ids": ["target03"],
+            "watcher_target_scope": "scoped",
+            "output_block_summary": {
+                "items": [
+                    {
+                        "target_id": "target02",
+                        "ready_unaccepted": True,
+                        "publish_ready_path": r"C:\runs\target02\source-outbox\publish.ready.json",
+                    },
+                ],
+            },
+            "targets": [
+                {
+                    "TargetId": "target02",
+                    "Phase": "waiting-output",
+                    "CycleCount": 12,
+                    "MaxCycleCount": 20,
+                    "LastDispatchState": "router-ready-file-created",
+                    "LastRouterReadyPath": r"C:\runs\target02.ready.json",
+                },
+            ],
+            "manifest_targets": [
+                {"TargetId": "target02", "Enabled": True, "TriggerKinds": ["publish-ready"], "MaxCycleCount": 20},
+            ],
+        }
+        panel._append_target_autoloop_recommendation_history = lambda **kwargs: calls.append(("history", kwargs))
+        panel.request_restart_target_autoloop_watcher_with_target_scope = lambda **kwargs: calls.append(("scope_restart", kwargs))
+
+        panel.run_target_autoloop_policy_card_primary_action("target02")
+
+        self.assertEqual("target02", panel.target_id_var.get())
+        self.assertEqual("history", calls[0][0])
+        self.assertEqual("restart_watch_with_target_scope", calls[0][1]["action_key"])
+        self.assertEqual("scope_restart", calls[1][0])
+        self.assertEqual("target02", calls[1][1]["target_id"])
+        self.assertEqual("restart_watch_with_target_scope", calls[1][1]["history_action_key"])
+
+    def test_request_restart_target_autoloop_watcher_with_target_scope_restarts_union_scope(self) -> None:
+        panel = self._make_panel()
+        panel.request_restart_target_autoloop_watcher_with_target_scope = (
+            RelayOperatorPanel.request_restart_target_autoloop_watcher_with_target_scope.__get__(panel, RelayOperatorPanel)
+        )
+        run_root = self._canonical_target_autoloop_run_root("run_scope_restart")
+        panel._current_run_root_for_actions = lambda: run_root
+        panel.config_path_var.set("cfg.psd1")
+        panel._snapshot_context = lambda **kwargs: AppContext(
+            config_path="cfg.psd1",
+            run_root=str(kwargs.get("run_root", run_root)),
+            pair_id="pair01",
+            target_id="target02",
+        )
+        panel._target_autoloop_runtime_snapshot = lambda _run_root=None: {
+            "run_root": run_root,
+            "watcher_state": "running",
+            "watcher_target_ids": ["target03"],
+            "watcher_target_scope": "scoped",
+            "process_started_at": "2026-05-11T13:00:00+09:00",
+            "manifest_targets": [
+                {"TargetId": "target02", "Enabled": True},
+                {"TargetId": "target03", "Enabled": True},
+            ],
+        }
+        panel._wait_for_target_autoloop_control_ack = lambda *args, **kwargs: {
+            "run_root": run_root,
+            "controller_state": "stopped",
+            "watcher_state": "stopped",
+            "process_started_at": "2026-05-11T13:00:00+09:00",
+        }
+        panel._wait_for_target_autoloop_watcher_ready = lambda *args, **kwargs: {
+            "run_root": run_root,
+            "controller_state": "running",
+            "watcher_state": "running",
+            "watcher_target_ids": ["target03", "target02"],
+            "watcher_target_scope": "scoped",
+            "heartbeat_at": "2026-05-11T13:06:02+09:00",
+            "process_started_at": "2026-05-11T13:06:00+09:00",
+        }
+        panel.refresh_target_autoloop_status_panel = lambda: setattr(panel, "_target_autoloop_refreshed", True)
+        panel._refresh_sticky_context_bar = lambda: None
+        captured_calls: list[tuple[str, list[str]]] = []
+
+        class StatusServiceStub:
+            def run_json_script(self, script_name: str, context: AppContext, **kwargs) -> dict:
+                captured_calls.append((script_name, list(kwargs.get("extra", []))))
+                if script_name == "tests/Request-TargetAutoloopControl.ps1":
+                    return {
+                        "Ok": True,
+                        "RequestId": "stop-scope-001",
+                        "Message": "stop requested",
+                    }
+                if script_name == "tests/Start-TargetAutoloopWatcher.ps1":
+                    return {
+                        "Ok": True,
+                        "Result": "launch-requested",
+                        "WatcherTargetIds": ["target03", "target02"],
+                        "WatcherTargetScope": "scoped",
+                    }
+                raise AssertionError(script_name)
+
+        panel.status_service = StatusServiceStub()
+        panel.run_background_task = lambda **kwargs: kwargs["on_success"](kwargs["worker"]())
+
+        panel.request_restart_target_autoloop_watcher_with_target_scope(target_id="target02")
+
+        self.assertEqual("tests/Request-TargetAutoloopControl.ps1", captured_calls[0][0])
+        self.assertEqual(
+            ["-Action", "stop", "-RequestedBy", "relay_operator_panel_scope_restart", "-AsJson"],
+            captured_calls[0][1],
+        )
+        self.assertEqual("tests/Start-TargetAutoloopWatcher.ps1", captured_calls[1][0])
+        self.assertEqual(
+            ["-RunMode", "target-autoloop", "-Targets", "target03", "target02", "-Detached", "-AsJson"],
+            captured_calls[1][1],
+        )
+        self.assertTrue(panel.__dict__.get("_target_autoloop_refreshed", False))
+        self.assertIn("WatcherTargetIds: target03, target02", panel._captured_output)
+
+    def test_target_autoloop_policy_card_retry_pending_buttons_are_target_scoped(self) -> None:
+        panel = self._make_panel()
+        panel.target_autoloop_policy_card_retry_pending_buttons = {
+            "target01": ButtonStub(),
+            "target02": ButtonStub(),
+            "target03": ButtonStub(),
+        }
+        panel.target_autoloop_policy_card_vars = {
+            "target01": {"retry_pending_state_var": VarStub("")},
+            "target02": {"retry_pending_state_var": VarStub("")},
+            "target03": {"retry_pending_state_var": VarStub("")},
+        }
+
+        panel._update_target_autoloop_policy_card_retry_pending_buttons(
+            {
+                "retry_pending_summary": {
+                    "current_items": [
+                        {"target_id": "target01", "path": r"C:\runs\target01.ready.json"},
+                        {"target_id": "target01", "path": r"C:\runs\target01b.ready.json"},
+                    ],
+                    "stale_items": [
+                        {"target_id": "target02", "path": r"C:\runs\target02.old.ready.json"},
+                    ],
+                }
+            }
+        )
+
+        self.assertEqual("target01 전송보류 재시도 2", panel.target_autoloop_policy_card_retry_pending_buttons["target01"].text)
+        self.assertEqual("normal", panel.target_autoloop_policy_card_retry_pending_buttons["target01"].state)
+        self.assertEqual("target02 stale 보류 1", panel.target_autoloop_policy_card_retry_pending_buttons["target02"].text)
+        self.assertEqual("disabled", panel.target_autoloop_policy_card_retry_pending_buttons["target02"].state)
+        self.assertEqual("target03 전송보류 재시도", panel.target_autoloop_policy_card_retry_pending_buttons["target03"].text)
+        self.assertEqual("disabled", panel.target_autoloop_policy_card_retry_pending_buttons["target03"].state)
+        self.assertIn("가능", panel.target_autoloop_policy_card_vars["target01"]["retry_pending_state_var"].get())
+        self.assertIn("current retry-pending 2개", panel.target_autoloop_policy_card_vars["target01"]["retry_pending_state_var"].get())
+        self.assertIn("비활성", panel.target_autoloop_policy_card_vars["target02"]["retry_pending_state_var"].get())
+        self.assertIn("stale retry-pending 1개만", panel.target_autoloop_policy_card_vars["target02"]["retry_pending_state_var"].get())
+        self.assertIn("retry-pending 항목이 없습니다", panel.target_autoloop_policy_card_vars["target03"]["retry_pending_state_var"].get())
+
+    def test_target_autoloop_policy_card_retry_pending_disables_manual_duplicate_risk(self) -> None:
+        panel = self._make_panel()
+        panel._target_autoloop_policy_card_primary_action_spec = (
+            RelayOperatorPanel._target_autoloop_policy_card_primary_action_spec.__get__(panel, RelayOperatorPanel)
+        )
+        panel.target_autoloop_policy_card_retry_pending_buttons = {"target08": ButtonStub()}
+        panel.target_autoloop_policy_card_vars = {"target08": {"retry_pending_state_var": VarStub("")}}
+        snapshot = {
+            "retry_pending_summary": {
+                "current_items": [
+                    {
+                        "target_id": "target08",
+                        "path": r"C:\runs\target08.ready.json",
+                        "send_stage": "post-submit-dispatch",
+                        "send_retry_policy": "manual-review-duplicate-risk",
+                        "operator_retry_hint": "이미 전송됐을 수 있어 중복 전송 위험이 있습니다.",
+                    },
+                ],
+            }
+        }
+
+        panel._update_target_autoloop_policy_card_retry_pending_buttons(snapshot)
+        spec = panel._target_autoloop_policy_card_primary_action_spec(snapshot, target_id="target08")
+
+        self.assertEqual("target08 수동확인 필요 1", panel.target_autoloop_policy_card_retry_pending_buttons["target08"].text)
+        self.assertEqual("disabled", panel.target_autoloop_policy_card_retry_pending_buttons["target08"].state)
+        self.assertIn("수동확인 필요", panel.target_autoloop_policy_card_vars["target08"]["retry_pending_state_var"].get())
+        self.assertIn("중복 전송 위험", panel.target_autoloop_policy_card_vars["target08"]["retry_pending_state_var"].get())
+        self.assertIn("retryPolicy=manual-review-duplicate-risk", panel.target_autoloop_policy_card_vars["target08"]["retry_pending_state_var"].get())
+        self.assertEqual("target08 수동확인 필요", spec["label"])
+        self.assertFalse(spec["enabled"])
+        self.assertEqual("", spec["action_key"])
+
+    def test_target_autoloop_policy_card_retry_pending_uses_submit_only_label(self) -> None:
+        panel = self._make_panel()
+        panel._target_autoloop_policy_card_primary_action_spec = (
+            RelayOperatorPanel._target_autoloop_policy_card_primary_action_spec.__get__(panel, RelayOperatorPanel)
+        )
+        panel.target_autoloop_policy_card_retry_pending_buttons = {"target08": ButtonStub()}
+        panel.target_autoloop_policy_card_vars = {"target08": {"retry_pending_state_var": VarStub("")}}
+        snapshot = {
+            "retry_pending_summary": {
+                "current_items": [
+                    {
+                        "target_id": "target08",
+                        "path": r"C:\runs\target08.ready.txt",
+                        "send_stage": "submit-ready-no-dispatch",
+                        "send_retry_policy": "manual-submit-only-retry",
+                        "operator_retry_hint": "재붙여넣기하지 말고 submit-only로 1회 제출하세요.",
+                    }
+                ],
+            }
+        }
+
+        panel._update_target_autoloop_policy_card_retry_pending_buttons(snapshot)
+        spec = panel._target_autoloop_policy_card_primary_action_spec(snapshot, target_id="target08")
+
+        self.assertEqual("target08 Enter만 제출 1", panel.target_autoloop_policy_card_retry_pending_buttons["target08"].text)
+        self.assertEqual("normal", panel.target_autoloop_policy_card_retry_pending_buttons["target08"].state)
+        self.assertIn("submit-only 가능", panel.target_autoloop_policy_card_vars["target08"]["retry_pending_state_var"].get())
+        self.assertIn("재붙여넣기하지 않고", panel.target_autoloop_policy_card_vars["target08"]["retry_pending_state_var"].get())
+        self.assertEqual("target08 Enter만 제출", spec["label"])
+        self.assertTrue(spec["enabled"])
+        self.assertEqual("submit_only_retry", spec["action_key"])
+
+    def test_run_target_autoloop_policy_card_retry_pending_routes_current_target_only(self) -> None:
+        panel = self._make_panel()
+        panel.run_target_autoloop_policy_card_retry_pending = (
+            RelayOperatorPanel.run_target_autoloop_policy_card_retry_pending.__get__(panel, RelayOperatorPanel)
+        )
+        calls: list[dict[str, object]] = []
+        panel._target_autoloop_runtime_snapshot = lambda _run_root=None: {
+            "retry_pending_summary": {
+                "current_items": [
+                    {"target_id": "target02", "path": r"C:\runs\target02.ready.json"},
+                    {"target_id": "target04", "path": r"C:\runs\target04.ready.json"},
+                ],
+            },
+        }
+        panel.request_requeue_target_autoloop_retry_pending = lambda **kwargs: calls.append(kwargs)
+
+        panel.run_target_autoloop_policy_card_retry_pending("target02")
+
+        self.assertEqual("target02", panel.target_id_var.get())
+        self.assertEqual(1, len(calls))
+        self.assertEqual("target02", calls[0]["target_id"])
+        self.assertEqual("target02 전송보류 재시도", calls[0]["history_label"])
+        self.assertEqual("requeue_retry_pending", calls[0]["history_action_key"])
+        self.assertIn("current retry-pending=1", calls[0]["history_detail"])
+
+    def test_run_target_autoloop_policy_card_retry_pending_routes_submit_only(self) -> None:
+        panel = self._make_panel()
+        panel.run_target_autoloop_policy_card_retry_pending = (
+            RelayOperatorPanel.run_target_autoloop_policy_card_retry_pending.__get__(panel, RelayOperatorPanel)
+        )
+        calls: list[dict[str, object]] = []
+        panel._target_autoloop_runtime_snapshot = lambda _run_root=None: {
+            "retry_pending_summary": {
+                "current_items": [
+                    {
+                        "target_id": "target08",
+                        "path": r"C:\runs\target08.ready.txt",
+                        "send_stage": "submit-ready-no-dispatch",
+                        "send_retry_policy": "manual-submit-only-retry",
+                    },
+                ],
+            },
+        }
+        panel.request_target_autoloop_submit_only_retry_pending = lambda **kwargs: calls.append(kwargs)
+        panel.request_requeue_target_autoloop_retry_pending = lambda **kwargs: self.fail("submit-only retry must not requeue")
+
+        panel.run_target_autoloop_policy_card_retry_pending("target08")
+
+        self.assertEqual(1, len(calls))
+        self.assertEqual("target08", calls[0]["target_id"])
+        self.assertEqual("target08 Enter만 제출", calls[0]["history_label"])
+        self.assertEqual("submit_only_retry", calls[0]["history_action_key"])
+        self.assertIn("current retry-pending=1", calls[0]["history_detail"])
+
+    def test_request_target_autoloop_submit_only_retry_pending_sends_enter_and_archives_retry(self) -> None:
+        panel = self._make_panel()
+        panel.request_target_autoloop_submit_only_retry_pending = (
+            RelayOperatorPanel.request_target_autoloop_submit_only_retry_pending.__get__(panel, RelayOperatorPanel)
+        )
+        panel.last_command_var = VarStub("")
+        panel.output_text = TextWidgetStub("")
+        panel.set_text = lambda widget, value: setattr(widget, "value", value)
+        panel.target_autoloop_guidance_var = VarStub("")
+        panel.refresh_target_autoloop_status_panel = lambda: setattr(panel, "_target_autoloop_refreshed", True)
+        history_calls: list[dict[str, object]] = []
+        panel._append_target_autoloop_recommendation_history = lambda **kwargs: history_calls.append(kwargs)
+        panel.run_background_task = lambda **kwargs: kwargs["on_success"](kwargs["worker"]())
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            run_root = root / "run"
+            retry_root = root / "retry-pending"
+            processed_root = root / "processed"
+            logs_root = root / "logs"
+            retry_root.mkdir(parents=True)
+            run_root.mkdir()
+            ahk_exe = root / "AutoHotkey64.exe"
+            ahk_script = root / "SendToWindow.ahk"
+            runtime_map = root / "runtime-map.json"
+            ahk_exe.write_text("", encoding="utf-8")
+            ahk_script.write_text("", encoding="utf-8")
+            runtime_map.write_text("[]", encoding="utf-8")
+            retry_path = retry_root / "target08.ready.txt"
+            retry_path.write_text("payload already pasted", encoding="utf-8")
+            Path(str(retry_path) + ".meta.json").write_text('{"ok":true}', encoding="utf-8")
+            Path(str(retry_path) + ".delivery.json").write_text('{"ok":true}', encoding="utf-8")
+
+            panel._current_run_root_for_actions = lambda: str(run_root)
+            panel._target_autoloop_runtime_snapshot = lambda _run_root=None: {
+                "run_root": str(run_root),
+                "retry_pending_summary": {
+                    "root": str(retry_root),
+                    "current_items": [
+                        {
+                            "target_id": "target08",
+                            "path": str(retry_path),
+                            "send_stage": "submit-ready-no-dispatch",
+                            "send_retry_policy": "manual-submit-only-retry",
+                        },
+                    ],
+                },
+            }
+            panel.effective_data = {
+                "Config": {
+                    "AhkExePath": str(ahk_exe),
+                    "AhkScriptPath": str(ahk_script),
+                    "RuntimeMapPath": str(runtime_map),
+                    "ResolverShellPath": "pwsh.exe",
+                    "ProcessedRoot": str(processed_root),
+                    "LogsRoot": str(logs_root),
+                    "SendTimeoutMs": 7000,
+                    "SubmitGuardMs": 333,
+                    "EnterDelayMs": 44,
+                    "PostSubmitDelayMs": 55,
+                    "SubmitRetryIntervalMs": 666,
+                    "ActivateSettleMs": 77,
+                    "VisibleExecutionFailOnFocusSteal": True,
+                }
+            }
+            captured: dict[str, object] = {}
+
+            def run_command(command: list[str], *, timeout_sec: float | None = None) -> subprocess.CompletedProcess[str]:
+                captured["command"] = list(command)
+                captured["timeout_sec"] = timeout_sec
+                return subprocess.CompletedProcess(command, 0, stdout="ok", stderr="")
+
+            panel.command_service = SimpleNamespace(run=run_command)
+
+            panel.request_target_autoloop_submit_only_retry_pending(
+                target_id="target08",
+                history_label="target08 Enter만 제출",
+                history_action_key="submit_only_retry",
+                history_detail="unit test",
+            )
+
+            command = captured["command"]
+            self.assertIsInstance(command, list)
+            assert isinstance(command, list)
+            self.assertEqual(str(ahk_exe), command[0])
+            self.assertEqual(str(ahk_script), command[1])
+            self.assertEqual("target08", command[command.index("--targetId") + 1])
+            self.assertEqual(str(retry_path), command[command.index("--file") + 1])
+            self.assertEqual("1", command[command.index("--submitOnly") + 1])
+            self.assertEqual("0", command[command.index("--textSettleMs") + 1])
+            self.assertEqual("enter", command[command.index("--submitModes") + 1])
+            self.assertEqual("333", command[command.index("--submitGuardMs") + 1])
+            self.assertGreaterEqual(float(captured["timeout_sec"]), 17.0)
+            self.assertFalse(retry_path.exists())
+            self.assertFalse(Path(str(retry_path) + ".meta.json").exists())
+            self.assertFalse(Path(str(retry_path) + ".delivery.json").exists())
+            archived_ready = list(processed_root.glob("*__target08.ready.txt"))
+            self.assertEqual(1, len(archived_ready))
+            self.assertTrue(Path(str(archived_ready[0]) + ".meta.json").exists())
+            self.assertTrue(Path(str(archived_ready[0]) + ".delivery.json").exists())
+            records = list(processed_root.glob("*.submit-only.json"))
+            self.assertEqual(1, len(records))
+            record = json.loads(records[0].read_text(encoding="utf-8"))
+            self.assertEqual("target-autoloop-submit-only-retry", record["ArchiveKind"])
+            self.assertEqual(str(retry_path), record["OriginalRetryPath"])
+            self.assertIn("완료: submit-only Enter 1회 전송", panel.output_text.value)
+            self.assertIn("같은 payload를 다시 붙여넣지 말고", panel.output_text.value)
+            self.assertEqual("8 Cell Autoloop submit-only 완료", panel.operator_status_var.get())
+            self.assertIn("Enter만 1회 제출 완료", panel.operator_hint_var.get())
+            self.assertEqual("submit_only_retry", history_calls[0]["action_key"])
+            self.assertTrue(panel.__dict__.get("_target_autoloop_refreshed", False))
+
+    def test_run_target_autoloop_policy_card_retry_pending_blocks_manual_duplicate_risk(self) -> None:
+        panel = self._make_panel()
+        panel.run_target_autoloop_policy_card_retry_pending = (
+            RelayOperatorPanel.run_target_autoloop_policy_card_retry_pending.__get__(panel, RelayOperatorPanel)
+        )
+        panel.output_text = TextWidgetStub("")
+        panel.set_text = lambda widget, value: setattr(widget, "value", value)
+        panel.target_autoloop_guidance_var = VarStub("")
+        panel.refresh_target_autoloop_status_panel = lambda: setattr(panel, "_target_autoloop_refreshed", True)
+        calls: list[dict[str, object]] = []
+        panel.request_requeue_target_autoloop_retry_pending = lambda **kwargs: calls.append(kwargs)
+        panel._target_autoloop_runtime_snapshot = lambda _run_root=None: {
+            "retry_pending_summary": {
+                "current_items": [
+                    {
+                        "target_id": "target08",
+                        "path": r"C:\runs\target08.ready.json",
+                        "send_stage": "post-submit-dispatch",
+                        "send_retry_policy": "manual-review-duplicate-risk",
+                        "operator_retry_hint": "이미 전송됐을 수 있어 중복 전송 위험이 있습니다.",
+                    },
+                ],
+            },
+        }
+
+        panel.run_target_autoloop_policy_card_retry_pending("target08")
+
+        self.assertEqual([], calls)
+        self.assertIn("State: manual-review-required", panel.output_text.value)
+        self.assertIn("RetryPolicy: manual-review-duplicate-risk", panel.output_text.value)
+        self.assertIn("자동 재큐잉하지 않습니다", panel.output_text.value)
+        self.assertIn("중복 전송 위험", panel.target_autoloop_guidance_var.get())
+        self.assertTrue(panel.__dict__.get("_target_autoloop_refreshed", False))
+
+    def test_request_requeue_target_autoloop_retry_pending_filters_retry_paths_by_target(self) -> None:
+        panel = self._make_panel()
+        panel.request_requeue_target_autoloop_retry_pending = (
+            RelayOperatorPanel.request_requeue_target_autoloop_retry_pending.__get__(panel, RelayOperatorPanel)
+        )
+        before_snapshot = {
+            "run_root": self._canonical_target_autoloop_run_root(),
+            "retry_pending_summary": {
+                "count": 2,
+                "current_count": 2,
+                "current_items": [
+                    {"target_id": "target02", "path": r"C:\runs\target02.ready.json"},
+                    {"target_id": "target04", "path": r"C:\runs\target04.ready.json"},
+                ],
+                "current_target_ids": ["target02", "target04"],
+            },
+        }
+        after_snapshot = {
+            "run_root": self._canonical_target_autoloop_run_root(),
+            "retry_pending_summary": {"count": 1},
+        }
+        snapshots = [before_snapshot, after_snapshot]
+        panel._target_autoloop_runtime_snapshot = lambda _run_root=None: snapshots.pop(0) if snapshots else after_snapshot
+        panel._current_context = lambda: AppContext(config_path="cfg.psd1", run_root=self._canonical_target_autoloop_run_root())
+        panel.command_service = SimpleNamespace(
+            build_script_command=lambda script_name, *, config_path="", extra=None, **_kwargs: [script_name, *(extra or [])]
+        )
+        captured: dict[str, object] = {}
+
+        class StatusServiceStub:
+            def run_script(self, script_name, context, extra=None, **_kwargs):
+                captured["script_name"] = script_name
+                captured["extra"] = list(extra or [])
+                return subprocess.CompletedProcess([script_name], 0, stdout="ok", stderr="")
+
+        panel.status_service = StatusServiceStub()
+        panel.last_command_var = VarStub("")
+        panel.target_autoloop_status_var = VarStub("")
+        panel.target_autoloop_guidance_var = VarStub("")
+        panel._clear_target_autoloop_runtime_snapshot_cache = lambda: None
+        panel.refresh_target_autoloop_status_panel = lambda: setattr(panel, "_target_autoloop_refreshed", True)
+        panel._append_target_autoloop_recommendation_history = lambda **_kwargs: None
+        panel._apply_target_autoloop_recent_result_badge = lambda _record: None
+        panel.run_background_task = lambda **kwargs: kwargs["on_success"](kwargs["worker"]())
+
+        panel.request_requeue_target_autoloop_retry_pending(target_id="target02")
+
+        extra = captured["extra"]
+        self.assertIn(r"C:\runs\target02.ready.json", extra)
+        self.assertNotIn(r"C:\runs\target04.ready.json", extra)
+        self.assertIn("Before: 1", panel._captured_output)
+        self.assertIn("Targets: target02", panel._captured_output)
+
+    def test_request_requeue_target_autoloop_retry_pending_blocks_manual_duplicate_risk(self) -> None:
+        panel = self._make_panel()
+        panel.request_requeue_target_autoloop_retry_pending = (
+            RelayOperatorPanel.request_requeue_target_autoloop_retry_pending.__get__(panel, RelayOperatorPanel)
+        )
+        panel.output_text = TextWidgetStub("")
+        panel.set_text = lambda widget, value: setattr(widget, "value", value)
+        panel.target_autoloop_status_var = VarStub("")
+        panel.target_autoloop_guidance_var = VarStub("")
+        panel._target_autoloop_runtime_snapshot = lambda _run_root=None: {
+            "run_root": self._canonical_target_autoloop_run_root(),
+            "retry_pending_summary": {
+                "count": 1,
+                "current_count": 1,
+                "stale_count": 0,
+                "current_items": [
+                    {
+                        "target_id": "target08",
+                        "path": r"C:\runs\target08.ready.json",
+                        "send_stage": "post-submit-dispatch",
+                        "send_retry_policy": "manual-review-duplicate-risk",
+                        "operator_retry_hint": "이미 전송됐을 수 있어 중복 전송 위험이 있습니다.",
+                    },
+                ],
+                "current_target_ids": ["target08"],
+            },
+        }
+        panel._current_context = lambda: AppContext(config_path="cfg.psd1", run_root=self._canonical_target_autoloop_run_root())
+        panel.command_service = SimpleNamespace(
+            build_script_command=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("manual duplicate risk should not build requeue command")
+            )
+        )
+
+        class StatusServiceStub:
+            def run_script(self, *_args, **_kwargs):
+                raise AssertionError("manual duplicate risk should not run requeue script")
+
+        panel.status_service = StatusServiceStub()
+        panel.last_command_var = VarStub("")
+        panel.refresh_target_autoloop_status_panel = lambda: setattr(panel, "_target_autoloop_refreshed", True)
+        history_calls: list[dict[str, object]] = []
+        panel._append_target_autoloop_recommendation_history = lambda **kwargs: history_calls.append(kwargs)
+        panel._apply_target_autoloop_recent_result_badge = lambda record: setattr(panel, "_recent_result_badge", record)
+        panel.run_background_task = lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("manual duplicate risk should not enter background requeue")
+        )
+
+        panel.request_requeue_target_autoloop_retry_pending(
+            history_label="target08 전송보류 재시도",
+            history_action_key="requeue_retry_pending",
+            history_detail="manual risk",
+        )
+
+        self.assertIn("State: manual-review-required", panel.output_text.value)
+        self.assertIn("Targets: target08", panel.output_text.value)
+        self.assertIn("RetryPolicy: manual-review-duplicate-risk", panel.output_text.value)
+        self.assertIn("자동 재큐잉을 차단", panel.output_text.value)
+        self.assertEqual("retry-pending 재큐잉 차단: manual-review-required", panel.target_autoloop_status_var.get())
+        self.assertIn("중복 전송 위험", panel.target_autoloop_guidance_var.get())
+        self.assertEqual("blocked", history_calls[0]["outcome"])
+        self.assertEqual("blocked", panel.__dict__.get("_recent_result_badge", {}).get("outcome"))
+        self.assertTrue(panel.__dict__.get("_target_autoloop_refreshed", False))
+
+    def test_request_requeue_target_autoloop_retry_pending_restarts_scope_when_active_watcher_misses_target(self) -> None:
+        panel = self._make_panel()
+        panel.request_requeue_target_autoloop_retry_pending = (
+            RelayOperatorPanel.request_requeue_target_autoloop_retry_pending.__get__(panel, RelayOperatorPanel)
+        )
+        before_snapshot = {
+            "run_root": self._canonical_target_autoloop_run_root(),
+            "retry_pending_summary": {
+                "count": 1,
+                "current_count": 1,
+                "current_items": [
+                    {"target_id": "target02", "path": r"C:\runs\target02.ready.json"},
+                ],
+                "current_target_ids": ["target02"],
+            },
+        }
+        after_snapshot = {
+            "run_root": self._canonical_target_autoloop_run_root(),
+            "retry_pending_summary": {"count": 0},
+            "watcher_state": "running",
+            "watcher_target_ids": ["target03"],
+            "watcher_target_scope": "scoped",
+            "heartbeat_at": datetime.now(timezone.utc).isoformat(),
+        }
+        snapshots = [before_snapshot, after_snapshot]
+        panel._target_autoloop_runtime_snapshot = lambda _run_root=None: snapshots.pop(0) if snapshots else after_snapshot
+        panel._target_autoloop_watcher_is_fresh = lambda _snapshot=None: True
+        panel._target_autoloop_watcher_covers_target = (
+            RelayOperatorPanel._target_autoloop_watcher_covers_target.__get__(panel, RelayOperatorPanel)
+        )
+        panel._current_context = lambda: AppContext(config_path="cfg.psd1", run_root=self._canonical_target_autoloop_run_root())
+        panel.command_service = SimpleNamespace(
+            build_script_command=lambda script_name, *, config_path="", extra=None, **_kwargs: [script_name, *(extra or [])]
+        )
+        captured: dict[str, object] = {}
+
+        class StatusServiceStub:
+            def run_script(self, script_name, context, extra=None, **_kwargs):
+                captured["script_name"] = script_name
+                captured["extra"] = list(extra or [])
+                return subprocess.CompletedProcess([script_name], 0, stdout="ok", stderr="")
+
+        scope_restart_calls: list[dict[str, object]] = []
+        panel.status_service = StatusServiceStub()
+        panel.last_command_var = VarStub("")
+        panel.target_autoloop_status_var = VarStub("")
+        panel.target_autoloop_guidance_var = VarStub("")
+        panel._clear_target_autoloop_runtime_snapshot_cache = lambda: None
+        panel.refresh_target_autoloop_status_panel = lambda: setattr(panel, "_target_autoloop_refreshed", True)
+        panel._append_target_autoloop_recommendation_history = lambda **_kwargs: None
+        panel._apply_target_autoloop_recent_result_badge = lambda _record: None
+        panel.request_restart_target_autoloop_watcher_with_target_scope = lambda **kwargs: scope_restart_calls.append(dict(kwargs))
+        panel.after = lambda _ms, callback: callback()
+        panel.run_background_task = lambda **kwargs: kwargs["on_success"](kwargs["worker"]())
+
+        panel.request_requeue_target_autoloop_retry_pending(target_id="target02")
+
+        self.assertIn(r"C:\runs\target02.ready.json", captured["extra"])
+        self.assertIn("Next: active watcher가 target02를 포함하지 않아", panel._captured_output)
+        self.assertIn("target 포함 감지 재시작", panel.target_autoloop_status_var.get())
+        self.assertEqual(1, len(scope_restart_calls))
+        self.assertEqual("target02", scope_restart_calls[0]["target_id"])
+        self.assertEqual("requeue_retry_pending_then_scope_restart_watch", scope_restart_calls[0]["history_action_key"])
+
+    def test_request_requeue_target_autoloop_retry_pending_restarts_scope_for_single_global_current_target(self) -> None:
+        panel = self._make_panel()
+        panel.request_requeue_target_autoloop_retry_pending = (
+            RelayOperatorPanel.request_requeue_target_autoloop_retry_pending.__get__(panel, RelayOperatorPanel)
+        )
+        before_snapshot = {
+            "run_root": self._canonical_target_autoloop_run_root(),
+            "retry_pending_summary": {
+                "count": 1,
+                "current_count": 1,
+                "current_items": [
+                    {"target_id": "target02", "path": r"C:\runs\target02.ready.json"},
+                ],
+                "current_target_ids": ["target02"],
+            },
+        }
+        after_snapshot = {
+            "run_root": self._canonical_target_autoloop_run_root(),
+            "retry_pending_summary": {"count": 0},
+            "watcher_state": "running",
+            "watcher_target_ids": ["target03"],
+            "heartbeat_at": datetime.now(timezone.utc).isoformat(),
+        }
+        snapshots = [before_snapshot, after_snapshot]
+        panel._target_autoloop_runtime_snapshot = lambda _run_root=None: snapshots.pop(0) if snapshots else after_snapshot
+        panel._target_autoloop_watcher_is_fresh = lambda _snapshot=None: True
+        panel._target_autoloop_watcher_covers_target = (
+            RelayOperatorPanel._target_autoloop_watcher_covers_target.__get__(panel, RelayOperatorPanel)
+        )
+        panel._current_context = lambda: AppContext(config_path="cfg.psd1", run_root=self._canonical_target_autoloop_run_root())
+        panel.command_service = SimpleNamespace(
+            build_script_command=lambda script_name, *, config_path="", extra=None, **_kwargs: [script_name, *(extra or [])]
+        )
+
+        class StatusServiceStub:
+            def run_script(self, script_name, context, extra=None, **_kwargs):
+                return subprocess.CompletedProcess([script_name], 0, stdout="ok", stderr="")
+
+        scope_restart_calls: list[dict[str, object]] = []
+        panel.status_service = StatusServiceStub()
+        panel.last_command_var = VarStub("")
+        panel.target_autoloop_status_var = VarStub("")
+        panel.target_autoloop_guidance_var = VarStub("")
+        panel._clear_target_autoloop_runtime_snapshot_cache = lambda: None
+        panel.refresh_target_autoloop_status_panel = lambda: None
+        panel._append_target_autoloop_recommendation_history = lambda **_kwargs: None
+        panel._apply_target_autoloop_recent_result_badge = lambda _record: None
+        panel.request_restart_target_autoloop_watcher_with_target_scope = lambda **kwargs: scope_restart_calls.append(dict(kwargs))
+        panel.after = lambda _ms, callback: callback()
+        panel.run_background_task = lambda **kwargs: kwargs["on_success"](kwargs["worker"]())
+
+        panel.request_requeue_target_autoloop_retry_pending()
+
+        self.assertIn("Next: active watcher가 target02를 포함하지 않아", panel._captured_output)
+        self.assertEqual(1, len(scope_restart_calls))
+        self.assertEqual("target02", scope_restart_calls[0]["target_id"])
+
     def test_target_autoloop_policy_card_runtime_progress_shows_cycle_attempts(self) -> None:
         panel = self._make_panel()
         panel.target_autoloop_policy_card_vars = {
@@ -22090,19 +24628,26 @@ class RelayOperatorPanelWatcherOptionTests(unittest.TestCase):
                         "LastDispatchState": "dispatch-delay-waiting",
                     },
                 ],
+                "watcher_state": "running",
+                "watcher_target_ids": ["target01"],
+                "heartbeat_at": datetime.now(timezone.utc).isoformat(),
             }
         )
 
         target01 = panel.target_autoloop_policy_card_vars["target01"]
-        self.assertEqual("target01 3번째 진행 중 / 2/5 완료 / 남은 3", target01["runtime_badge_var"].get())
+        self.assertEqual("target01 smoke 2회 확인 완료 / 2/5 완료 / 남은 3", target01["runtime_badge_var"].get())
         self.assertIn("runtime=RUNNING", target01["runtime_summary_var"].get())
         self.assertIn("progress=2/5 완료 / 3번째 진행 중 / 남은 3", target01["runtime_summary_var"].get())
+        self.assertIn("smoke 2회 확인 완료 / 운영한도 5", target01["runtime_summary_var"].get())
         self.assertIn("dispatch=router-ready-file-created", target01["runtime_summary_var"].get())
+        self.assertIn("watcher=감지범위 포함(target01)", target01["runtime_summary_var"].get())
         self.assertEqual("#2563EB", panel.target_autoloop_policy_card_runtime_badge_labels["target01"].bg)
 
         target04 = panel.target_autoloop_policy_card_vars["target04"]
         self.assertEqual("target04 2번째 대기 / 1/3 완료 / 남은 2", target04["runtime_badge_var"].get())
         self.assertIn("runtime=WAITING", target04["runtime_summary_var"].get())
+        self.assertIn("watcher=감지범위 누락", target04["runtime_summary_var"].get())
+        self.assertIn("현재 감지 target=target01", target04["runtime_summary_var"].get())
         self.assertEqual("#B45309", panel.target_autoloop_policy_card_runtime_badge_labels["target04"].bg)
 
         self.assertEqual("target08 DISABLED", panel.target_autoloop_policy_card_vars["target08"]["runtime_badge_var"].get())
@@ -22128,6 +24673,34 @@ class RelayOperatorPanelWatcherOptionTests(unittest.TestCase):
         self.assertIn("새 RunRoot 재시작", text)
         self.assertIn("[선택 target만 새 RunRoot]", text)
         self.assertIn("시작문을 다시 submit", text)
+
+    def test_target_autoloop_extend_strategy_text_lists_other_extendable_targets(self) -> None:
+        panel = self._make_panel()
+
+        text = panel._target_autoloop_extend_strategy_text(
+            {
+                "target_id": "target01",
+                "phase": "queued",
+                "cycle_count": 2,
+                "max_cycle_count": 5,
+            },
+            extend_cycles=3,
+            extend_allowed=False,
+            extend_detail="아직 limit-reached가 아닙니다: target01 2/5 phase=queued",
+            extend_candidates=[
+                {
+                    "target_id": "target02",
+                    "cycle_count": 5,
+                    "max_cycle_count": 5,
+                    "phase": "limit-reached",
+                    "detail": "추가 진행 가능: target02 5/5 -> 5/8 (+3)",
+                }
+            ],
+        )
+
+        self.assertIn("추가 가능 target=target02(5/5, phase=limit-reached)", text)
+        self.assertIn("해당 target 카드", text)
+        self.assertIn("[추가 3회+감지]", text)
 
     def test_target_autoloop_extend_preferences_loads_recent_additional_cycles(self) -> None:
         panel = self._make_panel()
@@ -22262,8 +24835,8 @@ class RelayOperatorPanelWatcherOptionTests(unittest.TestCase):
 
         self.assertEqual("tests/Extend-TargetAutoloopCycleLimit.ps1", captured["script_name"])
         self.assertEqual(run_root, captured["kwargs"]["run_root_override"])
-        self.assertEqual("target01", captured["kwargs"]["target_id_override"])
-        self.assertEqual(["-AdditionalCycles", "3", "-AsJson"], captured["kwargs"]["extra"])
+        self.assertNotIn("target_id_override", captured["kwargs"])
+        self.assertEqual(["-TargetId", "target01", "-AdditionalCycles", "3", "-AsJson"], captured["kwargs"]["extra"])
         self.assertTrue(panel.__dict__.get("_target_autoloop_refreshed", False))
         self.assertIn("완료: target01 5/5 -> 5/8 (+3)", panel.output_text.value)
         self.assertIn("시작문 복사가 아니라", panel.output_text.value)
@@ -22347,8 +24920,8 @@ class RelayOperatorPanelWatcherOptionTests(unittest.TestCase):
         panel.request_extend_target_autoloop_cycle_limit(target_id="target02")
 
         self.assertEqual("tests/Extend-TargetAutoloopCycleLimit.ps1", captured["script_name"])
-        self.assertEqual("target02", captured["kwargs"]["target_id_override"])
-        self.assertEqual(["-AdditionalCycles", "6", "-AsJson"], captured["kwargs"]["extra"])
+        self.assertNotIn("target_id_override", captured["kwargs"])
+        self.assertEqual(["-TargetId", "target02", "-AdditionalCycles", "6", "-AsJson"], captured["kwargs"]["extra"])
         self.assertIn("완료: target02 5/5 -> 5/11 (+6)", panel.output_text.value)
         self.assertIn("시작문 복사가 아니라", panel.output_text.value)
         self.assertIn("SelectedTargetProgress: 선택 target 진행: target02 / 5/11 완료 / 남은 6", panel.output_text.value)
@@ -22386,7 +24959,9 @@ class RelayOperatorPanelWatcherOptionTests(unittest.TestCase):
             ],
         }
         start_calls: list[dict[str, object]] = []
+        scope_restart_calls: list[dict[str, object]] = []
         panel.request_start_target_autoloop_watcher = lambda **kwargs: start_calls.append(dict(kwargs))
+        panel.request_restart_target_autoloop_watcher_with_target_scope = lambda **kwargs: scope_restart_calls.append(dict(kwargs))
         panel.after = lambda _delay, callback=None: callback() if callable(callback) else None
 
         class StatusServiceStub:
@@ -22414,7 +24989,161 @@ class RelayOperatorPanelWatcherOptionTests(unittest.TestCase):
         self.assertEqual("추가 진행 후 감지 시작", start_calls[0]["history_label"])
         self.assertEqual("extend_cycle_limit_then_start_watch", start_calls[0]["history_action_key"])
         self.assertIn("target01 5/5 -> 5/7 (+2)", start_calls[0]["history_detail"])
+        self.assertEqual("target01", start_calls[0]["target_id"])
         self.assertIn("다음: 이어서 독립셀 감지 시작", panel.output_text.value)
+
+    def test_request_extend_target_autoloop_cycle_limit_skips_start_when_watcher_already_active(self) -> None:
+        panel = self._make_panel()
+        panel.request_extend_target_autoloop_cycle_limit = RelayOperatorPanel.request_extend_target_autoloop_cycle_limit.__get__(panel, RelayOperatorPanel)
+        panel._clear_target_autoloop_runtime_snapshot_cache = RelayOperatorPanel._clear_target_autoloop_runtime_snapshot_cache.__get__(panel, RelayOperatorPanel)
+        panel.target_id_var.set("target01")
+        panel.target_autoloop_extend_cycles_var.set("2")
+        panel.target_autoloop_status_var = VarStub("")
+        panel.target_autoloop_guidance_var = VarStub("")
+        panel.target_autoloop_extend_reason_var = VarStub("")
+        panel.output_text = TextWidgetStub("")
+        panel.set_text = lambda widget, value: setattr(widget, "value", value)
+        panel._refresh_sticky_context_bar = lambda: None
+        panel.refresh_target_autoloop_status_panel = lambda: setattr(panel, "_target_autoloop_refreshed", True)
+        run_root = self._canonical_target_autoloop_run_root("run_extend_active")
+        panel.run_root_var.set(run_root)
+        panel.config_path_var.set("cfg.psd1")
+        runtime_state = {"max_cycle_count": 5}
+
+        def runtime_snapshot(_run_root=None) -> dict[str, object]:
+            return {
+                "run_root": run_root,
+                "run_root_error": "",
+                "manifest_exists": True,
+                "manifest_error": "",
+                "manifest_run_mode": "target-autoloop",
+                "manifest_targets": [{"TargetId": "target01", "MaxCycleCount": runtime_state["max_cycle_count"]}],
+                "targets": [
+                    {
+                        "TargetId": "target01",
+                        "Phase": "limit-reached" if runtime_state["max_cycle_count"] == 5 else "idle",
+                        "CycleCount": 5,
+                        "MaxCycleCount": runtime_state["max_cycle_count"],
+                    }
+                ],
+                "watcher_state": "running",
+                "heartbeat_at": datetime.now(timezone.utc).isoformat(),
+                "status_last_updated_at": "",
+                "watcher_target_ids": ["target01"],
+                "watcher_target_scope": "all",
+            }
+
+        panel._target_autoloop_runtime_snapshot = runtime_snapshot
+        start_calls: list[dict[str, object]] = []
+        scope_restart_calls: list[dict[str, object]] = []
+        panel.request_start_target_autoloop_watcher = lambda **kwargs: start_calls.append(dict(kwargs))
+        panel.request_restart_target_autoloop_watcher_with_target_scope = lambda **kwargs: scope_restart_calls.append(dict(kwargs))
+        panel.after = lambda _delay, callback=None: callback() if callable(callback) else None
+
+        class StatusServiceStub:
+            def run_json_script(self, script_name: str, context: AppContext, **kwargs) -> dict:
+                runtime_state["max_cycle_count"] = 7
+                return {
+                    "Ok": True,
+                    "RunRoot": run_root,
+                    "TargetId": "target01",
+                    "CycleCount": 5,
+                    "BeforeMaxCycleCount": 5,
+                    "AfterMaxCycleCount": 7,
+                    "AdditionalCycles": 2,
+                    "StatePath": str(Path(run_root) / ".state" / "target-autoloop-state.json"),
+                    "ControlPath": str(Path(run_root) / ".state" / "target-autoloop-control.json"),
+                    "StatusPath": str(Path(run_root) / ".state" / "target-autoloop-status.json"),
+                    "ExtensionPath": str(Path(run_root) / ".state" / "target-autoloop-cycle-extensions.json"),
+                }
+
+        panel.status_service = StatusServiceStub()
+        panel.run_background_task = lambda **kwargs: kwargs["on_success"](kwargs["worker"]())
+
+        panel.request_extend_target_autoloop_cycle_limit(continue_with_start=True)
+
+        self.assertEqual([], start_calls)
+        self.assertIn("감지기가 이미 active", panel.output_text.value)
+        self.assertIn("감지기 active 유지", panel.target_autoloop_status_var.get())
+        self.assertIn("새 start 요청은 생략", panel.target_autoloop_guidance_var.get())
+
+    def test_request_extend_target_autoloop_cycle_limit_starts_when_active_watcher_misses_target(self) -> None:
+        panel = self._make_panel()
+        panel.request_extend_target_autoloop_cycle_limit = RelayOperatorPanel.request_extend_target_autoloop_cycle_limit.__get__(panel, RelayOperatorPanel)
+        panel._clear_target_autoloop_runtime_snapshot_cache = RelayOperatorPanel._clear_target_autoloop_runtime_snapshot_cache.__get__(panel, RelayOperatorPanel)
+        panel.target_id_var.set("target01")
+        panel.target_autoloop_extend_cycles_var.set("2")
+        panel.target_autoloop_status_var = VarStub("")
+        panel.target_autoloop_guidance_var = VarStub("")
+        panel.target_autoloop_extend_reason_var = VarStub("")
+        panel.output_text = TextWidgetStub("")
+        panel.set_text = lambda widget, value: setattr(widget, "value", value)
+        panel._refresh_sticky_context_bar = lambda: None
+        panel.refresh_target_autoloop_status_panel = lambda: setattr(panel, "_target_autoloop_refreshed", True)
+        run_root = self._canonical_target_autoloop_run_root("run_extend_active_wrong_scope")
+        panel.run_root_var.set(run_root)
+        panel.config_path_var.set("cfg.psd1")
+        runtime_state = {"max_cycle_count": 5}
+
+        def runtime_snapshot(_run_root=None) -> dict[str, object]:
+            return {
+                "run_root": run_root,
+                "run_root_error": "",
+                "manifest_exists": True,
+                "manifest_error": "",
+                "manifest_run_mode": "target-autoloop",
+                "manifest_targets": [{"TargetId": "target01", "MaxCycleCount": runtime_state["max_cycle_count"]}],
+                "targets": [
+                    {
+                        "TargetId": "target01",
+                        "Phase": "limit-reached" if runtime_state["max_cycle_count"] == 5 else "idle",
+                        "CycleCount": 5,
+                        "MaxCycleCount": runtime_state["max_cycle_count"],
+                    }
+                ],
+                "watcher_state": "running",
+                "heartbeat_at": datetime.now(timezone.utc).isoformat(),
+                "status_last_updated_at": "",
+                "watcher_target_ids": ["target03"],
+                "watcher_target_scope": "scoped",
+            }
+
+        panel._target_autoloop_runtime_snapshot = runtime_snapshot
+        start_calls: list[dict[str, object]] = []
+        scope_restart_calls: list[dict[str, object]] = []
+        panel.request_start_target_autoloop_watcher = lambda **kwargs: start_calls.append(dict(kwargs))
+        panel.request_restart_target_autoloop_watcher_with_target_scope = lambda **kwargs: scope_restart_calls.append(dict(kwargs))
+        panel.after = lambda _delay, callback=None: callback() if callable(callback) else None
+
+        class StatusServiceStub:
+            def run_json_script(self, script_name: str, context: AppContext, **kwargs) -> dict:
+                runtime_state["max_cycle_count"] = 7
+                return {
+                    "Ok": True,
+                    "RunRoot": run_root,
+                    "TargetId": "target01",
+                    "CycleCount": 5,
+                    "BeforeMaxCycleCount": 5,
+                    "AfterMaxCycleCount": 7,
+                    "AdditionalCycles": 2,
+                    "StatePath": str(Path(run_root) / ".state" / "target-autoloop-state.json"),
+                    "ControlPath": str(Path(run_root) / ".state" / "target-autoloop-control.json"),
+                    "StatusPath": str(Path(run_root) / ".state" / "target-autoloop-status.json"),
+                    "ExtensionPath": str(Path(run_root) / ".state" / "target-autoloop-cycle-extensions.json"),
+                }
+
+        panel.status_service = StatusServiceStub()
+        panel.run_background_task = lambda **kwargs: kwargs["on_success"](kwargs["worker"]())
+
+        panel.request_extend_target_autoloop_cycle_limit(continue_with_start=True)
+
+        self.assertEqual([], start_calls)
+        self.assertEqual(1, len(scope_restart_calls))
+        self.assertEqual("target01", scope_restart_calls[0]["target_id"])
+        self.assertEqual("추가 진행 후 target 포함 감지 재시작", scope_restart_calls[0]["history_label"])
+        self.assertEqual("extend_cycle_limit_then_scope_restart_watch", scope_restart_calls[0]["history_action_key"])
+        self.assertIn("target 포함 감지 재시작", panel.output_text.value)
+        self.assertNotIn("감지기가 이미 active", panel.output_text.value)
 
     def test_target_autoloop_start_precheck_text_summarizes_blocked_publish_ready(self) -> None:
         panel = self._make_panel()
@@ -22804,7 +25533,8 @@ class RelayOperatorPanelWatcherOptionTests(unittest.TestCase):
         panel.target_autoloop_history_var = VarStub("")
         panel._target_autoloop_recommendation_spec = lambda _snapshot=None: {
             "action_key": "extend_cycle_limit_then_start_watch",
-            "label": "추가 3회+감지 시작",
+            "label": "target02 추가 3회+감지 시작",
+            "target_id": "target02",
             "detail": "target01 5/5 -> 5/8",
             "read_only": False,
         }
@@ -22819,8 +25549,9 @@ class RelayOperatorPanelWatcherOptionTests(unittest.TestCase):
 
         self.assertTrue(panel.__dict__.get("_extend_requested", False))
         self.assertTrue(panel.__dict__.get("_extend_kwargs", {}).get("continue_with_start"))
+        self.assertEqual("target02", panel.__dict__.get("_extend_kwargs", {}).get("target_id"))
         self.assertFalse(panel.__dict__.get("_target_autoloop_refreshed", False))
-        self.assertIn("추가 3회+감지 시작", panel.target_autoloop_history_var.get())
+        self.assertIn("target02 추가 3회+감지 시작", panel.target_autoloop_history_var.get())
 
     def test_run_target_autoloop_recommendation_action_resumes_paused_controller(self) -> None:
         panel = self._make_panel()
@@ -23145,6 +25876,7 @@ class RelayOperatorPanelWatcherOptionTests(unittest.TestCase):
         panel._current_run_root_for_actions = lambda: run_root
         panel._refresh_sticky_context_bar = lambda: None
         panel.update_pair_button_states = lambda: None
+        panel.target_autoloop_control_reason_var = VarStub("")
         panel._snapshot_context = lambda **kwargs: AppContext(
             config_path="cfg.psd1",
             run_root=str(kwargs.get("run_root", run_root)),
@@ -23231,6 +25963,17 @@ class RelayOperatorPanelWatcherOptionTests(unittest.TestCase):
         self.assertIn("AckMatched: True", panel._captured_output)
         self.assertIn("LastHandledResult: paused", panel._captured_output)
         self.assertIn("ControlPendingAction: (none)", panel._captured_output)
+        self.assertIn("scope=전체 감지기", panel._captured_output)
+        self.assertIn("target별 제어가 아니라", panel._captured_output)
+        self.assertIn("scope=전체 감지기", panel.target_autoloop_control_reason_var.get())
+
+    def test_target_autoloop_global_control_tooltip_explains_scope(self) -> None:
+        tooltip_text = RelayOperatorPanel._target_autoloop_global_control_tooltip_text("정지")
+
+        self.assertIn("전체 감지기 제어: 정지", tooltip_text)
+        self.assertIn("target별 제어가 아니라", tooltip_text)
+        self.assertIn("target 카드의 NEXT/권장 액션", tooltip_text)
+        self.assertIn("stop 뒤에는 resume이 아니라", tooltip_text)
 
     def test_request_stop_target_autoloop_failure_surfaces_ack_state_without_history(self) -> None:
         panel = self._make_panel()
@@ -23343,6 +26086,8 @@ class RelayOperatorPanelWatcherOptionTests(unittest.TestCase):
         self.assertIn("ControlPendingRequestId: req-stop-1", panel._captured_output)
         self.assertIn("LastHandledAction: pause", panel._captured_output)
         self.assertIn("stop=실패", panel.target_autoloop_control_reason_var.get())
+        self.assertIn("scope=전체 감지기", panel._captured_output)
+        self.assertIn("target별 제어가 아니라", panel.target_autoloop_control_reason_var.get())
         self.assertIn("최근 결과: 실패 / 8 Cell Autoloop stop 요청 실패", panel.target_autoloop_recent_result_var.get())
 
     def test_target_autoloop_start_eligibility_blocks_manifest_run_mode_mismatch(self) -> None:
@@ -23396,6 +26141,42 @@ class RelayOperatorPanelWatcherOptionTests(unittest.TestCase):
         self.assertFalse(allowed)
         self.assertIn("publish-ready", detail)
         self.assertIn("1/2", detail)
+
+    def test_target_autoloop_scoped_start_eligibility_ignores_other_target_publish_ready_gap(self) -> None:
+        panel = self._make_panel()
+        snapshot = {
+            "run_root": self._canonical_target_autoloop_run_root(),
+            "run_root_error": "",
+            "status_error": "",
+            "control_error": "",
+            "manifest_exists": True,
+            "manifest_error": "",
+            "manifest_run_mode": "target-autoloop",
+            "manifest_targets": [
+                {"TargetId": "target01", "Enabled": True, "TriggerKinds": ["publish-ready"], "MaxCycleCount": 8},
+                {"TargetId": "target02", "Enabled": True, "TriggerKinds": ["input-file"], "MaxCycleCount": 5},
+            ],
+            "manifest_enabled_count": 2,
+            "manifest_publish_ready_count": 1,
+            "targets": [
+                {"TargetId": "target01", "Enabled": True, "Phase": "idle", "CycleCount": 5, "MaxCycleCount": 8},
+                {"TargetId": "target02", "Enabled": True, "Phase": "limit-reached", "CycleCount": 5, "MaxCycleCount": 5},
+            ],
+            "control_pending_action": "",
+            "watcher_state": "stopped",
+            "controller_state": "running",
+            "heartbeat_at": "",
+            "status_last_updated_at": "",
+            **self._router_ok_snapshot(),
+        }
+
+        global_allowed, global_detail = panel._target_autoloop_start_eligibility(snapshot)
+        scoped_allowed, scoped_detail = panel._target_autoloop_scoped_start_eligibility(snapshot, target_id="target01")
+
+        self.assertFalse(global_allowed)
+        self.assertIn("publish-ready", global_detail)
+        self.assertTrue(scoped_allowed)
+        self.assertEqual("", scoped_detail)
 
     def test_target_autoloop_start_eligibility_blocks_manifest_without_enabled_targets(self) -> None:
         panel = self._make_panel()
@@ -23891,6 +26672,99 @@ class RelayOperatorPanelWatcherOptionTests(unittest.TestCase):
         self.assertIn("WatcherState: running", panel._captured_output)
         self.assertIn("독립셀 감지 시작", panel.target_autoloop_history_var.get())
         self.assertIn("ack: controller=running / detector=running", panel.target_autoloop_history_var.get())
+
+    def test_request_start_target_autoloop_watcher_scoped_target_includes_publish_ready_enabled_peers(self) -> None:
+        panel = self._make_panel()
+        panel.request_start_target_autoloop_watcher = RelayOperatorPanel.request_start_target_autoloop_watcher.__get__(panel, RelayOperatorPanel)
+        panel._append_target_autoloop_recommendation_history = RelayOperatorPanel._append_target_autoloop_recommendation_history.__get__(panel, RelayOperatorPanel)
+        panel._handle_background_failure = RelayOperatorPanel._handle_background_failure.__get__(panel, RelayOperatorPanel)
+        panel._handle_background_success = RelayOperatorPanel._handle_background_success.__get__(panel, RelayOperatorPanel)
+        panel._format_background_exception = RelayOperatorPanel._format_background_exception.__get__(panel, RelayOperatorPanel)
+        panel.set_idle = RelayOperatorPanel.set_idle.__get__(panel, RelayOperatorPanel)
+        panel.set_operator_status = RelayOperatorPanel.set_operator_status.__get__(panel, RelayOperatorPanel)
+        panel._target_autoloop_watcher_is_fresh = lambda _snapshot=None: False
+        panel._target_autoloop_watcher_health = lambda _snapshot=None: ("stopped", "stopped")
+        panel._utc_now_iso = lambda: "2026-05-11T06:06:03+00:00"
+        panel.target_autoloop_history_var = VarStub("")
+        run_root = self._canonical_target_autoloop_run_root("run_scoped_start_peers")
+        panel._current_run_root_for_actions = lambda: run_root
+        panel._refresh_sticky_context_bar = lambda: None
+        panel.update_pair_button_states = lambda: None
+        panel.config_path_var.set("cfg.psd1")
+        panel._snapshot_context = lambda **kwargs: AppContext(
+            config_path="cfg.psd1",
+            run_root=str(kwargs.get("run_root", run_root)),
+            pair_id="pair01",
+            target_id="target03",
+        )
+        panel.refresh_target_autoloop_status_panel = lambda: setattr(panel, "_target_autoloop_refreshed", True)
+        panel._target_autoloop_runtime_snapshot = lambda _run_root=None: {
+            "run_root": run_root,
+            "run_root_error": "",
+            "status_path": Path(run_root) / ".state" / "target-autoloop-status.json",
+            "control_path": Path(run_root) / ".state" / "target-autoloop-control.json",
+            "status_error": "",
+            "control_error": "",
+            "manifest_exists": True,
+            "manifest_error": "",
+            "manifest_run_mode": "target-autoloop",
+            "manifest_targets": [
+                {"TargetId": "target02", "Enabled": True, "TriggerKinds": ["publish-ready"], "MaxCycleCount": 20},
+                {"TargetId": "target03", "Enabled": True, "TriggerKinds": ["publish-ready"], "MaxCycleCount": 20},
+                {"TargetId": "target04", "Enabled": True, "TriggerKinds": ["input-file"], "MaxCycleCount": 20},
+            ],
+            "targets": [
+                {"TargetId": "target03", "Enabled": True, "Phase": "idle", "CycleCount": 3, "MaxCycleCount": 20},
+            ],
+            "controller_state": "stopped",
+            "watcher_state": "stopped",
+            "heartbeat_at": "",
+            "process_started_at": "2026-05-11T13:00:00+09:00",
+            "control_pending_action": "",
+            **self._router_ok_snapshot(),
+        }
+        panel._wait_for_target_autoloop_watcher_ready = lambda *args, **kwargs: {
+            "controller_state": "running",
+            "watcher_state": "running",
+            "watcher_target_ids": ["target02", "target03"],
+            "watcher_target_scope": "scoped",
+            "process_started_at": "2026-05-11T13:05:00+09:00",
+            "heartbeat_at": "2026-05-11T13:05:02+09:00",
+            "status_path": Path(run_root) / ".state" / "target-autoloop-status.json",
+            "control_path": Path(run_root) / ".state" / "target-autoloop-control.json",
+        }
+        captured: dict[str, object] = {}
+
+        class StatusServiceStub:
+            def run_json_script(self, script_name: str, context: AppContext, **kwargs) -> dict:
+                captured["script_name"] = script_name
+                captured["extra"] = list(kwargs.get("extra", []))
+                return {
+                    "Ok": True,
+                    "RunRoot": run_root,
+                    "Result": "launch-requested",
+                    "Message": "target-autoloop watcher launch를 요청했습니다.",
+                    "WatcherTargetIds": ["target02", "target03"],
+                    "WatcherTargetScope": "scoped",
+                }
+
+        panel.status_service = StatusServiceStub()
+        panel.run_background_task = lambda **kwargs: kwargs["on_success"](kwargs["worker"]())
+
+        panel.request_start_target_autoloop_watcher(
+            target_id="target03",
+            history_label="target03 포함 감지 시작",
+            history_action_key="start_watch",
+            history_detail="card start",
+        )
+
+        self.assertEqual("tests/Start-TargetAutoloopWatcher.ps1", captured["script_name"])
+        self.assertEqual(
+            ["-RunMode", "target-autoloop", "-Targets", "target02", "target03", "-Detached", "-AsJson"],
+            captured["extra"],
+        )
+        self.assertIn("LaunchWatcherTargetIds: target02, target03", panel._captured_output)
+        self.assertIn("WatcherTargetIds: target02, target03", panel._captured_output)
 
     def test_target_autoloop_watcher_fresh_accepts_dotnet_seven_digit_iso_heartbeat(self) -> None:
         panel = self._make_panel()
@@ -24867,6 +27741,47 @@ class RelayOperatorPanelWatcherOptionTests(unittest.TestCase):
         self.assertIn("감지 상태: 준비필요", detector_spec["text"])
         self.assertEqual("#1D4ED8", detector_spec["background"])
 
+    def test_target_autoloop_active_watcher_missing_publish_ready_target_warns_partial_detection(self) -> None:
+        panel = self._make_panel()
+        snapshot = {
+            "run_root": self._canonical_target_autoloop_run_root("run_partial_detection"),
+            "run_root_error": "",
+            "manifest_exists": True,
+            "manifest_error": "",
+            "manifest_run_mode": "target-autoloop",
+            "manifest_targets": [
+                {"TargetId": "target02", "Enabled": True, "TriggerKinds": [" Publish-Ready "], "MaxCycleCount": 20},
+                {"TargetId": "target03", "Enabled": True, "TriggerKinds": ["publish-ready"], "MaxCycleCount": 20},
+            ],
+            "manifest_enabled_count": 2,
+            "manifest_publish_ready_count": 2,
+            "targets": [
+                {"TargetId": "target02", "Enabled": True, "Phase": "waiting-output", "CycleCount": 12, "MaxCycleCount": 20},
+                {"TargetId": "target03", "Enabled": True, "Phase": "waiting-output", "CycleCount": 4, "MaxCycleCount": 20},
+            ],
+            "counts": {"QueuedTargets": 0, "WaitingOutputTargets": 2, "FailedTargets": 0},
+            "control_pending_action": "",
+            "watcher_state": "running",
+            "watcher_target_ids": ["target03"],
+            "watcher_target_scope": "scoped",
+            "controller_state": "running",
+            "heartbeat_at": datetime.now(timezone.utc).isoformat(),
+            "status_last_updated_at": "",
+            **self._router_ok_snapshot(),
+        }
+
+        attention_spec = panel._target_autoloop_runroot_attention_spec(snapshot)
+        detector_spec = panel._target_autoloop_detector_badge_spec(snapshot)
+
+        self.assertIn("부분감지", attention_spec["text"])
+        self.assertIn("누락 target=target02", attention_spec["text"])
+        self.assertIn("현재 감지 target=target03", attention_spec["text"])
+        self.assertEqual("#B45309", attention_spec["background"])
+        self.assertIn("감지 상태: 부분감지", detector_spec["text"])
+        self.assertIn("감지 target: target03", detector_spec["text"])
+        self.assertIn("누락 target: target02", detector_spec["text"])
+        self.assertEqual("#B45309", detector_spec["background"])
+
     def test_target_autoloop_status_refresh_keeps_sync_notice_for_noncanonical_runroot(self) -> None:
         panel = self._make_panel()
         run_root = r"C:\dev\python\relay-workrepo-visible-smoke\.relay-runs\bottest-live-visible\focus_guard_user_visible_20260516_012837"
@@ -24978,12 +27893,14 @@ class RelayOperatorPanelWatcherOptionTests(unittest.TestCase):
                     {
                         "TargetId": "target04",
                         "TriggerKinds": ["input-file", "publish-ready"],
+                        "WorkRepoRoot": r"C:\work\target04",
                         "SourceOutboxPath": r"C:\work\target04\.relay-contract\source-outbox",
                         "QueueRoot": r"C:\work\target04\.relay-bookkeeping\queue",
                     },
                     {
                         "TargetId": "target08",
                         "TriggerKinds": ["input-file", "publish-ready"],
+                        "WorkRepoRoot": r"C:\work\target08",
                         "SourceOutboxPath": r"C:\work\target08\.relay-contract\source-outbox",
                         "QueueRoot": r"C:\work\target08\.relay-bookkeeping\queue",
                     },
@@ -24997,6 +27914,8 @@ class RelayOperatorPanelWatcherOptionTests(unittest.TestCase):
         self.assertIn("이번 RunRoot 포함 target: target04,target08", text)
         self.assertIn("publish-ready: 2/2", text)
         self.assertIn("감지 시작 가능: yes", text)
+        self.assertIn(r"target04: C:\work\target04", text)
+        self.assertIn(r"target08: C:\work\target08", text)
         self.assertIn(r"target04: C:\work\target04\.relay-contract\source-outbox", text)
         self.assertIn(r"target08: C:\work\target08\.relay-bookkeeping\queue", text)
 
@@ -26262,7 +29181,7 @@ class RelayOperatorPanelWatcherOptionTests(unittest.TestCase):
 
         self.assertIsNone(blocked)
         self.assertIs(allowed, state)
-        self.assertEqual("Visible Acceptance 대기", warnings[0][0])
+        self.assertEqual("Pair Acceptance 대기", warnings[0][0])
         self.assertIn("recovery card", warnings[0][1])
         self.assertIn("셀창 전환 후", warnings[0][1])
 

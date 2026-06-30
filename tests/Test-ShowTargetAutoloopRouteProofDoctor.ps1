@@ -161,7 +161,11 @@ Assert-True (-not [bool]$doctorSelectedJson.ManifestMismatch) 'doctor json shoul
 Assert-True ([string]$doctorSelectedJson.ManifestScope -eq 'selected-targets') 'doctor json should surface selected-target manifest scope.'
 Assert-True ([string]$doctorSelectedJson.ManifestMismatchReason -eq '') 'doctor json should not explain a mismatch for selected-target scope.'
 Assert-True ([string]$doctorSelectedJson.OperationalRecommendation -eq '') 'doctor json should not recommend a new RunRoot for selected-target scope.'
+$doctorSelectedTarget02 = @($doctorSelectedJson.Targets | Where-Object { [string]$_.TargetId -eq 'target02' } | Select-Object -First 1)[0]
+Assert-True ([string]$doctorSelectedTarget02.RouteScope -eq 'outside-current-manifest') 'doctor json should mark selected-scope excluded targets as outside current manifest.'
+Assert-True ([int]$doctorSelectedJson.Counts.OutOfScopeTargets -eq 1) 'doctor json should count selected-scope excluded targets.'
 Assert-True ($doctorSelectedText -match 'ManifestScope: selected-targets') 'doctor text should surface selected-target manifest scope.'
+Assert-True ($doctorSelectedText -match 'manifest: inManifest=False manifestEnabled=False routeScope=outside-current-manifest reason=target-not-in-current-run-manifest') 'doctor text should explain out-of-scope target rows.'
 
 Remove-Item -LiteralPath ([string]$start.SmokeReceiptPath) -Force
 $stateRoot = Split-Path -Parent ([string]$start.SmokeReceiptPath)
@@ -227,6 +231,7 @@ Assert-True ([string]$doctorStaleJson.OperationalRecommendation -match '새 RunR
 $doctorStaleTarget01 = @($doctorStaleJson.Targets | Where-Object { [string]$_.TargetId -eq 'target01' } | Select-Object -First 1)[0]
 $doctorStaleTarget02 = @($doctorStaleJson.Targets | Where-Object { [string]$_.TargetId -eq 'target02' } | Select-Object -First 1)[0]
 Assert-True (-not [bool]$doctorStaleTarget01.InManifest) 'target01 should be marked absent from stale manifest.'
+Assert-True ([string]$doctorStaleTarget01.RouteScope -eq 'outside-current-manifest') 'target01 should be marked outside current manifest in stale doctor output.'
 Assert-True ([bool]$doctorStaleTarget02.InManifest) 'target02 should be marked present in stale manifest.'
 Assert-True (-not [bool]$doctorStaleTarget02.ManifestEnabled) 'target02 should be marked disabled in stale manifest.'
 Assert-True ($doctorStaleText -match 'Manifest: exists=True runMode=target-autoloop targets=target02 enabled=\(none\) mismatch=True') 'doctor text should show stale manifest mismatch.'

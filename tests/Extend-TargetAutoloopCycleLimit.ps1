@@ -93,9 +93,9 @@ $phase = [string](Get-ConfigValue -Object $stateRecord -Name 'Phase' -DefaultVal
 if ($beforeMax -le 0) {
     throw "target has no finite MaxCycleCount to extend: $TargetId"
 }
-if ($cycleCount -lt $beforeMax -and $phase -ne 'limit-reached') {
-    throw "target has not reached MaxCycleCount yet: target=$TargetId cycle=$cycleCount max=$beforeMax phase=$phase"
-}
+$nextActionBeforeExtension = [string](Get-ConfigValue -Object $stateRecord -Name 'NextAction' -DefaultValue '')
+$limitReachedBeforeExtension = ($cycleCount -ge $beforeMax) -or $phase -eq 'limit-reached'
+$preservedInFlightState = -not $limitReachedBeforeExtension
 
 $afterMax = ([math]::Max($cycleCount, $beforeMax) + $AdditionalCycles)
 $manifestTarget = $null
@@ -111,16 +111,32 @@ if ($null -eq $manifestTarget) {
 
 $triggerKinds = @(Get-StringArray (Get-ConfigValue -Object $stateRecord -Name 'TriggerKinds' -DefaultValue @()))
 $nextAction = Get-TargetAutoloopDefaultNextAction -TriggerKinds @($triggerKinds)
+$lastRouterReadyPath = [string](Get-ConfigValue -Object $stateRecord -Name 'LastRouterReadyPath' -DefaultValue '')
+$lastDispatchState = [string](Get-ConfigValue -Object $stateRecord -Name 'LastDispatchState' -DefaultValue '')
+$restoreWaitingOutput = (Test-NonEmptyString $lastRouterReadyPath) -or $lastDispatchState -eq 'router-ready-file-created'
+if ($limitReachedBeforeExtension) {
+    $nextPhase = if ($restoreWaitingOutput) { 'waiting-output' } else { 'idle' }
+    $nextActionAfterExtend = if ($restoreWaitingOutput) { 'wait-for-output' } else { $nextAction }
+    $nextDispatchState = if ($restoreWaitingOutput) { 'router-ready-file-created' } else { '' }
+}
+else {
+    $restoreWaitingOutput = $false
+    $nextPhase = if (Test-NonEmptyString $phase) { $phase } else { 'idle' }
+    $nextActionAfterExtend = if (Test-NonEmptyString $nextActionBeforeExtension) { $nextActionBeforeExtension } else { $nextAction }
+    $nextDispatchState = $lastDispatchState
+}
 Set-JsonMemberValue -Object $stateRecord -Name 'MaxCycleCount' -Value $afterMax
-Set-JsonMemberValue -Object $stateRecord -Name 'Phase' -Value 'idle'
-Set-JsonMemberValue -Object $stateRecord -Name 'NextAction' -Value $nextAction
-Set-JsonMemberValue -Object $stateRecord -Name 'PausedPhase' -Value ''
-Set-JsonMemberValue -Object $stateRecord -Name 'PausedNextAction' -Value ''
-Set-JsonMemberValue -Object $stateRecord -Name 'StoppedPhase' -Value ''
-Set-JsonMemberValue -Object $stateRecord -Name 'StoppedNextAction' -Value ''
-Set-JsonMemberValue -Object $stateRecord -Name 'LastDispatchState' -Value ''
-Set-JsonMemberValue -Object $stateRecord -Name 'RelayTargetFolderState' -Value ''
-Set-JsonMemberValue -Object $stateRecord -Name 'LastFailureReason' -Value ''
+Set-JsonMemberValue -Object $stateRecord -Name 'Phase' -Value $nextPhase
+Set-JsonMemberValue -Object $stateRecord -Name 'NextAction' -Value $nextActionAfterExtend
+Set-JsonMemberValue -Object $stateRecord -Name 'LastDispatchState' -Value $nextDispatchState
+if ($limitReachedBeforeExtension) {
+    Set-JsonMemberValue -Object $stateRecord -Name 'PausedPhase' -Value ''
+    Set-JsonMemberValue -Object $stateRecord -Name 'PausedNextAction' -Value ''
+    Set-JsonMemberValue -Object $stateRecord -Name 'StoppedPhase' -Value ''
+    Set-JsonMemberValue -Object $stateRecord -Name 'StoppedNextAction' -Value ''
+    Set-JsonMemberValue -Object $stateRecord -Name 'RelayTargetFolderState' -Value ''
+    Set-JsonMemberValue -Object $stateRecord -Name 'LastFailureReason' -Value ''
+}
 Set-JsonMemberValue -Object $manifestTarget -Name 'MaxCycleCount' -Value $afterMax
 
 Set-TargetAutoloopTargetStateMap -TargetStateMap $targetMap -StateDocument $stateDocument
@@ -141,8 +157,11 @@ $extensionRecord = [ordered]@{
     AfterMaxCycleCount = $afterMax
     AdditionalCycles = $AdditionalCycles
     PreviousPhase = $phase
-    NextPhase = 'idle'
-    NextAction = $nextAction
+    NextPhase = $nextPhase
+    NextAction = $nextActionAfterExtend
+    LimitReachedBeforeExtension = $limitReachedBeforeExtension
+    PreservedInFlightState = $preservedInFlightState
+    RestoredWaitingOutput = $restoreWaitingOutput
     RequestedBy = $RequestedBy
     ExtendedAt = $updatedAt
 }
@@ -173,19 +192,30 @@ Append-TargetAutoloopEvent -Path $statePaths.EventsPath -EventType 'cycle-limit-
     AdditionalCycles = $AdditionalCycles
     CycleCount = $cycleCount
     RequestedBy = $RequestedBy
+    NextPhase = $nextPhase
+    LimitReachedBeforeExtension = $limitReachedBeforeExtension
+    PreservedInFlightState = $preservedInFlightState
+    RestoredWaitingOutput = $restoreWaitingOutput
 }
+$watcherStopReason = if ($limitReachedBeforeExtension) { 'cycle-limit-extended' } else { 'cycle-limit-extended-state-preserved' }
 $statusDocument = New-TargetAutoloopStatusDocument `
     -Config $config `
     -RunRoot $resolvedRunRoot `
     -StateDocument $stateDocument `
     -ControlDocument $controlDocument `
     -WatcherState 'stopped' `
-    -WatcherStopReason 'cycle-limit-extended' `
+    -WatcherStopReason $watcherStopReason `
     -WatcherMutexName (Get-TargetAutoloopCycleExtensionWatcherMutexName -RunRoot $resolvedRunRoot) `
     -HeartbeatAt $updatedAt `
     -ProcessStartedAt $updatedAt `
     -ConfiguredRunDurationSec 0
 Write-JsonFileAtomically -Path $statePaths.StatusPath -Payload $statusDocument
+Sync-TargetAutoloopTargetSidecarDocuments `
+    -Config $config `
+    -RunRoot $resolvedRunRoot `
+    -StateDocument $stateDocument `
+    -ControlDocument $controlDocument `
+    -StatusDocument $statusDocument
 
 $payload = [ordered]@{
     SchemaVersion = $script:TargetAutoloopSchemaVersion
@@ -198,8 +228,11 @@ $payload = [ordered]@{
     AfterMaxCycleCount = $afterMax
     AdditionalCycles = $AdditionalCycles
     PreviousPhase = $phase
-    NextPhase = 'idle'
-    NextAction = $nextAction
+    NextPhase = $nextPhase
+    NextAction = $nextActionAfterExtend
+    LimitReachedBeforeExtension = $limitReachedBeforeExtension
+    PreservedInFlightState = $preservedInFlightState
+    RestoredWaitingOutput = $restoreWaitingOutput
     ManifestPath = $manifestPath
     StatePath = [string]$statePaths.StatePath
     ControlPath = [string]$statePaths.ControlPath

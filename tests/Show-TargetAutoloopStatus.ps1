@@ -10,6 +10,22 @@ $ErrorActionPreference = 'Stop'
 
 $root = Split-Path -Parent $PSScriptRoot
 . (Join-Path $PSScriptRoot 'TargetAutoloopConfig.ps1')
+$script:TargetAutoloopSmokeMinCycleCount = 2
+
+function Get-TargetAutoloopSmokeCycleLabel {
+    param(
+        [int]$CycleCount,
+        [int]$MaxCycleCount
+    )
+
+    $normalizedCycleCount = [math]::Max(0, $CycleCount)
+    $normalizedMaxCycleCount = [math]::Max(0, $MaxCycleCount)
+    $maxLabel = if ($normalizedMaxCycleCount -gt 0) { [string]$normalizedMaxCycleCount } else { 'unbounded' }
+    if ($normalizedCycleCount -ge $script:TargetAutoloopSmokeMinCycleCount) {
+        return ('smoke: satisfied({0}-cycle), max={1}' -f $script:TargetAutoloopSmokeMinCycleCount, $maxLabel)
+    }
+    return ('smoke: pending({0}/{1}), max={2}' -f $normalizedCycleCount, $script:TargetAutoloopSmokeMinCycleCount, $maxLabel)
+}
 
 function Get-TargetAutoloopRemainingDelayLabel {
     param([string]$EligibleAt)
@@ -88,6 +104,107 @@ function Get-TargetAutoloopWatcherHealthSummary {
         Health = 'missing'
         Detail = 'status-missing'
         Recommendation = 'status가 없거나 watcher 메타데이터가 비어 있습니다. watch start로 초기화하세요.'
+    }
+}
+
+function Add-TargetAutoloopWatcherCoverageToTargets {
+    param(
+        [object[]]$TargetRows = @(),
+        [string[]]$WatcherTargetIds = @(),
+        [string]$WatcherHealth = '',
+        [string[]]$ManifestEnabledTargetIds = @()
+    )
+
+    $activeWatcherTargets = @(
+        $WatcherTargetIds |
+            Where-Object { Test-NonEmptyString $_ } |
+            ForEach-Object { [string]$_ } |
+            Sort-Object -Unique
+    )
+    $activeLookup = @{}
+    foreach ($targetId in @($activeWatcherTargets)) {
+        $activeLookup[[string]$targetId] = $true
+    }
+    $enabledLookup = @{}
+    foreach ($targetId in @($ManifestEnabledTargetIds)) {
+        if (Test-NonEmptyString $targetId) {
+            $enabledLookup[[string]$targetId] = $true
+        }
+    }
+
+    $coveredTargetIds = New-Object System.Collections.Generic.List[string]
+    $missingTargetIds = New-Object System.Collections.Generic.List[string]
+    $unknownTargetIds = New-Object System.Collections.Generic.List[string]
+    $coverageRows = New-Object System.Collections.Generic.List[object]
+    foreach ($row in @($TargetRows)) {
+        if ($null -eq $row) {
+            continue
+        }
+        $targetId = [string](Get-ConfigValue -Object $row -Name 'TargetId' -DefaultValue '')
+        $manifestEnabled = if (Test-NonEmptyString $targetId -and $enabledLookup.Count -gt 0) {
+            $enabledLookup.ContainsKey($targetId)
+        }
+        else {
+            [bool](Get-ConfigValue -Object $row -Name 'Enabled' -DefaultValue $true)
+        }
+        $state = 'inactive'
+        $detail = if (Test-NonEmptyString $WatcherHealth) { ('watcher={0}' -f $WatcherHealth) } else { 'watcher=unknown' }
+        $covered = $false
+        if (-not $manifestEnabled) {
+            $state = 'disabled'
+            $detail = 'manifest disabled'
+        }
+        elseif ($WatcherHealth -eq 'active') {
+            if ($activeLookup.Count -eq 0) {
+                $state = 'unknown'
+                $detail = 'active watcher target scope unknown'
+                if (Test-NonEmptyString $targetId) {
+                    [void]$unknownTargetIds.Add($targetId)
+                }
+            }
+            elseif ($activeLookup.ContainsKey($targetId)) {
+                $state = 'covered'
+                $covered = $true
+                $detail = ('active watcher includes {0}' -f $targetId)
+                if (Test-NonEmptyString $targetId) {
+                    [void]$coveredTargetIds.Add($targetId)
+                }
+            }
+            else {
+                $state = 'missing'
+                $detail = ('active watcher does not include {0}; watcherTargets={1}' -f $targetId, $(if (@($activeWatcherTargets).Count -gt 0) { @($activeWatcherTargets) -join ',' } else { '(unknown)' }))
+                if (Test-NonEmptyString $targetId) {
+                    [void]$missingTargetIds.Add($targetId)
+                }
+            }
+        }
+
+        $row | Add-Member -NotePropertyName WatcherCoverageState -NotePropertyValue $state -Force
+        $row | Add-Member -NotePropertyName WatcherCovered -NotePropertyValue $covered -Force
+        $row | Add-Member -NotePropertyName WatcherCoverageDetail -NotePropertyValue $detail -Force
+        [void]$coverageRows.Add($row)
+    }
+
+    $summaryState = 'inactive'
+    if ($WatcherHealth -eq 'active') {
+        if (@($unknownTargetIds).Count -gt 0) {
+            $summaryState = 'unknown'
+        }
+        elseif (@($missingTargetIds).Count -gt 0) {
+            $summaryState = 'partial'
+        }
+        else {
+            $summaryState = 'covered'
+        }
+    }
+
+    return [pscustomobject][ordered]@{
+        State = $summaryState
+        WatcherTargetIds = @($activeWatcherTargets)
+        CoveredTargetIds = @($coveredTargetIds.ToArray())
+        MissingTargetIds = @($missingTargetIds.ToArray())
+        UnknownTargetIds = @($unknownTargetIds.ToArray())
+        Targets = @($coverageRows.ToArray())
     }
 }
 
@@ -375,6 +492,190 @@ function Get-TargetAutoloopRetryReasonBadge {
     }
 }
 
+function Get-TargetAutoloopFocusLostRetryPolicy {
+    param(
+        [AllowEmptyString()][string]$FailureCategory = '',
+        [AllowEmptyString()][string]$DebugLogPath = ''
+    )
+
+    if ([string]$FailureCategory -ne 'focus_lost') {
+        return [pscustomobject][ordered]@{
+            Stage = 'not-focus-lost'
+            Policy = 'not-focus-lost'
+            Hint = ''
+        }
+    }
+
+    if (-not (Test-NonEmptyString $DebugLogPath) -or -not (Test-Path -LiteralPath $DebugLogPath -PathType Leaf)) {
+        return [pscustomobject][ordered]@{
+            Stage = 'unknown'
+            Policy = 'manual-review'
+            Hint = 'focus_lost debug log를 찾지 못했습니다. 대상 셀창 상태를 확인한 뒤 current 항목만 재시도하세요.'
+        }
+    }
+
+    try {
+        $debugLog = Get-Content -LiteralPath $DebugLogPath -Raw -Encoding UTF8
+    }
+    catch {
+        return [pscustomobject][ordered]@{
+            Stage = 'unknown'
+            Policy = 'manual-review'
+            Hint = 'focus_lost debug log를 읽지 못했습니다. 대상 셀창 상태를 확인한 뒤 current 항목만 재시도하세요.'
+        }
+    }
+
+    $preInputFocusLost = ($debugLog -match 'text_pre_(clear|paste)_focus_stolen_hard_fail')
+    $submitDispatched = ($debugLog -match 'submit_(attempt|after_dispatch|complete)')
+    $submitStarted = ($debugLog.Contains('submit_precheck') -or $debugLog.Contains('submit_guard_begin') -or $debugLog.Contains('submit_guard_complete'))
+    $payloadInputStarted = $false
+    foreach ($marker in @('terminal_sendtext', 'terminal_paste', 'control_sendtext')) {
+        if ($debugLog.Contains($marker)) {
+            $payloadInputStarted = $true
+            break
+        }
+    }
+    $payloadOrSubmitStarted = $false
+    foreach ($marker in @('terminal_input_mode', 'terminal_sendtext', 'terminal_paste', 'control_sendtext', 'submit_precheck', 'submit_complete')) {
+        if ($debugLog.Contains($marker)) {
+            $payloadOrSubmitStarted = $true
+            break
+        }
+    }
+
+    if ($preInputFocusLost -and -not $payloadOrSubmitStarted) {
+        return [pscustomobject][ordered]@{
+            Stage = 'pre-input'
+            Policy = 'bounded-auto-retry-exhausted'
+            Hint = '입력 시작 전 포커스 이탈입니다. router가 안전한 자동 재시도를 이미 소진했으므로, 셀창 포커스/사용자 idle을 확보한 뒤 current 항목만 재시도하세요.'
+        }
+    }
+
+    if ($payloadInputStarted -and $submitStarted -and -not $submitDispatched) {
+        return [pscustomobject][ordered]@{
+            Stage = 'submit-ready-no-dispatch'
+            Policy = 'manual-submit-only-retry'
+            Hint = 'payload 붙여넣기는 완료됐지만 submit dispatch 전 focus_lost입니다. 재붙여넣기하지 말고 셀창 입력 내용을 확인한 뒤 submit-only로 1회 제출하세요.'
+        }
+    }
+
+    if ($payloadOrSubmitStarted) {
+        return [pscustomobject][ordered]@{
+            Stage = 'post-input-or-submit'
+            Policy = 'manual-review-duplicate-risk'
+            Hint = 'payload 입력 또는 submit 단계 이후 focus_lost입니다. 중복 전송 위험이 있어 자동 재시도하지 않습니다. 셀창에 이미 입력/전송된 내용이 있는지 먼저 확인하세요.'
+        }
+    }
+
+    return [pscustomobject][ordered]@{
+        Stage = 'unknown'
+        Policy = 'manual-review'
+        Hint = 'focus_lost 단계가 불명확합니다. 대상 셀창 상태를 확인한 뒤 current 항목만 재시도하세요.'
+    }
+}
+
+function Get-TargetAutoloopSendRetryPolicy {
+    param(
+        [AllowEmptyString()][string]$FailureCategory = '',
+        [AllowEmptyString()][string]$DebugLogPath = ''
+    )
+
+    if ([string]$FailureCategory -eq 'focus_lost') {
+        return Get-TargetAutoloopFocusLostRetryPolicy -FailureCategory $FailureCategory -DebugLogPath $DebugLogPath
+    }
+    if ([string]$FailureCategory -eq 'user_active_hold') {
+        return [pscustomobject][ordered]@{
+            Stage = 'pre-input-user-active'
+            Policy = 'bounded-auto-retry-exhausted'
+            Hint = '사용자 입력/포커스 활동 때문에 전송을 보류했습니다. 사용자 idle을 확보한 뒤 current 항목만 재시도하세요.'
+        }
+    }
+    if ([string]$FailureCategory -eq 'window_not_found') {
+        return [pscustomobject][ordered]@{
+            Stage = 'pre-input-window-resolution'
+            Policy = 'manual-retry-after-window-check'
+            Hint = '대상 셀창을 찾지 못했습니다. 공식 8창/binding 상태를 확인한 뒤 current 항목만 재시도하세요.'
+        }
+    }
+    if ([string]$FailureCategory -ne 'send_failed') {
+        return [pscustomobject][ordered]@{
+            Stage = 'not-send-failure'
+            Policy = 'not-send-failure'
+            Hint = ''
+        }
+    }
+    if (-not (Test-NonEmptyString $DebugLogPath) -or -not (Test-Path -LiteralPath $DebugLogPath -PathType Leaf)) {
+        return [pscustomobject][ordered]@{
+            Stage = 'unknown'
+            Policy = 'manual-review'
+            Hint = 'send_failed debug log를 찾지 못했습니다. payload 입력 여부가 불명확하므로 셀창 상태를 확인한 뒤 current 항목만 재시도하세요.'
+        }
+    }
+    try {
+        $debugLog = Get-Content -LiteralPath $DebugLogPath -Raw -Encoding UTF8
+    }
+    catch {
+        return [pscustomobject][ordered]@{
+            Stage = 'unknown'
+            Policy = 'manual-review'
+            Hint = 'send_failed debug log를 읽지 못했습니다. payload 입력 여부가 불명확하므로 셀창 상태를 확인한 뒤 current 항목만 재시도하세요.'
+        }
+    }
+
+    $clipboardInputPrepFailed = ($debugLog.Contains('terminal_paste_clipwait_failed') -or $debugLog.Contains('clipboard_not_ready_for_terminal_paste'))
+    $unsupportedSubmitMode = $debugLog.Contains('unsupported_submit_mode')
+    $submitDispatched = ($debugLog -match 'submit_(attempt|after_dispatch|complete)')
+    $submitStarted = ($debugLog.Contains('submit_precheck') -or $debugLog.Contains('submit_guard_begin') -or $debugLog.Contains('submit_guard_complete'))
+    $payloadInputStarted = $false
+    foreach ($marker in @('terminal_sendtext', 'terminal_paste', 'control_sendtext')) {
+        if ($debugLog.Contains($marker)) {
+            $payloadInputStarted = $true
+            break
+        }
+    }
+
+    if ($clipboardInputPrepFailed -and -not $payloadInputStarted -and -not $submitStarted) {
+        return [pscustomobject][ordered]@{
+            Stage = 'pre-input'
+            Policy = 'bounded-auto-retry-exhausted'
+            Hint = 'clipboard/paste 준비 단계 실패라 payload 입력 전으로 판단했습니다. router가 제한된 자동 재시도를 소진했으므로 current 항목만 재시도하세요.'
+        }
+    }
+    if ($unsupportedSubmitMode) {
+        return [pscustomobject][ordered]@{
+            Stage = 'submit-config'
+            Policy = 'manual-review-config-error'
+            Hint = '지원하지 않는 submit mode 설정입니다. SubmitRetryModes 설정을 수정한 뒤 current 항목만 재시도하세요.'
+        }
+    }
+    if ($submitDispatched) {
+        return [pscustomobject][ordered]@{
+            Stage = 'post-submit-dispatch'
+            Policy = 'manual-review-duplicate-risk'
+            Hint = 'submit dispatch 이후 send_failed입니다. 이미 전송됐을 수 있어 셀창 결과/산출물을 먼저 확인하세요.'
+        }
+    }
+    if ($payloadInputStarted -and $submitStarted -and -not $submitDispatched) {
+        return [pscustomobject][ordered]@{
+            Stage = 'submit-ready-no-dispatch'
+            Policy = 'manual-submit-only-retry'
+            Hint = 'payload 붙여넣기는 완료됐지만 submit dispatch 전 send_failed입니다. 재붙여넣기하지 말고 셀창 입력 내용을 확인한 뒤 submit-only로 1회 제출하세요.'
+        }
+    }
+    if ($submitStarted -or $payloadInputStarted -or $debugLog.Contains('terminal_input_mode')) {
+        return [pscustomobject][ordered]@{
+            Stage = 'post-input-or-submit'
+            Policy = 'manual-review-duplicate-risk'
+            Hint = 'payload 입력 또는 submit 준비 이후 send_failed입니다. 중복 전송 위험이 있어 셀창 입력 상태를 먼저 확인하세요.'
+        }
+    }
+    return [pscustomobject][ordered]@{
+        Stage = 'unknown'
+        Policy = 'manual-review'
+        Hint = 'send_failed 단계가 불명확합니다. 셀창 상태를 확인한 뒤 current 항목만 재시도하세요.'
+    }
+}
+
 function Get-TargetAutoloopRecommendationMode {
     param($RecommendationSpec)
 
@@ -497,7 +798,9 @@ function Get-TargetAutoloopStartEligibility {
 function Get-TargetAutoloopRetryPendingSummary {
     param(
         $Config,
-        [string[]]$TargetIds = @()
+        [string[]]$TargetIds = @(),
+        [string[]]$ScopeRunRoots = @(),
+        $CurrentRouterReadyPathByTargetId = @{}
     )
 
     $retryPendingRoot = [string](Get-ConfigValue -Object $Config -Name 'RetryPendingRoot' -DefaultValue '')
@@ -523,8 +826,16 @@ function Get-TargetAutoloopRetryPendingSummary {
             $allowedTargets[$normalizedTargetId] = $true
         }
     }
+    $scopeRunRootSet = @{}
+    foreach ($scopeRunRoot in @($ScopeRunRoots)) {
+        $normalizedRunRoot = Normalize-TargetAutoloopRetryPendingScopePath -Path ([string]$scopeRunRoot)
+        if (Test-NonEmptyString $normalizedRunRoot) {
+            $scopeRunRootSet[$normalizedRunRoot] = $true
+        }
+    }
 
     $items = @()
+    $ignoredOutOfScopeCount = 0
     if ((Test-NonEmptyString $retryPendingRoot) -and (Test-Path -LiteralPath $retryPendingRoot -PathType Container)) {
         $files = @(Get-ChildItem -LiteralPath $retryPendingRoot -Filter '*.ready.txt' -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTimeUtc, Name)
         foreach ($file in $files) {
@@ -547,15 +858,112 @@ function Get-TargetAutoloopRetryPendingSummary {
                     $metadata = $null
                 }
             }
+            $deliveryPath = ($file.FullName + '.delivery.json')
+            $delivery = $null
+            if (Test-Path -LiteralPath $deliveryPath -PathType Leaf) {
+                try {
+                    $delivery = Get-Content -LiteralPath $deliveryPath -Raw -Encoding UTF8 | ConvertFrom-Json
+                }
+                catch {
+                    $delivery = $null
+                }
+            }
+            if ($scopeRunRootSet.Count -gt 0 -and -not (Test-TargetAutoloopRetryPendingFileInScope -FilePath ([string]$file.FullName) -Delivery $delivery -ScopeRunRootSet $scopeRunRootSet)) {
+                $ignoredOutOfScopeCount += 1
+                continue
+            }
+
+            $originalPath = [string](Get-ConfigValue -Object $metadata -Name 'OriginalPath' -DefaultValue '')
+            $currentRouterReadyPath = ''
+            if ($null -ne $CurrentRouterReadyPathByTargetId -and $CurrentRouterReadyPathByTargetId.Contains($targetId)) {
+                $currentRouterReadyPath = [string]$CurrentRouterReadyPathByTargetId[$targetId]
+            }
+            $isCurrentForTarget = $true
+            $staleReason = ''
+            if (Test-NonEmptyString $currentRouterReadyPath) {
+                if (-not (Test-NonEmptyString $originalPath)) {
+                    $isCurrentForTarget = $false
+                    $staleReason = 'missing-original-path'
+                }
+                elseif ((Get-NormalizedFullPath -Path $originalPath) -ne (Get-NormalizedFullPath -Path $currentRouterReadyPath)) {
+                    $isCurrentForTarget = $false
+                    $staleReason = 'not-current-last-router-ready-path'
+                }
+            }
 
             $items += [pscustomobject][ordered]@{
                 TargetId = $targetId
                 Path = [string]$file.FullName
                 LastWriteTime = $file.LastWriteTime.ToString('o')
+                RunRoot = [string](Get-ConfigValue -Object $delivery -Name 'RunRoot' -DefaultValue '')
+                OriginalPath = $originalPath
+                CurrentRouterReadyPath = $currentRouterReadyPath
+                IsCurrentForTarget = [bool]$isCurrentForTarget
+                StaleReason = $staleReason
                 FailureCategory = [string](Get-ConfigValue -Object $metadata -Name 'FailureCategory' -DefaultValue '')
                 FailureMessage = [string](Get-ConfigValue -Object $metadata -Name 'FailureMessage' -DefaultValue '')
                 DebugLogPath = [string](Get-ConfigValue -Object $metadata -Name 'DebugLogPath' -DefaultValue '')
             }
+            $focusLostStage = [string](Get-ConfigValue -Object $metadata -Name 'FocusLostStage' -DefaultValue '')
+            $focusLostRetryPolicy = [string](Get-ConfigValue -Object $metadata -Name 'FocusLostRetryPolicy' -DefaultValue '')
+            $sendStage = [string](Get-ConfigValue -Object $metadata -Name 'SendStage' -DefaultValue '')
+            $sendRetryPolicy = [string](Get-ConfigValue -Object $metadata -Name 'SendRetryPolicy' -DefaultValue '')
+            $hasMetadataSendStage = Test-NonEmptyString $sendStage
+            $hasMetadataSendRetryPolicy = Test-NonEmptyString $sendRetryPolicy
+            $operatorRetryHint = [string](Get-ConfigValue -Object $metadata -Name 'OperatorRetryHint' -DefaultValue '')
+            $computedSendPolicy = Get-TargetAutoloopSendRetryPolicy `
+                -FailureCategory ([string](Get-ConfigValue -Object $items[-1] -Name 'FailureCategory' -DefaultValue '')) `
+                -DebugLogPath ([string](Get-ConfigValue -Object $items[-1] -Name 'DebugLogPath' -DefaultValue ''))
+            if ([string]$sendRetryPolicy -eq 'manual-review-duplicate-risk' -and [string]$computedSendPolicy.Policy -eq 'manual-submit-only-retry') {
+                $sendStage = [string]$computedSendPolicy.Stage
+                $sendRetryPolicy = [string]$computedSendPolicy.Policy
+                $operatorRetryHint = [string]$computedSendPolicy.Hint
+            }
+            if (-not (Test-NonEmptyString $sendStage) -or -not (Test-NonEmptyString $sendRetryPolicy)) {
+                if (-not (Test-NonEmptyString $sendStage)) {
+                    $sendStage = [string]$computedSendPolicy.Stage
+                }
+                if (-not (Test-NonEmptyString $sendRetryPolicy)) {
+                    $sendRetryPolicy = [string]$computedSendPolicy.Policy
+                }
+                if (-not (Test-NonEmptyString $operatorRetryHint)) {
+                    $operatorRetryHint = [string]$computedSendPolicy.Hint
+                }
+            }
+            $computedFocusPolicy = Get-TargetAutoloopFocusLostRetryPolicy `
+                -FailureCategory ([string](Get-ConfigValue -Object $items[-1] -Name 'FailureCategory' -DefaultValue '')) `
+                -DebugLogPath ([string](Get-ConfigValue -Object $items[-1] -Name 'DebugLogPath' -DefaultValue ''))
+            if ([string]$focusLostRetryPolicy -eq 'manual-review-duplicate-risk' -and [string]$computedFocusPolicy.Policy -eq 'manual-submit-only-retry') {
+                $focusLostStage = [string]$computedFocusPolicy.Stage
+                $focusLostRetryPolicy = [string]$computedFocusPolicy.Policy
+                if (-not (Test-NonEmptyString $operatorRetryHint) -or [string]$operatorRetryHint -match '중복 전송 위험') {
+                    $operatorRetryHint = [string]$computedFocusPolicy.Hint
+                }
+            }
+            if (-not (Test-NonEmptyString $focusLostStage) -or -not (Test-NonEmptyString $focusLostRetryPolicy)) {
+                if (-not (Test-NonEmptyString $focusLostStage)) {
+                    $focusLostStage = [string]$computedFocusPolicy.Stage
+                }
+                if (-not (Test-NonEmptyString $focusLostRetryPolicy)) {
+                    $focusLostRetryPolicy = [string]$computedFocusPolicy.Policy
+                }
+                if (-not (Test-NonEmptyString $operatorRetryHint)) {
+                    $operatorRetryHint = [string]$computedFocusPolicy.Hint
+                }
+            }
+            if ([string](Get-ConfigValue -Object $items[-1] -Name 'FailureCategory' -DefaultValue '') -eq 'focus_lost') {
+                if (-not $hasMetadataSendStage) {
+                    $sendStage = $focusLostStage
+                }
+                if (-not $hasMetadataSendRetryPolicy) {
+                    $sendRetryPolicy = $focusLostRetryPolicy
+                }
+            }
+            $items[-1] | Add-Member -NotePropertyName SendStage -NotePropertyValue $sendStage -Force
+            $items[-1] | Add-Member -NotePropertyName SendRetryPolicy -NotePropertyValue $sendRetryPolicy -Force
+            $items[-1] | Add-Member -NotePropertyName FocusLostStage -NotePropertyValue $focusLostStage -Force
+            $items[-1] | Add-Member -NotePropertyName FocusLostRetryPolicy -NotePropertyValue $focusLostRetryPolicy -Force
+            $items[-1] | Add-Member -NotePropertyName OperatorRetryHint -NotePropertyValue $operatorRetryHint -Force
         }
     }
 
@@ -563,18 +971,175 @@ function Get-TargetAutoloopRetryPendingSummary {
     if (@($items).Count -gt 0) {
         $latest = @($items | Sort-Object LastWriteTime | Select-Object -Last 1)[0]
     }
+    $currentItems = @($items | Where-Object { [bool]$_.IsCurrentForTarget })
+    $staleItems = @($items | Where-Object { -not [bool]$_.IsCurrentForTarget })
+    $latestCurrent = $null
+    if ($currentItems.Count -gt 0) {
+        $latestCurrent = @($currentItems | Sort-Object LastWriteTime | Select-Object -Last 1)[0]
+    }
+    $latestStale = $null
+    if ($staleItems.Count -gt 0) {
+        $latestStale = @($staleItems | Sort-Object LastWriteTime | Select-Object -Last 1)[0]
+    }
 
     return [pscustomobject][ordered]@{
         Root = [string]$retryPendingRoot
         Count = [int](@($items).Count)
         TargetIds = @($items | ForEach-Object { [string]$_.TargetId } | Where-Object { Test-NonEmptyString $_ } | Select-Object -Unique)
+        CurrentCount = [int](@($currentItems).Count)
+        CurrentTargetIds = @($currentItems | ForEach-Object { [string]$_.TargetId } | Where-Object { Test-NonEmptyString $_ } | Select-Object -Unique)
+        StaleCount = [int](@($staleItems).Count)
+        StaleTargetIds = @($staleItems | ForEach-Object { [string]$_.TargetId } | Where-Object { Test-NonEmptyString $_ } | Select-Object -Unique)
         LatestPath = [string](Get-ConfigValue -Object $latest -Name 'Path' -DefaultValue '')
         LatestTargetId = [string](Get-ConfigValue -Object $latest -Name 'TargetId' -DefaultValue '')
         LatestFailureCategory = [string](Get-ConfigValue -Object $latest -Name 'FailureCategory' -DefaultValue '')
         LatestFailureMessage = [string](Get-ConfigValue -Object $latest -Name 'FailureMessage' -DefaultValue '')
         LatestDebugLogPath = [string](Get-ConfigValue -Object $latest -Name 'DebugLogPath' -DefaultValue '')
+        LatestCurrentPath = [string](Get-ConfigValue -Object $latestCurrent -Name 'Path' -DefaultValue '')
+        LatestCurrentTargetId = [string](Get-ConfigValue -Object $latestCurrent -Name 'TargetId' -DefaultValue '')
+        LatestCurrentFailureCategory = [string](Get-ConfigValue -Object $latestCurrent -Name 'FailureCategory' -DefaultValue '')
+        LatestCurrentFailureMessage = [string](Get-ConfigValue -Object $latestCurrent -Name 'FailureMessage' -DefaultValue '')
+        LatestCurrentDebugLogPath = [string](Get-ConfigValue -Object $latestCurrent -Name 'DebugLogPath' -DefaultValue '')
+        LatestCurrentSendStage = [string](Get-ConfigValue -Object $latestCurrent -Name 'SendStage' -DefaultValue '')
+        LatestCurrentSendRetryPolicy = [string](Get-ConfigValue -Object $latestCurrent -Name 'SendRetryPolicy' -DefaultValue '')
+        LatestCurrentFocusLostStage = [string](Get-ConfigValue -Object $latestCurrent -Name 'FocusLostStage' -DefaultValue '')
+        LatestCurrentFocusLostRetryPolicy = [string](Get-ConfigValue -Object $latestCurrent -Name 'FocusLostRetryPolicy' -DefaultValue '')
+        LatestCurrentOperatorRetryHint = [string](Get-ConfigValue -Object $latestCurrent -Name 'OperatorRetryHint' -DefaultValue '')
+        LatestStalePath = [string](Get-ConfigValue -Object $latestStale -Name 'Path' -DefaultValue '')
+        LatestStaleTargetId = [string](Get-ConfigValue -Object $latestStale -Name 'TargetId' -DefaultValue '')
+        LatestStaleReason = [string](Get-ConfigValue -Object $latestStale -Name 'StaleReason' -DefaultValue '')
+        LatestStaleSendStage = [string](Get-ConfigValue -Object $latestStale -Name 'SendStage' -DefaultValue '')
+        LatestStaleSendRetryPolicy = [string](Get-ConfigValue -Object $latestStale -Name 'SendRetryPolicy' -DefaultValue '')
+        LatestStaleFocusLostStage = [string](Get-ConfigValue -Object $latestStale -Name 'FocusLostStage' -DefaultValue '')
+        LatestStaleFocusLostRetryPolicy = [string](Get-ConfigValue -Object $latestStale -Name 'FocusLostRetryPolicy' -DefaultValue '')
+        LatestStaleOperatorRetryHint = [string](Get-ConfigValue -Object $latestStale -Name 'OperatorRetryHint' -DefaultValue '')
+        ScopeRunRoots = @($scopeRunRootSet.Keys)
+        IgnoredOutOfScopeCount = [int]$ignoredOutOfScopeCount
         Items = @($items)
+        CurrentItems = @($currentItems)
+        StaleItems = @($staleItems)
     }
+}
+
+function Get-TargetAutoloopCurrentRouterReadyPathMap {
+    param(
+        $StateDocument,
+        [object[]]$StatusRows = @()
+    )
+
+    $map = @{}
+    $stateTargetMap = Get-TargetAutoloopTargetStateMap -StateDocument $StateDocument
+    foreach ($targetId in @($stateTargetMap.Keys)) {
+        $readyPath = [string](Get-ConfigValue -Object $stateTargetMap[$targetId] -Name 'LastRouterReadyPath' -DefaultValue '')
+        if (Test-NonEmptyString $readyPath) {
+            $map[[string]$targetId] = $readyPath
+        }
+    }
+    foreach ($row in @($StatusRows)) {
+        $targetId = [string](Get-ConfigValue -Object $row -Name 'TargetId' -DefaultValue '')
+        if (-not (Test-NonEmptyString $targetId) -or $map.ContainsKey($targetId)) {
+            continue
+        }
+        $readyPath = [string](Get-ConfigValue -Object $row -Name 'LastRouterReadyPath' -DefaultValue '')
+        if (Test-NonEmptyString $readyPath) {
+            $map[$targetId] = $readyPath
+        }
+    }
+    return $map
+}
+
+function Get-TargetAutoloopTargetRecoveryHint {
+    param(
+        [Parameter(Mandatory)]$TargetRow,
+        $RetryPendingSummary = $null,
+        $RouterInboxReadySummary = $null
+    )
+
+    $targetId = [string](Get-ConfigValue -Object $TargetRow -Name 'TargetId' -DefaultValue '')
+    $phase = [string](Get-ConfigValue -Object $TargetRow -Name 'Phase' -DefaultValue '')
+    $dispatchState = [string](Get-ConfigValue -Object $TargetRow -Name 'LastDispatchState' -DefaultValue '')
+    $lastRouterReadyPath = [string](Get-ConfigValue -Object $TargetRow -Name 'LastRouterReadyPath' -DefaultValue '')
+    $currentRetryCount = @((Get-ConfigValue -Object $RetryPendingSummary -Name 'CurrentItems' -DefaultValue @()) | Where-Object {
+            [string](Get-ConfigValue -Object $_ -Name 'TargetId' -DefaultValue '') -eq $targetId
+        }).Count
+    $staleRetryCount = @((Get-ConfigValue -Object $RetryPendingSummary -Name 'StaleItems' -DefaultValue @()) | Where-Object {
+            [string](Get-ConfigValue -Object $_ -Name 'TargetId' -DefaultValue '') -eq $targetId
+        }).Count
+    $routerInboxReadyCount = @((Get-ConfigValue -Object $RouterInboxReadySummary -Name 'Items' -DefaultValue @()) | Where-Object {
+            [string](Get-ConfigValue -Object $_ -Name 'TargetId' -DefaultValue '') -eq $targetId
+        }).Count
+
+    if ($currentRetryCount -gt 0) {
+        return ('recovery: current-retry-pending({0}) -> 현재 전송보류 재시도' -f $currentRetryCount)
+    }
+    if ($routerInboxReadyCount -gt 0) {
+        return ('recovery: router-inbox-ready({0}) -> router 처리 대기, 시작문 재입력 금지' -f $routerInboxReadyCount)
+    }
+    if ($phase -eq 'waiting-output' -and ((Test-NonEmptyString $lastRouterReadyPath) -or $dispatchState -eq 'router-ready-file-created')) {
+        if ($staleRetryCount -gt 0) {
+            return ('recovery: already-submitted -> 시작문 재입력 금지, 셀창 결과/산출물 대기; stale retry-pending={0} 확인' -f $staleRetryCount)
+        }
+        return 'recovery: already-submitted -> 시작문 재입력 금지, 해당 셀창 결과/산출물 대기'
+    }
+    if ($phase -in @('queued', 'dispatch-delay', 'cooldown')) {
+        return 'recovery: queued -> 감지/dispatch 대기, 시작문 재입력 금지'
+    }
+    if ($phase -eq 'failed') {
+        return 'recovery: failed -> 실패 원인 확인 후 현재 전송보류 재시도 또는 새 RunRoot'
+    }
+    if ($phase -eq 'limit-reached') {
+        return 'recovery: limit-reached -> 추가 N회+감지 또는 새 RunRoot'
+    }
+    if ($staleRetryCount -gt 0) {
+        return ('recovery: stale-retry-pending({0}) -> 자동 재큐잉 금지, 경로 확인' -f $staleRetryCount)
+    }
+    return 'recovery: normal -> 다음 publish.ready 산출물 대기'
+}
+
+function Normalize-TargetAutoloopRetryPendingScopePath {
+    param([AllowEmptyString()][string]$Path)
+
+    $value = [string]$Path
+    if (-not (Test-NonEmptyString $value)) {
+        return ''
+    }
+
+    try {
+        $value = [System.IO.Path]::GetFullPath($value)
+    }
+    catch {
+    }
+
+    return $value.Trim().TrimEnd('\', '/').Replace('/', '\').ToLowerInvariant()
+}
+
+function Test-TargetAutoloopRetryPendingFileInScope {
+    param(
+        [Parameter(Mandatory)][string]$FilePath,
+        $Delivery,
+        [Parameter(Mandatory)]$ScopeRunRootSet
+    )
+
+    $deliveryRunRoot = Normalize-TargetAutoloopRetryPendingScopePath -Path ([string](Get-ConfigValue -Object $Delivery -Name 'RunRoot' -DefaultValue ''))
+    if ((Test-NonEmptyString $deliveryRunRoot) -and $ScopeRunRootSet.ContainsKey($deliveryRunRoot)) {
+        return $true
+    }
+
+    try {
+        $payloadText = Get-Content -LiteralPath $FilePath -Raw -Encoding UTF8
+    }
+    catch {
+        return $false
+    }
+
+    $normalizedPayload = ([string]$payloadText).Replace('/', '\').ToLowerInvariant()
+    foreach ($scopeRunRoot in @($ScopeRunRootSet.Keys)) {
+        if ((Test-NonEmptyString ([string]$scopeRunRoot)) -and $normalizedPayload.Contains([string]$scopeRunRoot)) {
+            return $true
+        }
+    }
+
+    return $false
 }
 
 function Get-TargetAutoloopRouterInboxReadySummary {
@@ -842,6 +1407,10 @@ function Get-TargetAutoloopCurrentRecommendationSpec {
         [bool]$RouterSessionMismatch = $false,
         [AllowEmptyString()][string]$RouterLauncherSessionId = '',
         [AllowEmptyString()][string]$RuntimeLauncherSessionId = '',
+        [bool]$RouterConfigDrift = $false,
+        [string[]]$RouterConfigDriftReasons = @(),
+        [int]$ConfiguredUserIdleWaitTimeoutMs = 0,
+        [AllowNull()]$RouterUserIdleWaitTimeoutMs = $null,
         $RetryPendingSummary,
         $OutputBlockSummary,
         $RecentRecommendation
@@ -896,15 +1465,37 @@ function Get-TargetAutoloopCurrentRecommendationSpec {
         $actionKey = 'restart_router_for_autoloop'
         $detail = [string](Get-ConfigValue -Object $startEligibility -Name 'Detail' -DefaultValue '')
     }
+    elseif ($RouterConfigDrift) {
+        $label = 'router 설정 재시작'
+        $actionKey = 'restart_router_for_autoloop'
+        $driftReasons = @($RouterConfigDriftReasons)
+        $detail = ('현재 router가 config의 전송 안정화 설정과 다르게 실행 중입니다. router 재시작 후 현재 전송보류 재시도를 진행하세요. reasons={0} configuredIdleWait={1}ms routerIdleWait={2}ms' -f
+            $(if (@($driftReasons).Count -gt 0) { @($driftReasons) -join ',' } else { '(none)' }),
+            [int]$ConfiguredUserIdleWaitTimeoutMs,
+            $(if ($null -ne $RouterUserIdleWaitTimeoutMs) { [string]$RouterUserIdleWaitTimeoutMs } else { '(missing)' }))
+    }
     elseif ([int](Get-ConfigValue -Object $RetryPendingSummary -Name 'Count' -DefaultValue 0) -gt 0) {
         $retryPendingTargetIds = @(Get-ConfigValue -Object $RetryPendingSummary -Name 'TargetIds' -DefaultValue @())
         $retryPendingCount = [int](Get-ConfigValue -Object $RetryPendingSummary -Name 'Count' -DefaultValue 0)
-        $latestFailureCategory = [string](Get-ConfigValue -Object $RetryPendingSummary -Name 'LatestFailureCategory' -DefaultValue '')
-        $latestFailureMessage = [string](Get-ConfigValue -Object $RetryPendingSummary -Name 'LatestFailureMessage' -DefaultValue '')
-        $latestDebugLogPath = [string](Get-ConfigValue -Object $RetryPendingSummary -Name 'LatestDebugLogPath' -DefaultValue '')
-        $label = 'retry-pending 재큐잉'
-        $actionKey = 'requeue_retry_pending'
-        $detail = ('router retry-pending에 target-autoloop ready 파일 {0}개가 있습니다. metadata 포함 재큐잉 후 watcher/router가 다시 처리하게 하세요. targets={1}' -f $retryPendingCount, $(if ($retryPendingTargetIds.Count -gt 0) { $retryPendingTargetIds -join ',' } else { '(none)' }))
+        $currentRetryPendingCount = [int](Get-ConfigValue -Object $RetryPendingSummary -Name 'CurrentCount' -DefaultValue $retryPendingCount)
+        $staleRetryPendingCount = [int](Get-ConfigValue -Object $RetryPendingSummary -Name 'StaleCount' -DefaultValue 0)
+        $currentRetryPendingTargetIds = @(Get-ConfigValue -Object $RetryPendingSummary -Name 'CurrentTargetIds' -DefaultValue @())
+        $latestFailureCategory = [string](Get-ConfigValue -Object $RetryPendingSummary -Name 'LatestCurrentFailureCategory' -DefaultValue '')
+        $latestFailureMessage = [string](Get-ConfigValue -Object $RetryPendingSummary -Name 'LatestCurrentFailureMessage' -DefaultValue '')
+        $latestDebugLogPath = [string](Get-ConfigValue -Object $RetryPendingSummary -Name 'LatestCurrentDebugLogPath' -DefaultValue '')
+        if (-not (Test-NonEmptyString $latestFailureCategory)) {
+            $latestFailureCategory = [string](Get-ConfigValue -Object $RetryPendingSummary -Name 'LatestFailureCategory' -DefaultValue '')
+            $latestFailureMessage = [string](Get-ConfigValue -Object $RetryPendingSummary -Name 'LatestFailureMessage' -DefaultValue '')
+            $latestDebugLogPath = [string](Get-ConfigValue -Object $RetryPendingSummary -Name 'LatestDebugLogPath' -DefaultValue '')
+        }
+        $label = if ($currentRetryPendingCount -gt 0) { '현재 전송보류 재시도' } else { 'stale retry-pending 확인' }
+        $actionKey = if ($currentRetryPendingCount -gt 0) { 'requeue_retry_pending' } else { '' }
+        $readOnly = ($currentRetryPendingCount -le 0)
+        $targetIdsForDetail = @(if ($currentRetryPendingCount -gt 0) { $currentRetryPendingTargetIds } else { $retryPendingTargetIds })
+        $detail = ('router retry-pending에 target-autoloop ready 파일 {0}개가 있습니다. current={1}, stale={2}. 현재 전송과 연결된 current 항목만 재큐잉 대상입니다. targets={3}' -f $retryPendingCount, $currentRetryPendingCount, $staleRetryPendingCount, $(if (@($targetIdsForDetail).Count -gt 0) { @($targetIdsForDetail) -join ',' } else { '(none)' }))
+        if ($staleRetryPendingCount -gt 0) {
+            $detail += ' stale 항목은 이전 LastRouterReadyPath와 맞지 않아 자동 재큐잉 대상에서 제외해야 합니다.'
+        }
         if (Test-NonEmptyString $latestFailureCategory) {
             $detail += (' latestFailure={0}' -f $latestFailureCategory)
         }
@@ -913,6 +1504,34 @@ function Get-TargetAutoloopCurrentRecommendationSpec {
         }
         if (Test-NonEmptyString $latestDebugLogPath) {
             $detail += (' debugLog={0}' -f $latestDebugLogPath)
+        }
+        $latestSendPolicy = [string](Get-ConfigValue -Object $RetryPendingSummary -Name 'LatestCurrentSendRetryPolicy' -DefaultValue '')
+        if (-not (Test-NonEmptyString $latestSendPolicy)) {
+            $latestSendPolicy = [string](Get-ConfigValue -Object $RetryPendingSummary -Name 'LatestStaleSendRetryPolicy' -DefaultValue '')
+        }
+        $latestSendStage = [string](Get-ConfigValue -Object $RetryPendingSummary -Name 'LatestCurrentSendStage' -DefaultValue '')
+        if (-not (Test-NonEmptyString $latestSendStage)) {
+            $latestSendStage = [string](Get-ConfigValue -Object $RetryPendingSummary -Name 'LatestStaleSendStage' -DefaultValue '')
+        }
+        if (Test-NonEmptyString $latestSendPolicy -and $latestSendPolicy -ne 'not-send-failure') {
+            $detail += (' retryPolicy={0}' -f $latestSendPolicy)
+        }
+        if (Test-NonEmptyString $latestSendStage -and $latestSendStage -ne 'not-send-failure') {
+            $detail += (' retryStage={0}' -f $latestSendStage)
+        }
+        $latestFocusPolicy = [string](Get-ConfigValue -Object $RetryPendingSummary -Name 'LatestCurrentFocusLostRetryPolicy' -DefaultValue '')
+        if (-not (Test-NonEmptyString $latestFocusPolicy)) {
+            $latestFocusPolicy = [string](Get-ConfigValue -Object $RetryPendingSummary -Name 'LatestStaleFocusLostRetryPolicy' -DefaultValue '')
+        }
+        $latestFocusHint = [string](Get-ConfigValue -Object $RetryPendingSummary -Name 'LatestCurrentOperatorRetryHint' -DefaultValue '')
+        if (-not (Test-NonEmptyString $latestFocusHint)) {
+            $latestFocusHint = [string](Get-ConfigValue -Object $RetryPendingSummary -Name 'LatestStaleOperatorRetryHint' -DefaultValue '')
+        }
+        if (Test-NonEmptyString $latestFocusPolicy -and $latestFocusPolicy -ne 'not-focus-lost') {
+            $detail += (' focusPolicy={0}' -f $latestFocusPolicy)
+        }
+        if (Test-NonEmptyString $latestFocusHint) {
+            $detail += (' hint={0}' -f (Get-TargetAutoloopCompactText -Value $latestFocusHint -MaxChars 140))
         }
     }
     elseif ($WatcherHealth -eq 'stale') {
@@ -1065,7 +1684,15 @@ $manifestTargetIds = @($manifestSummary.ManifestTargetIds)
 $manifestEnabledTargetIds = @($manifestSummary.ManifestEnabledTargetIds)
 $manifestPublishReadyTargetIds = @($manifestSummary.ManifestPublishReadyTargetIds)
 $manifestPublishReadyMissingTargetIds = @($manifestSummary.ManifestPublishReadyMissingTargetIds)
-$retryPendingSummary = Get-TargetAutoloopRetryPendingSummary -Config $config -TargetIds @($manifestEnabledTargetIds)
+$retryPendingScopeRunRoots = @($resolvedRunRoot)
+foreach ($manifestTarget in @($manifestSummary.ManifestTargetRows)) {
+    foreach ($propertyName in @('RunRoot', 'CoordinatorRunRoot', 'TargetRunRoot')) {
+        $scopeRunRoot = [string](Get-ConfigValue -Object $manifestTarget -Name $propertyName -DefaultValue '')
+        if (Test-NonEmptyString $scopeRunRoot) {
+            $retryPendingScopeRunRoots += $scopeRunRoot
+        }
+    }
+}
 $routerInboxReadySummary = Get-TargetAutoloopRouterInboxReadySummary -Config $config -TargetIds @($manifestEnabledTargetIds)
 
 $stateDocument = Read-JsonObject -Path $statePaths.StatePath
@@ -1077,6 +1704,8 @@ else {
     New-TargetAutoloopStatusDocument -Config $config -RunRoot $resolvedRunRoot -StateDocument $stateDocument -ControlDocument $controlDocument
 }
 $statusRows = @(Get-ConfigValue -Object $statusDocument -Name 'Targets' -DefaultValue @())
+$currentRouterReadyPathByTargetId = Get-TargetAutoloopCurrentRouterReadyPathMap -StateDocument $stateDocument -StatusRows @($statusRows)
+$retryPendingSummary = Get-TargetAutoloopRetryPendingSummary -Config $config -TargetIds @($manifestEnabledTargetIds) -ScopeRunRoots @($retryPendingScopeRunRoots) -CurrentRouterReadyPathByTargetId $currentRouterReadyPathByTargetId
 $outputBlockSummary = Get-TargetAutoloopStatusOutputBlockSummary `
     -Config $config `
     -RunRoot $resolvedRunRoot `
@@ -1102,6 +1731,8 @@ $payload = [pscustomobject][ordered]@{
     WatcherState = [string](Get-ConfigValue -Object $statusDocument -Name 'WatcherState' -DefaultValue '')
     WatcherStopReason = [string](Get-ConfigValue -Object $statusDocument -Name 'WatcherStopReason' -DefaultValue '')
     WatcherMutexName = [string](Get-ConfigValue -Object $statusDocument -Name 'WatcherMutexName' -DefaultValue '')
+    WatcherTargetIds = @(Get-ConfigValue -Object $statusDocument -Name 'WatcherTargetIds' -DefaultValue @())
+    WatcherTargetScope = [string](Get-ConfigValue -Object $statusDocument -Name 'WatcherTargetScope' -DefaultValue '')
     HeartbeatAt = [string](Get-ConfigValue -Object $statusDocument -Name 'HeartbeatAt' -DefaultValue '')
     ProcessStartedAt = [string](Get-ConfigValue -Object $statusDocument -Name 'ProcessStartedAt' -DefaultValue '')
     ConfiguredRunDurationSec = [int](Get-ConfigValue -Object $statusDocument -Name 'ConfiguredRunDurationSec' -DefaultValue 0)
@@ -1137,9 +1768,57 @@ $payload = [pscustomobject][ordered]@{
     RouterPidExists = [bool](Get-ConfigValue -Object $routerSessionState -Name 'RouterPidExists' -DefaultValue $false)
     RouterMutexName = [string](Get-ConfigValue -Object $routerSessionState -Name 'RouterMutexName' -DefaultValue '')
     RouterMutexHeld = [bool](Get-ConfigValue -Object $routerSessionState -Name 'RouterMutexHeld' -DefaultValue $false)
+    RouterConfigDrift = [bool](Get-ConfigValue -Object $routerSessionState -Name 'RouterConfigDrift' -DefaultValue $false)
+    RouterConfigDriftReasons = @(Get-ConfigValue -Object $routerSessionState -Name 'RouterConfigDriftReasons' -DefaultValue @())
+    ConfiguredRequireUserIdleBeforeSend = [bool](Get-ConfigValue -Object $routerSessionState -Name 'ConfiguredRequireUserIdleBeforeSend' -DefaultValue $false)
+    ConfiguredMinUserIdleBeforeSendMs = [int](Get-ConfigValue -Object $routerSessionState -Name 'ConfiguredMinUserIdleBeforeSendMs' -DefaultValue 0)
+    ConfiguredUserIdleWaitTimeoutMs = [int](Get-ConfigValue -Object $routerSessionState -Name 'ConfiguredUserIdleWaitTimeoutMs' -DefaultValue 0)
+    ConfiguredUserIdleWaitPollMs = [int](Get-ConfigValue -Object $routerSessionState -Name 'ConfiguredUserIdleWaitPollMs' -DefaultValue 250)
+    ConfiguredSubmitGuardMs = [int](Get-ConfigValue -Object $routerSessionState -Name 'ConfiguredSubmitGuardMs' -DefaultValue 0)
+    ConfiguredVisibleExecutionFailOnFocusSteal = [bool](Get-ConfigValue -Object $routerSessionState -Name 'ConfiguredVisibleExecutionFailOnFocusSteal' -DefaultValue $false)
+    RouterRequireUserIdleBeforeSend = Get-ConfigValue -Object $routerSessionState -Name 'RouterRequireUserIdleBeforeSend' -DefaultValue $null
+    RouterMinUserIdleBeforeSendMs = Get-ConfigValue -Object $routerSessionState -Name 'RouterMinUserIdleBeforeSendMs' -DefaultValue $null
+    RouterUserIdleWaitTimeoutMs = Get-ConfigValue -Object $routerSessionState -Name 'RouterUserIdleWaitTimeoutMs' -DefaultValue $null
+    RouterUserIdleWaitPollMs = Get-ConfigValue -Object $routerSessionState -Name 'RouterUserIdleWaitPollMs' -DefaultValue $null
+    RouterSubmitGuardMs = Get-ConfigValue -Object $routerSessionState -Name 'RouterSubmitGuardMs' -DefaultValue $null
+    RouterVisibleExecutionFailOnFocusSteal = Get-ConfigValue -Object $routerSessionState -Name 'RouterVisibleExecutionFailOnFocusSteal' -DefaultValue $null
     RouterRetryPendingSummary = $retryPendingSummary
     RouterInboxReadySummary = $routerInboxReadySummary
     OutputBlockSummary = $outputBlockSummary
+}
+
+foreach ($targetRow in @($payload.Targets)) {
+    $targetId = [string](Get-ConfigValue -Object $targetRow -Name 'TargetId' -DefaultValue '')
+    if (-not (Test-NonEmptyString $targetId)) {
+        continue
+    }
+    $cycleCountForSmoke = [int](Get-ConfigValue -Object $targetRow -Name 'CycleCount' -DefaultValue 0)
+    $maxCycleCountForSmoke = [int](Get-ConfigValue -Object $targetRow -Name 'MaxCycleCount' -DefaultValue 0)
+    $smokeCycleSummary = Get-TargetAutoloopSmokeCycleLabel -CycleCount $cycleCountForSmoke -MaxCycleCount $maxCycleCountForSmoke
+    $targetRow | Add-Member -NotePropertyName SmokeCycleMinCount -NotePropertyValue $script:TargetAutoloopSmokeMinCycleCount -Force
+    $targetRow | Add-Member -NotePropertyName SmokeCycleSatisfied -NotePropertyValue ([bool]($cycleCountForSmoke -ge $script:TargetAutoloopSmokeMinCycleCount)) -Force
+    $targetRow | Add-Member -NotePropertyName SmokeCycleSummary -NotePropertyValue $smokeCycleSummary -Force
+    if (-not $manifestSummary.ManifestTargetMap.ContainsKey($targetId)) {
+        continue
+    }
+    $manifestTarget = $manifestSummary.ManifestTargetMap[$targetId]
+    foreach ($fieldName in @(
+            'TargetStateRoot',
+            'TargetStatePath',
+            'TargetStatusPath',
+            'TargetControlPath',
+            'TargetEventsPath',
+            'TargetWatcherMutexName'
+        )) {
+        $currentValue = [string](Get-ConfigValue -Object $targetRow -Name $fieldName -DefaultValue '')
+        if (Test-NonEmptyString $currentValue) {
+            continue
+        }
+        $manifestValue = [string](Get-ConfigValue -Object $manifestTarget -Name $fieldName -DefaultValue '')
+        if (Test-NonEmptyString $manifestValue) {
+            $targetRow | Add-Member -NotePropertyName $fieldName -NotePropertyValue $manifestValue -Force
+        }
+    }
 }
 
 $delaySummary = Get-TargetAutoloopDelaySummary -TargetRows @($payload.Targets)
@@ -1192,6 +1871,20 @@ $watcherHealthSummary = Get-TargetAutoloopWatcherHealthSummary `
 $watcherHealth = [string](Get-ConfigValue -Object $watcherHealthSummary -Name 'Health' -DefaultValue 'missing')
 $watcherHealthDetail = [string](Get-ConfigValue -Object $watcherHealthSummary -Name 'Detail' -DefaultValue '')
 $watcherRecommendation = [string](Get-ConfigValue -Object $watcherHealthSummary -Name 'Recommendation' -DefaultValue '')
+$watcherTargetIds = @(
+    Get-ConfigValue -Object $payload -Name 'WatcherTargetIds' -DefaultValue @() |
+        Where-Object { Test-NonEmptyString $_ } |
+        ForEach-Object { [string]$_ } |
+        Sort-Object -Unique
+)
+$watcherTargetScope = [string](Get-ConfigValue -Object $payload -Name 'WatcherTargetScope' -DefaultValue '')
+$watcherCoverageSummary = Add-TargetAutoloopWatcherCoverageToTargets `
+    -TargetRows @($payload.Targets) `
+    -WatcherTargetIds @($watcherTargetIds) `
+    -WatcherHealth $watcherHealth `
+    -ManifestEnabledTargetIds @($manifestEnabledTargetIds)
+$payload.Targets = @($watcherCoverageSummary.Targets)
+$payload | Add-Member -NotePropertyName WatcherCoverageSummary -NotePropertyValue $watcherCoverageSummary -Force
 $recommendationHistorySnapshot = Get-TargetAutoloopRecommendationHistorySnapshot -Root $root -RunRoot $resolvedRunRoot
 $recentRecommendation = Get-ConfigValue -Object $recommendationHistorySnapshot -Name 'Recent' -DefaultValue $null
 $recentRecommendationAction = [string](Get-ConfigValue -Object $recentRecommendation -Name 'ActionKey' -DefaultValue 'none')
@@ -1215,6 +1908,10 @@ $recommendationSpec = Get-TargetAutoloopCurrentRecommendationSpec `
     -RouterSessionMismatch:$routerSessionMismatch `
     -RouterLauncherSessionId $routerLauncherSessionId `
     -RuntimeLauncherSessionId $runtimeLauncherSessionId `
+    -RouterConfigDrift ([bool](Get-ConfigValue -Object $routerSessionState -Name 'RouterConfigDrift' -DefaultValue $false)) `
+    -RouterConfigDriftReasons @(Get-ConfigValue -Object $routerSessionState -Name 'RouterConfigDriftReasons' -DefaultValue @()) `
+    -ConfiguredUserIdleWaitTimeoutMs ([int](Get-ConfigValue -Object $routerSessionState -Name 'ConfiguredUserIdleWaitTimeoutMs' -DefaultValue 0)) `
+    -RouterUserIdleWaitTimeoutMs (Get-ConfigValue -Object $routerSessionState -Name 'RouterUserIdleWaitTimeoutMs' -DefaultValue $null) `
     -RetryPendingSummary $retryPendingSummary `
     -OutputBlockSummary $outputBlockSummary `
     -RecentRecommendation $recentRecommendation
@@ -1251,6 +1948,7 @@ $closeoutSummaryText = [string](Get-ConfigValue -Object $proofCloseout -Name 'Su
 $closeoutNextStep = [string](Get-ConfigValue -Object $proofCloseout -Name 'RecommendedNextStep' -DefaultValue '')
 
 if ($AsJson) {
+    $payload | Add-Member -NotePropertyName SmokeCycleMinCount -NotePropertyValue $script:TargetAutoloopSmokeMinCycleCount -Force
     $payload | Add-Member -NotePropertyName WatcherHealth -NotePropertyValue $watcherHealth -Force
     $payload | Add-Member -NotePropertyName WatcherHealthDetail -NotePropertyValue $watcherHealthDetail -Force
     $payload | Add-Member -NotePropertyName WatcherRecommendation -NotePropertyValue $watcherRecommendation -Force
@@ -1300,10 +1998,17 @@ $lines = @(
     ('WatcherHealth: ' + $watcherHealth)
     ('WatcherHealthDetail: ' + $(if (Test-NonEmptyString $watcherHealthDetail) { $watcherHealthDetail } else { '(none)' }))
     ('WatcherStopReason: ' + $(if (Test-NonEmptyString $watcherStopReason) { $watcherStopReason } else { '(none)' }))
+    ('WatcherCoverage: state={0} scope={1} targets={2} covered={3} missing={4} unknown={5}' -f `
+        [string](Get-ConfigValue -Object $watcherCoverageSummary -Name 'State' -DefaultValue 'inactive'),
+        $(if (Test-NonEmptyString $watcherTargetScope) { $watcherTargetScope } else { '(unknown)' }),
+        $(if (@($watcherTargetIds).Count -gt 0) { @($watcherTargetIds) -join ',' } else { '(unknown)' }),
+        $(if (@(Get-ConfigValue -Object $watcherCoverageSummary -Name 'CoveredTargetIds' -DefaultValue @()).Count -gt 0) { @(Get-ConfigValue -Object $watcherCoverageSummary -Name 'CoveredTargetIds' -DefaultValue @()) -join ',' } else { '(none)' }),
+        $(if (@(Get-ConfigValue -Object $watcherCoverageSummary -Name 'MissingTargetIds' -DefaultValue @()).Count -gt 0) { @(Get-ConfigValue -Object $watcherCoverageSummary -Name 'MissingTargetIds' -DefaultValue @()) -join ',' } else { '(none)' }),
+        $(if (@(Get-ConfigValue -Object $watcherCoverageSummary -Name 'UnknownTargetIds' -DefaultValue @()).Count -gt 0) { @(Get-ConfigValue -Object $watcherCoverageSummary -Name 'UnknownTargetIds' -DefaultValue @()) -join ',' } else { '(none)' }))
     ('HeartbeatAt: ' + $(if (Test-NonEmptyString ([string]$payload.HeartbeatAt)) { [string]$payload.HeartbeatAt } else { '(none)' }))
     ('ProcessStartedAt: ' + $(if (Test-NonEmptyString ([string]$payload.ProcessStartedAt)) { [string]$payload.ProcessStartedAt } else { '(none)' }))
     ('ConfiguredRunDurationSec: ' + [string]$payload.ConfiguredRunDurationSec)
-    ('RouterSession: state={0} mismatch={1} router={2} runtime={3} routerStatus={4} routerPid={5} pidExists={6} mutexHeld={7} stateAgeSec={8}' -f `
+    ('RouterSession: state={0} mismatch={1} router={2} runtime={3} routerStatus={4} routerPid={5} pidExists={6} mutexHeld={7} stateAgeSec={8} configDrift={9} configuredIdleWaitMs={10} routerIdleWaitMs={11}' -f `
         $(if (Test-NonEmptyString ([string]$payload.RouterSessionState)) { [string]$payload.RouterSessionState } else { '(none)' }),
         [bool]$payload.RouterSessionMismatch,
         $(if (Test-NonEmptyString ([string]$payload.RouterLauncherSessionId)) { [string]$payload.RouterLauncherSessionId } else { '(none)' }),
@@ -1312,13 +2017,22 @@ $lines = @(
         [int]$payload.RouterPid,
         [bool]$payload.RouterPidExists,
         [bool]$payload.RouterMutexHeld,
-        [int]$payload.RouterStateAgeSeconds)
-    ('RouterRetryPending: count={0} targets={1} latestTarget={2} latestFailure={3} latestDebugLog={4}' -f `
+        [int]$payload.RouterStateAgeSeconds,
+        [bool]$payload.RouterConfigDrift,
+        [int]$payload.ConfiguredUserIdleWaitTimeoutMs,
+        $(if ($null -ne $payload.RouterUserIdleWaitTimeoutMs) { [string]$payload.RouterUserIdleWaitTimeoutMs } else { '(missing)' }))
+    ('RouterRetryPending: count={0} current={1} stale={2} targets={3} currentTargets={4} latestTarget={5} latestFailure={6} latestDebugLog={7} latestFocusPolicy={8} latestRetryPolicy={9} latestRetryStage={10}' -f `
         [int](Get-ConfigValue -Object $retryPendingSummary -Name 'Count' -DefaultValue 0),
+        [int](Get-ConfigValue -Object $retryPendingSummary -Name 'CurrentCount' -DefaultValue 0),
+        [int](Get-ConfigValue -Object $retryPendingSummary -Name 'StaleCount' -DefaultValue 0),
         $(if (@(Get-ConfigValue -Object $retryPendingSummary -Name 'TargetIds' -DefaultValue @()).Count -gt 0) { @(Get-ConfigValue -Object $retryPendingSummary -Name 'TargetIds' -DefaultValue @()) -join ',' } else { '(none)' }),
-        $(if (Test-NonEmptyString ([string](Get-ConfigValue -Object $retryPendingSummary -Name 'LatestTargetId' -DefaultValue ''))) { [string](Get-ConfigValue -Object $retryPendingSummary -Name 'LatestTargetId' -DefaultValue '') } else { '(none)' }),
-        $(if (Test-NonEmptyString ([string](Get-ConfigValue -Object $retryPendingSummary -Name 'LatestFailureCategory' -DefaultValue ''))) { [string](Get-ConfigValue -Object $retryPendingSummary -Name 'LatestFailureCategory' -DefaultValue '') } else { '(none)' }),
-        $(if (Test-NonEmptyString ([string](Get-ConfigValue -Object $retryPendingSummary -Name 'LatestDebugLogPath' -DefaultValue ''))) { [string](Get-ConfigValue -Object $retryPendingSummary -Name 'LatestDebugLogPath' -DefaultValue '') } else { '(none)' }))
+        $(if (@(Get-ConfigValue -Object $retryPendingSummary -Name 'CurrentTargetIds' -DefaultValue @()).Count -gt 0) { @(Get-ConfigValue -Object $retryPendingSummary -Name 'CurrentTargetIds' -DefaultValue @()) -join ',' } else { '(none)' }),
+        $(if (Test-NonEmptyString ([string](Get-ConfigValue -Object $retryPendingSummary -Name 'LatestCurrentTargetId' -DefaultValue ''))) { [string](Get-ConfigValue -Object $retryPendingSummary -Name 'LatestCurrentTargetId' -DefaultValue '') } elseif (Test-NonEmptyString ([string](Get-ConfigValue -Object $retryPendingSummary -Name 'LatestTargetId' -DefaultValue ''))) { [string](Get-ConfigValue -Object $retryPendingSummary -Name 'LatestTargetId' -DefaultValue '') } else { '(none)' }),
+        $(if (Test-NonEmptyString ([string](Get-ConfigValue -Object $retryPendingSummary -Name 'LatestCurrentFailureCategory' -DefaultValue ''))) { [string](Get-ConfigValue -Object $retryPendingSummary -Name 'LatestCurrentFailureCategory' -DefaultValue '') } elseif (Test-NonEmptyString ([string](Get-ConfigValue -Object $retryPendingSummary -Name 'LatestFailureCategory' -DefaultValue ''))) { [string](Get-ConfigValue -Object $retryPendingSummary -Name 'LatestFailureCategory' -DefaultValue '') } else { '(none)' }),
+        $(if (Test-NonEmptyString ([string](Get-ConfigValue -Object $retryPendingSummary -Name 'LatestCurrentDebugLogPath' -DefaultValue ''))) { [string](Get-ConfigValue -Object $retryPendingSummary -Name 'LatestCurrentDebugLogPath' -DefaultValue '') } elseif (Test-NonEmptyString ([string](Get-ConfigValue -Object $retryPendingSummary -Name 'LatestDebugLogPath' -DefaultValue ''))) { [string](Get-ConfigValue -Object $retryPendingSummary -Name 'LatestDebugLogPath' -DefaultValue '') } else { '(none)' }),
+        $(if (Test-NonEmptyString ([string](Get-ConfigValue -Object $retryPendingSummary -Name 'LatestCurrentFocusLostRetryPolicy' -DefaultValue ''))) { [string](Get-ConfigValue -Object $retryPendingSummary -Name 'LatestCurrentFocusLostRetryPolicy' -DefaultValue '') } elseif (Test-NonEmptyString ([string](Get-ConfigValue -Object $retryPendingSummary -Name 'LatestStaleFocusLostRetryPolicy' -DefaultValue ''))) { [string](Get-ConfigValue -Object $retryPendingSummary -Name 'LatestStaleFocusLostRetryPolicy' -DefaultValue '') } else { '(none)' }),
+        $(if (Test-NonEmptyString ([string](Get-ConfigValue -Object $retryPendingSummary -Name 'LatestCurrentSendRetryPolicy' -DefaultValue ''))) { [string](Get-ConfigValue -Object $retryPendingSummary -Name 'LatestCurrentSendRetryPolicy' -DefaultValue '') } elseif (Test-NonEmptyString ([string](Get-ConfigValue -Object $retryPendingSummary -Name 'LatestStaleSendRetryPolicy' -DefaultValue ''))) { [string](Get-ConfigValue -Object $retryPendingSummary -Name 'LatestStaleSendRetryPolicy' -DefaultValue '') } else { '(none)' }),
+        $(if (Test-NonEmptyString ([string](Get-ConfigValue -Object $retryPendingSummary -Name 'LatestCurrentSendStage' -DefaultValue ''))) { [string](Get-ConfigValue -Object $retryPendingSummary -Name 'LatestCurrentSendStage' -DefaultValue '') } elseif (Test-NonEmptyString ([string](Get-ConfigValue -Object $retryPendingSummary -Name 'LatestStaleSendStage' -DefaultValue ''))) { [string](Get-ConfigValue -Object $retryPendingSummary -Name 'LatestStaleSendStage' -DefaultValue '') } else { '(none)' }))
     ('RouterInboxReady: count={0} targets={1} latestTarget={2} latestSession={3} latestCreatedAt={4} latestPath={5}' -f `
         [int](Get-ConfigValue -Object $routerInboxReadySummary -Name 'Count' -DefaultValue 0),
         $(if (@(Get-ConfigValue -Object $routerInboxReadySummary -Name 'TargetIds' -DefaultValue @()).Count -gt 0) { @(Get-ConfigValue -Object $routerInboxReadySummary -Name 'TargetIds' -DefaultValue @()) -join ',' } else { '(none)' }),
@@ -1345,6 +2059,7 @@ $lines = @(
     ('RecommendationDetail: ' + $(if (Test-NonEmptyString ([string](Get-ConfigValue -Object $recommendationSpec -Name 'Detail' -DefaultValue ''))) { [string](Get-ConfigValue -Object $recommendationSpec -Name 'Detail' -DefaultValue '') } else { '(none)' }))
     ('RecommendationRetryBadge: ' + [string](Get-ConfigValue -Object $recommendationRetryBadge -Name 'Text' -DefaultValue '재시도 사유: (없음)'))
     ('SmokeSummary: ' + $smokeSummaryText)
+    ('SmokeCyclePolicy: {0}-cycle smoke check, MaxCycleCount is an operating cap' -f $script:TargetAutoloopSmokeMinCycleCount)
     ('CloseoutSummary: ' + $closeoutSummaryText)
     ('CloseoutNextStep: ' + $(if (Test-NonEmptyString $closeoutNextStep) { $closeoutNextStep } else { '(none)' }))
     ('SmokeReceiptPath: ' + [string](Get-ConfigValue -Object $smokeReceipt -Name 'Path' -DefaultValue [string]$statePaths.SmokeReceiptPath))
@@ -1396,6 +2111,7 @@ foreach ($targetRow in @($payload.Targets)) {
     $cycleCount = [int](Get-ConfigValue -Object $targetRow -Name 'CycleCount' -DefaultValue 0)
     $maxCycleCount = [int](Get-ConfigValue -Object $targetRow -Name 'MaxCycleCount' -DefaultValue 0)
     $cycleLabel = if ($maxCycleCount -gt 0) { ('cycle {0}/{1}' -f $cycleCount, $maxCycleCount) } else { ('cycle {0}' -f $cycleCount) }
+    $smokeCycleLabel = Get-TargetAutoloopSmokeCycleLabel -CycleCount $cycleCount -MaxCycleCount $maxCycleCount
     $dispatchState = [string](Get-ConfigValue -Object $targetRow -Name 'LastDispatchState' -DefaultValue '')
     $isDispatchDelayRow = Test-TargetAutoloopDispatchDelayRow -TargetRow $targetRow
     $line = ('{0} | {1} | {2} | next: {3} | trigger: {4} | dispatch: {5}' -f
@@ -1405,6 +2121,7 @@ foreach ($targetRow in @($payload.Targets)) {
         [string](Get-ConfigValue -Object $targetRow -Name 'NextAction' -DefaultValue ''),
         [string](Get-ConfigValue -Object $targetRow -Name 'LastTriggerKind' -DefaultValue ''),
         $dispatchState)
+    $line += (' | {0}' -f $smokeCycleLabel)
     if ($isDispatchDelayRow -and (Test-NonEmptyString $delayLabel)) {
         $line += (' | {0}' -f $delayLabel)
     }
@@ -1428,7 +2145,25 @@ foreach ($targetRow in @($payload.Targets)) {
     if (Test-NonEmptyString $lastFailureReason) {
         $line += (' | fail: {0}' -f $lastFailureReason)
     }
+    $watcherCoverageState = [string](Get-ConfigValue -Object $targetRow -Name 'WatcherCoverageState' -DefaultValue '')
+    if (Test-NonEmptyString $watcherCoverageState) {
+        $watcherCoverageDetail = [string](Get-ConfigValue -Object $targetRow -Name 'WatcherCoverageDetail' -DefaultValue '')
+        $line += (' | watcherCoverage: {0}{1}' -f $watcherCoverageState, $(if (Test-NonEmptyString $watcherCoverageDetail) { " ($watcherCoverageDetail)" } else { '' }))
+    }
+    $recoveryHint = Get-TargetAutoloopTargetRecoveryHint -TargetRow $targetRow -RetryPendingSummary $retryPendingSummary -RouterInboxReadySummary $routerInboxReadySummary
+    if (Test-NonEmptyString $recoveryHint) {
+        $line += (' | {0}' -f $recoveryHint)
+    }
     $lines += $line
+    $targetStatusPath = [string](Get-ConfigValue -Object $targetRow -Name 'TargetStatusPath' -DefaultValue '')
+    $targetControlPath = [string](Get-ConfigValue -Object $targetRow -Name 'TargetControlPath' -DefaultValue '')
+    $targetWatcherMutexName = [string](Get-ConfigValue -Object $targetRow -Name 'TargetWatcherMutexName' -DefaultValue '')
+    if ((Test-NonEmptyString $targetStatusPath) -or (Test-NonEmptyString $targetControlPath) -or (Test-NonEmptyString $targetWatcherMutexName)) {
+        $lines += ('  targetState: status={0} control={1} mutex={2}' -f
+            $(if (Test-NonEmptyString $targetStatusPath) { $targetStatusPath } else { '(none)' }),
+            $(if (Test-NonEmptyString $targetControlPath) { $targetControlPath } else { '(none)' }),
+            $(if (Test-NonEmptyString $targetWatcherMutexName) { $targetWatcherMutexName } else { '(none)' }))
+    }
 }
 
 $lines

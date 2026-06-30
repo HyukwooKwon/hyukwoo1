@@ -83,6 +83,25 @@ Assert-True ([string]$targetState.NextAction -eq 'wait-for-input') 'target01 nex
 Assert-True ([int]$targetState.CycleCount -eq 0) 'target01 cycle count should start at zero.'
 Assert-True (-not [bool]$start.QueueDispatchIntegrated) 'dispatch should remain disabled in the isolated groundwork.'
 
+$overrideRunRoot = Join-Path $tmpRoot 'run_target_autoloop_max_override'
+$overrideStartJson = & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Start-TargetAutoloopRun.ps1') `
+    -ConfigPath $configPath `
+    -RunRoot $overrideRunRoot `
+    -Targets target01 `
+    -MaxCycleCount 2 `
+    -AsJson
+$overrideStart = $overrideStartJson | ConvertFrom-Json
+$overrideManifest = Get-Content -LiteralPath $overrideStart.ManifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
+$overrideManifestTarget = @($overrideManifest.Targets | Where-Object { [string]$_.TargetId -eq 'target01' } | Select-Object -First 1)[0]
+$overrideState = Get-Content -LiteralPath $overrideStart.StatePath -Raw -Encoding UTF8 | ConvertFrom-Json
+$overrideStatus = Get-Content -LiteralPath $overrideStart.StatusPath -Raw -Encoding UTF8 | ConvertFrom-Json
+$overrideStatusTarget = @($overrideStatus.Targets | Where-Object { [string]$_.TargetId -eq 'target01' } | Select-Object -First 1)[0]
+Assert-True ([int]$overrideStart.MaxCycleCountOverride -eq 2) 'start result should surface the run max cycle override.'
+Assert-True ([int]$overrideManifest.TargetAutoloop.RunMaxCycleCountOverride -eq 2) 'manifest should persist the run max cycle override.'
+Assert-True ([int]$overrideManifestTarget.MaxCycleCount -eq 2) 'manifest target should use the run max cycle override.'
+Assert-True ([int]$overrideState.Targets.target01.MaxCycleCount -eq 2) 'state target should use the run max cycle override.'
+Assert-True ([int]$overrideStatusTarget.MaxCycleCount -eq 2) 'status target should use the run max cycle override.'
+
 $multiRunRoot = Join-Path $tmpRoot 'run_target_autoloop_multi'
 $multiStartJson = & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Start-TargetAutoloopRun.ps1') `
     -ConfigPath $configPath `
@@ -120,6 +139,7 @@ finally {
     $ErrorActionPreference = $previousErrorActionPreference
 }
 Assert-True ($unknownExitCode -ne 0) 'unknown -Targets should fail.'
-Assert-True ((($unknownOutput | Out-String) -match 'selected target was not found in TargetAutoloop\.Targets: target99')) 'unknown target failure should explain missing TargetAutoloop target.'
+$unknownOutputText = ($unknownOutput | Out-String)
+Assert-True (($unknownOutputText -match 'selected target was not found in TargetAutoloop\.Targets:' -and $unknownOutputText -match 'target99')) 'unknown target failure should explain missing TargetAutoloop target.'
 
 Write-Host 'start target autoloop run ok'

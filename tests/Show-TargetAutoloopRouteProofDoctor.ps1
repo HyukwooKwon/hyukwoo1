@@ -152,12 +152,16 @@ foreach ($target in @($config.Targets | Sort-Object TargetId)) {
     $inManifest = [bool]$manifestTargetMap.ContainsKey($targetId)
     $manifestTargetRecord = if ($inManifest) { $manifestTargetMap[$targetId] } else { $null }
     $manifestEnabled = if ($inManifest) { [bool](Get-ConfigValue -Object $manifestTargetRecord -Name 'Enabled' -DefaultValue $false) } else { $false }
+    $routeScope = Get-TargetAutoloopRouteScopeState -ManifestExists $manifestExists -ManifestRunMode $manifestRunMode -InManifest $inManifest
 
     $row = [pscustomobject]@{
         TargetId = $targetId
         Enabled = [bool](Get-ConfigValue -Object $target -Name 'Enabled' -DefaultValue $false)
         InManifest = [bool]$inManifest
         ManifestEnabled = [bool]$manifestEnabled
+        RouteScope = [string]$routeScope.Scope
+        RouteScopeActive = [bool]$routeScope.Active
+        RouteScopeReason = [string]$routeScope.Reason
         Phase = [string](Get-ConfigValue -Object $stateRecord -Name 'Phase' -DefaultValue ([string](Get-ConfigValue -Object $statusRow -Name 'Phase' -DefaultValue '')))
         CycleCount = [int](Get-ConfigValue -Object $stateRecord -Name 'CycleCount' -DefaultValue ([int](Get-ConfigValue -Object $statusRow -Name 'CycleCount' -DefaultValue 0)))
         MaxCycleCount = [int](Get-ConfigValue -Object $stateRecord -Name 'MaxCycleCount' -DefaultValue ([int](Get-ConfigValue -Object $statusRow -Name 'MaxCycleCount' -DefaultValue 0)))
@@ -221,6 +225,7 @@ $counts = [ordered]@{
     PartialContracts = @($targetRows | Where-Object { [string]$_.Contract.State -eq 'partial' }).Count
     InvalidContracts = @($targetRows | Where-Object { [string]$_.Contract.State -eq 'invalid' }).Count
     MissingContracts = @($targetRows | Where-Object { [string]$_.Contract.State -eq 'missing' }).Count
+    OutOfScopeTargets = @($targetRows | Where-Object { -not [bool]$_.RouteScopeActive }).Count
     CollisionEntries = @($collisions).Count
 }
 
@@ -270,13 +275,14 @@ $lines += @(
     ('SmokeSummary: ' + [string](Get-ConfigValue -Object $proofReceipt -Name 'Summary' -DefaultValue 'smoke: (없음)'))
     ('CloseoutSummary: ' + [string](Get-ConfigValue -Object $proofCloseout -Name 'Summary' -DefaultValue 'closeout: pending-proof / mode=not-ready / reason=no-proof'))
     ('CloseoutNextStep: ' + [string](Get-ConfigValue -Object $proofCloseout -Name 'RecommendedNextStep' -DefaultValue ''))
-    ('Counts: total={0} enabled={1} ready={2} partial={3} invalid={4} missing={5} collisions={6}' -f
+    ('Counts: total={0} enabled={1} ready={2} partial={3} invalid={4} missing={5} outOfScope={6} collisions={7}' -f
         [int]$counts.TotalTargets,
         [int]$counts.EnabledTargets,
         [int]$counts.ReadyContracts,
         [int]$counts.PartialContracts,
         [int]$counts.InvalidContracts,
         [int]$counts.MissingContracts,
+        [int]$counts.OutOfScopeTargets,
         [int]$counts.CollisionEntries)
     ''
 )

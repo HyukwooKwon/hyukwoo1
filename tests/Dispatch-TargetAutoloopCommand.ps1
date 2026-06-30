@@ -157,85 +157,6 @@ else {
     $resolvedCommandPath = $firstQueued.FullName
 }
 
-$routerSessionState = Get-TargetAutoloopRouterSessionState -Config $config
-$routerSessionStateName = [string](Get-ConfigValue -Object $routerSessionState -Name 'State' -DefaultValue '')
-$routerSessionMismatch = [bool](Get-ConfigValue -Object $routerSessionState -Name 'Mismatch' -DefaultValue $false)
-$routerSessionBlocksDispatch = $routerSessionMismatch -or ([string]$config.RunMode -eq 'target-autoloop' -and $routerSessionStateName -ne 'ok')
-if ($routerSessionBlocksDispatch) {
-    $queuedCommandPreview = Read-JsonObject -Path $resolvedCommandPath
-    $blockedCommandId = [string](Get-ConfigValue -Object $queuedCommandPreview -Name 'CommandId' -DefaultValue '')
-    $blockedTriggerKind = [string](Get-ConfigValue -Object $queuedCommandPreview -Name 'TriggerKind' -DefaultValue '')
-    $blockedTriggerFingerprint = [string](Get-ConfigValue -Object $queuedCommandPreview -Name 'TriggerFingerprint' -DefaultValue '')
-    $blockedLoopSource = [string](Get-ConfigValue -Object $queuedCommandPreview -Name 'LoopSource' -DefaultValue '')
-    $blockedCycleId = [int](Get-ConfigValue -Object $queuedCommandPreview -Name 'CycleId' -DefaultValue 0)
-    $blockMessage = New-TargetAutoloopRouterSessionNotReadyMessage -RouterSessionState $routerSessionState
-    $dispatchState = if ($routerSessionMismatch) { 'router-session-mismatch' } else { 'router-session-not-ready' }
-    $resultState = if ($routerSessionMismatch) { 'blocked-by-router-session-mismatch' } else { 'blocked-by-router-session-not-ready' }
-    $blockReason = if ($routerSessionMismatch) { 'router-launcher-session-mismatch' } elseif (Test-NonEmptyString $routerSessionStateName) { $routerSessionStateName } else { 'router-session-not-ready' }
-
-    $entry.Phase = 'queued'
-    $entry.NextAction = 'dispatch-command'
-    $entry.LastDispatchAt = (Get-Date).ToString('o')
-    $entry.LastDispatchState = $dispatchState
-    $entry.LastCommandPath = $resolvedCommandPath
-    $entry.LastFailureReason = $blockMessage
-    $entry.LastProgressSignalAt = (Get-Date).ToString('o')
-    Set-TargetAutoloopTargetStateMap -TargetStateMap $stateMap -StateDocument $stateDocument
-    $stateDocument.LastUpdatedAt = (Get-Date).ToString('o')
-    Write-JsonFileAtomically -Path $statePaths.StatePath -Payload $stateDocument
-    $statusDocument = New-TargetAutoloopStatusDocument -Config $config -RunRoot $resolvedRunRoot -StateDocument $stateDocument -ControlDocument $controlDocument
-    Write-JsonFileAtomically -Path $statePaths.StatusPath -Payload $statusDocument
-
-    Append-TargetAutoloopEvent -Path $statePaths.EventsPath -EventType 'dispatch-blocked' -TargetId $TargetId -TriggerKind $blockedTriggerKind -TriggerFingerprint $blockedTriggerFingerprint -Extra @{
-        CommandId = $blockedCommandId
-        CommandPath = $resolvedCommandPath
-        CycleId = $blockedCycleId
-        LoopSource = $blockedLoopSource
-        BlockReason = $blockReason
-        RouterSessionState = $routerSessionStateName
-        RouterLauncherSessionId = [string](Get-ConfigValue -Object $routerSessionState -Name 'RouterLauncherSessionId' -DefaultValue '')
-        RuntimeLauncherSessionId = [string](Get-ConfigValue -Object $routerSessionState -Name 'RuntimeLauncherSessionId' -DefaultValue '')
-        RouterPid = [int](Get-ConfigValue -Object $routerSessionState -Name 'RouterPid' -DefaultValue 0)
-        RouterPidExists = [bool](Get-ConfigValue -Object $routerSessionState -Name 'RouterPidExists' -DefaultValue $false)
-        RouterMutexName = [string](Get-ConfigValue -Object $routerSessionState -Name 'RouterMutexName' -DefaultValue '')
-        RouterMutexHeld = [bool](Get-ConfigValue -Object $routerSessionState -Name 'RouterMutexHeld' -DefaultValue $false)
-    }
-
-    $sessionBlockedResult = [pscustomobject][ordered]@{
-        SchemaVersion = $script:TargetAutoloopSchemaVersion
-        RunRoot = $resolvedRunRoot
-        TargetId = $TargetId
-        CommandId = $blockedCommandId
-        CommandPath = $resolvedCommandPath
-        TriggerKind = $blockedTriggerKind
-        TriggerFingerprint = $blockedTriggerFingerprint
-        LoopSource = $blockedLoopSource
-        CycleId = $blockedCycleId
-        State = $resultState
-        BlockReason = $blockReason
-        Message = $blockMessage
-        ReadyPath = ''
-        RuntimeMapPath = [string](Get-ConfigValue -Object $routerSessionState -Name 'RuntimeMapPath' -DefaultValue '')
-        RuntimeLauncherSessionId = [string](Get-ConfigValue -Object $routerSessionState -Name 'RuntimeLauncherSessionId' -DefaultValue '')
-        RouterStatePath = [string](Get-ConfigValue -Object $routerSessionState -Name 'RouterStatePath' -DefaultValue '')
-        RouterLauncherSessionId = [string](Get-ConfigValue -Object $routerSessionState -Name 'RouterLauncherSessionId' -DefaultValue '')
-        RouterStatus = [string](Get-ConfigValue -Object $routerSessionState -Name 'RouterStatus' -DefaultValue '')
-        RouterSessionState = $routerSessionStateName
-        RouterPid = [int](Get-ConfigValue -Object $routerSessionState -Name 'RouterPid' -DefaultValue 0)
-        RouterPidExists = [bool](Get-ConfigValue -Object $routerSessionState -Name 'RouterPidExists' -DefaultValue $false)
-        RouterMutexName = [string](Get-ConfigValue -Object $routerSessionState -Name 'RouterMutexName' -DefaultValue '')
-        RouterMutexHeld = [bool](Get-ConfigValue -Object $routerSessionState -Name 'RouterMutexHeld' -DefaultValue $false)
-    }
-
-    if ($AsJson) {
-        $sessionBlockedResult | ConvertTo-Json -Depth 10
-        return
-    }
-
-    $sessionBlockedResult
-    return
-}
-
 $controllerState = [string](Get-ConfigValue -Object $controlDocument -Name 'State' -DefaultValue 'running')
 $controlPendingAction = [string](Get-TargetAutoloopPendingControlAction -ControlDocument $controlDocument)
 $dispatchBlockedByController = (Test-NonEmptyString $controlPendingAction) -or ($controllerState -ne 'running')
@@ -302,6 +223,91 @@ if ($dispatchBlockedByController) {
     return
 }
 
+$routerSessionState = Get-TargetAutoloopRouterSessionState -Config $config
+$routerSessionStateName = [string](Get-ConfigValue -Object $routerSessionState -Name 'State' -DefaultValue '')
+$routerSessionMismatch = [bool](Get-ConfigValue -Object $routerSessionState -Name 'Mismatch' -DefaultValue $false)
+$routerSessionBlocksDispatch = $routerSessionMismatch -or ([string]$config.RunMode -eq 'target-autoloop' -and $routerSessionStateName -ne 'ok')
+if ($routerSessionBlocksDispatch) {
+    $queuedCommandPreview = Read-JsonObject -Path $resolvedCommandPath
+    $blockedCommandId = [string](Get-ConfigValue -Object $queuedCommandPreview -Name 'CommandId' -DefaultValue '')
+    $blockedTriggerKind = [string](Get-ConfigValue -Object $queuedCommandPreview -Name 'TriggerKind' -DefaultValue '')
+    $blockedTriggerFingerprint = [string](Get-ConfigValue -Object $queuedCommandPreview -Name 'TriggerFingerprint' -DefaultValue '')
+    $blockedLoopSource = [string](Get-ConfigValue -Object $queuedCommandPreview -Name 'LoopSource' -DefaultValue '')
+    $blockedCycleId = [int](Get-ConfigValue -Object $queuedCommandPreview -Name 'CycleId' -DefaultValue 0)
+    $blockMessage = New-TargetAutoloopRouterSessionNotReadyMessage -RouterSessionState $routerSessionState
+    $dispatchState = if ($routerSessionMismatch) { 'router-session-mismatch' } else { 'router-session-not-ready' }
+    $resultState = if ($routerSessionMismatch) { 'blocked-by-router-session-mismatch' } else { 'blocked-by-router-session-not-ready' }
+    $blockReason = if ($routerSessionMismatch) { 'router-launcher-session-mismatch' } elseif (Test-NonEmptyString $routerSessionStateName) { $routerSessionStateName } else { 'router-session-not-ready' }
+
+    $entry.Phase = 'queued'
+    $entry.NextAction = 'dispatch-command'
+    $entry.LastDispatchAt = (Get-Date).ToString('o')
+    $entry.LastDispatchState = $dispatchState
+    $entry.LastCommandPath = $resolvedCommandPath
+    $entry.LastFailureReason = $blockMessage
+    $entry.LastProgressSignalAt = (Get-Date).ToString('o')
+    Set-TargetAutoloopTargetStateMap -TargetStateMap $stateMap -StateDocument $stateDocument
+    $stateDocument.LastUpdatedAt = (Get-Date).ToString('o')
+    Write-JsonFileAtomically -Path $statePaths.StatePath -Payload $stateDocument
+    $statusDocument = New-TargetAutoloopStatusDocument -Config $config -RunRoot $resolvedRunRoot -StateDocument $stateDocument -ControlDocument $controlDocument
+    Write-JsonFileAtomically -Path $statePaths.StatusPath -Payload $statusDocument
+    Sync-TargetAutoloopTargetSidecarDocuments `
+        -Config $config `
+        -RunRoot $resolvedRunRoot `
+        -StateDocument $stateDocument `
+        -ControlDocument $controlDocument `
+        -StatusDocument $statusDocument
+
+    Append-TargetAutoloopEvent -Path $statePaths.EventsPath -EventType 'dispatch-blocked' -TargetId $TargetId -TriggerKind $blockedTriggerKind -TriggerFingerprint $blockedTriggerFingerprint -Extra @{
+        CommandId = $blockedCommandId
+        CommandPath = $resolvedCommandPath
+        CycleId = $blockedCycleId
+        LoopSource = $blockedLoopSource
+        BlockReason = $blockReason
+        RouterSessionState = $routerSessionStateName
+        RouterLauncherSessionId = [string](Get-ConfigValue -Object $routerSessionState -Name 'RouterLauncherSessionId' -DefaultValue '')
+        RuntimeLauncherSessionId = [string](Get-ConfigValue -Object $routerSessionState -Name 'RuntimeLauncherSessionId' -DefaultValue '')
+        RouterPid = [int](Get-ConfigValue -Object $routerSessionState -Name 'RouterPid' -DefaultValue 0)
+        RouterPidExists = [bool](Get-ConfigValue -Object $routerSessionState -Name 'RouterPidExists' -DefaultValue $false)
+        RouterMutexName = [string](Get-ConfigValue -Object $routerSessionState -Name 'RouterMutexName' -DefaultValue '')
+        RouterMutexHeld = [bool](Get-ConfigValue -Object $routerSessionState -Name 'RouterMutexHeld' -DefaultValue $false)
+    }
+
+    $sessionBlockedResult = [pscustomobject][ordered]@{
+        SchemaVersion = $script:TargetAutoloopSchemaVersion
+        RunRoot = $resolvedRunRoot
+        TargetId = $TargetId
+        CommandId = $blockedCommandId
+        CommandPath = $resolvedCommandPath
+        TriggerKind = $blockedTriggerKind
+        TriggerFingerprint = $blockedTriggerFingerprint
+        LoopSource = $blockedLoopSource
+        CycleId = $blockedCycleId
+        State = $resultState
+        BlockReason = $blockReason
+        Message = $blockMessage
+        ReadyPath = ''
+        RuntimeMapPath = [string](Get-ConfigValue -Object $routerSessionState -Name 'RuntimeMapPath' -DefaultValue '')
+        RuntimeLauncherSessionId = [string](Get-ConfigValue -Object $routerSessionState -Name 'RuntimeLauncherSessionId' -DefaultValue '')
+        RouterStatePath = [string](Get-ConfigValue -Object $routerSessionState -Name 'RouterStatePath' -DefaultValue '')
+        RouterLauncherSessionId = [string](Get-ConfigValue -Object $routerSessionState -Name 'RouterLauncherSessionId' -DefaultValue '')
+        RouterStatus = [string](Get-ConfigValue -Object $routerSessionState -Name 'RouterStatus' -DefaultValue '')
+        RouterSessionState = $routerSessionStateName
+        RouterPid = [int](Get-ConfigValue -Object $routerSessionState -Name 'RouterPid' -DefaultValue 0)
+        RouterPidExists = [bool](Get-ConfigValue -Object $routerSessionState -Name 'RouterPidExists' -DefaultValue $false)
+        RouterMutexName = [string](Get-ConfigValue -Object $routerSessionState -Name 'RouterMutexName' -DefaultValue '')
+        RouterMutexHeld = [bool](Get-ConfigValue -Object $routerSessionState -Name 'RouterMutexHeld' -DefaultValue $false)
+    }
+
+    if ($AsJson) {
+        $sessionBlockedResult | ConvertTo-Json -Depth 10
+        return
+    }
+
+    $sessionBlockedResult
+    return
+}
+
 $processingPath = Move-CommandToArchive -Path $resolvedCommandPath -DestinationRoot ([string]$queuePaths.ProcessingRoot)
 $command = Read-JsonObject -Path $processingPath
 if ([string](Get-ConfigValue -Object $command -Name 'TargetId' -DefaultValue '') -ne $TargetId) {
@@ -341,6 +347,12 @@ try {
     Write-JsonFileAtomically -Path $statePaths.StatePath -Payload $stateDocument
     $statusDocument = New-TargetAutoloopStatusDocument -Config $config -RunRoot $resolvedRunRoot -StateDocument $stateDocument -ControlDocument $controlDocument
     Write-JsonFileAtomically -Path $statePaths.StatusPath -Payload $statusDocument
+    Sync-TargetAutoloopTargetSidecarDocuments `
+        -Config $config `
+        -RunRoot $resolvedRunRoot `
+        -StateDocument $stateDocument `
+        -ControlDocument $controlDocument `
+        -StatusDocument $statusDocument
     Append-TargetAutoloopEvent -Path $statePaths.EventsPath -EventType 'router-ready-created' -TargetId $TargetId -TriggerKind $triggerKind -TriggerFingerprint $triggerFingerprint -Extra @{
         CommandId = $commandId
         CycleId = $cycleId
@@ -379,6 +391,12 @@ catch {
     Write-JsonFileAtomically -Path $statePaths.StatePath -Payload $stateDocument
     $statusDocument = New-TargetAutoloopStatusDocument -Config $config -RunRoot $resolvedRunRoot -StateDocument $stateDocument -ControlDocument $controlDocument
     Write-JsonFileAtomically -Path $statePaths.StatusPath -Payload $statusDocument
+    Sync-TargetAutoloopTargetSidecarDocuments `
+        -Config $config `
+        -RunRoot $resolvedRunRoot `
+        -StateDocument $stateDocument `
+        -ControlDocument $controlDocument `
+        -StatusDocument $statusDocument
     Append-TargetAutoloopEvent -Path $statePaths.EventsPath -EventType 'router-ready-failed' -TargetId $TargetId -TriggerKind $triggerKind -TriggerFingerprint $triggerFingerprint -Extra @{
         CommandId = $commandId
         CycleId = $cycleId

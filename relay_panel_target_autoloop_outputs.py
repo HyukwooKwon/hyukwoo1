@@ -140,6 +140,7 @@ def format_prepare_manifest_summary_lines(
         manifest_targets = []
     included_target_ids = []
     publish_ready_count = 0
+    work_repo_lines = []
     source_outbox_lines = []
     queue_root_lines = []
     for row in manifest_targets:
@@ -160,8 +161,11 @@ def format_prepare_manifest_summary_lines(
         }
         if "publish-ready" in trigger_kinds:
             publish_ready_count += 1
+        work_repo_root = str(row.get("WorkRepoRoot", "") or "").strip()
         source_outbox = str(row.get("SourceOutboxPath", "") or "").strip()
         queue_root = str(row.get("QueueRoot", "") or "").strip()
+        if work_repo_root:
+            work_repo_lines.append(f"  {target_id}: {work_repo_root}")
         if source_outbox:
             source_outbox_lines.append(f"  {target_id}: {source_outbox}")
         if queue_root:
@@ -178,6 +182,8 @@ def format_prepare_manifest_summary_lines(
     ]
     if not start_allowed and start_detail:
         lines.append(f"감지 시작 차단 사유: {start_detail}")
+    lines.append("WorkRepoRoot:")
+    lines.extend(work_repo_lines or ["  (none)"])
     lines.append("SourceOutbox:")
     lines.extend(source_outbox_lines or ["  (none)"])
     lines.append("QueueRoot:")
@@ -205,6 +211,8 @@ def format_start_watcher_success_lines(
         f"Message: {launch_payload.get('Message', '') or '(none)'}",
         f"PreparedNewRun: {bool(launch_payload.get('PreparedNewRun', False))}",
         f"ExpectedWatcherState: {launch_payload.get('ExpectedWatcherState', '') or '-'}",
+        f"LaunchWatcherTargetScope: {launch_payload.get('WatcherTargetScope', '') or '-'}",
+        f"LaunchWatcherTargetIds: {_list_text(launch_payload.get('WatcherTargetIds', []))}",
         f"WatcherProcessId: {launch_payload.get('WatcherProcessId', '(none)')}",
         f"WatcherStdoutLogPath: {launch_payload.get('WatcherStdoutLogPath', '(none)')}",
         f"WatcherStderrLogPath: {launch_payload.get('WatcherStderrLogPath', '(none)')}",
@@ -212,12 +220,18 @@ def format_start_watcher_success_lines(
         f"{action_title} 확인",
         f"ControllerState: {ready_snapshot.get('controller_state', '') or '-'}",
         f"WatcherState: {ready_snapshot.get('watcher_state', '') or '-'}",
+        f"WatcherTargetScope: {ready_snapshot.get('watcher_target_scope', '') or '-'}",
+        f"WatcherTargetIds: {_list_text(ready_snapshot.get('watcher_target_ids', []))}",
         f"ProcessStartedAt: {ready_snapshot.get('process_started_at', '') or '(none)'}",
         f"HeartbeatAt: {ready_snapshot.get('heartbeat_at', '') or '(none)'}",
     ]
     restored_target_ids = launch_payload.get("RestoredTargetIds", [])
     if isinstance(restored_target_ids, list) and restored_target_ids:
         lines.append("RestoredTargetIds: " + ", ".join(str(item) for item in restored_target_ids))
+    reconciled_control_action = str(launch_payload.get("ReconciledControlAction", "") or "").strip()
+    if reconciled_control_action:
+        lines.append("ReconciledControlAction: " + reconciled_control_action)
+        lines.append("ReconciledControlState: " + str(launch_payload.get("ReconciledControlState", "") or "-"))
     prepared_target_ids = launch_payload.get("PreparedTargetIds", [])
     if isinstance(prepared_target_ids, list) and prepared_target_ids:
         lines.append("PreparedTargetIds: " + ", ".join(str(item) for item in prepared_target_ids))
@@ -225,17 +239,21 @@ def format_start_watcher_success_lines(
 
 
 def format_start_watcher_ack_detail(ready_snapshot: dict[str, object]) -> str:
-    return "ack: controller={0} / detector={1} / heartbeat={2}".format(
+    return "ack: controller={0} / detector={1} / scope={2} / targets={3} / heartbeat={4}".format(
         str(ready_snapshot.get("controller_state", "") or "-"),
         str(ready_snapshot.get("watcher_state", "") or "-"),
+        str(ready_snapshot.get("watcher_target_scope", "") or "-"),
+        _list_text(ready_snapshot.get("watcher_target_ids", [])),
         str(ready_snapshot.get("heartbeat_at", "") or "(none)"),
     )
 
 
 def format_start_watcher_recent_detail(ready_snapshot: dict[str, object]) -> str:
-    return "controller={0} / detector={1} / heartbeat={2}".format(
+    return "controller={0} / detector={1} / scope={2} / targets={3} / heartbeat={4}".format(
         str(ready_snapshot.get("controller_state", "") or "-"),
         str(ready_snapshot.get("watcher_state", "") or "-"),
+        str(ready_snapshot.get("watcher_target_scope", "") or "-"),
+        _list_text(ready_snapshot.get("watcher_target_ids", [])),
         str(ready_snapshot.get("heartbeat_at", "") or "(none)"),
     )
 

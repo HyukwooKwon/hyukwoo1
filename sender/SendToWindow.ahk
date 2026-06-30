@@ -20,9 +20,12 @@ submitGuardMs := args.Has("submitGuardMs") ? Max(0, args["submitGuardMs"] + 0) :
 enterDelayMs := args.Has("enterDelayMs") ? Max(0, args["enterDelayMs"] + 0) : 150
 postSubmitDelayMs := args.Has("postSubmitDelayMs") ? Max(0, args["postSubmitDelayMs"] + 0) : 150
 submitRetryIntervalMs := args.Has("submitRetryIntervalMs") ? Max(0, args["submitRetryIntervalMs"] + 0) : 1000
+submitOnly := args.Has("submitOnly") ? ((args["submitOnly"] + 0) != 0) : false
 requireActiveBeforeEnter := args.Has("requireActiveBeforeEnter") ? ((args["requireActiveBeforeEnter"] + 0) != 0) : true
 requireUserIdleBeforeSend := args.Has("requireUserIdleBeforeSend") ? ((args["requireUserIdleBeforeSend"] + 0) != 0) : false
 minUserIdleBeforeSendMs := args.Has("minUserIdleBeforeSendMs") ? Max(0, args["minUserIdleBeforeSendMs"] + 0) : 0
+userIdleWaitTimeoutMs := args.Has("userIdleWaitTimeoutMs") ? Max(0, args["userIdleWaitTimeoutMs"] + 0) : 0
+userIdleWaitPollMs := args.Has("userIdleWaitPollMs") ? Max(50, args["userIdleWaitPollMs"] + 0) : 250
 visibleBeaconEnabled := args.Has("visibleBeaconEnabled") ? ((args["visibleBeaconEnabled"] + 0) != 0) : false
 visibleLabel := args.Has("visibleLabel") ? args["visibleLabel"] : ""
 visiblePreHoldMs := args.Has("visiblePreHoldMs") ? Max(0, args["visiblePreHoldMs"] + 0) : 0
@@ -52,9 +55,23 @@ DetectHiddenWindows False
 
 if (requireUserIdleBeforeSend && minUserIdleBeforeSendMs > 0) {
     idleMs := A_TimeIdlePhysical
+    if (idleMs < minUserIdleBeforeSendMs && userIdleWaitTimeoutMs > 0) {
+        snapshot := GetActiveWindowSnapshot()
+        DebugLog("user_idle_wait_begin idleMs=" idleMs " requiredMs=" minUserIdleBeforeSendMs " timeoutMs=" userIdleWaitTimeoutMs " pollMs=" userIdleWaitPollMs " activeTitle=" snapshot["title"] " activeClass=" snapshot["class"] " activeProcess=" snapshot["process"])
+        deadlineTick := A_TickCount + userIdleWaitTimeoutMs
+        while (idleMs < minUserIdleBeforeSendMs) {
+            remainingMs := deadlineTick - A_TickCount
+            if (remainingMs <= 0)
+                break
+            Sleep(Min(userIdleWaitPollMs, remainingMs))
+            idleMs := A_TimeIdlePhysical
+        }
+        if (idleMs >= minUserIdleBeforeSendMs)
+            DebugLog("user_idle_wait_complete idleMs=" idleMs " requiredMs=" minUserIdleBeforeSendMs)
+    }
     if (idleMs < minUserIdleBeforeSendMs) {
         snapshot := GetActiveWindowSnapshot()
-        DebugLog("user_active_hold idleMs=" idleMs " requiredMs=" minUserIdleBeforeSendMs " activeTitle=" snapshot["title"] " activeClass=" snapshot["class"] " activeProcess=" snapshot["process"])
+        DebugLog("user_active_hold idleMs=" idleMs " requiredMs=" minUserIdleBeforeSendMs " waitTimeoutMs=" userIdleWaitTimeoutMs " activeTitle=" snapshot["title"] " activeClass=" snapshot["class"] " activeProcess=" snapshot["process"])
         ExitApp 43
     }
 }
@@ -64,7 +81,7 @@ if !TargetExists(target, timeoutSec)
 
 try {
     DebugLog("send_begin hwnd=" target["hwnd"] " windowPid=" target["windowPid"] " shellPid=" target["shellPid"] " title=" target["title"])
-    SendPayload(target, text, enterCount, clearInput, activateSettleMs, textSettleMs, inputMode, submitGuardMs, enterDelayMs, postSubmitDelayMs, requireActiveBeforeEnter, submitModes, submitRetryIntervalMs, visibleBeaconEnabled, visibleLabel, visiblePreHoldMs, visiblePostHoldMs, restorePreviousActive, failOnFocusSteal)
+    SendPayload(target, text, enterCount, clearInput, activateSettleMs, textSettleMs, inputMode, submitGuardMs, enterDelayMs, postSubmitDelayMs, submitOnly, requireActiveBeforeEnter, submitModes, submitRetryIntervalMs, visibleBeaconEnabled, visibleLabel, visiblePreHoldMs, visiblePostHoldMs, restorePreviousActive, failOnFocusSteal)
     DebugLog("send_complete")
 }
 catch as err {
@@ -200,17 +217,6 @@ EnsureWindowActive(winRef, isTerminalHosted, contextLabel, failOnFocusSteal := f
         return true
 
     if (failOnFocusSteal) {
-        Loop attemptCount {
-            DebugLogWindowState(contextLabel "_focus_steal_reactivate try=" A_Index "/" attemptCount, winRef)
-            try WinActivate winRef
-            if (settleMs > 0)
-                Sleep settleMs
-            if WinActive(winRef) {
-                DebugLogWindowState(contextLabel "_focus_steal_recovered try=" A_Index "/" attemptCount, winRef)
-                return true
-            }
-        }
-
         DebugLogWindowState(contextLabel "_focus_stolen_hard_fail", winRef)
         return false
     }
@@ -235,7 +241,7 @@ EnsureWindowActive(winRef, isTerminalHosted, contextLabel, failOnFocusSteal := f
     return false
 }
 
-SendPayload(target, text, enterCount, clearInput := false, activateSettleMs := 120, textSettleMs := 400, inputMode := "sendtext", submitGuardMs := 0, enterDelayMs := 150, postSubmitDelayMs := 150, requireActiveBeforeEnter := true, submitModes := "", submitRetryIntervalMs := 1000, visibleBeaconEnabled := false, visibleLabel := "", visiblePreHoldMs := 0, visiblePostHoldMs := 0, restorePreviousActive := true, failOnFocusSteal := false) {
+SendPayload(target, text, enterCount, clearInput := false, activateSettleMs := 120, textSettleMs := 400, inputMode := "sendtext", submitGuardMs := 0, enterDelayMs := 150, postSubmitDelayMs := 150, submitOnly := false, requireActiveBeforeEnter := true, submitModes := "", submitRetryIntervalMs := 1000, visibleBeaconEnabled := false, visibleLabel := "", visiblePreHoldMs := 0, visiblePostHoldMs := 0, restorePreviousActive := true, failOnFocusSteal := false) {
     winRef := ResolveWinRef(target)
     if (winRef = "")
         ExitApp 20
@@ -262,23 +268,27 @@ SendPayload(target, text, enterCount, clearInput := false, activateSettleMs := 1
             DebugLogWindowState("visible_pre_hold_complete ms=" visiblePreHoldMs, winRef)
         }
 
-        if !EnsureWindowActive(winRef, true, "text_pre_clear", failOnFocusSteal)
-            ExitApp 42
+        if (submitOnly) {
+            DebugLog("submit_only_mode target=terminal")
+        } else {
+            if !EnsureWindowActive(winRef, true, "text_pre_clear", failOnFocusSteal)
+                ExitApp 42
 
-        if clearInput {
-            ClearTerminalInput(winRef)
-        }
+            if clearInput {
+                ClearTerminalInput(winRef)
+            }
 
-        if !EnsureWindowActive(winRef, true, "text_pre_paste", failOnFocusSteal)
-            ExitApp 42
+            if !EnsureWindowActive(winRef, true, "text_pre_paste", failOnFocusSteal)
+                ExitApp 42
 
-        terminalInputMode := NormalizeTerminalInputMode(inputMode)
-        DebugLog("terminal_input_mode mode=" terminalInputMode)
-        SendTerminalPayload(terminalInputMode, text)
+            terminalInputMode := NormalizeTerminalInputMode(inputMode)
+            DebugLog("terminal_input_mode mode=" terminalInputMode)
+            SendTerminalPayload(terminalInputMode, text)
 
-        if (textSettleMs > 0) {
-            DebugLog("terminal_settle ms=" textSettleMs)
-            Sleep textSettleMs
+            if (textSettleMs > 0) {
+                DebugLog("terminal_settle ms=" textSettleMs)
+                Sleep textSettleMs
+            }
         }
 
         SubmitPayload(winRef, true, enterCount, submitGuardMs, enterDelayMs, postSubmitDelayMs, requireActiveBeforeEnter, submitModes, submitRetryIntervalMs, visibleBeaconEnabled, visibleBaseTitle, visibleLabel, visiblePostHoldMs, failOnFocusSteal)
@@ -295,16 +305,20 @@ SendPayload(target, text, enterCount, clearInput := false, activateSettleMs := 1
             DebugLog("terminal_restore_skipped restorePreviousActive=0")
         }
     } else {
-        if clearInput {
-            ClearControlInput(winRef)
-        }
+        if (submitOnly) {
+            DebugLog("submit_only_mode target=control")
+        } else {
+            if clearInput {
+                ClearControlInput(winRef)
+            }
 
-        DebugLog("control_sendtext ref=" winRef)
-        ControlSendText text, , winRef
+            DebugLog("control_sendtext ref=" winRef)
+            ControlSendText text, , winRef
 
-        if (textSettleMs > 0) {
-            DebugLog("control_settle ms=" textSettleMs)
-            Sleep textSettleMs
+            if (textSettleMs > 0) {
+                DebugLog("control_settle ms=" textSettleMs)
+                Sleep textSettleMs
+            }
         }
 
         SubmitPayload(winRef, false, enterCount, submitGuardMs, enterDelayMs, postSubmitDelayMs, requireActiveBeforeEnter, submitModes, submitRetryIntervalMs, visibleBeaconEnabled, visibleBaseTitle, visibleLabel, visiblePostHoldMs, failOnFocusSteal)

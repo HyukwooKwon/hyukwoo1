@@ -154,7 +154,7 @@ function Compose-InputPromptText {
     }
     $blocks.Add([string]$Payload.Body.Trim()) | Out-Null
     if (Test-NonEmptyString $EffectiveFixedSuffix) {
-        $blocks.Add($EffectiveFixedSuffix.Trim()) | Out-Null
+        $blocks.Add(("[고정문구 / 항상 포함]`r`n" + $EffectiveFixedSuffix.Trim())) | Out-Null
     }
 
     return ((@($blocks) | Where-Object { Test-NonEmptyString $_ }) -join "`r`n`r`n")
@@ -1132,6 +1132,7 @@ function Write-TargetAutoloopStatusSnapshot {
         [Parameter(Mandatory)][ValidateSet('running', 'paused', 'stopped')][string]$WatcherState,
         [string]$WatcherStopReason = '',
         [string]$WatcherMutexName = '',
+        [string[]]$WatcherTargetIds = @(),
         [string]$HeartbeatAt = '',
         [string]$ProcessStartedAt = '',
         [int]$ConfiguredRunDurationSec = 0
@@ -1145,10 +1146,17 @@ function Write-TargetAutoloopStatusSnapshot {
         -WatcherState $WatcherState `
         -WatcherStopReason $WatcherStopReason `
         -WatcherMutexName $WatcherMutexName `
+        -WatcherTargetIds @($WatcherTargetIds) `
         -HeartbeatAt $HeartbeatAt `
         -ProcessStartedAt $ProcessStartedAt `
         -ConfiguredRunDurationSec $ConfiguredRunDurationSec
     Write-JsonFileAtomically -Path $StatePaths.StatusPath -Payload $statusDocument
+    Sync-TargetAutoloopTargetSidecarDocuments `
+        -Config $Config `
+        -RunRoot $RunRoot `
+        -StateDocument $StateDocument `
+        -ControlDocument $ControlDocument `
+        -StatusDocument $statusDocument
 }
 
 if (-not (Test-NonEmptyString $ConfigPath)) {
@@ -1211,6 +1219,7 @@ try {
         -WatcherState $initialWatcherState `
         -WatcherStopReason '' `
         -WatcherMutexName $watcherMutexName `
+        -WatcherTargetIds @($selectedTargets) `
         -HeartbeatAt $watcherHeartbeatAt `
         -ProcessStartedAt $watcherProcessStartedAt `
         -ConfiguredRunDurationSec $RunDurationSec
@@ -1282,6 +1291,7 @@ try {
             -WatcherState $loopWatcherState `
             -WatcherStopReason '' `
             -WatcherMutexName $watcherMutexName `
+            -WatcherTargetIds @($selectedTargets) `
             -HeartbeatAt $watcherHeartbeatAt `
             -ProcessStartedAt $watcherProcessStartedAt `
             -ConfiguredRunDurationSec $RunDurationSec
@@ -1316,6 +1326,7 @@ try {
                 -WatcherState $dispatchWatcherState `
                 -WatcherStopReason '' `
                 -WatcherMutexName $watcherMutexName `
+                -WatcherTargetIds @($selectedTargets) `
                 -HeartbeatAt $watcherHeartbeatAt `
                 -ProcessStartedAt $watcherProcessStartedAt `
                 -ConfiguredRunDurationSec $RunDurationSec
@@ -1357,6 +1368,7 @@ finally {
             -WatcherState 'stopped' `
             -WatcherStopReason $watcherStopReason `
             -WatcherMutexName $watcherMutexName `
+            -WatcherTargetIds @($selectedTargets) `
             -HeartbeatAt $watcherHeartbeatAt `
             -ProcessStartedAt $watcherProcessStartedAt `
             -ConfiguredRunDurationSec $RunDurationSec
@@ -1392,6 +1404,7 @@ $result = [pscustomobject][ordered]@{
     WatcherState = 'stopped'
     WatcherStopReason = $watcherStopReason
     WatcherMutexName = $watcherMutexName
+    WatcherTargetIds = @($selectedTargets)
     HeartbeatAt = $watcherHeartbeatAt
     ProcessStartedAt = $watcherProcessStartedAt
     ConfiguredRunDurationSec = $RunDurationSec

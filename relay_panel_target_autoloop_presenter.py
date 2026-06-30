@@ -113,26 +113,75 @@ def target_autoloop_retry_pending_detail(snapshot: dict[str, object] | None) -> 
     if not isinstance(retry_pending_summary, dict):
         retry_pending_summary = {}
     count = int(retry_pending_summary.get("count", 0) or 0)
+    current_count = int(retry_pending_summary.get("current_count", count) or 0)
+    stale_count = int(retry_pending_summary.get("stale_count", 0) or 0)
     target_ids = retry_pending_summary.get("target_ids", [])
     if not isinstance(target_ids, list):
         target_ids = []
+    current_target_ids = retry_pending_summary.get("current_target_ids", [])
+    if not isinstance(current_target_ids, list):
+        current_target_ids = []
+    display_target_ids = current_target_ids if current_count > 0 else target_ids
     target_text = target_autoloop_join_target_ids(
-        [str(target_id or "").strip() for target_id in target_ids if str(target_id or "").strip()]
+        [str(target_id or "").strip() for target_id in display_target_ids if str(target_id or "").strip()]
     )
     detail = (
         f"router retry-pending에 target-autoloop ready 파일 {count}개가 있습니다. "
-        "focus_lost 등으로 중단된 payload라 metadata 포함 재큐잉 후 watcher/router가 다시 처리하게 하세요. "
+        f"current={current_count}, stale={stale_count}. "
+        "현재 전송과 연결된 current 항목만 재큐잉 대상입니다. "
         f"targets={target_text}"
     )
-    latest_failure = str(retry_pending_summary.get("latest_failure_category", "") or "").strip()
-    latest_message = target_autoloop_compact_text(retry_pending_summary.get("latest_failure_message", ""), max_chars=120)
-    latest_debug_log = str(retry_pending_summary.get("latest_debug_log_path", "") or "").strip()
+    if stale_count > 0:
+        detail += " stale 항목은 이전 LastRouterReadyPath와 맞지 않아 자동 재큐잉 대상에서 제외해야 합니다."
+    latest_failure = str(
+        retry_pending_summary.get("latest_current_failure_category", "")
+        or retry_pending_summary.get("latest_failure_category", "")
+        or ""
+    ).strip()
+    latest_message = target_autoloop_compact_text(
+        retry_pending_summary.get("latest_current_failure_message", "")
+        or retry_pending_summary.get("latest_failure_message", ""),
+        max_chars=120,
+    )
+    latest_debug_log = str(
+        retry_pending_summary.get("latest_current_debug_log_path", "")
+        or retry_pending_summary.get("latest_debug_log_path", "")
+        or ""
+    ).strip()
+    latest_focus_policy = str(
+        retry_pending_summary.get("latest_current_focus_lost_retry_policy", "")
+        or retry_pending_summary.get("latest_stale_focus_lost_retry_policy", "")
+        or ""
+    ).strip()
+    latest_send_policy = str(
+        retry_pending_summary.get("latest_current_send_retry_policy", "")
+        or retry_pending_summary.get("latest_stale_send_retry_policy", "")
+        or ""
+    ).strip()
+    latest_send_stage = str(
+        retry_pending_summary.get("latest_current_send_stage", "")
+        or retry_pending_summary.get("latest_stale_send_stage", "")
+        or ""
+    ).strip()
+    latest_focus_hint = target_autoloop_compact_text(
+        retry_pending_summary.get("latest_current_operator_retry_hint", "")
+        or retry_pending_summary.get("latest_stale_operator_retry_hint", ""),
+        max_chars=140,
+    )
     if latest_failure:
         detail += f" latestFailure={latest_failure}"
     if latest_message:
         detail += f" latestMessage={latest_message}"
     if latest_debug_log:
         detail += f" debugLog={latest_debug_log}"
+    if latest_send_policy and latest_send_policy != "not-send-failure":
+        detail += f" retryPolicy={latest_send_policy}"
+    if latest_send_stage and latest_send_stage != "not-send-failure":
+        detail += f" retryStage={latest_send_stage}"
+    if latest_focus_policy and latest_focus_policy != "not-focus-lost":
+        detail += f" focusPolicy={latest_focus_policy}"
+    if latest_focus_hint:
+        detail += f" hint={latest_focus_hint}"
     return detail
 
 
@@ -390,7 +439,19 @@ def target_autoloop_start_eligibility(
         return False, f"target-autoloop 제어 요청({pending_action})이 처리 중이라 독립셀 감지 시작을 막았습니다."
     watcher_state = str(snapshot.get("watcher_state", "") or "").strip()
     if watcher_fresh:
-        return False, f"현재 독립셀 감지기가 이미 active 상태입니다: {watcher_state or 'running'}"
+        watcher_target_ids = snapshot.get("watcher_target_ids", [])
+        if isinstance(watcher_target_ids, list):
+            watcher_target_text = target_autoloop_join_target_ids(
+                [str(target_id or "").strip() for target_id in watcher_target_ids if str(target_id or "").strip()]
+            )
+        else:
+            watcher_target_text = "(unknown)"
+        watcher_scope = str(snapshot.get("watcher_target_scope", "") or "").strip() or "unknown"
+        return (
+            False,
+            f"현재 독립셀 감지기가 이미 active 상태입니다: {watcher_state or 'running'} "
+            f"/ scope={watcher_scope} / 감지 target={watcher_target_text}",
+        )
     return True, ""
 
 
@@ -671,12 +732,33 @@ def target_autoloop_recommendation_spec(
         label = "새 RunRoot 준비"
         action_key = "prepare_autoloop_runroot"
         detail = target_autoloop_limit_ready_output_block_detail(snapshot)
+    elif bool(snapshot.get("router_config_drift", False)) or bool(
+        (snapshot.get("router_session", {}) if isinstance(snapshot.get("router_session", {}), dict) else {}).get("router_config_drift", False)
+    ):
+        router_session = snapshot.get("router_session", {}) if isinstance(snapshot.get("router_session", {}), dict) else {}
+        reasons = router_session.get("router_config_drift_reasons", snapshot.get("router_config_drift_reasons", []))
+        if not isinstance(reasons, list):
+            reasons = []
+        configured_idle_wait = int(router_session.get("configured_user_idle_wait_timeout_ms", 0) or 0)
+        router_idle_wait = router_session.get("router_user_idle_wait_timeout_ms", None)
+        label = "router 설정 재시작"
+        action_key = "restart_router_for_autoloop"
+        detail = (
+            "현재 router가 config의 전송 안정화 설정과 다르게 실행 중입니다. "
+            "router 재시작 후 현재 전송보류 재시도를 진행하세요. "
+            f"reasons={','.join(str(reason) for reason in reasons) or '(none)'} "
+            f"configuredIdleWait={configured_idle_wait}ms "
+            f"routerIdleWait={router_idle_wait if router_idle_wait is not None else '(missing)'}ms"
+        )
     elif int(
         (snapshot.get("retry_pending_summary", {}) if isinstance(snapshot.get("retry_pending_summary", {}), dict) else {}).get("count", 0)
         or 0
     ) > 0:
-        label = "retry-pending 재큐잉"
-        action_key = "requeue_retry_pending"
+        retry_pending_summary = snapshot.get("retry_pending_summary", {}) if isinstance(snapshot.get("retry_pending_summary", {}), dict) else {}
+        current_count = int(retry_pending_summary.get("current_count", retry_pending_summary.get("count", 0)) or 0)
+        label = "현재 전송보류 재시도" if current_count > 0 else "stale retry-pending 확인"
+        action_key = "requeue_retry_pending" if current_count > 0 else ""
+        read_only = current_count <= 0
         detail = target_autoloop_retry_pending_detail(snapshot)
     elif watcher_health == "stale":
         if stderr_exists and stderr_path:
@@ -756,6 +838,15 @@ def target_autoloop_recommendation_spec(
 
 def target_autoloop_detector_included_target_ids(runtime_snapshot: dict[str, object] | None) -> list[str]:
     snapshot = runtime_snapshot or {}
+    watcher_target_ids = snapshot.get("watcher_target_ids", [])
+    if isinstance(watcher_target_ids, list) and str(snapshot.get("watcher_state", "") or "").strip() in {"running", "paused"}:
+        normalized_watcher_target_ids = [
+            str(target_id or "").strip()
+            for target_id in watcher_target_ids
+            if str(target_id or "").strip()
+        ]
+        if normalized_watcher_target_ids:
+            return normalized_watcher_target_ids
     source_rows = snapshot.get("manifest_targets", []) or snapshot.get("targets", []) or []
     if not isinstance(source_rows, list):
         return []
@@ -767,6 +858,51 @@ def target_autoloop_detector_included_target_ids(runtime_snapshot: dict[str, obj
         if target_id and target_id not in target_ids:
             target_ids.append(target_id)
     return target_ids
+
+
+def target_autoloop_publish_ready_manifest_target_ids(runtime_snapshot: dict[str, object] | None) -> list[str]:
+    snapshot = runtime_snapshot or {}
+    rows = snapshot.get("manifest_targets", [])
+    if not isinstance(rows, list):
+        return []
+    target_ids: list[str] = []
+    for row in rows:
+        if not isinstance(row, dict) or not bool(row.get("Enabled", False)):
+            continue
+        trigger_values = row.get("TriggerKinds", []) or []
+        if isinstance(trigger_values, str):
+            trigger_values = [trigger_values]
+        if not isinstance(trigger_values, (list, tuple, set)):
+            trigger_values = []
+        trigger_kinds = {
+            str(trigger_kind or "").strip().lower()
+            for trigger_kind in trigger_values
+            if str(trigger_kind or "").strip()
+        }
+        if "publish-ready" not in trigger_kinds:
+            continue
+        target_id = str(row.get("TargetId", "") or "").strip()
+        if target_id and target_id not in target_ids:
+            target_ids.append(target_id)
+    return target_ids
+
+
+def target_autoloop_watcher_missing_publish_ready_target_ids(runtime_snapshot: dict[str, object] | None) -> list[str]:
+    snapshot = runtime_snapshot or {}
+    watcher_state = str(snapshot.get("watcher_state", "") or "").strip().lower()
+    if watcher_state not in {"running", "paused"}:
+        return []
+    expected_target_ids = target_autoloop_publish_ready_manifest_target_ids(snapshot)
+    if not expected_target_ids:
+        return []
+    active_value = snapshot.get("watcher_target_ids", [])
+    active_target_ids = [
+        str(target_id or "").strip()
+        for target_id in active_value
+        if str(target_id or "").strip()
+    ] if isinstance(active_value, list) else []
+    active_set = set(active_target_ids)
+    return [target_id for target_id in expected_target_ids if target_id not in active_set]
 
 
 def target_autoloop_detector_state_label(
@@ -806,6 +942,8 @@ def target_autoloop_detector_state_label(
         if watcher_state == "paused":
             return "일시정지"
         if watcher_state == "running":
+            if target_autoloop_watcher_missing_publish_ready_target_ids(snapshot):
+                return "부분감지"
             return "감지중"
     if (
         not start_allowed
@@ -835,7 +973,7 @@ def target_autoloop_detector_badge_spec(
         counts = {}
     target_text = ",".join(target_ids) if target_ids else "-"
     text = (
-        "감지 상태: {state} | 마지막 sweep: {sweep} | 포함 target: {targets} | "
+        "감지 상태: {state} | 마지막 sweep: {sweep} | 감지 target: {targets} | "
         "queue: {queued} / waiting-output: {waiting} / failed: {failed}"
     ).format(
         state=detector_state,
@@ -845,8 +983,12 @@ def target_autoloop_detector_badge_spec(
         waiting=int(counts.get("WaitingOutputTargets", 0) or 0),
         failed=int(counts.get("FailedTargets", 0) or 0),
     )
+    missing_target_ids = target_autoloop_watcher_missing_publish_ready_target_ids(snapshot)
+    if missing_target_ids:
+        text += " | 누락 target: " + target_autoloop_join_target_ids(missing_target_ids)
     palette = {
         "감지중": "#15803D",
+        "부분감지": "#B45309",
         "일시정지": "#B45309",
         "정지": "#6B7280",
         "준비필요": "#1D4ED8",
@@ -1029,11 +1171,32 @@ def target_autoloop_runroot_attention_spec(
         }
 
     if watcher_health == "active":
+        active_target_ids = snapshot.get("watcher_target_ids", [])
+        if isinstance(active_target_ids, list):
+            active_target_text = target_autoloop_join_target_ids(
+                [str(target_id or "").strip() for target_id in active_target_ids if str(target_id or "").strip()]
+            )
+        else:
+            active_target_text = "(unknown)"
+        active_scope = str(snapshot.get("watcher_target_scope", "") or "").strip() or "unknown"
+        missing_target_ids = target_autoloop_watcher_missing_publish_ready_target_ids(snapshot)
+        if missing_target_ids:
+            missing_target_text = target_autoloop_join_target_ids(missing_target_ids)
+            return {
+                "text": (
+                    "RunRoot 상태: 부분감지입니다. "
+                    f"active watcher가 일부 publish-ready target을 감지하지 않습니다. 누락 target={missing_target_text}, "
+                    f"현재 감지 target={active_target_text}, scope={active_scope}, heartbeat={watcher_health_detail or 'fresh'}. "
+                    "해당 target 카드의 [포함 감지 재시작]을 실행하세요."
+                ),
+                "background": "#B45309",
+                "foreground": "#FFFFFF",
+            }
         return {
             "text": (
                 "RunRoot 상태: 감지중입니다. "
                 f"manifest enabled={manifest_enabled_count}, publish-ready={manifest_publish_ready_count}/{manifest_enabled_count}, "
-                f"heartbeat={watcher_health_detail or 'fresh'}."
+                f"heartbeat={watcher_health_detail or 'fresh'}, scope={active_scope}, 감지 target={active_target_text}."
             ),
             "background": "#15803D",
             "foreground": "#FFFFFF",

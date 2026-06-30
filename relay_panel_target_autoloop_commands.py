@@ -14,12 +14,30 @@ class TargetAutoloopCommandPlan:
         return list(self.extra)
 
 
-def build_start_watcher_command_plan(*, run_root: str) -> TargetAutoloopCommandPlan:
+def build_start_watcher_command_plan(
+    *,
+    run_root: str,
+    target_id: str = "",
+    target_ids: list[str] | tuple[str, ...] | None = None,
+) -> TargetAutoloopCommandPlan:
+    normalized_target_ids = [
+        str(item or "").strip()
+        for item in (list(target_ids or []) if target_ids is not None else [target_id])
+        if str(item or "").strip()
+    ]
+    normalized_target_ids = list(dict.fromkeys(normalized_target_ids))
+    extra = ["-RunMode", "target-autoloop"]
+    display_target_part = ""
+    if normalized_target_ids:
+        extra += ["-Targets"]
+        extra += normalized_target_ids
+        display_target_part = " -Targets " + ",".join(normalized_target_ids)
+    extra += ["-Detached", "-AsJson"]
     return TargetAutoloopCommandPlan(
         script_name="tests/Start-TargetAutoloopWatcher.ps1",
         run_root_override=str(run_root or ""),
-        extra=("-RunMode", "target-autoloop", "-Detached", "-AsJson"),
-        display_command="Start-TargetAutoloopWatcher.ps1 -RunMode target-autoloop -Detached -AsJson",
+        extra=tuple(extra),
+        display_command=f"Start-TargetAutoloopWatcher.ps1 -RunMode target-autoloop{display_target_part} -Detached -AsJson",
     )
 
 
@@ -39,6 +57,19 @@ def build_process_once_command_plan(*, run_root: str, target_id: str = "") -> Ta
     )
 
 
+def build_publish_ready_marker_command_plan(*, run_root: str, target_id: str) -> TargetAutoloopCommandPlan:
+    normalized_target_id = str(target_id or "").strip()
+    return TargetAutoloopCommandPlan(
+        script_name="tests/Publish-TargetAutoloopArtifact.ps1",
+        run_root_override=str(run_root or ""),
+        extra=("-TargetId", normalized_target_id, "-Overwrite", "-AsJson"),
+        display_command=(
+            "Publish-TargetAutoloopArtifact.ps1 "
+            f"-TargetId {normalized_target_id} -Overwrite -AsJson"
+        ),
+    )
+
+
 def build_extend_cycle_limit_command_plan(
     *,
     run_root: str,
@@ -50,7 +81,7 @@ def build_extend_cycle_limit_command_plan(
     return TargetAutoloopCommandPlan(
         script_name="tests/Extend-TargetAutoloopCycleLimit.ps1",
         run_root_override=str(run_root or ""),
-        extra=("-AdditionalCycles", str(normalized_additional_cycles), "-AsJson"),
+        extra=("-TargetId", normalized_target_id, "-AdditionalCycles", str(normalized_additional_cycles), "-AsJson"),
         display_command=(
             "Extend-TargetAutoloopCycleLimit.ps1 "
             f"-TargetId {normalized_target_id} -AdditionalCycles {normalized_additional_cycles} -AsJson"
@@ -90,16 +121,32 @@ def build_router_restart_command_plan() -> TargetAutoloopCommandPlan:
     )
 
 
-def build_requeue_retry_pending_command_plan(*, target_ids: list[str]) -> TargetAutoloopCommandPlan:
+def build_requeue_retry_pending_command_plan(
+    *,
+    target_ids: list[str],
+    retry_paths: list[str] | None = None,
+) -> TargetAutoloopCommandPlan:
     normalized_target_ids = [
         str(target_id or "").strip()
         for target_id in list(target_ids or [])
         if str(target_id or "").strip()
     ]
+    normalized_retry_paths = [
+        str(retry_path or "").strip()
+        for retry_path in list(retry_paths or [])
+        if str(retry_path or "").strip()
+    ]
     extra: list[str] = []
     if len(normalized_target_ids) == 1:
         extra += ["-TargetId", normalized_target_ids[0]]
-    display_suffix = f" -TargetId {normalized_target_ids[0]}" if len(normalized_target_ids) == 1 else ""
+    if normalized_retry_paths:
+        extra += ["-RetryPath", *normalized_retry_paths]
+    display_parts: list[str] = []
+    if len(normalized_target_ids) == 1:
+        display_parts.append(f"-TargetId {normalized_target_ids[0]}")
+    if normalized_retry_paths:
+        display_parts.append(f"-RetryPath ({len(normalized_retry_paths)} current)")
+    display_suffix = " " + " ".join(display_parts) if display_parts else ""
     return TargetAutoloopCommandPlan(
         script_name="router/Requeue-RetryPending.ps1",
         run_root_override=None,

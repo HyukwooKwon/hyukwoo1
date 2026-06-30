@@ -66,10 +66,11 @@ $state | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $start.StatePath -E
 
 $control = Get-Content -LiteralPath $start.ControlPath -Raw -Encoding UTF8 | ConvertFrom-Json
 $control.State = 'stopped'
-$control.Action = ''
-$control.RequestId = ''
-$control.RequestedAt = ''
-$control.RequestedBy = ''
+$control.Action = 'stop'
+$control.RequestId = 'req-stale-stop'
+$control.RequestedAt = (Get-Date).AddSeconds(-30).ToString('o')
+$control.RequestedBy = 'test-stale-stop'
+$control.StopRequested = $true
 $control.LastHandledAction = 'stop'
 $control.LastHandledResult = 'stopped'
 $control.LastHandledAt = (Get-Date).ToString('o')
@@ -95,6 +96,8 @@ $watcher = $watcherJson | ConvertFrom-Json
 Assert-True ([bool]$watcher.Ok) 'watcher start should succeed.'
 Assert-True ([string]$watcher.Result -eq 'completed-inline') 'inline watcher start should finish synchronously.'
 Assert-True (@($watcher.RestoredTargetIds) -contains 'target01') 'restart should restore stopped target state bookkeeping.'
+Assert-True ([string]$watcher.ReconciledControlAction -eq 'stop') 'restart should reconcile stale stop control pending action.'
+Assert-True ([string]$watcher.ReconciledControlState -eq 'stopped') 'restart should report reconciled stopped control state.'
 
 $finalStatus = & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Show-TargetAutoloopStatus.ps1') `
     -ConfigPath $configPath `
@@ -110,10 +113,113 @@ Assert-True (([string]$finalStatus.WatcherRecommendation).Contains('watcher가 s
 Assert-True ([string]$finalState.Targets.target01.Phase -ne 'stopped') 'restart should restore target phase from stopped.'
 Assert-True ([string]$finalState.Targets.target01.NextAction -eq 'wait-for-input') 'restored input target should return to wait-for-input.'
 
+$scopedConfigPath = Join-Path $tmpRoot 'settings.target-autoloop.scoped-restore.psd1'
+$scopedRunRoot = Join-Path $tmpRoot 'run_target_autoloop_scoped_restore'
+[System.IO.File]::WriteAllText($scopedConfigPath, @"
+@{
+    LaneName = 'bottest-live-visible'
+    Targets = @(
+        @{ Id = 'target01'; Folder = 'C:\tmp\target01'; WindowTitle = 'Target01'; FixedSuffix = 'suffix-01' },
+        @{ Id = 'target02'; Folder = 'C:\tmp\target02'; WindowTitle = 'Target02'; FixedSuffix = 'suffix-02' }
+    )
+    TargetAutoloop = @{
+        Enabled = `$true
+        RunMode = 'target-inbox-submit'
+        DispatchQueuedCommandsInline = `$false
+        PollIntervalMs = 200
+        RunRootBase = '$($tmpRoot.Replace("'", "''"))'
+        Targets = @(
+            @{ TargetId = 'target01'; Enabled = `$true; TriggerKinds = @('input-file') },
+            @{ TargetId = 'target02'; Enabled = `$true; TriggerKinds = @('input-file') }
+        )
+    }
+}
+"@, (New-Utf8NoBomEncoding))
+
+$scopedStartJson = & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Start-TargetAutoloopRun.ps1') `
+    -ConfigPath $scopedConfigPath `
+    -RunRoot $scopedRunRoot `
+    -Targets target01,target02 `
+    -RunMode target-inbox-submit `
+    -AsJson
+$scopedStart = $scopedStartJson | ConvertFrom-Json
+
+$scopedState = Get-Content -LiteralPath $scopedStart.StatePath -Raw -Encoding UTF8 | ConvertFrom-Json
+$scopedState.State = 'stopped'
+$scopedState.Targets.target01.Phase = 'stopped'
+$scopedState.Targets.target01.NextAction = 'stopped'
+$scopedState.Targets.target01.StoppedPhase = 'idle'
+$scopedState.Targets.target01.StoppedNextAction = 'wait-for-input'
+$scopedState.Targets.target02.Phase = 'stopped'
+$scopedState.Targets.target02.NextAction = 'stopped'
+$scopedState.Targets.target02.StoppedPhase = 'idle'
+$scopedState.Targets.target02.StoppedNextAction = 'wait-for-input'
+$scopedState.LastUpdatedAt = (Get-Date).ToString('o')
+$scopedState | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $scopedStart.StatePath -Encoding UTF8
+
+$scopedControl = Get-Content -LiteralPath $scopedStart.ControlPath -Raw -Encoding UTF8 | ConvertFrom-Json
+$scopedControl.State = 'stopped'
+$scopedControl.LastHandledAction = 'stop'
+$scopedControl.LastHandledResult = 'stopped'
+$scopedControl.LastHandledAt = (Get-Date).ToString('o')
+$scopedControl.LastUpdatedAt = (Get-Date).ToString('o')
+$scopedControl | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $scopedStart.ControlPath -Encoding UTF8
+
+$scopedStatus = Get-Content -LiteralPath $scopedStart.StatusPath -Raw -Encoding UTF8 | ConvertFrom-Json
+$scopedStatus.ControllerState = 'stopped'
+$scopedStatus.WatcherState = 'stopped'
+$scopedStatus.WatcherStopReason = 'control-stop-request'
+$scopedStatus.HeartbeatAt = (Get-Date).AddSeconds(-30).ToString('o')
+$scopedStatus.ProcessStartedAt = (Get-Date).AddSeconds(-60).ToString('o')
+$scopedStatus.LastUpdatedAt = (Get-Date).ToString('o')
+$scopedStatus | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $scopedStart.StatusPath -Encoding UTF8
+
+$scopedWatcherJson = & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Start-TargetAutoloopWatcher.ps1') `
+    -ConfigPath $scopedConfigPath `
+    -RunRoot $scopedRunRoot `
+    -Targets target01 `
+    -RunDurationSec 1 `
+    -AsJson
+$scopedWatcher = $scopedWatcherJson | ConvertFrom-Json
+$scopedFinalState = Get-Content -LiteralPath $scopedStart.StatePath -Raw -Encoding UTF8 | ConvertFrom-Json
+
+Assert-True ([bool]$scopedWatcher.Ok) 'scoped watcher start should succeed.'
+Assert-True (@($scopedWatcher.RestoredTargetIds) -contains 'target01') 'scoped restart should restore selected target.'
+Assert-True (-not (@($scopedWatcher.RestoredTargetIds) -contains 'target02')) 'scoped restart should not restore unselected target.'
+Assert-True ([string]$scopedFinalState.Targets.target01.Phase -ne 'stopped') 'selected target should leave stopped phase.'
+Assert-True ([string]$scopedFinalState.Targets.target02.Phase -eq 'stopped') 'unselected target should remain stopped.'
+
+$scopedActiveStatus = Get-Content -LiteralPath $scopedStart.StatusPath -Raw -Encoding UTF8 | ConvertFrom-Json
+$scopedActiveStatus.ControllerState = 'running'
+$scopedActiveStatus.WatcherState = 'running'
+$scopedActiveStatus.WatcherStopReason = ''
+$scopedActiveStatus.WatcherTargetIds = @('target01')
+$scopedActiveStatus.WatcherTargetScope = 'scoped'
+$scopedActiveStatus.HeartbeatAt = (Get-Date).ToString('o')
+$scopedActiveStatus.ProcessStartedAt = (Get-Date).AddMinutes(-5).ToString('o')
+$scopedActiveStatus.LastUpdatedAt = (Get-Date).ToString('o')
+$scopedActiveStatus | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $scopedStart.StatusPath -Encoding UTF8
+
+$scopeMismatchJson = & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Start-TargetAutoloopWatcher.ps1') `
+    -ConfigPath $scopedConfigPath `
+    -RunRoot $scopedRunRoot `
+    -Targets target02 `
+    -RunDurationSec 1 `
+    -AsJson
+$scopeMismatch = $scopeMismatchJson | ConvertFrom-Json
+
+Assert-True (-not [bool]$scopeMismatch.Ok) 'fresh active watcher should reject requests for uncovered targets.'
+Assert-True ([string]$scopeMismatch.Result -eq 'watcher-target-scope-mismatch') 'uncovered active watcher should return a stable scope mismatch result.'
+Assert-True (@($scopeMismatch.ReasonCodes) -contains 'watcher_target_scope_mismatch') 'scope mismatch should include a stable reason code.'
+Assert-True (@($scopeMismatch.WatcherTargetIds) -contains 'target01') 'scope mismatch should report active watcher target ids.'
+Assert-True (@($scopeMismatch.RequestedTargetIds) -contains 'target02') 'scope mismatch should report requested target ids.'
+
 $activeStatus = Get-Content -LiteralPath $start.StatusPath -Raw -Encoding UTF8 | ConvertFrom-Json
 $activeStatus.ControllerState = 'running'
 $activeStatus.WatcherState = 'running'
 $activeStatus.WatcherStopReason = ''
+$activeStatus.WatcherTargetIds = @('target01')
+$activeStatus.WatcherTargetScope = 'all'
 $activeStatus.HeartbeatAt = (Get-Date).ToString('o')
 $activeStatus.ProcessStartedAt = (Get-Date).AddMinutes(-5).ToString('o')
 $activeStatus.LastUpdatedAt = (Get-Date).ToString('o')

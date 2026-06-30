@@ -102,6 +102,7 @@ $launcherScripts = @(
     'launcher\Attach-TargetsFromBindings.ps1',
     'launcher\Check-TargetWindowVisibility.ps1',
     'launcher\Refresh-BindingProfileFromExisting.ps1',
+    'launcher\Restart-BoundVisibleTarget.ps1',
     'launcher\Start-Targets.ps1'
 )
 

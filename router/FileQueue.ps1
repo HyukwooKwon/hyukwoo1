@@ -68,6 +68,17 @@ function Write-RouterState {
         [bool]$RequireReadyDeliveryMetadata = $false,
         [bool]$RequirePairTransportMetadata = $false,
         [string]$IgnoredRoot = '',
+        [string]$ConfigPath = '',
+        [bool]$RequireActiveBeforeEnter = $true,
+        [bool]$RequireUserIdleBeforeSend = $false,
+        [int]$MinUserIdleBeforeSendMs = 0,
+        [int]$UserIdleWaitTimeoutMs = 0,
+        [int]$UserIdleWaitPollMs = 250,
+        [int]$SubmitGuardMs = 0,
+        [string]$TerminalInputMode = 'sendtext',
+        [string[]]$SubmitRetryModes = @('enter'),
+        [bool]$VisibleExecutionFailOnFocusSteal = $false,
+        [bool]$VisibleExecutionRestorePreviousActive = $true,
         [hashtable]$StateCache = $null,
         [switch]$Force
     )
@@ -103,6 +114,17 @@ function Write-RouterState {
         RequireReadyDeliveryMetadata = [bool]$RequireReadyDeliveryMetadata
         RequirePairTransportMetadata = [bool]$RequirePairTransportMetadata
         IgnoredRoot       = $IgnoredRoot
+        ConfigPath        = $ConfigPath
+        RequireActiveBeforeEnter = [bool]$RequireActiveBeforeEnter
+        RequireUserIdleBeforeSend = [bool]$RequireUserIdleBeforeSend
+        MinUserIdleBeforeSendMs = [int]$MinUserIdleBeforeSendMs
+        UserIdleWaitTimeoutMs = [int]$UserIdleWaitTimeoutMs
+        UserIdleWaitPollMs = [int]$UserIdleWaitPollMs
+        SubmitGuardMs = [int]$SubmitGuardMs
+        TerminalInputMode = $TerminalInputMode
+        SubmitRetryModes = @($SubmitRetryModes)
+        VisibleExecutionFailOnFocusSteal = [bool]$VisibleExecutionFailOnFocusSteal
+        VisibleExecutionRestorePreviousActive = [bool]$VisibleExecutionRestorePreviousActive
     }
 
     Ensure-Directory -Path (Split-Path -Parent $Path)

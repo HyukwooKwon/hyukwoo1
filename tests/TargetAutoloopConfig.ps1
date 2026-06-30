@@ -153,6 +153,95 @@ function Get-TargetAutoloopFileAgeSeconds {
     }
 }
 
+function Test-TargetAutoloopObjectProperty {
+    param(
+        $Object,
+        [Parameter(Mandatory)][string]$Name
+    )
+
+    return ($null -ne $Object -and $null -ne $Object.PSObject.Properties[$Name])
+}
+
+function Get-TargetAutoloopRouterConfigDriftSummary {
+    param(
+        [Parameter(Mandatory)]$Config,
+        $RouterState = $null,
+        [string]$RouterStatus = ''
+    )
+
+    $sourceConfig = $Config
+    $configPath = [string](Get-ConfigValue -Object $Config -Name 'ConfigPath' -DefaultValue '')
+    if ((Test-NonEmptyString $configPath) -and (Test-Path -LiteralPath $configPath -PathType Leaf)) {
+        try {
+            $sourceConfig = Import-PowerShellDataFile -LiteralPath $configPath
+        }
+        catch {
+            $sourceConfig = $Config
+        }
+    }
+
+    $configured = [ordered]@{
+        RequireUserIdleBeforeSend = [bool](Get-ConfigValue -Object $sourceConfig -Name 'RequireUserIdleBeforeSend' -DefaultValue $false)
+        MinUserIdleBeforeSendMs = [int](Get-ConfigValue -Object $sourceConfig -Name 'MinUserIdleBeforeSendMs' -DefaultValue 0)
+        UserIdleWaitTimeoutMs = [int](Get-ConfigValue -Object $sourceConfig -Name 'UserIdleWaitTimeoutMs' -DefaultValue 0)
+        UserIdleWaitPollMs = [int](Get-ConfigValue -Object $sourceConfig -Name 'UserIdleWaitPollMs' -DefaultValue 250)
+        SubmitGuardMs = [int](Get-ConfigValue -Object $sourceConfig -Name 'SubmitGuardMs' -DefaultValue 0)
+        VisibleExecutionFailOnFocusSteal = [bool](Get-ConfigValue -Object $sourceConfig -Name 'VisibleExecutionFailOnFocusSteal' -DefaultValue $false)
+        VisibleExecutionRestorePreviousActive = [bool](Get-ConfigValue -Object $sourceConfig -Name 'VisibleExecutionRestorePreviousActive' -DefaultValue $true)
+    }
+    $observed = [ordered]@{}
+    $driftReasons = @()
+    $hasAnyObservedSetting = $false
+    foreach ($name in @($configured.Keys)) {
+        if (Test-TargetAutoloopObjectProperty -Object $RouterState -Name $name) {
+            $hasAnyObservedSetting = $true
+            $observed[$name] = Get-ConfigValue -Object $RouterState -Name $name -DefaultValue $null
+        }
+        else {
+            $observed[$name] = $null
+        }
+    }
+
+    $configNeedsState = (
+        [bool]$configured.RequireUserIdleBeforeSend -or
+        [int]$configured.MinUserIdleBeforeSendMs -gt 0 -or
+        [int]$configured.UserIdleWaitTimeoutMs -gt 0 -or
+        [int]$configured.SubmitGuardMs -gt 0 -or
+        [bool]$configured.VisibleExecutionFailOnFocusSteal -or
+        -not [bool]$configured.VisibleExecutionRestorePreviousActive
+    )
+
+    if ($RouterStatus -eq 'running' -and $configNeedsState -and -not $hasAnyObservedSetting) {
+        $driftReasons += 'router-state-missing-effective-send-settings'
+    }
+    elseif ($RouterStatus -eq 'running' -and $hasAnyObservedSetting) {
+        foreach ($name in @($configured.Keys)) {
+            $configuredValue = $configured[$name]
+            $observedValue = $observed[$name]
+            if ($null -eq $observedValue) {
+                $driftReasons += ('missing:{0}' -f $name)
+                continue
+            }
+            if ($configuredValue -is [bool]) {
+                if ([bool]$observedValue -ne [bool]$configuredValue) {
+                    $driftReasons += ('mismatch:{0}:config={1}:router={2}' -f $name, [bool]$configuredValue, [bool]$observedValue)
+                }
+                continue
+            }
+            if ([int]$observedValue -ne [int]$configuredValue) {
+                $driftReasons += ('mismatch:{0}:config={1}:router={2}' -f $name, [int]$configuredValue, [int]$observedValue)
+            }
+        }
+    }
+
+    return [pscustomobject][ordered]@{
+        Drift = (@($driftReasons).Count -gt 0)
+        Reasons = @($driftReasons)
+        Configured = [pscustomobject]$configured
+        Router = [pscustomobject]$observed
+    }
+}
+
 function Get-TargetAutoloopRouterSessionState {
     param([Parameter(Mandatory)]$Config)
 
@@ -176,6 +265,7 @@ function Get-TargetAutoloopRouterSessionState {
         $false
     }
     $routerStateAgeSeconds = Get-TargetAutoloopFileAgeSeconds -Path $routerStatePath
+    $routerConfigDrift = Get-TargetAutoloopRouterConfigDriftSummary -Config $Config -RouterState $routerState -RouterStatus $routerStatus
     $state = 'not-configured'
     if (Test-NonEmptyString $runtimeMapPath -or Test-NonEmptyString $routerStatePath) {
         $state = 'insufficient-data'
@@ -224,6 +314,20 @@ function Get-TargetAutoloopRouterSessionState {
         RouterPidExists = $routerPidExists
         RouterMutexName = $routerMutexName
         RouterMutexHeld = $routerMutexHeld
+        RouterConfigDrift = [bool]$routerConfigDrift.Drift
+        RouterConfigDriftReasons = @($routerConfigDrift.Reasons)
+        ConfiguredRequireUserIdleBeforeSend = [bool]$routerConfigDrift.Configured.RequireUserIdleBeforeSend
+        ConfiguredMinUserIdleBeforeSendMs = [int]$routerConfigDrift.Configured.MinUserIdleBeforeSendMs
+        ConfiguredUserIdleWaitTimeoutMs = [int]$routerConfigDrift.Configured.UserIdleWaitTimeoutMs
+        ConfiguredUserIdleWaitPollMs = [int]$routerConfigDrift.Configured.UserIdleWaitPollMs
+        ConfiguredSubmitGuardMs = [int]$routerConfigDrift.Configured.SubmitGuardMs
+        ConfiguredVisibleExecutionFailOnFocusSteal = [bool]$routerConfigDrift.Configured.VisibleExecutionFailOnFocusSteal
+        RouterRequireUserIdleBeforeSend = $routerConfigDrift.Router.RequireUserIdleBeforeSend
+        RouterMinUserIdleBeforeSendMs = $routerConfigDrift.Router.MinUserIdleBeforeSendMs
+        RouterUserIdleWaitTimeoutMs = $routerConfigDrift.Router.UserIdleWaitTimeoutMs
+        RouterUserIdleWaitPollMs = $routerConfigDrift.Router.UserIdleWaitPollMs
+        RouterSubmitGuardMs = $routerConfigDrift.Router.SubmitGuardMs
+        RouterVisibleExecutionFailOnFocusSteal = $routerConfigDrift.Router.VisibleExecutionFailOnFocusSteal
     }
 }
 
@@ -455,6 +559,30 @@ function Get-TargetAutoloopDelayRangeLabel {
     return ''
 }
 
+function Convert-TargetAutoloopTimestampText {
+    param($Value)
+
+    if ($null -eq $Value) {
+        return ''
+    }
+    if ($Value -is [datetimeoffset]) {
+        return $Value.ToString("yyyy-MM-dd'T'HH:mm:ssK", [System.Globalization.CultureInfo]::InvariantCulture)
+    }
+    if ($Value -is [datetime]) {
+        return $Value.ToString("yyyy-MM-dd'T'HH:mm:ssK", [System.Globalization.CultureInfo]::InvariantCulture)
+    }
+    return [string]$Value
+}
+
+function Get-TargetAutoloopTimestampFieldText {
+    param(
+        $Object,
+        [Parameter(Mandatory)][string]$Name
+    )
+
+    return (Convert-TargetAutoloopTimestampText -Value (Get-ConfigValue -Object $Object -Name $Name -DefaultValue $null))
+}
+
 function Get-TargetAutoloopDelaySummary {
     param($TargetRows)
 
@@ -481,7 +609,7 @@ function Get-TargetAutoloopDelaySummary {
 
         $targetId = [string](Get-ConfigValue -Object $targetRow -Name 'TargetId' -DefaultValue '')
         $delayRangeLabel = Get-TargetAutoloopDelayRangeLabel -TargetRow $targetRow
-        $eligibleAtText = [string](Get-ConfigValue -Object $targetRow -Name 'PendingDispatchEligibleAt' -DefaultValue '')
+        $eligibleAtText = Convert-TargetAutoloopTimestampText -Value (Get-ConfigValue -Object $targetRow -Name 'PendingDispatchEligibleAt' -DefaultValue '')
 
         if (-not (Test-NonEmptyString $eligibleAtText)) {
             $invalidDueAtCount += 1
@@ -622,12 +750,12 @@ function ConvertTo-TargetAutoloopSmokeReceiptDocument {
         $watcherStopReason = [string](Get-ConfigValue -Object $receipt -Name 'StopReason' -DefaultValue '')
     }
 
-    $completedAt = [string](Get-ConfigValue -Object $receipt -Name 'CompletedAt' -DefaultValue '')
+    $completedAt = Get-TargetAutoloopTimestampFieldText -Object $receipt -Name 'CompletedAt'
     if (-not (Test-NonEmptyString $completedAt)) {
-        $completedAt = [string](Get-ConfigValue -Object $receipt -Name 'LastUpdatedAt' -DefaultValue '')
+        $completedAt = Get-TargetAutoloopTimestampFieldText -Object $receipt -Name 'LastUpdatedAt'
     }
     if (-not (Test-NonEmptyString $completedAt)) {
-        $completedAt = [string](Get-ConfigValue -Object $receipt -Name 'GeneratedAt' -DefaultValue '')
+        $completedAt = Get-TargetAutoloopTimestampFieldText -Object $receipt -Name 'GeneratedAt'
     }
 
     return [pscustomobject][ordered]@{
@@ -934,9 +1062,9 @@ function Get-TargetAutoloopVisibleAcceptanceProofSummary {
     }
 
     $finalPhase = [string](Get-ConfigValue -Object $payload -Name 'Stage' -DefaultValue '')
-    $completedAt = [string](Get-ConfigValue -Object $payload -Name 'LastUpdatedAt' -DefaultValue '')
+    $completedAt = Get-TargetAutoloopTimestampFieldText -Object $payload -Name 'LastUpdatedAt'
     if (-not (Test-NonEmptyString $completedAt)) {
-        $completedAt = [string](Get-ConfigValue -Object $payload -Name 'GeneratedAt' -DefaultValue '')
+        $completedAt = Get-TargetAutoloopTimestampFieldText -Object $payload -Name 'GeneratedAt'
     }
 
     $summary = ('smoke: {0} / proof=visible-live / source=shared-visible-acceptance' -f $resultText)
@@ -1595,10 +1723,75 @@ function Get-TargetAutoloopRouteRowManifestTextLine {
         [string]$Indent = '  '
     )
 
-    return ('{0}manifest: inManifest={1} manifestEnabled={2}' -f
+    $line = ('{0}manifest: inManifest={1} manifestEnabled={2}' -f
         $Indent,
         [bool](Get-ConfigValue -Object $Row -Name 'InManifest' -DefaultValue $false),
         [bool](Get-ConfigValue -Object $Row -Name 'ManifestEnabled' -DefaultValue $false))
+    $routeScope = [string](Get-ConfigValue -Object $Row -Name 'RouteScope' -DefaultValue '')
+    $routeScopeReason = [string](Get-ConfigValue -Object $Row -Name 'RouteScopeReason' -DefaultValue '')
+    if (Test-NonEmptyString $routeScope) {
+        $line += (' routeScope={0}' -f $routeScope)
+    }
+    if (Test-NonEmptyString $routeScopeReason) {
+        $line += (' reason={0}' -f $routeScopeReason)
+    }
+    return $line
+}
+
+function Get-TargetAutoloopRouteScopeState {
+    param(
+        [bool]$ManifestExists = $false,
+        [AllowEmptyString()][string]$ManifestRunMode = '',
+        [bool]$InManifest = $false
+    )
+
+    if (-not $ManifestExists) {
+        return [pscustomobject][ordered]@{
+            Scope = 'manifest-missing'
+            Active = $false
+            Reason = 'runroot-manifest-missing'
+        }
+    }
+
+    if ($ManifestExists -and $ManifestRunMode -eq 'target-autoloop' -and -not $InManifest) {
+        return [pscustomobject][ordered]@{
+            Scope = 'outside-current-manifest'
+            Active = $false
+            Reason = 'target-not-in-current-run-manifest'
+        }
+    }
+
+    return [pscustomobject][ordered]@{
+        Scope = 'current-run'
+        Active = $true
+        Reason = ''
+    }
+}
+
+function Get-TargetAutoloopRouteBadgeForScope {
+    param(
+        [bool]$Enabled = $false,
+        [AllowEmptyString()][string]$ContractState = '',
+        [bool]$RouteScopeActive = $true,
+        [AllowEmptyString()][string]$RouteScope = ''
+    )
+
+    if (-not $Enabled) {
+        return 'DISABLED'
+    }
+    if (-not $RouteScopeActive) {
+        if ($RouteScope -eq 'manifest-missing' -and $ContractState -eq 'missing') {
+            return 'ROUTE EMPTY'
+        }
+        return 'ROUTE OUT'
+    }
+    if ($ContractState -eq 'ready') {
+        return 'ROUTE READY'
+    }
+    if ($ContractState -in @('partial', 'invalid')) {
+        return 'ROUTE CHECK'
+    }
+    return 'ROUTE EMPTY'
 }
 
 function Get-TargetAutoloopDeliveryTextLines {
@@ -1644,6 +1837,18 @@ function Get-TargetAutoloopStatePaths {
         SmokeReceiptPath = Join-Path $stateRoot 'target-autoloop-live-smoke-result.json'
         AcceptanceReceiptPath = Join-Path $stateRoot 'live-acceptance-result.json'
     }
+}
+
+function Get-TargetAutoloopTargetWatcherMutexName {
+    param(
+        [Parameter(Mandatory)][string]$TargetRunRoot,
+        [Parameter(Mandatory)][string]$TargetId
+    )
+
+    $scopeKey = '{0}|{1}' -f (Get-NormalizedFullPath -Path $TargetRunRoot), ([string]$TargetId).Trim()
+    $hashHex = (Get-TextHashHex -Text $scopeKey)
+    $token = if ($hashHex.Length -ge 24) { $hashHex.Substring(0, 24) } else { $hashHex }
+    return ('Global\RelayTargetAutoloopTarget_{0}' -f $token)
 }
 
 function Get-TargetAutoloopTargetWorkRepoRoot {
@@ -1772,7 +1977,13 @@ function Use-TargetAutoloopManifestTargetPaths {
             @{ Property = 'SourceSummaryPath'; Field = 'SourceSummaryPath' },
             @{ Property = 'SourceReviewZipPath'; Field = 'SourceReviewZipPath' },
             @{ Property = 'PublishReadyPath'; Field = 'PublishReadyPath' },
-            @{ Property = 'ReceiptsRoot'; Field = 'ReceiptsRoot' }
+            @{ Property = 'ReceiptsRoot'; Field = 'ReceiptsRoot' },
+            @{ Property = 'TargetStateRoot'; Field = 'TargetStateRoot' },
+            @{ Property = 'TargetStatePath'; Field = 'TargetStatePath' },
+            @{ Property = 'TargetStatusPath'; Field = 'TargetStatusPath' },
+            @{ Property = 'TargetControlPath'; Field = 'TargetControlPath' },
+            @{ Property = 'TargetEventsPath'; Field = 'TargetEventsPath' },
+            @{ Property = 'TargetWatcherMutexName'; Field = 'TargetWatcherMutexName' }
         )) {
         if (-not (Test-TargetAutoloopObjectPropertyExists -Object $ManifestTarget -Name ([string]$mapping.Field))) {
             continue
@@ -1858,6 +2069,11 @@ function Get-TargetAutoloopTargetPaths {
     $workRoot = Join-Path $targetRoot 'work'
     $sourceOutboxRoot = Join-Path $targetRoot 'source-outbox'
     $receiptsRoot = Join-Path $targetRoot 'receipts'
+    $targetStateRoot = Join-Path $targetRoot '.state'
+    $stateFileName = if ($null -ne $Config) { [string](Get-ConfigValue -Object $Config -Name 'StateFileName' -DefaultValue 'target-state.json') } else { 'target-state.json' }
+    $statusFileName = if ($null -ne $Config) { [string](Get-ConfigValue -Object $Config -Name 'StatusFileName' -DefaultValue 'target-autoloop-status.json') } else { 'target-autoloop-status.json' }
+    $controlFileName = if ($null -ne $Config) { [string](Get-ConfigValue -Object $Config -Name 'ControlFileName' -DefaultValue 'target-autoloop-control.json') } else { 'target-autoloop-control.json' }
+    $eventsFileName = if ($null -ne $Config) { [string](Get-ConfigValue -Object $Config -Name 'EventsFileName' -DefaultValue 'target-events.jsonl') } else { 'target-events.jsonl' }
     return [pscustomobject]@{
         CoordinatorRunRoot = [System.IO.Path]::GetFullPath($RunRoot)
         TargetRunRoot = $targetRunRoot
@@ -1877,6 +2093,12 @@ function Get-TargetAutoloopTargetPaths {
         SourceReviewZipPath = Join-Path $sourceOutboxRoot 'review.zip'
         PublishReadyPath = Join-Path $sourceOutboxRoot 'publish.ready.json'
         ReceiptsRoot = $receiptsRoot
+        TargetStateRoot = $targetStateRoot
+        TargetStatePath = Join-Path $targetStateRoot $stateFileName
+        TargetStatusPath = Join-Path $targetStateRoot $statusFileName
+        TargetControlPath = Join-Path $targetStateRoot $controlFileName
+        TargetEventsPath = Join-Path $targetStateRoot $eventsFileName
+        TargetWatcherMutexName = Get-TargetAutoloopTargetWatcherMutexName -TargetRunRoot $targetRunRoot -TargetId $TargetId
     }
 }
 
@@ -1892,7 +2114,8 @@ function Ensure-TargetAutoloopTargetDirectories {
             $Paths.InboxFailedRoot,
             $Paths.WorkRoot,
             $Paths.SourceOutboxRoot,
-            $Paths.ReceiptsRoot
+            $Paths.ReceiptsRoot,
+            $Paths.TargetStateRoot
         )) {
         Ensure-Directory -Path $path
     }
@@ -1969,6 +2192,12 @@ function New-TargetAutoloopTargetStateRecord {
         SourceReviewZipPath = [string]$Paths.SourceReviewZipPath
         PublishReadyPath = [string]$Paths.PublishReadyPath
         ReceiptsRoot = [string]$Paths.ReceiptsRoot
+        TargetStateRoot = [string]$Paths.TargetStateRoot
+        TargetStatePath = [string]$Paths.TargetStatePath
+        TargetStatusPath = [string]$Paths.TargetStatusPath
+        TargetControlPath = [string]$Paths.TargetControlPath
+        TargetEventsPath = [string]$Paths.TargetEventsPath
+        TargetWatcherMutexName = [string]$Paths.TargetWatcherMutexName
     }
 }
 
@@ -2321,6 +2550,12 @@ function Convert-TargetAutoloopTargetMapToRows {
                     CooldownUntil = [string](Get-ConfigValue -Object $entry -Name 'CooldownUntil' -DefaultValue '')
                     WorkRepoRoot = [string](Get-ConfigValue -Object $entry -Name 'WorkRepoRoot' -DefaultValue '')
                     TargetRunRoot = [string](Get-ConfigValue -Object $entry -Name 'TargetRunRoot' -DefaultValue '')
+                    TargetStateRoot = [string](Get-ConfigValue -Object $entry -Name 'TargetStateRoot' -DefaultValue '')
+                    TargetStatePath = [string](Get-ConfigValue -Object $entry -Name 'TargetStatePath' -DefaultValue '')
+                    TargetStatusPath = [string](Get-ConfigValue -Object $entry -Name 'TargetStatusPath' -DefaultValue '')
+                    TargetControlPath = [string](Get-ConfigValue -Object $entry -Name 'TargetControlPath' -DefaultValue '')
+                    TargetEventsPath = [string](Get-ConfigValue -Object $entry -Name 'TargetEventsPath' -DefaultValue '')
+                    TargetWatcherMutexName = [string](Get-ConfigValue -Object $entry -Name 'TargetWatcherMutexName' -DefaultValue '')
                     PublishReadyDispatchDelayMode = [string](Get-ConfigValue -Object $entry -Name 'PublishReadyDispatchDelayMode' -DefaultValue 'fixed')
                     PublishReadyDispatchDelaySeconds = [int](Get-ConfigValue -Object $entry -Name 'PublishReadyDispatchDelaySeconds' -DefaultValue 0)
                     PublishReadyDispatchMinDelaySeconds = [int](Get-ConfigValue -Object $entry -Name 'PublishReadyDispatchMinDelaySeconds' -DefaultValue ([int](Get-ConfigValue -Object $entry -Name 'PublishReadyDispatchDelaySeconds' -DefaultValue 0)))
@@ -2340,12 +2575,35 @@ function New-TargetAutoloopStatusDocument {
         [string]$WatcherState = '',
         [string]$WatcherStopReason = '',
         [string]$WatcherMutexName = '',
+        [string[]]$WatcherTargetIds = @(),
         [string]$HeartbeatAt = '',
         [string]$ProcessStartedAt = '',
         [int]$ConfiguredRunDurationSec = 0
     )
 
     $targetRows = @(Convert-TargetAutoloopTargetMapToRows -TargetsObject (Get-ConfigValue -Object $StateDocument -Name 'Targets' -DefaultValue @{}))
+    $watcherTargetIds = @(
+        $WatcherTargetIds |
+            Where-Object { Test-NonEmptyString $_ } |
+            ForEach-Object { [string]$_ } |
+            Sort-Object -Unique
+    )
+    if (@($watcherTargetIds).Count -eq 0) {
+        $watcherTargetIds = @(
+            $targetRows |
+                ForEach-Object { [string](Get-ConfigValue -Object $_ -Name 'TargetId' -DefaultValue '') } |
+                Where-Object { Test-NonEmptyString $_ } |
+                Sort-Object -Unique
+        )
+    }
+    $enabledTargetIds = @(
+        $targetRows |
+            Where-Object { [bool]$_.Enabled } |
+            ForEach-Object { [string](Get-ConfigValue -Object $_ -Name 'TargetId' -DefaultValue '') } |
+            Where-Object { Test-NonEmptyString $_ } |
+            Sort-Object -Unique
+    )
+    $watcherTargetScope = if (@($watcherTargetIds).Count -gt 0 -and @($enabledTargetIds).Count -gt 0 -and @($watcherTargetIds).Count -lt @($enabledTargetIds).Count) { 'scoped' } else { 'all' }
     $counts = [ordered]@{
         TotalTargets = @($targetRows).Count
         EnabledTargets = @($targetRows | Where-Object { [bool]$_.Enabled }).Count
@@ -2387,6 +2645,8 @@ function New-TargetAutoloopStatusDocument {
         WatcherState = $WatcherState
         WatcherStopReason = $WatcherStopReason
         WatcherMutexName = $WatcherMutexName
+        WatcherTargetIds = @($watcherTargetIds)
+        WatcherTargetScope = $watcherTargetScope
         HeartbeatAt = $HeartbeatAt
         ProcessStartedAt = $ProcessStartedAt
         ConfiguredRunDurationSec = $ConfiguredRunDurationSec
@@ -2404,6 +2664,248 @@ function New-TargetAutoloopStatusDocument {
             PublishReadyLoop = ([string]$Config.RunMode -eq 'target-autoloop')
             MaxConcurrentTargets = [int]$Config.MaxConcurrentTargets
             MaxConcurrentSubmits = [int]$Config.MaxConcurrentSubmits
+        }
+    }
+}
+
+function Get-TargetAutoloopStatusTargetRowMap {
+    param($StatusDocument)
+
+    $map = @{}
+    foreach ($row in @(Get-ConfigValue -Object $StatusDocument -Name 'Targets' -DefaultValue @())) {
+        $targetId = [string](Get-ConfigValue -Object $row -Name 'TargetId' -DefaultValue '')
+        if (Test-NonEmptyString $targetId) {
+            $map[$targetId] = $row
+        }
+    }
+    return $map
+}
+
+function Get-TargetAutoloopTargetSidecarPaths {
+    param(
+        [Parameter(Mandatory)][string]$RunRoot,
+        [Parameter(Mandatory)][string]$TargetId,
+        $TargetEntry,
+        $Config = $null
+    )
+
+    $targetRunRoot = [string](Get-ConfigValue -Object $TargetEntry -Name 'TargetRunRoot' -DefaultValue $RunRoot)
+    if (-not (Test-NonEmptyString $targetRunRoot)) {
+        $targetRunRoot = $RunRoot
+    }
+
+    $targetRoot = [string](Get-ConfigValue -Object $TargetEntry -Name 'TargetRoot' -DefaultValue '')
+    if (-not (Test-NonEmptyString $targetRoot)) {
+        $targetRoot = Join-Path (Join-Path $targetRunRoot 'targets') $TargetId
+    }
+
+    $stateFileName = if ($null -ne $Config) { [string](Get-ConfigValue -Object $Config -Name 'StateFileName' -DefaultValue 'target-state.json') } else { 'target-state.json' }
+    $statusFileName = if ($null -ne $Config) { [string](Get-ConfigValue -Object $Config -Name 'StatusFileName' -DefaultValue 'target-autoloop-status.json') } else { 'target-autoloop-status.json' }
+    $controlFileName = if ($null -ne $Config) { [string](Get-ConfigValue -Object $Config -Name 'ControlFileName' -DefaultValue 'target-autoloop-control.json') } else { 'target-autoloop-control.json' }
+    $eventsFileName = if ($null -ne $Config) { [string](Get-ConfigValue -Object $Config -Name 'EventsFileName' -DefaultValue 'target-events.jsonl') } else { 'target-events.jsonl' }
+
+    $targetStateRoot = [string](Get-ConfigValue -Object $TargetEntry -Name 'TargetStateRoot' -DefaultValue '')
+    if (-not (Test-NonEmptyString $targetStateRoot)) {
+        $targetStateRoot = Join-Path $targetRoot '.state'
+    }
+
+    $targetStatePath = [string](Get-ConfigValue -Object $TargetEntry -Name 'TargetStatePath' -DefaultValue '')
+    if (-not (Test-NonEmptyString $targetStatePath)) {
+        $targetStatePath = Join-Path $targetStateRoot $stateFileName
+    }
+    $targetStatusPath = [string](Get-ConfigValue -Object $TargetEntry -Name 'TargetStatusPath' -DefaultValue '')
+    if (-not (Test-NonEmptyString $targetStatusPath)) {
+        $targetStatusPath = Join-Path $targetStateRoot $statusFileName
+    }
+    $targetControlPath = [string](Get-ConfigValue -Object $TargetEntry -Name 'TargetControlPath' -DefaultValue '')
+    if (-not (Test-NonEmptyString $targetControlPath)) {
+        $targetControlPath = Join-Path $targetStateRoot $controlFileName
+    }
+    $targetEventsPath = [string](Get-ConfigValue -Object $TargetEntry -Name 'TargetEventsPath' -DefaultValue '')
+    if (-not (Test-NonEmptyString $targetEventsPath)) {
+        $targetEventsPath = Join-Path $targetStateRoot $eventsFileName
+    }
+    $targetWatcherMutexName = [string](Get-ConfigValue -Object $TargetEntry -Name 'TargetWatcherMutexName' -DefaultValue '')
+    if (-not (Test-NonEmptyString $targetWatcherMutexName)) {
+        $targetWatcherMutexName = Get-TargetAutoloopTargetWatcherMutexName -TargetRunRoot $targetRunRoot -TargetId $TargetId
+    }
+
+    return [pscustomobject][ordered]@{
+        TargetRunRoot = $targetRunRoot
+        TargetRoot = $targetRoot
+        TargetStateRoot = $targetStateRoot
+        TargetStatePath = $targetStatePath
+        TargetStatusPath = $targetStatusPath
+        TargetControlPath = $targetControlPath
+        TargetEventsPath = $targetEventsPath
+        TargetWatcherMutexName = $targetWatcherMutexName
+    }
+}
+
+function New-TargetAutoloopTargetSidecarStateDocument {
+    param(
+        [Parameter(Mandatory)][string]$RunRoot,
+        [Parameter(Mandatory)][string]$TargetId,
+        [Parameter(Mandatory)]$StateDocument,
+        [Parameter(Mandatory)]$TargetEntry,
+        [Parameter(Mandatory)]$SidecarPaths
+    )
+
+    return [ordered]@{
+        SchemaVersion = $script:TargetAutoloopSchemaVersion
+        SidecarKind = 'target-state'
+        SidecarScope = 'target'
+        RunMode = [string](Get-ConfigValue -Object $StateDocument -Name 'RunMode' -DefaultValue '')
+        RunRoot = $RunRoot
+        TargetId = $TargetId
+        State = [string](Get-ConfigValue -Object $StateDocument -Name 'State' -DefaultValue '')
+        LastUpdatedAt = [string](Get-ConfigValue -Object $StateDocument -Name 'LastUpdatedAt' -DefaultValue '')
+        TargetStatePath = [string]$SidecarPaths.TargetStatePath
+        TargetStatusPath = [string]$SidecarPaths.TargetStatusPath
+        TargetControlPath = [string]$SidecarPaths.TargetControlPath
+        TargetEventsPath = [string]$SidecarPaths.TargetEventsPath
+        TargetWatcherMutexName = [string]$SidecarPaths.TargetWatcherMutexName
+        Target = $TargetEntry
+    }
+}
+
+function New-TargetAutoloopTargetSidecarControlDocument {
+    param(
+        [Parameter(Mandatory)][string]$RunRoot,
+        [Parameter(Mandatory)][string]$TargetId,
+        [Parameter(Mandatory)]$ControlDocument,
+        [Parameter(Mandatory)]$SidecarPaths
+    )
+
+    return [ordered]@{
+        SchemaVersion = $script:TargetAutoloopSchemaVersion
+        SidecarKind = 'target-control'
+        SidecarScope = 'global-control-mirror'
+        RunMode = [string](Get-ConfigValue -Object $ControlDocument -Name 'RunMode' -DefaultValue '')
+        RunRoot = $RunRoot
+        TargetId = $TargetId
+        State = [string](Get-ConfigValue -Object $ControlDocument -Name 'State' -DefaultValue '')
+        Action = [string](Get-ConfigValue -Object $ControlDocument -Name 'Action' -DefaultValue '')
+        RequestId = [string](Get-ConfigValue -Object $ControlDocument -Name 'RequestId' -DefaultValue '')
+        RequestedAt = [string](Get-ConfigValue -Object $ControlDocument -Name 'RequestedAt' -DefaultValue '')
+        RequestedBy = [string](Get-ConfigValue -Object $ControlDocument -Name 'RequestedBy' -DefaultValue '')
+        LastHandledRequestId = [string](Get-ConfigValue -Object $ControlDocument -Name 'LastHandledRequestId' -DefaultValue '')
+        LastHandledAction = [string](Get-ConfigValue -Object $ControlDocument -Name 'LastHandledAction' -DefaultValue '')
+        LastHandledResult = [string](Get-ConfigValue -Object $ControlDocument -Name 'LastHandledResult' -DefaultValue '')
+        LastHandledAt = [string](Get-ConfigValue -Object $ControlDocument -Name 'LastHandledAt' -DefaultValue '')
+        LastUpdatedAt = [string](Get-ConfigValue -Object $ControlDocument -Name 'LastUpdatedAt' -DefaultValue '')
+        TargetControlPath = [string]$SidecarPaths.TargetControlPath
+        TargetWatcherMutexName = [string]$SidecarPaths.TargetWatcherMutexName
+        Control = $ControlDocument
+    }
+}
+
+function New-TargetAutoloopTargetSidecarStatusDocument {
+    param(
+        [Parameter(Mandatory)][string]$RunRoot,
+        [Parameter(Mandatory)][string]$TargetId,
+        [Parameter(Mandatory)]$StatusDocument,
+        $StatusRow = $null,
+        [Parameter(Mandatory)]$SidecarPaths
+    )
+
+    return [ordered]@{
+        SchemaVersion = $script:TargetAutoloopSchemaVersion
+        SidecarKind = 'target-status'
+        SidecarScope = 'target'
+        RunMode = [string](Get-ConfigValue -Object $StatusDocument -Name 'RunMode' -DefaultValue '')
+        RunRoot = $RunRoot
+        TargetId = $TargetId
+        ControllerState = [string](Get-ConfigValue -Object $StatusDocument -Name 'ControllerState' -DefaultValue '')
+        ControlPendingAction = [string](Get-ConfigValue -Object $StatusDocument -Name 'ControlPendingAction' -DefaultValue '')
+        ControlPendingRequestId = [string](Get-ConfigValue -Object $StatusDocument -Name 'ControlPendingRequestId' -DefaultValue '')
+        WatcherState = [string](Get-ConfigValue -Object $StatusDocument -Name 'WatcherState' -DefaultValue '')
+        WatcherStopReason = [string](Get-ConfigValue -Object $StatusDocument -Name 'WatcherStopReason' -DefaultValue '')
+        WatcherMutexName = [string](Get-ConfigValue -Object $StatusDocument -Name 'WatcherMutexName' -DefaultValue '')
+        WatcherTargetIds = @(Get-ConfigValue -Object $StatusDocument -Name 'WatcherTargetIds' -DefaultValue @())
+        WatcherTargetScope = [string](Get-ConfigValue -Object $StatusDocument -Name 'WatcherTargetScope' -DefaultValue '')
+        HeartbeatAt = [string](Get-ConfigValue -Object $StatusDocument -Name 'HeartbeatAt' -DefaultValue '')
+        ProcessStartedAt = [string](Get-ConfigValue -Object $StatusDocument -Name 'ProcessStartedAt' -DefaultValue '')
+        State = [string](Get-ConfigValue -Object $StatusDocument -Name 'State' -DefaultValue '')
+        LastUpdatedAt = [string](Get-ConfigValue -Object $StatusDocument -Name 'LastUpdatedAt' -DefaultValue '')
+        TargetStatusPath = [string]$SidecarPaths.TargetStatusPath
+        TargetControlPath = [string]$SidecarPaths.TargetControlPath
+        TargetStatePath = [string]$SidecarPaths.TargetStatePath
+        TargetEventsPath = [string]$SidecarPaths.TargetEventsPath
+        TargetWatcherMutexName = [string]$SidecarPaths.TargetWatcherMutexName
+        Target = $StatusRow
+    }
+}
+
+function Sync-TargetAutoloopTargetSidecarDocuments {
+    param(
+        [Parameter(Mandatory)]$Config,
+        [Parameter(Mandatory)][string]$RunRoot,
+        $StateDocument = $null,
+        $ControlDocument = $null,
+        $StatusDocument = $null,
+        [bool]$WriteState = $true,
+        [bool]$WriteControl = $true,
+        [bool]$WriteStatus = $true
+    )
+
+    if ($null -eq $StateDocument) {
+        return
+    }
+
+    $stateTargetMap = Get-TargetAutoloopTargetStateMap -StateDocument $StateDocument
+    $statusRowMap = if ($null -ne $StatusDocument) {
+        Get-TargetAutoloopStatusTargetRowMap -StatusDocument $StatusDocument
+    }
+    else {
+        @{}
+    }
+
+    foreach ($targetId in @($stateTargetMap.Keys | Sort-Object)) {
+        if (-not (Test-NonEmptyString ([string]$targetId))) {
+            continue
+        }
+        $entry = $stateTargetMap[$targetId]
+        if ($null -eq $entry) {
+            continue
+        }
+
+        $sidecarPaths = Get-TargetAutoloopTargetSidecarPaths -RunRoot $RunRoot -TargetId ([string]$targetId) -TargetEntry $entry -Config $Config
+        Ensure-Directory -Path ([string]$sidecarPaths.TargetStateRoot)
+
+        if ($WriteState) {
+            Write-JsonFileAtomically `
+                -Path ([string]$sidecarPaths.TargetStatePath) `
+                -Payload (New-TargetAutoloopTargetSidecarStateDocument `
+                    -RunRoot $RunRoot `
+                    -TargetId ([string]$targetId) `
+                    -StateDocument $StateDocument `
+                    -TargetEntry $entry `
+                    -SidecarPaths $sidecarPaths)
+        }
+        if ($WriteControl -and $null -ne $ControlDocument) {
+            Write-JsonFileAtomically `
+                -Path ([string]$sidecarPaths.TargetControlPath) `
+                -Payload (New-TargetAutoloopTargetSidecarControlDocument `
+                    -RunRoot $RunRoot `
+                    -TargetId ([string]$targetId) `
+                    -ControlDocument $ControlDocument `
+                    -SidecarPaths $sidecarPaths)
+        }
+        if ($WriteStatus -and $null -ne $StatusDocument) {
+            $statusRow = if ($statusRowMap.ContainsKey([string]$targetId)) { $statusRowMap[[string]$targetId] } else { $null }
+            Write-JsonFileAtomically `
+                -Path ([string]$sidecarPaths.TargetStatusPath) `
+                -Payload (New-TargetAutoloopTargetSidecarStatusDocument `
+                    -RunRoot $RunRoot `
+                    -TargetId ([string]$targetId) `
+                    -StatusDocument $StatusDocument `
+                    -StatusRow $statusRow `
+                    -SidecarPaths $sidecarPaths)
+        }
+        if ((Test-NonEmptyString ([string]$sidecarPaths.TargetEventsPath)) -and -not (Test-Path -LiteralPath ([string]$sidecarPaths.TargetEventsPath) -PathType Leaf)) {
+            Ensure-Directory -Path (Split-Path -Parent ([string]$sidecarPaths.TargetEventsPath))
+            '' | Set-Content -LiteralPath ([string]$sidecarPaths.TargetEventsPath) -Encoding UTF8
         }
     }
 }
@@ -2681,7 +3183,7 @@ function Get-TargetAutoloopDeliverySnapshot {
     $pendingDispatchEligibleAt = [string](Get-ConfigValue -Object $StateRecord -Name 'PendingDispatchEligibleAt' -DefaultValue ([string](Get-ConfigValue -Object $StatusRow -Name 'PendingDispatchEligibleAt' -DefaultValue '')))
     $pendingDispatchDelaySeconds = [int](Get-ConfigValue -Object $StateRecord -Name 'PendingDispatchDelaySeconds' -DefaultValue ([int](Get-ConfigValue -Object $StatusRow -Name 'PendingDispatchDelaySeconds' -DefaultValue 0)))
     $routerStateName = [string](Get-ConfigValue -Object $RouterSessionState -Name 'State' -DefaultValue '')
-    $routerDelivered = $lastDispatchState -eq 'router-ready-file-created'
+    $routerDelivered = $lastDispatchState -eq 'router-ready-file-created' -or (Test-NonEmptyString $lastRouterReadyPath)
     $routerStage = if ($routerDelivered) {
         'ready-file-created'
     }
@@ -2728,7 +3230,7 @@ function Get-TargetAutoloopDeliverySnapshot {
         $nextActionLabel = 'dispatch delay 확인'
         ('watcher는 marker를 accepted 처리했고 publish-ready dispatch delay 대기 중입니다. delaySeconds={0}, eligibleAt={1}' -f $pendingDispatchDelaySeconds, $(if (Test-NonEmptyString $pendingDispatchEligibleAt) { $pendingDispatchEligibleAt } else { '-' }))
     }
-    elseif ($lastDispatchState -ne 'router-ready-file-created') {
+    elseif (-not $routerDelivered) {
         $nextActionCode = 'check-router-delivery'
         $nextActionLabel = 'router 전달 확인'
         if ([bool]$UseRouterSessionFallback) {

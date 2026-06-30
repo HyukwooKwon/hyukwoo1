@@ -4,6 +4,7 @@ param(
     [string]$RunRoot,
     [ValidateSet('target-inbox-submit', 'target-autoloop')][string]$RunMode = '',
     [string[]]$Targets = @(),
+    [ValidateRange(-1, 2147483647)][int]$MaxCycleCount = -1,
     [switch]$AsJson,
     [Parameter(ValueFromRemainingArguments = $true)][string[]]$RemainingTargets = @()
 )
@@ -119,6 +120,14 @@ $manifestTargets = New-Object System.Collections.Generic.List[object]
 $routePathKeys = @{}
 foreach ($target in @($config.Targets | Where-Object { $selectedSet.ContainsKey([string]$_.TargetId) })) {
     $targetId = [string]$target.TargetId
+    if ($MaxCycleCount -ge 0) {
+        if ($target -is [System.Collections.IDictionary]) {
+            $target['MaxCycleCount'] = [int]$MaxCycleCount
+        }
+        else {
+            $target | Add-Member -NotePropertyName 'MaxCycleCount' -NotePropertyValue ([int]$MaxCycleCount) -Force
+        }
+    }
     $paths = Get-TargetAutoloopTargetPaths -RunRoot $resolvedRunRoot -TargetId $targetId -Target $target -Config $config
     Ensure-TargetAutoloopTargetDirectories -Paths $paths
 
@@ -130,7 +139,10 @@ foreach ($target in @($config.Targets | Where-Object { $selectedSet.ContainsKey(
     foreach ($routePath in @(
             @{ Label = 'InboxPendingRoot'; Path = [string]$paths.InboxPendingRoot },
             @{ Label = 'SourceOutboxPath'; Path = [string]$paths.SourceOutboxRoot },
-            @{ Label = 'QueueRoot'; Path = [string]$queuePaths.QueueRoot }
+            @{ Label = 'QueueRoot'; Path = [string]$queuePaths.QueueRoot },
+            @{ Label = 'TargetStateRoot'; Path = [string]$paths.TargetStateRoot },
+            @{ Label = 'TargetControlPath'; Path = [string]$paths.TargetControlPath },
+            @{ Label = 'TargetStatusPath'; Path = [string]$paths.TargetStatusPath }
         )) {
         $routeKey = Get-NormalizedFullPath -Path ([string]$routePath.Path)
         if (-not (Test-NonEmptyString $routeKey)) {
@@ -172,6 +184,12 @@ foreach ($target in @($config.Targets | Where-Object { $selectedSet.ContainsKey(
             SourceReviewZipPath = [string]$paths.SourceReviewZipPath
             PublishReadyPath = [string]$paths.PublishReadyPath
             ReceiptsRoot = [string]$paths.ReceiptsRoot
+            TargetStateRoot = [string]$paths.TargetStateRoot
+            TargetStatePath = [string]$paths.TargetStatePath
+            TargetStatusPath = [string]$paths.TargetStatusPath
+            TargetControlPath = [string]$paths.TargetControlPath
+            TargetEventsPath = [string]$paths.TargetEventsPath
+            TargetWatcherMutexName = [string]$paths.TargetWatcherMutexName
             QueueRoot = [string]$queuePaths.QueueRoot
             QueueQueuedRoot = [string]$queuePaths.QueuedRoot
             QueueProcessingRoot = [string]$queuePaths.ProcessingRoot
@@ -222,6 +240,7 @@ $manifest = [ordered]@{
         DefaultPublishReadyDispatchMinDelaySeconds = [int]$config.DefaultPublishReadyDispatchMinDelaySeconds
         DefaultPublishReadyDispatchMaxDelaySeconds = [int]$config.DefaultPublishReadyDispatchMaxDelaySeconds
         DefaultMaxCycleCount = [int]$config.DefaultMaxCycleCount
+        RunMaxCycleCountOverride = [int]$MaxCycleCount
         RequireExplicitContractPath = [bool]$config.RequireExplicitContractPath
         RequireTargetMetadata = [bool]$config.RequireTargetMetadata
         AllowRecursiveWatch = [bool]$config.AllowRecursiveWatch
@@ -243,6 +262,12 @@ Write-JsonFileAtomically -Path $manifestPath -Payload $manifest
 Write-JsonFileAtomically -Path $statePaths.StatePath -Payload $stateDocument
 Write-JsonFileAtomically -Path $statePaths.ControlPath -Payload $controlDocument
 Write-JsonFileAtomically -Path $statePaths.StatusPath -Payload $statusDocument
+Sync-TargetAutoloopTargetSidecarDocuments `
+    -Config $config `
+    -RunRoot $resolvedRunRoot `
+    -StateDocument $stateDocument `
+    -ControlDocument $controlDocument `
+    -StatusDocument $statusDocument
 if (-not (Test-Path -LiteralPath $statePaths.EventsPath -PathType Leaf)) {
     '' | Set-Content -LiteralPath $statePaths.EventsPath -Encoding UTF8
 }
@@ -259,6 +284,7 @@ $result = [pscustomobject][ordered]@{
     EventsPath = [string]$statePaths.EventsPath
     SmokeReceiptPath = [string]$statePaths.SmokeReceiptPath
     TargetIds = @($selectedTargets)
+    MaxCycleCountOverride = [int]$MaxCycleCount
     QueueDispatchIntegrated = $false
     RouterReadyDispatchIntegrated = [bool]$config.DispatchQueuedCommandsInline
 }

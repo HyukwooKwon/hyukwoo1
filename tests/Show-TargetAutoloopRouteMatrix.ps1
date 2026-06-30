@@ -140,18 +140,8 @@ foreach ($target in @($config.Targets | Sort-Object TargetId)) {
     $contract = Get-TargetAutoloopRouteMatrixContractSnapshot -Paths $paths -TargetId $targetId
     $delivery = Get-TargetAutoloopDeliverySnapshot -Contract $contract -StateRecord $stateRecord -StatusRow $statusRow
     $contractState = [string](Get-ConfigValue -Object $contract -Name 'State' -DefaultValue 'missing')
-    $routeBadge = if (-not $enabled) {
-        'DISABLED'
-    }
-    elseif ($contractState -eq 'ready') {
-        'ROUTE READY'
-    }
-    elseif ($contractState -in @('partial', 'invalid')) {
-        'ROUTE CHECK'
-    }
-    else {
-        'ROUTE EMPTY'
-    }
+    $routeScope = Get-TargetAutoloopRouteScopeState -ManifestExists $manifestExists -ManifestRunMode $manifestRunMode -InManifest $inManifest
+    $routeBadge = Get-TargetAutoloopRouteBadgeForScope -Enabled $enabled -ContractState $contractState -RouteScopeActive ([bool]$routeScope.Active) -RouteScope ([string]$routeScope.Scope)
     $cycleCount = [int](Get-ConfigValue -Object $stateRecord -Name 'CycleCount' -DefaultValue ([int](Get-ConfigValue -Object $statusRow -Name 'CycleCount' -DefaultValue 0)))
     $maxCycleCount = [int](Get-ConfigValue -Object $stateRecord -Name 'MaxCycleCount' -DefaultValue ([int](Get-ConfigValue -Object $statusRow -Name 'MaxCycleCount' -DefaultValue ([int]$target.MaxCycleCount))))
 
@@ -160,6 +150,9 @@ foreach ($target in @($config.Targets | Sort-Object TargetId)) {
         Enabled = $enabled
         InManifest = [bool]$inManifest
         ManifestEnabled = [bool]$manifestEnabled
+        RouteScope = [string]$routeScope.Scope
+        RouteScopeActive = [bool]$routeScope.Active
+        RouteScopeReason = [string]$routeScope.Reason
         RouteBadge = $routeBadge
         ContractState = $contractState
         ContractReason = [string](Get-ConfigValue -Object $contract -Name 'Reason' -DefaultValue '')
@@ -175,6 +168,12 @@ foreach ($target in @($config.Targets | Sort-Object TargetId)) {
         SourceReviewZipPath = [string]$paths.SourceReviewZipPath
         PublishReadyPath = [string]$paths.PublishReadyPath
         SourceOutboxPath = [string]$paths.SourceOutboxRoot
+        TargetStateRoot = [string]$paths.TargetStateRoot
+        TargetStatePath = [string]$paths.TargetStatePath
+        TargetStatusPath = [string]$paths.TargetStatusPath
+        TargetControlPath = [string]$paths.TargetControlPath
+        TargetEventsPath = [string]$paths.TargetEventsPath
+        TargetWatcherMutexName = [string]$paths.TargetWatcherMutexName
         QueueRoot = [string]$queuePaths.QueueRoot
         Delivery = $delivery
         DeliverySummary = [string](Get-ConfigValue -Object $delivery -Name 'Summary' -DefaultValue '')
@@ -191,6 +190,7 @@ $counts = [ordered]@{
     RouteReadyTargets = @($targetRows | Where-Object { [string]$_.RouteBadge -eq 'ROUTE READY' }).Count
     RouteCheckTargets = @($targetRows | Where-Object { [string]$_.RouteBadge -eq 'ROUTE CHECK' }).Count
     RouteEmptyTargets = @($targetRows | Where-Object { [string]$_.RouteBadge -eq 'ROUTE EMPTY' }).Count
+    RouteOutOfScopeTargets = @($targetRows | Where-Object { [string]$_.RouteBadge -eq 'ROUTE OUT' }).Count
     ReadyContracts = @($targetRows | Where-Object { [string]$_.ContractState -eq 'ready' }).Count
     PartialContracts = @($targetRows | Where-Object { [string]$_.ContractState -eq 'partial' }).Count
     InvalidContracts = @($targetRows | Where-Object { [string]$_.ContractState -eq 'invalid' }).Count
@@ -244,7 +244,7 @@ $lines += @(
     ('SmokeSummary: ' + [string](Get-ConfigValue -Object $proofReceipt -Name 'Summary' -DefaultValue 'smoke: (없음)'))
     ('CloseoutSummary: ' + [string](Get-ConfigValue -Object $proofCloseout -Name 'Summary' -DefaultValue 'closeout: pending-proof / mode=not-ready / reason=no-proof'))
     ('CloseoutNextStep: ' + [string](Get-ConfigValue -Object $proofCloseout -Name 'RecommendedNextStep' -DefaultValue ''))
-    ('Counts: total={0} enabled={1} routeReady={2} routeCheck={3} routeEmpty={4} disabled={5} contractReady={6} partial={7} invalid={8} missing={9}' -f
+    ('Counts: total={0} enabled={1} routeReady={2} routeCheck={3} routeEmpty={4} disabled={5} contractReady={6} partial={7} invalid={8} missing={9} routeOut={10}' -f
         [int]$counts.TotalTargets,
         [int]$counts.EnabledTargets,
         [int]$counts.RouteReadyTargets,
@@ -254,7 +254,8 @@ $lines += @(
         [int]$counts.ReadyContracts,
         [int]$counts.PartialContracts,
         [int]$counts.InvalidContracts,
-        [int]$counts.MissingContracts)
+        [int]$counts.MissingContracts,
+        [int]$counts.RouteOutOfScopeTargets)
     ''
 )
 
@@ -282,6 +283,10 @@ foreach ($row in @($targetRows)) {
     $lines += ('  review : ' + [string]$row.SourceReviewZipPath)
     $lines += ('  publish: ' + [string]$row.PublishReadyPath)
     $lines += ('  queue  : ' + [string]$row.QueueRoot)
+    $lines += ('  targetState: status={0} control={1} mutex={2}' -f
+        [string]$row.TargetStatusPath,
+        [string]$row.TargetControlPath,
+        $(if (Test-NonEmptyString ([string]$row.TargetWatcherMutexName)) { [string]$row.TargetWatcherMutexName } else { '(none)' }))
     $lines += @(Get-TargetAutoloopDeliveryTextLines -Row $row)
     $lines += ''
 }

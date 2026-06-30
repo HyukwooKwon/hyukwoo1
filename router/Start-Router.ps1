@@ -32,6 +32,235 @@ function Write-RelayLog {
     Write-Host $line
 }
 
+function Get-RelayFailureDebugLogPath {
+    param([AllowEmptyString()][string]$FailureMessage = '')
+
+    if ([string]::IsNullOrWhiteSpace($FailureMessage)) {
+        return ''
+    }
+
+    if ($FailureMessage -match 'debugLog=(?<path>.+)$') {
+        return ([string]$Matches['path']).Trim()
+    }
+
+    return ''
+}
+
+function Test-RelayFocusLostBeforePayloadRetryEligible {
+    param([AllowEmptyString()][string]$FailureMessage = '')
+
+    $policy = Get-RelayFocusLostRetryMetadata -FailureCategory 'focus_lost' -FailureMessage $FailureMessage
+    return ([string]$policy.Stage -eq 'pre-input')
+}
+
+function Get-RelayFocusLostRetryMetadata {
+    param(
+        [AllowEmptyString()][string]$FailureCategory = '',
+        [AllowEmptyString()][string]$FailureMessage = ''
+    )
+
+    if ([string]$FailureCategory -ne 'focus_lost') {
+        return [pscustomobject][ordered]@{
+            Stage = 'not-focus-lost'
+            Policy = 'not-focus-lost'
+            Hint = ''
+        }
+    }
+
+    $debugLogPath = Get-RelayFailureDebugLogPath -FailureMessage $FailureMessage
+    if ([string]::IsNullOrWhiteSpace($debugLogPath)) {
+        return [pscustomobject][ordered]@{
+            Stage = 'unknown'
+            Policy = 'manual-review'
+            Hint = 'focus_lost debug log를 찾지 못했습니다. 대상 셀창 상태를 확인한 뒤 current 항목만 재시도하세요.'
+        }
+    }
+    if (-not (Test-Path -LiteralPath $debugLogPath -PathType Leaf)) {
+        return [pscustomobject][ordered]@{
+            Stage = 'unknown'
+            Policy = 'manual-review'
+            Hint = 'focus_lost debug log를 찾지 못했습니다. 대상 셀창 상태를 확인한 뒤 current 항목만 재시도하세요.'
+        }
+    }
+
+    try {
+        $debugLog = [System.IO.File]::ReadAllText($debugLogPath, (New-Utf8StrictEncoding))
+    }
+    catch {
+        return [pscustomobject][ordered]@{
+            Stage = 'unknown'
+            Policy = 'manual-review'
+            Hint = 'focus_lost debug log를 읽지 못했습니다. 대상 셀창 상태를 확인한 뒤 current 항목만 재시도하세요.'
+        }
+    }
+
+    $preInputFocusLost = ($debugLog -match 'text_pre_(clear|paste)_focus_stolen_hard_fail')
+    $submitDispatched = ($debugLog -match 'submit_(attempt|after_dispatch|complete)')
+    $submitStarted = ($debugLog.Contains('submit_precheck') -or $debugLog.Contains('submit_guard_begin') -or $debugLog.Contains('submit_guard_complete'))
+    $payloadInputStarted = $false
+    foreach ($marker in @('terminal_sendtext', 'terminal_paste', 'control_sendtext')) {
+        if ($debugLog.Contains($marker)) {
+            $payloadInputStarted = $true
+            break
+        }
+    }
+    $payloadOrSubmitStarted = $false
+    foreach ($marker in @('terminal_input_mode', 'terminal_sendtext', 'terminal_paste', 'control_sendtext', 'submit_precheck', 'submit_complete')) {
+        if ($debugLog.Contains($marker)) {
+            $payloadOrSubmitStarted = $true
+            break
+        }
+    }
+
+    if ($preInputFocusLost -and -not $payloadOrSubmitStarted) {
+        return [pscustomobject][ordered]@{
+            Stage = 'pre-input'
+            Policy = 'bounded-auto-retry-exhausted'
+            Hint = '입력 시작 전 포커스 이탈입니다. router가 안전한 자동 재시도를 이미 소진했으므로, 셀창 포커스/사용자 idle을 확보한 뒤 current 항목만 재시도하세요.'
+        }
+    }
+
+    if ($payloadInputStarted -and $submitStarted -and -not $submitDispatched) {
+        return [pscustomobject][ordered]@{
+            Stage = 'submit-ready-no-dispatch'
+            Policy = 'manual-submit-only-retry'
+            Hint = 'payload 붙여넣기는 완료됐지만 submit dispatch 전 focus_lost입니다. 재붙여넣기하지 말고 셀창 입력 내용을 확인한 뒤 submit-only로 1회 제출하세요.'
+        }
+    }
+
+    if ($payloadOrSubmitStarted) {
+        return [pscustomobject][ordered]@{
+            Stage = 'post-input-or-submit'
+            Policy = 'manual-review-duplicate-risk'
+            Hint = 'payload 입력 또는 submit 단계 이후 focus_lost입니다. 중복 전송 위험이 있어 자동 재시도하지 않습니다. 셀창에 이미 입력/전송된 내용이 있는지 먼저 확인하세요.'
+        }
+    }
+
+    return [pscustomobject][ordered]@{
+        Stage = 'unknown'
+        Policy = 'manual-review'
+        Hint = 'focus_lost 단계가 불명확합니다. 대상 셀창 상태를 확인한 뒤 current 항목만 재시도하세요.'
+    }
+}
+
+function Get-RelaySendRetryMetadata {
+    param(
+        [AllowEmptyString()][string]$FailureCategory = '',
+        [AllowEmptyString()][string]$FailureMessage = ''
+    )
+
+    if ([string]$FailureCategory -eq 'focus_lost') {
+        $focusPolicy = Get-RelayFocusLostRetryMetadata -FailureCategory $FailureCategory -FailureMessage $FailureMessage
+        return [pscustomobject][ordered]@{
+            Stage = [string]$focusPolicy.Stage
+            Policy = [string]$focusPolicy.Policy
+            Hint = [string]$focusPolicy.Hint
+        }
+    }
+
+    if ([string]$FailureCategory -eq 'user_active_hold') {
+        return [pscustomobject][ordered]@{
+            Stage = 'pre-input-user-active'
+            Policy = 'bounded-auto-retry-exhausted'
+            Hint = '사용자 입력/포커스 활동 때문에 전송을 보류했습니다. router가 제한된 자동 재시도를 소진했으므로 사용자 idle을 확보한 뒤 current 항목만 재시도하세요.'
+        }
+    }
+
+    if ([string]$FailureCategory -eq 'window_not_found') {
+        return [pscustomobject][ordered]@{
+            Stage = 'pre-input-window-resolution'
+            Policy = 'manual-retry-after-window-check'
+            Hint = '대상 셀창을 찾지 못했습니다. 공식 8창/binding 상태를 확인한 뒤 current 항목만 재시도하세요.'
+        }
+    }
+
+    if ([string]$FailureCategory -ne 'send_failed') {
+        return [pscustomobject][ordered]@{
+            Stage = 'not-send-failure'
+            Policy = 'not-send-failure'
+            Hint = ''
+        }
+    }
+
+    $debugLogPath = Get-RelayFailureDebugLogPath -FailureMessage $FailureMessage
+    if ([string]::IsNullOrWhiteSpace($debugLogPath) -or -not (Test-Path -LiteralPath $debugLogPath -PathType Leaf)) {
+        return [pscustomobject][ordered]@{
+            Stage = 'unknown'
+            Policy = 'manual-review'
+            Hint = 'send_failed debug log를 찾지 못했습니다. payload 입력 여부가 불명확하므로 셀창 상태를 확인한 뒤 current 항목만 재시도하세요.'
+        }
+    }
+
+    try {
+        $debugLog = [System.IO.File]::ReadAllText($debugLogPath, (New-Utf8StrictEncoding))
+    }
+    catch {
+        return [pscustomobject][ordered]@{
+            Stage = 'unknown'
+            Policy = 'manual-review'
+            Hint = 'send_failed debug log를 읽지 못했습니다. payload 입력 여부가 불명확하므로 셀창 상태를 확인한 뒤 current 항목만 재시도하세요.'
+        }
+    }
+
+    $clipboardInputPrepFailed = ($debugLog.Contains('terminal_paste_clipwait_failed') -or $debugLog.Contains('clipboard_not_ready_for_terminal_paste'))
+    $unsupportedSubmitMode = $debugLog.Contains('unsupported_submit_mode')
+    $submitDispatched = ($debugLog -match 'submit_(attempt|after_dispatch|complete)')
+    $submitStarted = ($debugLog.Contains('submit_precheck') -or $debugLog.Contains('submit_guard_begin') -or $debugLog.Contains('submit_guard_complete'))
+    $payloadInputStarted = $false
+    foreach ($marker in @('terminal_sendtext', 'terminal_paste', 'control_sendtext')) {
+        if ($debugLog.Contains($marker)) {
+            $payloadInputStarted = $true
+            break
+        }
+    }
+
+    if ($clipboardInputPrepFailed -and -not $payloadInputStarted -and -not $submitStarted) {
+        return [pscustomobject][ordered]@{
+            Stage = 'pre-input'
+            Policy = 'bounded-auto-retry'
+            Hint = 'clipboard/paste 준비 단계 실패라 payload 입력 전으로 판단했습니다. router가 제한된 자동 재시도를 수행하고, 계속 실패하면 current 항목으로 보존합니다.'
+        }
+    }
+
+    if ($unsupportedSubmitMode) {
+        return [pscustomobject][ordered]@{
+            Stage = 'submit-config'
+            Policy = 'manual-review-config-error'
+            Hint = '지원하지 않는 submit mode 설정입니다. SubmitRetryModes 설정을 수정한 뒤 current 항목만 재시도하세요.'
+        }
+    }
+
+    if ($submitDispatched) {
+        return [pscustomobject][ordered]@{
+            Stage = 'post-submit-dispatch'
+            Policy = 'manual-review-duplicate-risk'
+            Hint = 'submit dispatch 이후 send_failed입니다. 이미 전송됐을 수 있어 자동 재시도하지 않습니다. 셀창 결과/산출물을 먼저 확인하세요.'
+        }
+    }
+
+    if ($payloadInputStarted -and $submitStarted -and -not $submitDispatched) {
+        return [pscustomobject][ordered]@{
+            Stage = 'submit-ready-no-dispatch'
+            Policy = 'manual-submit-only-retry'
+            Hint = 'payload 붙여넣기는 완료됐지만 submit dispatch 전 send_failed입니다. 재붙여넣기하지 말고 셀창 입력 내용을 확인한 뒤 submit-only로 1회 제출하세요.'
+        }
+    }
+
+    if ($submitStarted -or $payloadInputStarted -or $debugLog.Contains('terminal_input_mode')) {
+        return [pscustomobject][ordered]@{
+            Stage = 'post-input-or-submit'
+            Policy = 'manual-review-duplicate-risk'
+            Hint = 'payload 입력 또는 submit 준비 이후 send_failed입니다. 중복 전송 위험이 있어 자동 재시도하지 않습니다. 셀창 입력 상태를 먼저 확인하세요.'
+        }
+    }
+
+    return [pscustomobject][ordered]@{
+        Stage = 'unknown'
+        Policy = 'manual-review'
+        Hint = 'send_failed 단계가 불명확합니다. 셀창 상태를 확인한 뒤 current 항목만 재시도하세요.'
+    }
+}
+
 function Write-RetryPendingMetadata {
     param(
         [Parameter(Mandatory)][string]$RetryPath,
@@ -46,11 +275,18 @@ function Write-RetryPendingMetadata {
         return
     }
 
-    $debugLogPath = ''
-    if ($FailureMessage -match 'debugLog=(.+)$') {
-        $debugLogPath = ([string]$Matches[1]).Trim()
-    }
+    $debugLogPath = Get-RelayFailureDebugLogPath -FailureMessage $FailureMessage
 
+    $focusLostPolicy = Get-RelayFocusLostRetryMetadata -FailureCategory $FailureCategory -FailureMessage $FailureMessage
+    $sendRetryPolicy = Get-RelaySendRetryMetadata -FailureCategory $FailureCategory -FailureMessage $FailureMessage
+    $sendRetryPolicyText = [string]$sendRetryPolicy.Policy
+    if ($sendRetryPolicyText -eq 'bounded-auto-retry') {
+        $sendRetryPolicyText = 'bounded-auto-retry-exhausted'
+    }
+    $operatorRetryHint = [string]$sendRetryPolicy.Hint
+    if ([string]::IsNullOrWhiteSpace($operatorRetryHint)) {
+        $operatorRetryHint = [string]$focusLostPolicy.Hint
+    }
     $metadataPath = ($RetryPath + '.meta.json')
     $payload = [ordered]@{
         SchemaVersion = '1.0.0'
@@ -58,6 +294,11 @@ function Write-RetryPendingMetadata {
         FailureCategory = $FailureCategory
         FailureMessage = $FailureMessage
         DebugLogPath = $debugLogPath
+        SendStage = [string]$sendRetryPolicy.Stage
+        SendRetryPolicy = $sendRetryPolicyText
+        FocusLostStage = [string]$focusLostPolicy.Stage
+        FocusLostRetryPolicy = [string]$focusLostPolicy.Policy
+        OperatorRetryHint = $operatorRetryHint
         TargetId = $TargetId
         OriginalPath = $OriginalPath
         Attempt = $Attempt
@@ -325,6 +566,36 @@ function Get-RelayStringListSetting {
     }
 
     return @($DefaultValues)
+}
+
+function Get-RouterEffectiveSendSettings {
+    param(
+        [Parameter(Mandatory)]$Config,
+        [Parameter(Mandatory)][string]$ConfigPath
+    )
+
+    $terminalInputMode = 'sendtext'
+    $terminalInputModeValue = $null
+    if (TryGet-RelaySettingValue -Config $Config -Name 'TerminalInputMode' -Value ([ref]$terminalInputModeValue) -AllowNull:$false) {
+        $terminalInputMode = [string]$terminalInputModeValue
+    }
+    if (-not (Test-NonEmptyString $terminalInputMode)) {
+        $terminalInputMode = 'sendtext'
+    }
+
+    return @{
+        ConfigPath = [string]$ConfigPath
+        RequireActiveBeforeEnter = Get-RelayBooleanSetting -Config $Config -Name 'RequireActiveBeforeEnter' -DefaultValue $true
+        RequireUserIdleBeforeSend = Get-RelayBooleanSetting -Config $Config -Name 'RequireUserIdleBeforeSend' -DefaultValue $false
+        MinUserIdleBeforeSendMs = Get-RelayTimingSetting -Config $Config -Name 'MinUserIdleBeforeSendMs' -DefaultValue 0
+        UserIdleWaitTimeoutMs = Get-RelayTimingSetting -Config $Config -Name 'UserIdleWaitTimeoutMs' -DefaultValue 0
+        UserIdleWaitPollMs = Get-RelayTimingSetting -Config $Config -Name 'UserIdleWaitPollMs' -DefaultValue 250
+        SubmitGuardMs = Get-RelayTimingSetting -Config $Config -Name 'SubmitGuardMs' -DefaultValue 0
+        TerminalInputMode = [string]$terminalInputMode
+        SubmitRetryModes = @(Get-RelayStringListSetting -Config $Config -Name 'SubmitRetryModes' -DefaultValues @('enter'))
+        VisibleExecutionFailOnFocusSteal = Get-RelayBooleanSetting -Config $Config -Name 'VisibleExecutionFailOnFocusSteal' -DefaultValue $false
+        VisibleExecutionRestorePreviousActive = Get-RelayBooleanSetting -Config $Config -Name 'VisibleExecutionRestorePreviousActive' -DefaultValue $true
+    }
 }
 
 function TryGet-RelaySettingValue {
@@ -741,6 +1012,8 @@ function Invoke-AhkSend {
     $requireActiveBeforeEnter = Get-RelayBooleanSetting -Config $Config -Name 'RequireActiveBeforeEnter' -DefaultValue $true
     $requireUserIdleBeforeSend = Get-RelayBooleanSetting -Config $Config -Name 'RequireUserIdleBeforeSend' -DefaultValue $false
     $minUserIdleBeforeSendMs = Get-RelayTimingSetting -Config $Config -Name 'MinUserIdleBeforeSendMs' -DefaultValue 0
+    $userIdleWaitTimeoutMs = Get-RelayTimingSetting -Config $Config -Name 'UserIdleWaitTimeoutMs' -DefaultValue 0
+    $userIdleWaitPollMs = Get-RelayTimingSetting -Config $Config -Name 'UserIdleWaitPollMs' -DefaultValue 250
     $visibleBeaconEnabled = Get-RelayBooleanSetting -Config $Config -Name 'VisibleExecutionBeaconEnabled' -DefaultValue $false
     $visiblePreHoldMs = Get-RelayTimingSetting -Config $Config -Name 'VisibleExecutionPreHoldMs' -DefaultValue 0
     $visiblePostHoldMs = Get-RelayTimingSetting -Config $Config -Name 'VisibleExecutionPostHoldMs' -DefaultValue 0
@@ -772,6 +1045,8 @@ function Invoke-AhkSend {
             '--requireActiveBeforeEnter', $requireActiveBeforeEnterArg,
             '--requireUserIdleBeforeSend', $requireUserIdleBeforeSendArg,
             '--minUserIdleBeforeSendMs', [string]$minUserIdleBeforeSendMs,
+            '--userIdleWaitTimeoutMs', [string]$userIdleWaitTimeoutMs,
+            '--userIdleWaitPollMs', [string]$userIdleWaitPollMs,
             '--visibleBeaconEnabled', $visibleBeaconEnabledArg,
             '--visibleLabel', $TargetId,
             '--visiblePreHoldMs', [string]$visiblePreHoldMs,
@@ -788,6 +1063,8 @@ function Invoke-AhkSend {
             TextSettleMs = [int]$textSettleMs
             TerminalInputMode = [string]$terminalInputMode
             SubmitGuardMs = [int]$submitGuardMs
+            UserIdleWaitTimeoutMs = [int]$userIdleWaitTimeoutMs
+            UserIdleWaitPollMs = [int]$userIdleWaitPollMs
             BaseTextSettleMs = [int]$textSettle.BaseTextSettleMs
             ExtraTextSettleMs = [int]$textSettle.ExtraTextSettleMs
             VisibleBeaconEnabled = [bool]$visibleBeaconEnabled
@@ -824,6 +1101,8 @@ function New-WorkItemProcessResult {
         TextSettleMs     = [int]$SendResult.TextSettleMs
         TerminalInputMode = [string]$SendResult.TerminalInputMode
         SubmitGuardMs    = [int]$SendResult.SubmitGuardMs
+        UserIdleWaitTimeoutMs = [int]$SendResult.UserIdleWaitTimeoutMs
+        UserIdleWaitPollMs = [int]$SendResult.UserIdleWaitPollMs
         BaseTextSettleMs = [int]$SendResult.BaseTextSettleMs
         ExtraTextSettleMs = [int]$SendResult.ExtraTextSettleMs
         VisibleBeaconEnabled = [bool]$SendResult.VisibleBeaconEnabled
@@ -1047,7 +1326,7 @@ function Invoke-WorkItemDelivery {
         -SendResult $sendResult `
         -Payload ([string]$Context.Payload)
 
-    Write-RelayLog -Path $LogPath -Level 'info' -Message ("sending target={0} enter={1} submitModes={2} inputMode={3} submitGuardMs={4} visibleBeacon={5} visiblePreHoldMs={6} visiblePostHoldMs={7} restorePreviousActive={8} failOnFocusSteal={9} file={10} payloadBytes={11} textSettleMs={12} ahkDebugLog={13}" -f $Target.Id, $result.EnterCount, ($result.SubmitRetryModes -join '>'), $result.TerminalInputMode, $result.SubmitGuardMs, $result.VisibleBeaconEnabled, $result.VisiblePreHoldMs, $result.VisiblePostHoldMs, $result.RestorePreviousActive, $result.FailOnFocusSteal, $result.Path, $result.PayloadBytes, $result.TextSettleMs, $result.DebugLogPath)
+    Write-RelayLog -Path $LogPath -Level 'info' -Message ("sending target={0} enter={1} submitModes={2} inputMode={3} submitGuardMs={4} userIdleWaitTimeoutMs={5} userIdleWaitPollMs={6} visibleBeacon={7} visiblePreHoldMs={8} visiblePostHoldMs={9} restorePreviousActive={10} failOnFocusSteal={11} file={12} payloadBytes={13} textSettleMs={14} ahkDebugLog={15}" -f $Target.Id, $result.EnterCount, ($result.SubmitRetryModes -join '>'), $result.TerminalInputMode, $result.SubmitGuardMs, $result.UserIdleWaitTimeoutMs, $result.UserIdleWaitPollMs, $result.VisibleBeaconEnabled, $result.VisiblePreHoldMs, $result.VisiblePostHoldMs, $result.RestorePreviousActive, $result.FailOnFocusSteal, $result.Path, $result.PayloadBytes, $result.TextSettleMs, $result.DebugLogPath)
     $category = Get-FailureCategoryFromAhkExitCode -ExitCode ([int]$result.ExitCode)
 
     if ($category -ne 'success') {
@@ -1063,7 +1342,8 @@ function Resolve-WorkItemFailureDisposition {
         [Parameter(Mandatory)][string]$Category,
         [Parameter(Mandatory)][int]$Attempt,
         [Parameter(Mandatory)][int]$AttemptsAllowed,
-        [Parameter(Mandatory)][int]$RetryDelayMs
+        [Parameter(Mandatory)][int]$RetryDelayMs,
+        [AllowEmptyString()][string]$FailureMessage = ''
     )
 
     $logLevel = if ($Category -in @('window_not_found', 'focus_lost', 'user_active_hold', 'ignored')) { 'warn' } else { 'error' }
@@ -1084,14 +1364,26 @@ function Resolve-WorkItemFailureDisposition {
             $result.WriteRetryMetadata = $true
         }
         'focus_lost' {
-            $result.ArchiveState = 'retry-pending'
-            $result.DestinationKey = 'RetryPendingRoot'
-            $result.WriteRetryMetadata = $true
+            if ($Attempt -lt $AttemptsAllowed -and (Test-RelayFocusLostBeforePayloadRetryEligible -FailureMessage $FailureMessage)) {
+                $result.RetryCurrentItem = $true
+                $result.DelayBeforeRetryMs = [int]$RetryDelayMs
+            }
+            else {
+                $result.ArchiveState = 'retry-pending'
+                $result.DestinationKey = 'RetryPendingRoot'
+                $result.WriteRetryMetadata = $true
+            }
         }
         'user_active_hold' {
-            $result.ArchiveState = 'retry-pending'
-            $result.DestinationKey = 'RetryPendingRoot'
-            $result.WriteRetryMetadata = $true
+            if ($Attempt -lt $AttemptsAllowed) {
+                $result.RetryCurrentItem = $true
+                $result.DelayBeforeRetryMs = [int]$RetryDelayMs
+            }
+            else {
+                $result.ArchiveState = 'retry-pending'
+                $result.DestinationKey = 'RetryPendingRoot'
+                $result.WriteRetryMetadata = $true
+            }
         }
         'ignored' {
             $result.ArchiveState = 'ignored'
@@ -1099,13 +1391,15 @@ function Resolve-WorkItemFailureDisposition {
             $result.WriteIgnoredArchiveMetadata = $true
         }
         'send_failed' {
-            if ($Attempt -lt $AttemptsAllowed) {
+            $sendRetryPolicy = Get-RelaySendRetryMetadata -FailureCategory $Category -FailureMessage $FailureMessage
+            if ($Attempt -lt $AttemptsAllowed -and [string]$sendRetryPolicy.Policy -eq 'bounded-auto-retry') {
                 $result.RetryCurrentItem = $true
                 $result.DelayBeforeRetryMs = [int]$RetryDelayMs
             }
             else {
-                $result.ArchiveState = 'failed'
-                $result.DestinationKey = 'FailedRoot'
+                $result.ArchiveState = 'retry-pending'
+                $result.DestinationKey = 'RetryPendingRoot'
+                $result.WriteRetryMetadata = $true
             }
         }
         default {
@@ -1232,6 +1526,7 @@ $routerStartedAtUtc = [datetime]::MinValue
 $commandRoot = Split-Path -Parent $PSScriptRoot
 $ensureTargetsCommand = Get-RootCommandText -Root $commandRoot -ScriptName 'ensure-targets.ps1' -ConfigPath $resolvedConfigPath
 $showStatusCommand = Get-RootCommandText -Root $commandRoot -ScriptName 'show-relay-status.ps1' -ConfigPath $resolvedConfigPath
+$effectiveRouterSendSettings = Get-RouterEffectiveSendSettings -Config $config -ConfigPath $resolvedConfigPath
 $routerStateCommon = @{
     RouterMutexName    = $routerMutexName
     RouterPid          = $PID
@@ -1245,6 +1540,9 @@ $routerStateCommon = @{
     RequireReadyDeliveryMetadata = [bool]$requireReadyDeliveryMetadata
     RequirePairTransportMetadata = [bool]$requirePairTransportMetadata
     IgnoredRoot        = [string]$ignoredRoot
+}
+foreach ($settingName in @($effectiveRouterSendSettings.Keys)) {
+    $routerStateCommon[$settingName] = $effectiveRouterSendSettings[$settingName]
 }
 
 try {
@@ -1298,8 +1596,11 @@ try {
         RequirePairTransportMetadata = [bool]$requirePairTransportMetadata
         IgnoredRoot        = [string]$ignoredRoot
     }
+    foreach ($settingName in @($effectiveRouterSendSettings.Keys)) {
+        $routerStateCommon[$settingName] = $effectiveRouterSendSettings[$settingName]
+    }
 
-    Write-RelayLog -Path $logPath -Level 'info' -Message "router started pid=$PID mutex=$routerMutexName launcherSession=$($launcherContext.LauncherSessionId) launcherPid=$($launcherContext.LauncherPid) ignorePreexisting=$ignorePreexistingReadyFiles preexistingMode=$preexistingHandlingMode requireReadyMetadata=$requireReadyDeliveryMetadata requirePairMetadata=$requirePairTransportMetadata ignoredRoot=$ignoredRoot"
+    Write-RelayLog -Path $logPath -Level 'info' -Message "router started pid=$PID mutex=$routerMutexName launcherSession=$($launcherContext.LauncherSessionId) launcherPid=$($launcherContext.LauncherPid) ignorePreexisting=$ignorePreexistingReadyFiles preexistingMode=$preexistingHandlingMode requireReadyMetadata=$requireReadyDeliveryMetadata requirePairMetadata=$requirePairTransportMetadata ignoredRoot=$ignoredRoot requireUserIdle=$($effectiveRouterSendSettings.RequireUserIdleBeforeSend) minUserIdleMs=$($effectiveRouterSendSettings.MinUserIdleBeforeSendMs) userIdleWaitTimeoutMs=$($effectiveRouterSendSettings.UserIdleWaitTimeoutMs) submitGuardMs=$($effectiveRouterSendSettings.SubmitGuardMs) failOnFocusSteal=$($effectiveRouterSendSettings.VisibleExecutionFailOnFocusSteal)"
 
     foreach ($target in $config.Targets) {
         $folder = [string]$target.Folder
@@ -1393,7 +1694,7 @@ try {
             catch {
                 $failure = Resolve-RelayFailure -Text $_.Exception.Message
                 $lastError = ($failure.Category + ': ' + $failure.Message)
-                $disposition = Resolve-WorkItemFailureDisposition -Category ([string]$failure.Category) -Attempt $attempt -AttemptsAllowed $attemptsAllowed -RetryDelayMs ([int]$config.RetryDelayMs)
+                $disposition = Resolve-WorkItemFailureDisposition -Category ([string]$failure.Category) -Attempt $attempt -AttemptsAllowed $attemptsAllowed -RetryDelayMs ([int]$config.RetryDelayMs) -FailureMessage ([string]$failure.Message)
                 Write-RelayLog -Path $logPath -Level ([string]$disposition.LogLevel) -Message "attempt failed target=$($target.Id) file=$($item.Path) category=$($failure.Category) reason=$($failure.Message)"
                 Complete-WorkItemFailure -Disposition $disposition -Config $config -Target $target -Item $item -FailureCategory ([string]$failure.Category) -FailureMessage ([string]$failure.Message) -Attempt $attempt -LogPath $logPath -IgnoredRoot $ignoredRoot
                 if (-not $disposition.RetryCurrentItem) {

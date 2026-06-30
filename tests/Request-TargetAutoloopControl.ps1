@@ -41,6 +41,29 @@ else {
 $result = Request-TargetAutoloopControlAction -ControlDocument $controlDocument -Action $Action -RequestedBy $RequestedBy
 $controlDocument.LastUpdatedAt = (Get-Date).ToString('o')
 Write-JsonFileAtomically -Path $statePaths.ControlPath -Payload $controlDocument
+$stateDocument = if (Test-Path -LiteralPath $statePaths.StatePath -PathType Leaf) {
+    Read-JsonObject -Path $statePaths.StatePath
+}
+else {
+    $null
+}
+$statusDocument = if (Test-Path -LiteralPath $statePaths.StatusPath -PathType Leaf) {
+    Read-JsonObject -Path $statePaths.StatusPath
+}
+else {
+    $null
+}
+if ($null -ne $stateDocument) {
+    Sync-TargetAutoloopTargetSidecarDocuments `
+        -Config $config `
+        -RunRoot $resolvedRunRoot `
+        -StateDocument $stateDocument `
+        -ControlDocument $controlDocument `
+        -StatusDocument $statusDocument `
+        -WriteState:$false `
+        -WriteControl:$true `
+        -WriteStatus:$false
+}
 
 $payload = [ordered]@{
     SchemaVersion = $script:TargetAutoloopSchemaVersion

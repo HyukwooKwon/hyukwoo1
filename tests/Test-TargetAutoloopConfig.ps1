@@ -204,6 +204,11 @@ Assert-True ([string]$workRepoTarget.WorkRepoRoot -eq [System.IO.Path]::GetFullP
 $workRepoPaths = Get-TargetAutoloopTargetPaths -RunRoot (Join-Path $tmpRoot 'central-runroot') -TargetId 'target01' -Target $workRepoTarget -Config $workRepoResolved
 Assert-True ([string]$workRepoPaths.TargetRunRoot -match [regex]::Escape('\.relay-runs\bottest-live-visible\target-autoloop\central-runroot')) 'target-local runroot should derive under WorkRepoRoot.'
 Assert-True ([string]$workRepoPaths.SourceSummaryPath -match [regex]::Escape('target01\source-outbox\summary.txt')) 'target-local contract summary should remain target-scoped.'
+Assert-True ([string]$workRepoPaths.TargetStateRoot -match [regex]::Escape('target01\.state')) 'target sidecar state root should remain target-scoped.'
+Assert-True ([string]$workRepoPaths.TargetStatusPath -match [regex]::Escape('target01\.state\target-autoloop-status.json')) 'target sidecar status path should remain target-scoped.'
+Assert-True ([string]$workRepoPaths.TargetControlPath -match [regex]::Escape('target01\.state\target-autoloop-control.json')) 'target sidecar control path should remain target-scoped.'
+Assert-True ([string]$workRepoPaths.TargetEventsPath -match [regex]::Escape('target01\.state\target-events.jsonl')) 'target sidecar events path should remain target-scoped.'
+Assert-True ([string]$workRepoPaths.TargetWatcherMutexName -match '^Global\\RelayTargetAutoloopTarget_[0-9a-f]+$') 'target watcher mutex preview should be target-scoped.'
 
 $automationRepoWorkRepoConfigPath = Join-Path $tmpRoot 'automation-workrepo-target-autoloop.psd1'
 [System.IO.File]::WriteAllText($automationRepoWorkRepoConfigPath, @"

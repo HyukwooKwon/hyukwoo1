@@ -103,6 +103,41 @@ function Test-TargetAutoloopWatcherFresh {
     return (($timestamp - [datetimeoffset]::Now).TotalSeconds -ge (-1 * [math]::Max(5, $StaleAfterSeconds)))
 }
 
+function Get-TargetAutoloopAppliedPendingControlState {
+    param(
+        [string]$PendingAction,
+        $ControlDocument = $null,
+        $StatusDocument = $null
+    )
+
+    $action = ([string]$PendingAction).Trim().ToLowerInvariant()
+    if (-not (Test-NonEmptyString $action)) {
+        return ''
+    }
+
+    $controllerState = [string](Get-ConfigValue -Object $ControlDocument -Name 'State' -DefaultValue '')
+    $watcherState = [string](Get-ConfigValue -Object $StatusDocument -Name 'WatcherState' -DefaultValue '')
+    switch ($action) {
+        'stop' {
+            if ($controllerState -eq 'stopped' -or $watcherState -eq 'stopped') {
+                return 'stopped'
+            }
+        }
+        'pause' {
+            if ($controllerState -eq 'paused' -or $watcherState -eq 'paused') {
+                return 'paused'
+            }
+        }
+        'resume' {
+            if ($controllerState -eq 'running' -or $watcherState -eq 'running') {
+                return 'running'
+            }
+        }
+    }
+
+    return ''
+}
+
 function New-TargetAutoloopAlreadyRunningPayload {
     param(
         [Parameter(Mandatory)]$Config,
@@ -137,6 +172,111 @@ function New-TargetAutoloopAlreadyRunningPayload {
         HeartbeatAt = [string](Get-ConfigValue -Object $StatusDocument -Name 'HeartbeatAt' -DefaultValue '')
         ProcessStartedAt = [string](Get-ConfigValue -Object $StatusDocument -Name 'ProcessStartedAt' -DefaultValue '')
         WatcherMutexName = $WatcherMutexName
+        WatcherTargetIds = @(Get-StringArray (Get-ConfigValue -Object $StatusDocument -Name 'WatcherTargetIds' -DefaultValue @()))
+        WatcherTargetScope = [string](Get-ConfigValue -Object $StatusDocument -Name 'WatcherTargetScope' -DefaultValue '')
+        StatusPath = [string]$StatePaths.StatusPath
+        ControlPath = [string]$StatePaths.ControlPath
+    }
+}
+
+function Get-TargetAutoloopStatusWatcherTargetIds {
+    param($StatusDocument)
+
+    return @(
+        Get-StringArray (Get-ConfigValue -Object $StatusDocument -Name 'WatcherTargetIds' -DefaultValue @()) |
+            Where-Object { Test-NonEmptyString $_ } |
+            ForEach-Object { [string]$_ } |
+            Sort-Object -Unique
+    )
+}
+
+function Test-TargetAutoloopWatcherCoversTargets {
+    param(
+        [string[]]$ActiveTargetIds = @(),
+        [string[]]$RequestedTargetIds = @()
+    )
+
+    $requested = @(
+        $RequestedTargetIds |
+            Where-Object { Test-NonEmptyString $_ } |
+            ForEach-Object { [string]$_ } |
+            Sort-Object -Unique
+    )
+    if (@($requested).Count -eq 0) {
+        return $true
+    }
+    $activeLookup = @{}
+    foreach ($targetId in @($ActiveTargetIds)) {
+        if (Test-NonEmptyString $targetId) {
+            $activeLookup[[string]$targetId] = $true
+        }
+    }
+    if ($activeLookup.Count -eq 0) {
+        return $false
+    }
+    foreach ($targetId in @($requested)) {
+        if (-not $activeLookup.ContainsKey([string]$targetId)) {
+            return $false
+        }
+    }
+    return $true
+}
+
+function New-TargetAutoloopWatcherScopeMismatchPayload {
+    param(
+        [Parameter(Mandatory)]$Config,
+        [Parameter(Mandatory)][string]$ResolvedRunRoot,
+        [Parameter(Mandatory)]$StatePaths,
+        $ControlDocument = $null,
+        $StatusDocument = $null,
+        [string]$WatcherMutexName = '',
+        [string[]]$RequestedTargetIds = @(),
+        [string[]]$ActiveTargetIds = @(),
+        [bool]$ScopeKnown = $true
+    )
+
+    $requested = @(
+        $RequestedTargetIds |
+            Where-Object { Test-NonEmptyString $_ } |
+            ForEach-Object { [string]$_ } |
+            Sort-Object -Unique
+    )
+    $active = @(
+        $ActiveTargetIds |
+            Where-Object { Test-NonEmptyString $_ } |
+            ForEach-Object { [string]$_ } |
+            Sort-Object -Unique
+    )
+    $result = if ($ScopeKnown) { 'watcher-target-scope-mismatch' } else { 'watcher-target-scope-unknown' }
+    $reason = if ($ScopeKnown) { 'watcher_target_scope_mismatch' } else { 'watcher_target_scope_unknown' }
+    $activeText = if (@($active).Count -gt 0) { @($active) -join ', ' } else { '(unknown)' }
+    $requestedText = if (@($requested).Count -gt 0) { @($requested) -join ', ' } else { '(all)' }
+    $message = if ($ScopeKnown) {
+        'target-autoloop watcher가 이미 active지만 요청 target 범위를 포함하지 않습니다. activeTargets={0}; requestedTargets={1}. stop 후 해당 target 포함 범위로 재시작하세요.' -f $activeText, $requestedText
+    }
+    else {
+        'target-autoloop watcher가 이미 active지만 감지 대상 범위를 확인할 수 없습니다. requestedTargets={0}. 안전하게 stop 후 해당 target 포함 범위로 재시작하세요.' -f $requestedText
+    }
+
+    return [ordered]@{
+        SchemaVersion = $script:TargetAutoloopSchemaVersion
+        Ok = $false
+        RunMode = [string]$Config.RunMode
+        RunRoot = $ResolvedRunRoot
+        Result = $result
+        Message = $message
+        ReasonCodes = @($reason, 'watcher_already_active')
+        Idempotent = $false
+        ActiveConfirmed = $true
+        WatcherMutexHeld = $false
+        ControllerState = [string](Get-ConfigValue -Object $ControlDocument -Name 'State' -DefaultValue '')
+        WatcherState = [string](Get-ConfigValue -Object $StatusDocument -Name 'WatcherState' -DefaultValue '')
+        HeartbeatAt = [string](Get-ConfigValue -Object $StatusDocument -Name 'HeartbeatAt' -DefaultValue '')
+        ProcessStartedAt = [string](Get-ConfigValue -Object $StatusDocument -Name 'ProcessStartedAt' -DefaultValue '')
+        WatcherMutexName = $WatcherMutexName
+        RequestedTargetIds = @($requested)
+        WatcherTargetIds = @($active)
+        WatcherTargetScope = [string](Get-ConfigValue -Object $StatusDocument -Name 'WatcherTargetScope' -DefaultValue $(if ($ScopeKnown) { 'scoped' } else { 'unknown' }))
         StatusPath = [string]$StatePaths.StatusPath
         ControlPath = [string]$StatePaths.ControlPath
     }
@@ -332,6 +472,7 @@ foreach ($selectedTargetId in @($selectedTargets)) {
         $selectedTargetLookup[[string]$selectedTargetId] = $true
     }
 }
+$manifestAllEnabledTargetIds = New-Object System.Collections.Generic.List[string]
 $manifestEnabledTargetIds = New-Object System.Collections.Generic.List[string]
 $manifestPublishReadyTargetIds = New-Object System.Collections.Generic.List[string]
 $manifestPublishReadyMissingTargetIds = New-Object System.Collections.Generic.List[string]
@@ -340,10 +481,12 @@ foreach ($manifestTarget in @(Get-ConfigValue -Object $manifestDocument -Name 'T
     if (-not (Test-NonEmptyString $manifestTargetId)) {
         continue
     }
-    if ($selectedTargetLookup.Count -gt 0 -and -not $selectedTargetLookup.ContainsKey($manifestTargetId)) {
+    $manifestTargetEnabled = [bool](Get-ConfigValue -Object $manifestTarget -Name 'Enabled' -DefaultValue $false)
+    if (-not $manifestTargetEnabled) {
         continue
     }
-    if (-not [bool](Get-ConfigValue -Object $manifestTarget -Name 'Enabled' -DefaultValue $false)) {
+    $manifestAllEnabledTargetIds.Add($manifestTargetId) | Out-Null
+    if ($selectedTargetLookup.Count -gt 0 -and -not $selectedTargetLookup.ContainsKey($manifestTargetId)) {
         continue
     }
     $manifestEnabledTargetIds.Add($manifestTargetId) | Out-Null
@@ -377,6 +520,13 @@ if ([string]$config.RunMode -eq 'target-autoloop' -and @($manifestPublishReadyMi
     }
     $triggerPayload
     return
+}
+
+$requestedWatcherTargetIds = if (@($selectedTargets).Count -gt 0) {
+    @($selectedTargets)
+}
+else {
+    @($manifestEnabledTargetIds.ToArray())
 }
 
 $routerSessionState = Get-TargetAutoloopRouterSessionState -Config $config
@@ -428,6 +578,38 @@ else {
 $pollIntervalMs = [int](Get-ConfigValue -Object $config -Name 'PollIntervalMs' -DefaultValue 1000)
 $watcherFreshWindowSec = [math]::Max(10, [int][math]::Ceiling(($pollIntervalMs * 4) / 1000.0))
 $pendingAction = Get-TargetAutoloopPendingControlAction -ControlDocument $controlDocument
+$reconciledControlAction = ''
+$reconciledControlState = ''
+if (Test-NonEmptyString $pendingAction) {
+    $appliedControlState = Get-TargetAutoloopAppliedPendingControlState `
+        -PendingAction $pendingAction `
+        -ControlDocument $controlDocument `
+        -StatusDocument $statusDocument
+    if (Test-NonEmptyString $appliedControlState) {
+        $reconciledControlAction = $pendingAction
+        $reconciledControlState = $appliedControlState
+        Complete-TargetAutoloopControlAction `
+            -ControlDocument $controlDocument `
+            -State $appliedControlState `
+            -Result ('reconciled-{0}' -f $appliedControlState)
+        $timestamp = (Get-Date).ToString('o')
+        $stateDocument.State = $appliedControlState
+        $stateDocument.LastUpdatedAt = $timestamp
+        $controlDocument.LastUpdatedAt = $timestamp
+        $statusDocument.ControllerState = $appliedControlState
+        $statusDocument.LastUpdatedAt = $timestamp
+        Write-JsonFileAtomically -Path $statePaths.StatePath -Payload $stateDocument
+        Write-JsonFileAtomically -Path $statePaths.ControlPath -Payload $controlDocument
+        Write-JsonFileAtomically -Path $statePaths.StatusPath -Payload $statusDocument
+        Sync-TargetAutoloopTargetSidecarDocuments `
+            -Config $config `
+            -RunRoot $resolvedRunRoot `
+            -StateDocument $stateDocument `
+            -ControlDocument $controlDocument `
+            -StatusDocument $statusDocument
+        $pendingAction = Get-TargetAutoloopPendingControlAction -ControlDocument $controlDocument
+    }
+}
 if (Test-NonEmptyString $pendingAction) {
     $pendingPayload = [ordered]@{
         SchemaVersion = $script:TargetAutoloopSchemaVersion
@@ -452,6 +634,25 @@ if (Test-NonEmptyString $pendingAction) {
 
 $currentWatcherState = [string](Get-ConfigValue -Object $statusDocument -Name 'WatcherState' -DefaultValue '')
 if (Test-TargetAutoloopWatcherFresh -StatusDocument $statusDocument -StaleAfterSeconds $watcherFreshWindowSec) {
+    $activeTargetIds = @(Get-TargetAutoloopStatusWatcherTargetIds -StatusDocument $statusDocument)
+    if (@($requestedWatcherTargetIds).Count -gt 0 -and -not (Test-TargetAutoloopWatcherCoversTargets -ActiveTargetIds @($activeTargetIds) -RequestedTargetIds @($requestedWatcherTargetIds))) {
+        $scopeMismatchPayload = New-TargetAutoloopWatcherScopeMismatchPayload `
+            -Config $config `
+            -ResolvedRunRoot $resolvedRunRoot `
+            -StatePaths $statePaths `
+            -ControlDocument $controlDocument `
+            -StatusDocument $statusDocument `
+            -WatcherMutexName $watcherMutexName `
+            -RequestedTargetIds @($requestedWatcherTargetIds) `
+            -ActiveTargetIds @($activeTargetIds) `
+            -ScopeKnown (@($activeTargetIds).Count -gt 0)
+        if ($AsJson) {
+            $scopeMismatchPayload | ConvertTo-Json -Depth 12
+            return
+        }
+        $scopeMismatchPayload
+        return
+    }
     $alreadyRunningPayload = New-TargetAutoloopAlreadyRunningPayload `
         -Config $config `
         -ResolvedRunRoot $resolvedRunRoot `
@@ -473,6 +674,9 @@ $restoredTargetIds = New-Object System.Collections.Generic.List[string]
 if ($controllerState -eq 'stopped') {
     $stateMap = Get-TargetAutoloopTargetStateMap -StateDocument $stateDocument
     foreach ($targetId in @($stateMap.Keys)) {
+        if ($selectedTargetLookup.Count -gt 0 -and -not $selectedTargetLookup.ContainsKey([string]$targetId)) {
+            continue
+        }
         $entry = $stateMap[$targetId]
         $entryPhase = [string](Get-ConfigValue -Object $entry -Name 'Phase' -DefaultValue '')
         $stoppedPhase = [string](Get-ConfigValue -Object $entry -Name 'StoppedPhase' -DefaultValue '')
@@ -500,6 +704,12 @@ if ($controllerState -eq 'stopped') {
         -WatcherState 'stopped' `
         -WatcherStopReason 'restart-requested'
     Write-JsonFileAtomically -Path $statePaths.StatusPath -Payload $statusDocument
+    Sync-TargetAutoloopTargetSidecarDocuments `
+        -Config $config `
+        -RunRoot $resolvedRunRoot `
+        -StateDocument $stateDocument `
+        -ControlDocument $controlDocument `
+        -StatusDocument $statusDocument
 }
 
 $expectedWatcherState = if ($controllerState -eq 'paused') { 'paused' } else { 'running' }
@@ -538,8 +748,12 @@ $result = [ordered]@{
     PreparedNewRun = $preparedNewRun
     PreparedTargetIds = @($preparedTargetIds)
     RestoredTargetIds = $restoredTargetIds.ToArray()
+    ReconciledControlAction = $reconciledControlAction
+    ReconciledControlState = $reconciledControlState
     ControllerState = $controllerState
     ExpectedWatcherState = $expectedWatcherState
+    WatcherTargetIds = @($requestedWatcherTargetIds)
+    WatcherTargetScope = if (@($requestedWatcherTargetIds).Count -gt 0 -and @($requestedWatcherTargetIds).Count -lt @($manifestAllEnabledTargetIds.ToArray()).Count) { 'scoped' } else { 'all' }
     StatusPath = [string]$statePaths.StatusPath
     ControlPath = [string]$statePaths.ControlPath
     StatePath = [string]$statePaths.StatePath
@@ -564,6 +778,25 @@ if ($Detached) {
         $message = ('target-autoloop watcher mutex가 이미 사용 중입니다: {0}' -f $watcherMutexName)
         $activeConfirmed = Test-TargetAutoloopWatcherFresh -StatusDocument $latestStatusDocument -StaleAfterSeconds $watcherFreshWindowSec
         if ($activeConfirmed) {
+            $activeTargetIds = @(Get-TargetAutoloopStatusWatcherTargetIds -StatusDocument $latestStatusDocument)
+            if (@($requestedWatcherTargetIds).Count -gt 0 -and -not (Test-TargetAutoloopWatcherCoversTargets -ActiveTargetIds @($activeTargetIds) -RequestedTargetIds @($requestedWatcherTargetIds))) {
+                $scopeMismatchPayload = New-TargetAutoloopWatcherScopeMismatchPayload `
+                    -Config $config `
+                    -ResolvedRunRoot $resolvedRunRoot `
+                    -StatePaths $statePaths `
+                    -ControlDocument $controlDocument `
+                    -StatusDocument $latestStatusDocument `
+                    -WatcherMutexName $watcherMutexName `
+                    -RequestedTargetIds @($requestedWatcherTargetIds) `
+                    -ActiveTargetIds @($activeTargetIds) `
+                    -ScopeKnown (@($activeTargetIds).Count -gt 0)
+                if ($AsJson) {
+                    $scopeMismatchPayload | ConvertTo-Json -Depth 12
+                    return
+                }
+                $scopeMismatchPayload
+                return
+            }
             $reasonCodes = @('watcher_already_active', 'watcher_mutex_held')
             $message = ('target-autoloop watcher가 이미 active 상태입니다: {0}' -f ([string](Get-ConfigValue -Object $latestStatusDocument -Name 'WatcherState' -DefaultValue '')))
         }

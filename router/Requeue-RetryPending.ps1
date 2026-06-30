@@ -1,7 +1,8 @@
 [CmdletBinding()]
 param(
     [string]$ConfigPath = (Join-Path $PSScriptRoot '..\config\settings.psd1'),
-    [string]$TargetId
+    [string]$TargetId,
+    [string[]]$RetryPath = @()
 )
 
 Set-StrictMode -Version Latest
@@ -17,8 +18,90 @@ foreach ($target in $config.Targets) {
     $targetById[[string]$target.Id] = $target
 }
 
-$files = Get-ChildItem -LiteralPath ([string]$config.RetryPendingRoot) -Filter '*.ready.txt' -File -ErrorAction SilentlyContinue |
-    Sort-Object LastWriteTimeUtc, Name
+function Update-RequeuedRetryMetadata {
+    param(
+        [Parameter(Mandatory)][string]$MetadataPath,
+        [Parameter(Mandatory)][string]$SourceRetryPath,
+        [Parameter(Mandatory)][string]$DestinationPath
+    )
+
+    if (-not (Test-Path -LiteralPath $MetadataPath -PathType Leaf)) {
+        return
+    }
+
+    try {
+        $metadata = Get-Content -LiteralPath $MetadataPath -Raw -Encoding UTF8 | ConvertFrom-Json
+    }
+    catch {
+        return
+    }
+
+    $requeueCount = 0
+    if ($null -ne $metadata.PSObject.Properties['RequeueCount']) {
+        $parsedCount = 0
+        if ([int]::TryParse(([string]$metadata.RequeueCount), [ref]$parsedCount)) {
+            $requeueCount = $parsedCount
+        }
+    }
+    $requeueCount += 1
+
+    $history = @()
+    if ($null -ne $metadata.PSObject.Properties['RequeueHistory']) {
+        $history = @($metadata.RequeueHistory)
+    }
+    $history += [pscustomobject][ordered]@{
+        RequeuedAt = (Get-Date).ToString('o')
+        FromRetryPath = $SourceRetryPath
+        ToReadyPath = $DestinationPath
+    }
+
+    $metadata | Add-Member -NotePropertyName RequeueCount -NotePropertyValue $requeueCount -Force
+    $metadata | Add-Member -NotePropertyName LastRequeuedAt -NotePropertyValue (Get-Date).ToString('o') -Force
+    $metadata | Add-Member -NotePropertyName LastRequeuedFromRetryPath -NotePropertyValue $SourceRetryPath -Force
+    $metadata | Add-Member -NotePropertyName LastRequeuedToReadyPath -NotePropertyValue $DestinationPath -Force
+    $metadata | Add-Member -NotePropertyName RequeueHistory -NotePropertyValue @($history) -Force
+
+    $metadata | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $MetadataPath -Encoding UTF8
+}
+
+$retryPendingRoot = [string]$config.RetryPendingRoot
+$files = @()
+if (@($RetryPath).Count -gt 0) {
+    $normalizedRoot = ''
+    if (-not [string]::IsNullOrWhiteSpace($retryPendingRoot)) {
+        try {
+            $normalizedRoot = [System.IO.Path]::GetFullPath($retryPendingRoot).TrimEnd('\', '/').ToLowerInvariant()
+        }
+        catch {
+            $normalizedRoot = $retryPendingRoot.TrimEnd('\', '/').ToLowerInvariant()
+        }
+    }
+    foreach ($path in @($RetryPath)) {
+        if ([string]::IsNullOrWhiteSpace($path)) {
+            continue
+        }
+        $item = Get-Item -LiteralPath $path -ErrorAction Stop
+        if (-not $item.PSIsContainer -and $item.Name -like '*.ready.txt') {
+            if (-not [string]::IsNullOrWhiteSpace($normalizedRoot)) {
+                try {
+                    $normalizedItemPath = [System.IO.Path]::GetFullPath($item.FullName).ToLowerInvariant()
+                }
+                catch {
+                    $normalizedItemPath = $item.FullName.ToLowerInvariant()
+                }
+                if (-not ($normalizedItemPath.StartsWith($normalizedRoot + '\') -or $normalizedItemPath -eq $normalizedRoot)) {
+                    throw "retry path is outside RetryPendingRoot: $($item.FullName)"
+                }
+            }
+            $files += $item
+        }
+    }
+    $files = @($files | Sort-Object LastWriteTimeUtc, Name -Unique)
+}
+else {
+    $files = Get-ChildItem -LiteralPath $retryPendingRoot -Filter '*.ready.txt' -File -ErrorAction SilentlyContinue |
+        Sort-Object LastWriteTimeUtc, Name
+}
 
 foreach ($file in $files) {
     $name = $file.Name
@@ -53,6 +136,10 @@ foreach ($file in $files) {
     Move-Item -LiteralPath $file.FullName -Destination $destinationPath -Force
     if (Test-Path -LiteralPath $metadataPath -PathType Leaf) {
         Move-Item -LiteralPath $metadataPath -Destination $destinationMetadataPath -Force
+        Update-RequeuedRetryMetadata `
+            -MetadataPath $destinationMetadataPath `
+            -SourceRetryPath ([string]$file.FullName) `
+            -DestinationPath $destinationPath
     }
     if (Test-Path -LiteralPath $deliveryMetadataPath -PathType Leaf) {
         Move-Item -LiteralPath $deliveryMetadataPath -Destination $destinationDeliveryMetadataPath -Force

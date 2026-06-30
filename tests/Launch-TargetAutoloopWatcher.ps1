@@ -107,6 +107,12 @@ if ($controllerState -eq 'stopped' -or $stateValue -eq 'stopped') {
         -WatcherStopReason '' `
         -ConfiguredRunDurationSec $RunDurationSec
     Write-JsonFileAtomically -Path $statePaths.StatusPath -Payload $statusDocument
+    Sync-TargetAutoloopTargetSidecarDocuments `
+        -Config $config `
+        -RunRoot $resolvedRunRoot `
+        -StateDocument $stateDocument `
+        -ControlDocument $controlDocument `
+        -StatusDocument $statusDocument
     $restartRecovered = $true
 }
 

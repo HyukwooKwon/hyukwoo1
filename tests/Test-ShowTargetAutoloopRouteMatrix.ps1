@@ -128,6 +128,9 @@ $matrixTarget02 = @($matrixJson.Targets | Where-Object { [string]$_.TargetId -eq
 Assert-True ([string]$matrixTarget01.RouteBadge -eq 'ROUTE READY') 'target01 route badge should be ROUTE READY.'
 Assert-True ([bool]$matrixTarget01.InManifest) 'target01 should be marked present in manifest.'
 Assert-True ([bool]$matrixTarget01.ManifestEnabled) 'target01 should be marked enabled in manifest.'
+Assert-True ([string]$matrixTarget01.TargetStatusPath -match [regex]::Escape('target01\.state\target-autoloop-status.json')) 'target01 route matrix should expose target-scoped status path.'
+Assert-True ([string]$matrixTarget01.TargetControlPath -match [regex]::Escape('target01\.state\target-autoloop-control.json')) 'target01 route matrix should expose target-scoped control path.'
+Assert-True ([string]$matrixTarget01.TargetWatcherMutexName -match '^Global\\RelayTargetAutoloopTarget_[0-9a-f]+$') 'target01 route matrix should expose target-scoped watcher mutex preview.'
 Assert-True ([string]$matrixTarget01.Delivery.Watcher -eq 'not-yet-accepted-current-marker') 'target01 route matrix delivery should show that watcher has not accepted the marker yet.'
 Assert-True ([string]$matrixTarget01.DeliveryNextActionCode -eq 'wait-or-restart-watcher') 'target01 route matrix should expose the watcher accepted next action.'
 Assert-True ([string]$matrixTarget01.DeliveryNextActionLabel -eq 'watcher accepted 확인') 'target01 route matrix should expose a compact watcher accepted label.'
@@ -139,9 +142,33 @@ Assert-True ($matrixText -match 'Counts: total=2 enabled=2 routeReady=1 routeChe
 Assert-True ($matrixText -match 'target01 \| enabled \| ROUTE READY \| contract=ready \| cycle 1/2 \| phase=waiting-output \| next=wait-for-output \| triggers=input-file,publish-ready') 'route matrix text should surface target01 as route ready.'
 Assert-True ($matrixText -match 'delivery: artifact=created / watcher=not-yet-accepted-current-marker / router=not-delivered') 'route matrix text should surface target01 delivery stage.'
 Assert-True ($matrixText -match 'deliveryNext: watcher accepted 확인') 'route matrix text should surface the compact delivery next action.'
+Assert-True ($matrixText -match 'targetState: status=.*target01.*target-autoloop-status\.json control=.*target01.*target-autoloop-control\.json mutex=Global\\RelayTargetAutoloopTarget_') 'route matrix text should include target-scoped sidecar paths.'
 Assert-True ($matrixText -match 'target02 \| enabled \| ROUTE EMPTY \| contract=missing \| cycle 0/3 \| phase=idle \| next=wait-for-input \| triggers=input-file,publish-ready') 'route matrix text should surface target02 as route empty.'
 Assert-True ($matrixText -match [regex]::Escape([string]$target01.SourceSummaryPath)) 'route matrix text should include target01 summary path.'
 Assert-True ($matrixText -match 'CloseoutSummary: closeout: pending-visible-proof / mode=operational / reason=proof-passed-script-level / proof=script-level / source=script-smoke') 'route matrix text should surface pending visible proof closeout.'
+
+$stateWithRecordedReady = Read-JsonObject -Path ([string]$start.StatePath)
+$stateWithRecordedReady.Targets.target01.LastHandledOutputFingerprint = 'output-fingerprint-route-matrix-001'
+$stateWithRecordedReady.Targets.target01.LastDispatchState = ''
+$stateWithRecordedReady.Targets.target01.LastRouterReadyPath = Join-Path $inboxTarget01 'already-processed.ready.txt'
+Write-JsonFileAtomically -Path ([string]$start.StatePath) -Payload $stateWithRecordedReady
+$statusWithRecordedReady = New-TargetAutoloopStatusDocument `
+    -Config $config `
+    -RunRoot $runRoot `
+    -StateDocument $stateWithRecordedReady `
+    -ControlDocument $controlDocument `
+    -WatcherState 'running' `
+    -ConfiguredRunDurationSec 120
+Write-JsonFileAtomically -Path ([string]$start.StatusPath) -Payload $statusWithRecordedReady
+
+$matrixRecordedReadyJson = & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Show-TargetAutoloopRouteMatrix.ps1') `
+    -ConfigPath $configPath `
+    -RunRoot $runRoot `
+    -AsJson | ConvertFrom-Json
+$matrixRecordedReadyTarget01 = @($matrixRecordedReadyJson.Targets | Where-Object { [string]$_.TargetId -eq 'target01' } | Select-Object -First 1)[0]
+Assert-True ([string]$matrixRecordedReadyTarget01.Delivery.Watcher -eq 'accepted-current-marker') 'route matrix should show accepted marker when state handled fingerprint matches.'
+Assert-True ([string]$matrixRecordedReadyTarget01.Delivery.Router -eq 'ready-file-created') 'route matrix should treat LastRouterReadyPath as router delivery evidence.'
+Assert-True ([string]$matrixRecordedReadyTarget01.DeliveryNextActionCode -eq 'check-cell-processing') 'route matrix should guide to cell processing after recorded router delivery.'
 
 Remove-Item -LiteralPath ([string]$start.SmokeReceiptPath) -Force
 $stateRoot = Split-Path -Parent ([string]$start.SmokeReceiptPath)
@@ -206,8 +233,39 @@ Assert-True ((@($matrixStaleJson.ManifestReasonCodes) -contains 'enabled-targets
 $matrixStaleTarget01 = @($matrixStaleJson.Targets | Where-Object { [string]$_.TargetId -eq 'target01' } | Select-Object -First 1)[0]
 $matrixStaleTarget02 = @($matrixStaleJson.Targets | Where-Object { [string]$_.TargetId -eq 'target02' } | Select-Object -First 1)[0]
 Assert-True (-not [bool]$matrixStaleTarget01.InManifest) 'target01 should be marked absent from stale manifest.'
+Assert-True ([string]$matrixStaleTarget01.RouteScope -eq 'outside-current-manifest') 'target01 should be marked outside the current manifest scope.'
+Assert-True ([string]$matrixStaleTarget01.RouteScopeReason -eq 'target-not-in-current-run-manifest') 'target01 route scope should explain the out-of-scope reason.'
+Assert-True ([string]$matrixStaleTarget01.RouteBadge -eq 'ROUTE OUT') 'out-of-scope target01 should not be shown as an active route problem.'
 Assert-True ([bool]$matrixStaleTarget02.InManifest) 'target02 should be marked present in stale manifest.'
 Assert-True (-not [bool]$matrixStaleTarget02.ManifestEnabled) 'target02 should be marked disabled in stale manifest.'
 Assert-True ($matrixStaleText -match 'Manifest: exists=True runMode=target-autoloop targets=target02 enabled=\(none\) mismatch=True') 'route matrix text should show stale manifest mismatch.'
+Assert-True ($matrixStaleText -match 'target01 \| enabled \| ROUTE OUT \| contract=ready') 'route matrix text should show out-of-scope ready contracts as ROUTE OUT.'
+Assert-True ($matrixStaleText -match 'manifest: inManifest=False manifestEnabled=False routeScope=outside-current-manifest reason=target-not-in-current-run-manifest') 'route matrix text should explain route scope for out-of-scope targets.'
+
+Remove-Item -LiteralPath $target01.PublishReadyPath -Force
+$matrixStalePartialJson = & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Show-TargetAutoloopRouteMatrix.ps1') `
+    -ConfigPath $configPath `
+    -RunRoot $runRoot `
+    -AsJson | ConvertFrom-Json
+$matrixStalePartialTarget01 = @($matrixStalePartialJson.Targets | Where-Object { [string]$_.TargetId -eq 'target01' } | Select-Object -First 1)[0]
+Assert-True ([string]$matrixStalePartialTarget01.ContractState -eq 'partial') 'out-of-scope target01 should still report the actual partial contract state.'
+Assert-True ([string]$matrixStalePartialTarget01.ContractReason -eq 'summary-review-without-marker') 'out-of-scope partial contract should keep the marker-missing reason.'
+Assert-True ([string]$matrixStalePartialTarget01.RouteBadge -eq 'ROUTE OUT') 'out-of-scope partial contract should not be shown as ROUTE CHECK.'
+Assert-True ([int]$matrixStalePartialJson.Counts.RouteCheckTargets -eq 0) 'out-of-scope partial contracts should not increase active route check count.'
+Assert-True ([int]$matrixStalePartialJson.Counts.RouteOutOfScopeTargets -eq 1) 'out-of-scope partial contract should increase route out count.'
+
+Remove-Item -LiteralPath ([string]$start.ManifestPath) -Force
+$matrixMissingManifestJson = & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Show-TargetAutoloopRouteMatrix.ps1') `
+    -ConfigPath $configPath `
+    -RunRoot $runRoot `
+    -AsJson | ConvertFrom-Json
+$matrixMissingManifestTarget01 = @($matrixMissingManifestJson.Targets | Where-Object { [string]$_.TargetId -eq 'target01' } | Select-Object -First 1)[0]
+$matrixMissingManifestTarget02 = @($matrixMissingManifestJson.Targets | Where-Object { [string]$_.TargetId -eq 'target02' } | Select-Object -First 1)[0]
+Assert-True ([string]$matrixMissingManifestTarget01.RouteScope -eq 'manifest-missing') 'manifest-missing runroot should mark target01 route scope.'
+Assert-True ([string]$matrixMissingManifestTarget01.RouteScopeReason -eq 'runroot-manifest-missing') 'manifest-missing route scope should explain missing manifest.'
+Assert-True ([string]$matrixMissingManifestTarget01.ContractState -eq 'partial') 'manifest-missing target01 should keep actual partial contract state.'
+Assert-True ([string]$matrixMissingManifestTarget01.RouteBadge -eq 'ROUTE OUT') 'manifest-missing partial contract should not be shown as ROUTE CHECK.'
+Assert-True ([string]$matrixMissingManifestTarget02.ContractState -eq 'missing') 'manifest-missing empty target02 should keep missing contract state.'
+Assert-True ([string]$matrixMissingManifestTarget02.RouteBadge -eq 'ROUTE EMPTY') 'manifest-missing empty target should remain ROUTE EMPTY.'
 
 Write-Host 'show target autoloop route matrix ok'

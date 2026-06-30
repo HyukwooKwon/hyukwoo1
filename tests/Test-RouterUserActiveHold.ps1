@@ -88,6 +88,8 @@ $configText = @"
     RequireActiveBeforeEnter = `$true
     RequireUserIdleBeforeSend = `$true
     MinUserIdleBeforeSendMs = 2147483000
+    UserIdleWaitTimeoutMs = 15000
+    UserIdleWaitPollMs = 250
     Targets = @(
 $($targetBlocks -join ",`r`n")
     )
@@ -136,5 +138,18 @@ Assert-True ($processedFiles.Count -eq 0) 'user active hold must not move the me
 $routerLogPath = Join-Path $logsRoot 'router.log'
 $routerLog = [System.IO.File]::ReadAllText($routerLogPath, [System.Text.UTF8Encoding]::new($false, $true))
 Assert-True ($routerLog -like '*category=user_active_hold*') 'router log should record user_active_hold category.'
+Assert-True ($routerLog -like '*userIdleWaitTimeoutMs=15000*') 'router log should record the bounded user idle wait timeout.'
+Assert-True ($routerLog -like '*processing attempt=1/2*') 'user active hold should allow one automatic retry before retry-pending.'
+Assert-True ($routerLog -like '*processing attempt=2/2*') 'user active hold retry should make the final bounded attempt.'
+
+$retryMetadata = Get-Content -LiteralPath $retryMetaFiles[0].FullName -Raw -Encoding UTF8 | ConvertFrom-Json
+Assert-True ([int]$retryMetadata.Attempt -eq 2) 'retry-pending metadata should record the final user_active_hold attempt.'
+
+$routerStatePath = Join-Path $runtimeRoot 'router-state.json'
+$routerState = Get-Content -LiteralPath $routerStatePath -Raw -Encoding UTF8 | ConvertFrom-Json
+Assert-True ([bool]$routerState.RequireUserIdleBeforeSend) 'router state should record the effective user idle guard setting.'
+Assert-True ([int]$routerState.MinUserIdleBeforeSendMs -eq 2147483000) 'router state should record the effective minimum user idle setting.'
+Assert-True ([int]$routerState.UserIdleWaitTimeoutMs -eq 15000) 'router state should record the effective bounded idle wait setting.'
+Assert-True ([int]$routerState.UserIdleWaitPollMs -eq 250) 'router state should record the effective idle wait poll setting.'
 
 Write-Host ('router user-active-hold ok: root=' + $testRoot)

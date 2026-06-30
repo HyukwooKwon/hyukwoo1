@@ -46,7 +46,7 @@ class TargetAutoloopOutputFormatterTests(unittest.TestCase):
             "heartbeat_at": "2026-05-25T00:00:01Z",
         }
         self.assertEqual(
-            "ack: controller=running / detector=running / heartbeat=2026-05-25T00:00:01Z",
+            "ack: controller=running / detector=running / scope=- / targets=(none) / heartbeat=2026-05-25T00:00:01Z",
             outputs.format_start_watcher_ack_detail(ready_snapshot),
         )
         self.assertEqual(
@@ -231,6 +231,7 @@ class TargetAutoloopOutputFormatterTests(unittest.TestCase):
                     {
                         "TargetId": "target04",
                         "TriggerKinds": ["input-file", "publish-ready"],
+                        "WorkRepoRoot": r"C:\repo",
                         "SourceOutboxPath": r"C:\repo\.relay-contract\summary.txt",
                         "QueueRoot": r"C:\runs\run_1\queue\target04",
                     }
@@ -245,6 +246,8 @@ class TargetAutoloopOutputFormatterTests(unittest.TestCase):
         self.assertIn("ConfigAutoFix: TargetAutoloop.Enabled=True 저장 완료 / backup=C:\\cfg.backup.psd1", lines)
         self.assertIn("이번 RunRoot 포함 target: target04", summary_lines)
         self.assertIn("publish-ready: 1/1", summary_lines)
+        self.assertIn("WorkRepoRoot:", summary_lines)
+        self.assertIn("  target04: C:\\repo", summary_lines)
         self.assertIn("  target04: C:\\repo\\.relay-contract\\summary.txt", summary_lines)
 
 

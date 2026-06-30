@@ -82,6 +82,7 @@ Assert-True ($promptText.Contains([string]$target01.SourceReviewZipPath)) 'watch
 Assert-True ($promptText.Contains([string]$target01.PublishReadyPath)) 'watcher should append the manifest publish-ready path to the dispatched prompt.'
 Assert-True (($promptText | Select-String -Pattern ([regex]::Escape([string]$target01.SourceSummaryPath)) -AllMatches).Matches.Count -eq 1) 'watcher should append the summary path exactly once.'
 Assert-True ($promptText.Contains('input trigger body')) 'watcher should keep the operator input body.'
+Assert-True ($promptText.Contains('[고정문구 / 항상 포함]')) 'input trigger prompt should keep the fixed suffix header.'
 Assert-True ($promptText.Contains('suffix-01')) 'watcher should append the target fixed suffix.'
 
 $state = Get-Content -LiteralPath $start.StatePath -Raw -Encoding UTF8 | ConvertFrom-Json
