@@ -771,6 +771,8 @@ def target_autoloop_recent_ignored_summary(
     *,
     target_ids: list[str] | tuple[str, ...] | set[str] | None = None,
     max_items: int = 20,
+    recent_window_seconds: int = 0,
+    now_seconds: float | None = None,
 ) -> dict[str, object]:
     root_text = str(ignored_root or "").strip()
     allowed_targets = {
@@ -783,6 +785,8 @@ def target_autoloop_recent_ignored_summary(
     items: list[dict[str, object]] = []
     ignored_target_filtered_count = 0
     limit = max(0, int(max_items))
+    recent_window = max(0, int(recent_window_seconds))
+    observed_now = float(now_seconds) if now_seconds is not None else (time.time() if recent_window > 0 else 0.0)
     if root_exists and root_path is not None and limit > 0:
         ready_paths = list(root_path.glob("*.ready.txt"))
         ready_paths.sort(key=lambda path: (_file_mtime_ns(path), path.name), reverse=True)
@@ -801,6 +805,8 @@ def target_autoloop_recent_ignored_summary(
             except OSError:
                 last_write_time = 0.0
                 size_bytes = 0
+            age_seconds = max(0, int(observed_now - last_write_time)) if observed_now > 0.0 and last_write_time > 0.0 else 0
+            is_recent = True if recent_window <= 0 else bool(last_write_time > 0.0 and age_seconds <= recent_window)
             reason_code = str(archive.get("ArchiveReasonCode", "") or "").strip()
             reason_detail = str(archive.get("ArchiveReasonDetail", "") or "").strip()
             archive_error = ""
@@ -820,6 +826,8 @@ def target_autoloop_recent_ignored_summary(
                     "name": ready_path.name,
                     "size_bytes": size_bytes,
                     "last_write_time": last_write_time,
+                    "age_seconds": age_seconds,
+                    "is_recent": is_recent,
                     "archive_path": str(archive_path),
                     "archive_exists": archive_exists,
                     "archive_parse_error": archive_error,
@@ -838,19 +846,48 @@ def target_autoloop_recent_ignored_summary(
         if target_id and target_id not in target_id_values:
             target_id_values.append(target_id)
     latest = items[0] if items else {}
+    recent_items = [item for item in items if bool(item.get("is_recent", True))]
+    stale_items = [item for item in items if not bool(item.get("is_recent", True))]
+    recent_target_id_values: list[str] = []
+    for item in recent_items:
+        target_id = str(item.get("target_id", "") or "").strip()
+        if target_id and target_id not in recent_target_id_values:
+            recent_target_id_values.append(target_id)
+    stale_target_id_values: list[str] = []
+    for item in stale_items:
+        target_id = str(item.get("target_id", "") or "").strip()
+        if target_id and target_id not in stale_target_id_values:
+            stale_target_id_values.append(target_id)
+    latest_recent = recent_items[0] if recent_items else {}
+    latest_stale = stale_items[0] if stale_items else {}
     return {
         "root": root_text,
         "root_exists": root_exists,
         "count": len(items),
         "target_ids": target_id_values,
+        "recent_window_seconds": recent_window,
+        "recent_count": len(recent_items),
+        "recent_target_ids": recent_target_id_values,
+        "stale_count": len(stale_items),
+        "stale_target_ids": stale_target_id_values,
         "latest_path": str(latest.get("path", "") or ""),
         "latest_target_id": str(latest.get("target_id", "") or ""),
         "latest_reason_code": str(latest.get("reason_code", "") or ""),
         "latest_reason_detail": str(latest.get("reason_detail", "") or ""),
         "latest_archive_path": str(latest.get("archive_path", "") or ""),
+        "latest_recent_path": str(latest_recent.get("path", "") or ""),
+        "latest_recent_target_id": str(latest_recent.get("target_id", "") or ""),
+        "latest_recent_reason_code": str(latest_recent.get("reason_code", "") or ""),
+        "latest_recent_reason_detail": str(latest_recent.get("reason_detail", "") or ""),
+        "latest_stale_path": str(latest_stale.get("path", "") or ""),
+        "latest_stale_target_id": str(latest_stale.get("target_id", "") or ""),
+        "latest_stale_reason_code": str(latest_stale.get("reason_code", "") or ""),
+        "latest_stale_reason_detail": str(latest_stale.get("reason_detail", "") or ""),
         "ignored_target_filtered_count": ignored_target_filtered_count,
         "reason_counts": _reason_counts_from_items(items),
         "items": items,
+        "recent_items": recent_items,
+        "stale_items": stale_items,
     }
 
 

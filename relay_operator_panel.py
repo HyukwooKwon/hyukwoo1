@@ -203,6 +203,7 @@ RUN_ROOT_CONTEXT_REFRESH_DEBOUNCE_MS = 250
 PANEL_SOURCE_STALE_CHECK_MS = 15000
 TARGET_AUTOLOOP_RUNTIME_SNAPSHOT_CACHE_TTL_SECONDS = 0.75
 TARGET_AUTOLOOP_CARD_ACTION_AUTO_REFRESH_MS = 1500
+TARGET_AUTOLOOP_ROUTER_IGNORED_RECENT_SECONDS = 2 * 60 * 60
 ARTIFACT_VIEW_STATE_CACHE_TTL_SECONDS = 0.75
 WINDOW_ACTION_STARTUP_GUARD_SEC = 20.0
 WINDOW_ACTION_RECENT_INPUT_SEC = 2.5
@@ -9764,6 +9765,13 @@ class RelayOperatorPanel(tk.Tk):
             "items",
             normalized_target_id,
         )
+        router_ignored_recent_count = self._target_autoloop_count_summary_items_for_target(
+            router_ignored_summary,
+            "recent_items",
+            normalized_target_id,
+        )
+        if router_ignored_count > 0 and "recent_items" not in router_ignored_summary:
+            router_ignored_recent_count = router_ignored_count
 
         status_row = self._target_autoloop_row_for_target(
             runtime_snapshot.get("targets", []),
@@ -10045,17 +10053,17 @@ class RelayOperatorPanel(tk.Tk):
                 "detail": (start_detail or f"{normalized_target_id} 감지를 시작할 수 있습니다.") + f" 감지 target={start_scope_text}",
             }
 
-        if router_ignored_count > 0:
+        if router_ignored_recent_count > 0:
             ignored_item = self._target_autoloop_latest_summary_item_for_target(
                 router_ignored_summary,
-                "items",
+                "recent_items" if "recent_items" in router_ignored_summary else "items",
                 normalized_target_id,
             )
             reason_code = str(ignored_item.get("reason_code", "") or "unknown").strip()
             reason_detail = str(ignored_item.get("reason_detail", "") or "").strip()
             ignored_path = str(ignored_item.get("path", "") or "").strip()
             detail = (
-                f"{normalized_target_id} 최근 router ignored {router_ignored_count}개가 있습니다. "
+                f"{normalized_target_id} 최근 router ignored {router_ignored_recent_count}개가 있습니다. "
                 f"reason={reason_code}. 전송보류 재시도/이어쓰기 전에 router가 이 ready 파일을 왜 무시했는지 먼저 확인하세요."
             )
             if reason_detail:
@@ -22238,6 +22246,7 @@ class RelayOperatorPanel(tk.Tk):
         router_ignored_summary = target_autoloop_runtime.target_autoloop_recent_ignored_summary(
             ignored_root,
             target_ids=manifest_target_ids,
+            recent_window_seconds=TARGET_AUTOLOOP_ROUTER_IGNORED_RECENT_SECONDS,
         )
         output_block_summary = target_autoloop_runtime.target_autoloop_source_outbox_contract_summary(
             manifest_targets,
@@ -25912,9 +25921,17 @@ class RelayOperatorPanel(tk.Tk):
         if not isinstance(router_ignored_summary, dict):
             router_ignored_summary = {}
         router_ignored_count = int(router_ignored_summary.get("count", 0) or 0)
+        router_ignored_recent_count = int(router_ignored_summary.get("recent_count", router_ignored_count) or 0)
+        router_ignored_stale_count = int(router_ignored_summary.get("stale_count", 0) or 0)
         router_ignored_targets = router_ignored_summary.get("target_ids", [])
         if not isinstance(router_ignored_targets, list):
             router_ignored_targets = []
+        router_ignored_recent_targets = router_ignored_summary.get("recent_target_ids", router_ignored_targets)
+        if not isinstance(router_ignored_recent_targets, list):
+            router_ignored_recent_targets = []
+        router_ignored_stale_targets = router_ignored_summary.get("stale_target_ids", [])
+        if not isinstance(router_ignored_stale_targets, list):
+            router_ignored_stale_targets = []
         router_session_state = str(runtime_snapshot.get("router_session_state", "") or "")
         if router_session_state and router_session_state != "not-configured":
             summary_text += f" / routerSession={router_session_state}"
@@ -25936,10 +25953,14 @@ class RelayOperatorPanel(tk.Tk):
         if router_inbox_ready_count > 0:
             router_inbox_target_text = ",".join(str(target_id or "").strip() for target_id in router_inbox_ready_targets if str(target_id or "").strip()) or "(none)"
             summary_text += f" / routerInboxReady={router_inbox_ready_count}:{router_inbox_target_text}"
-        if router_ignored_count > 0:
-            router_ignored_target_text = ",".join(str(target_id or "").strip() for target_id in router_ignored_targets if str(target_id or "").strip()) or "(none)"
-            router_ignored_reason = str(router_ignored_summary.get("latest_reason_code", "") or "unknown")
-            summary_text += f" / ignored={router_ignored_count}:{router_ignored_target_text}:{router_ignored_reason}"
+        if router_ignored_recent_count > 0:
+            router_ignored_target_text = ",".join(str(target_id or "").strip() for target_id in router_ignored_recent_targets if str(target_id or "").strip()) or "(none)"
+            router_ignored_reason = str(router_ignored_summary.get("latest_recent_reason_code", "") or router_ignored_summary.get("latest_reason_code", "") or "unknown")
+            summary_text += f" / ignoredRecent={router_ignored_recent_count}:{router_ignored_target_text}:{router_ignored_reason}"
+        elif router_ignored_stale_count > 0:
+            router_ignored_target_text = ",".join(str(target_id or "").strip() for target_id in router_ignored_stale_targets if str(target_id or "").strip()) or "(none)"
+            router_ignored_reason = str(router_ignored_summary.get("latest_stale_reason_code", "") or router_ignored_summary.get("latest_reason_code", "") or "unknown")
+            summary_text += f" / ignoredOld={router_ignored_stale_count}:{router_ignored_target_text}:{router_ignored_reason}"
         if watcher_stop_reason:
             summary_text += f" / watchStop={watcher_stop_reason}"
         if last_handled_action:

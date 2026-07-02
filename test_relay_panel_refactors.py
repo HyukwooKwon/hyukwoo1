@@ -24227,7 +24227,10 @@ class RelayOperatorPanelWatcherOptionTests(unittest.TestCase):
                 "watcher_target_scope": "scoped",
                 "router_ignored_summary": {
                     "count": 1,
+                    "recent_count": 1,
+                    "stale_count": 0,
                     "target_ids": ["target07"],
+                    "recent_target_ids": ["target07"],
                     "items": [
                         {
                             "target_id": "target07",
@@ -24237,6 +24240,16 @@ class RelayOperatorPanelWatcherOptionTests(unittest.TestCase):
                             "reason_detail": "delivery metadata missing",
                         },
                     ],
+                    "recent_items": [
+                        {
+                            "target_id": "target07",
+                            "path": r"C:\runtime\ignored\target07__20260702_120000_000__message.ready.txt",
+                            "last_write_time": 1000.0,
+                            "reason_code": "metadata-missing",
+                            "reason_detail": "delivery metadata missing",
+                        },
+                    ],
+                    "stale_items": [],
                 },
                 "targets": [
                     {
@@ -24259,6 +24272,62 @@ class RelayOperatorPanelWatcherOptionTests(unittest.TestCase):
         self.assertIn("metadata-missing", spec["detail"])
         self.assertIn("delivery metadata missing", spec["detail"])
         self.assertIn("전송보류 재시도/이어쓰기 전에", spec["detail"])
+
+    def test_target_autoloop_policy_card_primary_action_ignores_stale_ignored_for_recommendation(self) -> None:
+        panel = self._make_panel()
+
+        spec = panel._target_autoloop_policy_card_primary_action_spec(
+            {
+                "watcher_state": "running",
+                "heartbeat_at": datetime.now(timezone.utc).isoformat(),
+                "watcher_target_ids": ["target07"],
+                "watcher_target_scope": "scoped",
+                "router_ignored_summary": {
+                    "count": 1,
+                    "recent_count": 0,
+                    "stale_count": 1,
+                    "target_ids": ["target07"],
+                    "recent_target_ids": [],
+                    "stale_target_ids": ["target07"],
+                    "items": [
+                        {
+                            "target_id": "target07",
+                            "path": r"C:\runtime\ignored\target07__20260702_090000_000__old.ready.txt",
+                            "last_write_time": 1000.0,
+                            "is_recent": False,
+                            "reason_code": "metadata-missing",
+                        },
+                    ],
+                    "recent_items": [],
+                    "stale_items": [
+                        {
+                            "target_id": "target07",
+                            "path": r"C:\runtime\ignored\target07__20260702_090000_000__old.ready.txt",
+                            "last_write_time": 1000.0,
+                            "is_recent": False,
+                            "reason_code": "metadata-missing",
+                        },
+                    ],
+                },
+                "targets": [
+                    {
+                        "TargetId": "target07",
+                        "Phase": "idle",
+                        "CycleCount": 3,
+                        "MaxCycleCount": 10,
+                    },
+                ],
+                "manifest_targets": [
+                    {"TargetId": "target07", "Enabled": True, "TriggerKinds": ["publish-ready"], "MaxCycleCount": 10},
+                ],
+            },
+            "target07",
+        )
+
+        self.assertEqual("상태 확인", spec["label"])
+        self.assertEqual("", spec["action_key"])
+        self.assertFalse(spec["enabled"])
+        self.assertNotIn("최근 ignored 확인", spec["label"])
 
     def test_target_autoloop_policy_card_primary_action_explains_disabled_manifest_target(self) -> None:
         panel = self._make_panel()

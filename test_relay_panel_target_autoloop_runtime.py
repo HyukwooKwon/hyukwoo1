@@ -200,8 +200,46 @@ class TargetAutoloopRuntimeTests(unittest.TestCase):
         self.assertEqual("target07", summary["latest_target_id"])
         self.assertEqual("metadata-missing", summary["latest_reason_code"])
         self.assertEqual("delivery metadata missing", summary["latest_reason_detail"])
+        self.assertEqual(1, summary["recent_count"])
+        self.assertEqual(0, summary["stale_count"])
+        self.assertEqual(str(target07_ready), summary["latest_recent_path"])
         self.assertEqual(1, summary["ignored_target_filtered_count"])
         self.assertEqual([{"reason_code": "metadata-missing", "count": 1}], summary["reason_counts"])
+
+    def test_recent_ignored_summary_splits_stale_items_by_age_window(self) -> None:
+        root = Path(make_workspace_tempdir("target-autoloop-runtime-ignored-age"))
+        ignored_root = root / "ignored"
+        ignored_root.mkdir()
+        old_ready = ignored_root / "target07__20260702_100000_000__old.ready.txt"
+        new_ready = ignored_root / "target07__20260702_120000_000__new.ready.txt"
+        old_ready.write_text("old", encoding="utf-8")
+        new_ready.write_text("new", encoding="utf-8")
+        Path(str(old_ready) + ".archive.json").write_text(
+            json.dumps({"ArchiveReasonCode": "metadata-missing", "TargetId": "target07"}),
+            encoding="utf-8",
+        )
+        Path(str(new_ready) + ".archive.json").write_text(
+            json.dumps({"ArchiveReasonCode": "launcher-session-mismatch", "TargetId": "target07"}),
+            encoding="utf-8",
+        )
+        os.utime(old_ready, (1000, 1000))
+        os.utime(new_ready, (1900, 1900))
+
+        summary = runtime.target_autoloop_recent_ignored_summary(
+            str(ignored_root),
+            target_ids=["target07"],
+            max_items=5,
+            recent_window_seconds=600,
+            now_seconds=2000,
+        )
+
+        self.assertEqual(2, summary["count"])
+        self.assertEqual(1, summary["recent_count"])
+        self.assertEqual(1, summary["stale_count"])
+        self.assertEqual(str(new_ready), summary["latest_recent_path"])
+        self.assertEqual("launcher-session-mismatch", summary["latest_recent_reason_code"])
+        self.assertEqual(str(old_ready), summary["latest_stale_path"])
+        self.assertEqual("metadata-missing", summary["latest_stale_reason_code"])
 
     def test_router_session_snapshot_reports_ok_for_matching_session(self) -> None:
         root = Path(make_workspace_tempdir("target-autoloop-runtime-ok"))
