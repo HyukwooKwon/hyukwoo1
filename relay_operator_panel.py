@@ -504,6 +504,15 @@ class RelayOperatorPanel(tk.Tk):
         self.target_autoloop_policy_selection_warning_var = tk.StringVar(value="")
         self.target_autoloop_policy_card_detail_visible_var = tk.BooleanVar(value=False)
         self.target_autoloop_policy_card_detail_toggle_var = tk.StringVar(value="카드 상세 펼치기")
+        self.target_autoloop_policy_card_view_mode_var = tk.StringVar(value="full")
+        self.target_autoloop_policy_card_focus_target_var = tk.StringVar(value=BOARD_TARGET_FALLBACK[0])
+        self.target_autoloop_policy_card_view_status_var = tk.StringVar(value="view=전체보기 / focus=target01")
+        self.target_autoloop_policy_bulk_controls_collapsed_var = tk.BooleanVar(value=True)
+        self.target_autoloop_policy_bulk_controls_toggle_var = tk.StringVar(value="일괄 작업 펼치기")
+        self.target_autoloop_policy_snapshot_controls_collapsed_var = tk.BooleanVar(value=True)
+        self.target_autoloop_policy_snapshot_controls_toggle_var = tk.StringVar(value="선택 snapshot 펼치기")
+        self.target_autoloop_policy_danger_controls_collapsed_var = tk.BooleanVar(value=True)
+        self.target_autoloop_policy_danger_controls_toggle_var = tk.StringVar(value="위험 적용 펼치기")
         self.target_autoloop_seed_status_var = tk.StringVar(value="8 Cell Autoloop seed composer는 target별 summary/review/publish 경로를 자동 주입합니다.")
         self.target_autoloop_seed_target_var = tk.StringVar(value=BOARD_TARGET_FALLBACK[0])
         self.target_autoloop_seed_input_var = tk.StringVar(value="")
@@ -689,6 +698,7 @@ class RelayOperatorPanel(tk.Tk):
         self.target_autoloop_policy_card_trigger_publish_checkbuttons: dict[str, ttk.Checkbutton] = {}
         self.target_autoloop_policy_card_effective_preview_widgets: dict[str, tk.Text] = {}
         self.target_autoloop_policy_card_frames: dict[str, ttk.LabelFrame] = {}
+        self.target_autoloop_policy_focus_target_buttons: dict[str, ttk.Button] = {}
         self.target_autoloop_policy_card_seed_copy_buttons: dict[str, ttk.Button] = {}
         self.target_autoloop_policy_card_extend_cycle_limit_buttons: dict[str, ttk.Button] = {}
         self.target_autoloop_policy_card_extend_and_start_buttons: dict[str, ttk.Button] = {}
@@ -1566,6 +1576,7 @@ class RelayOperatorPanel(tk.Tk):
         style.configure("WatcherBadgeBlocked.TLabel", foreground="#C2410C", font=("Segoe UI", 9, "bold"))
         style.configure("WatcherBadgeSuccess.TLabel", foreground="#15803D", font=("Segoe UI", 9, "bold"))
         style.configure("WatcherBadgeError.TLabel", foreground="#B91C1C", font=("Segoe UI", 9, "bold"))
+        style.configure("TargetAutoloopFocusTarget.TButton", foreground="#1D4ED8", font=("Segoe UI", 9, "bold"))
         style.configure(
             "FocusGuardBanner.TLabel",
             foreground="#7C2D12",
@@ -1999,6 +2010,194 @@ class RelayOperatorPanel(tk.Tk):
         visible_var.set(not bool(visible_var.get()))
         self._save_target_autoloop_card_view_preferences()
         self._apply_target_autoloop_policy_card_detail_visibility()
+
+    def _apply_target_autoloop_policy_action_section_visibility(self) -> None:
+        section_specs = (
+            (
+                "target_autoloop_policy_bulk_controls_frame",
+                "target_autoloop_policy_bulk_controls_collapsed_var",
+                "target_autoloop_policy_bulk_controls_toggle_var",
+                "일괄 작업 펼치기",
+                "일괄 작업 접기",
+            ),
+            (
+                "target_autoloop_policy_snapshot_controls_frame",
+                "target_autoloop_policy_snapshot_controls_collapsed_var",
+                "target_autoloop_policy_snapshot_controls_toggle_var",
+                "선택 snapshot 펼치기",
+                "선택 snapshot 접기",
+            ),
+            (
+                "target_autoloop_policy_danger_controls_frame",
+                "target_autoloop_policy_danger_controls_collapsed_var",
+                "target_autoloop_policy_danger_controls_toggle_var",
+                "위험 적용 펼치기",
+                "위험 적용 접기",
+            ),
+        )
+        for frame_attr, collapsed_attr, toggle_attr, collapsed_label, expanded_label in section_specs:
+            frame = self.__dict__.get(frame_attr)
+            collapsed_var = self.__dict__.get(collapsed_attr)
+            toggle_var = self.__dict__.get(toggle_attr)
+            if frame is None or collapsed_var is None or toggle_var is None or not hasattr(collapsed_var, "get"):
+                continue
+            collapsed = bool(collapsed_var.get())
+            try:
+                if collapsed:
+                    frame.grid_remove()
+                    toggle_var.set(collapsed_label)
+                else:
+                    frame.grid()
+                    toggle_var.set(expanded_label)
+            except Exception:
+                pass
+
+    def toggle_target_autoloop_policy_bulk_controls(self) -> None:
+        collapsed_var = self.__dict__.get("target_autoloop_policy_bulk_controls_collapsed_var")
+        if collapsed_var is None or not hasattr(collapsed_var, "get") or not hasattr(collapsed_var, "set"):
+            return
+        collapsed_var.set(not bool(collapsed_var.get()))
+        self._apply_target_autoloop_policy_action_section_visibility()
+
+    def toggle_target_autoloop_policy_snapshot_controls(self) -> None:
+        collapsed_var = self.__dict__.get("target_autoloop_policy_snapshot_controls_collapsed_var")
+        if collapsed_var is None or not hasattr(collapsed_var, "get") or not hasattr(collapsed_var, "set"):
+            return
+        collapsed_var.set(not bool(collapsed_var.get()))
+        self._apply_target_autoloop_policy_action_section_visibility()
+
+    def toggle_target_autoloop_policy_danger_controls(self) -> None:
+        collapsed_var = self.__dict__.get("target_autoloop_policy_danger_controls_collapsed_var")
+        if collapsed_var is None or not hasattr(collapsed_var, "get") or not hasattr(collapsed_var, "set"):
+            return
+        collapsed_var.set(not bool(collapsed_var.get()))
+        self._apply_target_autoloop_policy_action_section_visibility()
+
+    def _target_autoloop_policy_card_view_mode(self) -> str:
+        mode_var = self.__dict__.get("target_autoloop_policy_card_view_mode_var")
+        raw_mode = ""
+        if mode_var is not None and hasattr(mode_var, "get"):
+            try:
+                raw_mode = str(mode_var.get() or "").strip().lower()
+            except Exception:
+                raw_mode = ""
+        if raw_mode in {"compact", "single", "축소", "축소보기"}:
+            return "compact"
+        return "full"
+
+    def _target_autoloop_policy_card_focus_target_id(self, document: dict | None = None) -> str:
+        effective_document = document if isinstance(document, dict) else None
+        if effective_document is None:
+            cached_document = self.__dict__.get("message_config_doc", None)
+            effective_document = cached_document if isinstance(cached_document, dict) else {}
+        target_ids = self._target_autoloop_policy_target_ids(effective_document)
+        target_set = set(target_ids)
+        focus_var = self.__dict__.get("target_autoloop_policy_card_focus_target_var")
+        if focus_var is not None and hasattr(focus_var, "get"):
+            try:
+                focused_target_id = str(focus_var.get() or "").strip()
+            except Exception:
+                focused_target_id = ""
+            if focused_target_id in target_set:
+                return focused_target_id
+        target_var = self.__dict__.get("target_id_var")
+        if target_var is not None and hasattr(target_var, "get"):
+            try:
+                selected_target_id = str(target_var.get() or "").strip()
+            except Exception:
+                selected_target_id = ""
+            if selected_target_id in target_set:
+                return selected_target_id
+        return target_ids[0] if target_ids else ""
+
+    def _set_target_autoloop_policy_card_view_status(
+        self,
+        *,
+        mode: str | None = None,
+        focus_target_id: str | None = None,
+        visible_count: int | None = None,
+        hidden_count: int | None = None,
+    ) -> None:
+        status_var = self.__dict__.get("target_autoloop_policy_card_view_status_var")
+        if status_var is None or not hasattr(status_var, "set"):
+            return
+        normalized_mode = mode or self._target_autoloop_policy_card_view_mode()
+        mode_label = "축소보기" if normalized_mode == "compact" else "전체보기"
+        focus_label = str(focus_target_id or self._target_autoloop_policy_card_focus_target_id() or "(없음)")
+        count_part = ""
+        if visible_count is not None and hidden_count is not None:
+            count_part = f" / visible={visible_count} / hidden={hidden_count}"
+        try:
+            status_var.set(f"view={mode_label} / focus={focus_label}{count_part}")
+        except Exception:
+            pass
+        self._refresh_target_autoloop_policy_focus_target_buttons(focus_target_id=focus_label)
+
+    def _refresh_target_autoloop_policy_focus_target_buttons(self, *, focus_target_id: str | None = None) -> None:
+        button_map = self.__dict__.get("target_autoloop_policy_focus_target_buttons", {}) or {}
+        if not isinstance(button_map, dict):
+            return
+        focused = str(focus_target_id or self._target_autoloop_policy_card_focus_target_id() or "").strip()
+        for target_id, button in button_map.items():
+            if button is None:
+                continue
+            style_name = "TargetAutoloopFocusTarget.TButton" if str(target_id or "").strip() == focused else "TButton"
+            try:
+                button.configure(style=style_name)
+            except Exception:
+                continue
+
+    def set_target_autoloop_policy_card_view_mode(self, mode: str) -> None:
+        normalized_mode = "compact" if str(mode or "").strip().lower() in {"compact", "single", "축소", "축소보기"} else "full"
+        mode_var = self.__dict__.get("target_autoloop_policy_card_view_mode_var")
+        if mode_var is not None and hasattr(mode_var, "set"):
+            try:
+                mode_var.set(normalized_mode)
+            except Exception:
+                pass
+        if normalized_mode == "compact":
+            focus_target_id = self._target_autoloop_policy_card_focus_target_id()
+            focus_var = self.__dict__.get("target_autoloop_policy_card_focus_target_var")
+            if focus_target_id and focus_var is not None and hasattr(focus_var, "set"):
+                try:
+                    focus_var.set(focus_target_id)
+                except Exception:
+                    pass
+        self._save_target_autoloop_card_view_preferences()
+        self._apply_target_autoloop_policy_filter_layout()
+
+    def show_target_autoloop_policy_card_for_target(self, target_id: str) -> None:
+        normalized_target_id = str(target_id or "").strip()
+        if not normalized_target_id:
+            return
+        if normalized_target_id not in self._target_autoloop_policy_target_ids(self.__dict__.get("message_config_doc", {}) or {}):
+            return
+        mode_var = self.__dict__.get("target_autoloop_policy_card_view_mode_var")
+        if mode_var is not None and hasattr(mode_var, "set"):
+            try:
+                mode_var.set("compact")
+            except Exception:
+                pass
+        focus_var = self.__dict__.get("target_autoloop_policy_card_focus_target_var")
+        if focus_var is not None and hasattr(focus_var, "set"):
+            try:
+                focus_var.set(normalized_target_id)
+            except Exception:
+                pass
+        target_var = self.__dict__.get("target_id_var")
+        if target_var is not None and hasattr(target_var, "set"):
+            try:
+                target_var.set(normalized_target_id)
+            except Exception:
+                pass
+        self._save_target_autoloop_card_view_preferences()
+        self._apply_target_autoloop_policy_filter_layout()
+        refresh_seed = getattr(self, "refresh_target_autoloop_seed_composer", None)
+        if callable(refresh_seed):
+            try:
+                refresh_seed()
+            except Exception:
+                pass
 
     def _apply_message_fixed_section_visibility(self) -> None:
         body = self.__dict__.get("message_fixed_body_frame")
@@ -7504,6 +7703,22 @@ class RelayOperatorPanel(tk.Tk):
             if self._target_autoloop_policy_target_matches_filter(target_id, filter_mode)
         ]
 
+    def _target_autoloop_policy_displayed_target_ids(self, document: dict | None = None) -> list[str]:
+        effective_document = document if isinstance(document, dict) else None
+        if effective_document is None:
+            cached_document = self.__dict__.get("message_config_doc", None)
+            effective_document = cached_document if isinstance(cached_document, dict) else {}
+        target_ids = self._target_autoloop_policy_target_ids(effective_document)
+        if self._target_autoloop_policy_card_view_mode() == "compact":
+            focus_target_id = self._target_autoloop_policy_card_focus_target_id(effective_document)
+            return [focus_target_id] if focus_target_id in set(target_ids) else []
+        return self._target_autoloop_policy_visible_target_ids(effective_document)
+
+    def _target_autoloop_policy_displayed_scope_label(self) -> str:
+        if self._target_autoloop_policy_card_view_mode() == "compact":
+            return "현재 축소보기로 표시된"
+        return "현재 필터 기준으로 보이는"
+
     def _target_autoloop_policy_selected_target_ids(
         self,
         document: dict | None = None,
@@ -7515,7 +7730,7 @@ class RelayOperatorPanel(tk.Tk):
             cached_document = self.__dict__.get("message_config_doc", None)
             effective_document = cached_document if isinstance(cached_document, dict) else {}
         target_ids = (
-            self._target_autoloop_policy_visible_target_ids(effective_document)
+            self._target_autoloop_policy_displayed_target_ids(effective_document)
             if visible_only
             else self._target_autoloop_policy_target_ids(effective_document)
         )
@@ -7535,7 +7750,9 @@ class RelayOperatorPanel(tk.Tk):
             cached_document = self.__dict__.get("message_config_doc", None)
             effective_document = cached_document if isinstance(cached_document, dict) else {}
         target_ids = self._target_autoloop_policy_target_ids(effective_document)
-        visible_target_ids = self._target_autoloop_policy_visible_target_ids(effective_document)
+        view_mode = self._target_autoloop_policy_card_view_mode()
+        focus_target_id = self._target_autoloop_policy_card_focus_target_id(effective_document)
+        visible_target_ids = self._target_autoloop_policy_displayed_target_ids(effective_document)
         visible_set = set(visible_target_ids)
         for target_id in target_ids:
             frame = self.__dict__.get("target_autoloop_policy_card_frames", {}).get(target_id)
@@ -7543,14 +7760,23 @@ class RelayOperatorPanel(tk.Tk):
                 continue
             if target_id in visible_set:
                 visible_index = visible_target_ids.index(target_id)
-                card_row = 1 + (visible_index // 2)
-                card_column = visible_index % 2
+                if view_mode == "compact":
+                    card_row = 1
+                    card_column = 0
+                    columnspan = 2
+                    padx = (0, 0)
+                else:
+                    card_row = 1 + (visible_index // 2)
+                    card_column = visible_index % 2
+                    columnspan = 1
+                    padx = (0, 8) if card_column == 0 else (0, 0)
                 try:
                     frame.grid(
                         row=card_row,
                         column=card_column,
+                        columnspan=columnspan,
                         sticky="nsew",
-                        padx=(0, 8) if card_column == 0 else (0, 0),
+                        padx=padx,
                         pady=(0, 8),
                     )
                 except Exception:
@@ -7577,18 +7803,38 @@ class RelayOperatorPanel(tk.Tk):
                 cwd_mismatch=summary_counts["cwd_mismatch"],
             )
         )
+        if view_mode == "compact":
+            self.target_autoloop_policy_filter_status_var.set(
+                str(self.target_autoloop_policy_filter_status_var.get() or "")
+                + f" / view=compact / focus={focus_target_id or '(없음)'}"
+            )
+        self._set_target_autoloop_policy_card_view_status(
+            mode=view_mode,
+            focus_target_id=focus_target_id,
+            visible_count=len(visible_target_ids),
+            hidden_count=hidden_count,
+        )
         if save_selection:
             self._save_target_autoloop_policy_selection_state()
 
     def clear_target_autoloop_policy_filter(self) -> None:
         self.target_autoloop_policy_filter_var.set("all")
         self._apply_target_autoloop_policy_filter_layout()
-        self.target_autoloop_policy_editor_status_var.set(
-            "target-autoloop 필터를 해제했습니다. 전체 target 카드를 다시 표시합니다."
-        )
+        if self._target_autoloop_policy_card_view_mode() == "compact":
+            focus_target_id = self._target_autoloop_policy_card_focus_target_id()
+            self.target_autoloop_policy_editor_status_var.set(
+                "target-autoloop 필터를 해제했습니다. 축소보기 상태라 {target} 카드만 표시합니다. 전체 target을 보려면 전체보기를 선택하세요.".format(
+                    target=focus_target_id or "(focus 없음)",
+                )
+            )
+        else:
+            self.target_autoloop_policy_editor_status_var.set(
+                "target-autoloop 필터를 해제했습니다. 전체 target 카드를 다시 표시합니다."
+            )
 
     def select_visible_target_autoloop_policy_cards(self) -> None:
-        visible_target_ids = self._target_autoloop_policy_visible_target_ids()
+        visible_target_ids = self._target_autoloop_policy_displayed_target_ids()
+        scope_label = self._target_autoloop_policy_displayed_scope_label()
         self.__dict__["_target_autoloop_policy_selection_change_guard"] = True
         try:
             for target_id in self._target_autoloop_policy_target_ids(self.__dict__.get("message_config_doc", {}) or {}):
@@ -7598,7 +7844,8 @@ class RelayOperatorPanel(tk.Tk):
             self.__dict__["_target_autoloop_policy_selection_change_guard"] = False
         self._apply_target_autoloop_policy_filter_layout()
         self.target_autoloop_policy_editor_status_var.set(
-            "현재 필터 기준으로 보이는 target {count}개를 선택했습니다: {targets}".format(
+            "{scope} target {count}개를 선택했습니다: {targets}".format(
+                scope=scope_label,
                 count=len(visible_target_ids),
                 targets=", ".join(visible_target_ids) if visible_target_ids else "(없음)",
             )
@@ -9797,16 +10044,16 @@ class RelayOperatorPanel(tk.Tk):
             return
         visible_target_ids = [
             target_id
-            for target_id in self._target_autoloop_policy_visible_target_ids()
+            for target_id in self._target_autoloop_policy_displayed_target_ids()
             if target_id != source_target_id
         ]
         if not visible_target_ids:
-            messagebox.showwarning("적용 대상 없음", "현재 필터 기준으로 일괄 적용할 target 카드가 없습니다.")
+            messagebox.showwarning("적용 대상 없음", "현재 화면에 일괄 적용할 target 카드가 없습니다.")
             return
         self._apply_target_autoloop_policy_source_to_targets(
             source_target_id,
             visible_target_ids,
-            mode_label="현재 보이는",
+            mode_label=self._target_autoloop_policy_displayed_scope_label(),
         )
 
     def apply_target_autoloop_policy_clone_to_selected_targets(self) -> None:
@@ -16974,9 +17221,42 @@ class RelayOperatorPanel(tk.Tk):
         )
         target_autoloop_clone_button.grid(row=0, column=3, padx=(8, 0))
         self.target_autoloop_policy_clone_button = target_autoloop_clone_button
-        ttk.Label(target_autoloop_policy_actions, text="필터").grid(row=2, column=0, sticky="w", pady=(8, 0))
+        ttk.Label(target_autoloop_policy_actions, text="보기").grid(row=2, column=0, sticky="w", pady=(8, 0))
+        target_autoloop_view_controls = ttk.Frame(target_autoloop_policy_actions)
+        target_autoloop_view_controls.grid(row=2, column=1, columnspan=5, sticky="w", pady=(8, 0))
+        ttk.Radiobutton(
+            target_autoloop_view_controls,
+            text="전체보기",
+            value="full",
+            variable=self.target_autoloop_policy_card_view_mode_var,
+            command=lambda: self.set_target_autoloop_policy_card_view_mode("full"),
+        ).grid(row=0, column=0, sticky="w")
+        ttk.Radiobutton(
+            target_autoloop_view_controls,
+            text="축소보기",
+            value="compact",
+            variable=self.target_autoloop_policy_card_view_mode_var,
+            command=lambda: self.set_target_autoloop_policy_card_view_mode("compact"),
+        ).grid(row=0, column=1, sticky="w", padx=(8, 0))
+        ttk.Label(target_autoloop_view_controls, text="Target").grid(row=0, column=2, sticky="w", padx=(14, 4))
+        for target_button_index, target_id in enumerate(BOARD_TARGET_FALLBACK, start=3):
+            focus_target_button = ttk.Button(
+                target_autoloop_view_controls,
+                text=target_id[-2:],
+                width=3,
+                command=lambda current_target_id=target_id: self.show_target_autoloop_policy_card_for_target(current_target_id),
+            )
+            focus_target_button.grid(row=0, column=target_button_index, sticky="w", padx=(4, 0))
+            self.target_autoloop_policy_focus_target_buttons[target_id] = focus_target_button
+        ttk.Label(
+            target_autoloop_view_controls,
+            textvariable=self.target_autoloop_policy_card_view_status_var,
+            justify="left",
+        ).grid(row=0, column=11, sticky="w", padx=(12, 0))
+        self._refresh_target_autoloop_policy_focus_target_buttons()
+        ttk.Label(target_autoloop_policy_actions, text="필터").grid(row=3, column=0, sticky="w", pady=(8, 0))
         target_autoloop_filter_controls = ttk.Frame(target_autoloop_policy_actions)
-        target_autoloop_filter_controls.grid(row=2, column=1, columnspan=5, sticky="w", pady=(8, 0))
+        target_autoloop_filter_controls.grid(row=3, column=1, columnspan=5, sticky="w", pady=(8, 0))
         target_autoloop_policy_filter_combo = ttk.Combobox(
             target_autoloop_filter_controls,
             textvariable=self.target_autoloop_policy_filter_var,
@@ -16998,123 +17278,143 @@ class RelayOperatorPanel(tk.Tk):
         ).grid(row=0, column=2, padx=(8, 0))
         ttk.Button(
             target_autoloop_filter_controls,
-            text="보이는 target에 일괄 적용",
-            command=self.apply_target_autoloop_policy_clone_to_visible_targets,
-        ).grid(row=0, column=3, padx=(8, 0))
-        ttk.Button(
-            target_autoloop_filter_controls,
-            text="전체 선택",
-            command=self.select_all_target_autoloop_policy_cards,
-        ).grid(row=0, column=4, padx=(8, 0))
-        ttk.Button(
-            target_autoloop_filter_controls,
-            text="보이는 target 선택",
-            command=self.select_visible_target_autoloop_policy_cards,
-        ).grid(row=0, column=5, padx=(8, 0))
-        ttk.Button(
-            target_autoloop_filter_controls,
-            text="전체 해제",
-            command=self.clear_target_autoloop_policy_selection,
-        ).grid(row=0, column=6, padx=(8, 0))
-        ttk.Button(
-            target_autoloop_filter_controls,
-            text="선택 target에 일괄 적용",
-            command=self.apply_target_autoloop_policy_clone_to_selected_targets,
-        ).grid(row=0, column=7, padx=(8, 0))
-        ttk.Button(
-            target_autoloop_filter_controls,
-            text="선택 target에 repo만 적용",
-            command=self.apply_target_autoloop_work_repo_root_to_selected_targets,
-        ).grid(row=0, column=8, padx=(8, 0))
-        ttk.Button(
-            target_autoloop_filter_controls,
-            text="선택 repo 선택",
-            command=self.browse_target_autoloop_work_repo_root_for_selected_targets,
-        ).grid(row=0, column=9, padx=(8, 0))
-        ttk.Button(
-            target_autoloop_filter_controls,
             textvariable=self.target_autoloop_policy_card_detail_toggle_var,
             command=self.toggle_target_autoloop_policy_card_details,
-        ).grid(row=0, column=10, padx=(8, 0))
-        target_autoloop_quick_select_controls = ttk.Frame(target_autoloop_policy_actions)
-        target_autoloop_quick_select_controls.grid(row=3, column=1, columnspan=5, sticky="w", pady=(8, 0))
-        ttk.Label(target_autoloop_policy_actions, text="빠른 선택").grid(row=3, column=0, sticky="w", pady=(8, 0))
+        ).grid(row=0, column=3, padx=(8, 0))
+        target_autoloop_bulk_header = ttk.Frame(target_autoloop_policy_actions)
+        target_autoloop_bulk_header.grid(row=4, column=0, sticky="w", pady=(8, 0))
+        ttk.Label(target_autoloop_bulk_header, text="일괄 작업").grid(row=0, column=0, sticky="w")
+        ttk.Button(
+            target_autoloop_bulk_header,
+            textvariable=self.target_autoloop_policy_bulk_controls_toggle_var,
+            command=self.toggle_target_autoloop_policy_bulk_controls,
+        ).grid(row=0, column=1, sticky="w", padx=(8, 0))
+        target_autoloop_bulk_controls = ttk.Frame(target_autoloop_policy_actions)
+        self.target_autoloop_policy_bulk_controls_frame = target_autoloop_bulk_controls
+        target_autoloop_bulk_controls.grid(row=4, column=1, columnspan=5, sticky="w", pady=(8, 0))
+        ttk.Label(target_autoloop_bulk_controls, text="적용/선택").grid(row=0, column=0, sticky="w")
+        ttk.Button(
+            target_autoloop_bulk_controls,
+            text="보이는 target에 일괄 적용",
+            command=self.apply_target_autoloop_policy_clone_to_visible_targets,
+        ).grid(row=0, column=1, padx=(8, 0))
+        ttk.Button(
+            target_autoloop_bulk_controls,
+            text="전체 선택",
+            command=self.select_all_target_autoloop_policy_cards,
+        ).grid(row=0, column=2, padx=(8, 0))
+        ttk.Button(
+            target_autoloop_bulk_controls,
+            text="보이는 target 선택",
+            command=self.select_visible_target_autoloop_policy_cards,
+        ).grid(row=0, column=3, padx=(8, 0))
+        ttk.Button(
+            target_autoloop_bulk_controls,
+            text="전체 해제",
+            command=self.clear_target_autoloop_policy_selection,
+        ).grid(row=0, column=4, padx=(8, 0))
+        ttk.Button(
+            target_autoloop_bulk_controls,
+            text="선택 target에 일괄 적용",
+            command=self.apply_target_autoloop_policy_clone_to_selected_targets,
+        ).grid(row=0, column=5, padx=(8, 0))
+        ttk.Button(
+            target_autoloop_bulk_controls,
+            text="선택 target에 repo만 적용",
+            command=self.apply_target_autoloop_work_repo_root_to_selected_targets,
+        ).grid(row=0, column=6, padx=(8, 0))
+        ttk.Button(
+            target_autoloop_bulk_controls,
+            text="선택 repo 선택",
+            command=self.browse_target_autoloop_work_repo_root_for_selected_targets,
+        ).grid(row=0, column=7, padx=(8, 0))
+        target_autoloop_quick_select_controls = ttk.Frame(target_autoloop_bulk_controls)
+        target_autoloop_quick_select_controls.grid(row=1, column=0, columnspan=8, sticky="w", pady=(6, 0))
+        ttk.Label(target_autoloop_quick_select_controls, text="빠른 선택").grid(row=0, column=0, sticky="w")
         ttk.Button(
             target_autoloop_quick_select_controls,
             text="dirty 선택",
             command=self.select_dirty_target_autoloop_policy_cards,
-        ).grid(row=0, column=0)
+        ).grid(row=0, column=1, padx=(8, 0))
         ttk.Button(
             target_autoloop_quick_select_controls,
             text="attention 선택",
             command=self.select_attention_target_autoloop_policy_cards,
-        ).grid(row=0, column=1, padx=(8, 0))
+        ).grid(row=0, column=2, padx=(8, 0))
         ttk.Button(
             target_autoloop_quick_select_controls,
             text="disabled 선택",
             command=self.select_disabled_target_autoloop_policy_cards,
-        ).grid(row=0, column=2, padx=(8, 0))
+        ).grid(row=0, column=3, padx=(8, 0))
         ttk.Button(
             target_autoloop_quick_select_controls,
             text="enabled 선택",
             command=self.select_enabled_target_autoloop_policy_cards,
-        ).grid(row=0, column=3, padx=(8, 0))
+        ).grid(row=0, column=4, padx=(8, 0))
         ttk.Button(
             target_autoloop_quick_select_controls,
             text="attention+dirty 선택",
             command=self.select_attention_dirty_target_autoloop_policy_cards,
-        ).grid(row=0, column=4, padx=(8, 0))
+        ).grid(row=0, column=5, padx=(8, 0))
         ttk.Button(
             target_autoloop_quick_select_controls,
             text="cwd mismatch 선택",
             command=self.select_cwd_mismatch_target_autoloop_policy_cards,
-        ).grid(row=0, column=5, padx=(8, 0))
+        ).grid(row=0, column=6, padx=(8, 0))
         ttk.Button(
             target_autoloop_quick_select_controls,
             text="cwd 계획",
             command=self.preview_selected_cwd_restart_target_autoloop_plan,
-        ).grid(row=0, column=6, padx=(8, 0))
+        ).grid(row=0, column=7, padx=(8, 0))
         ttk.Button(
             target_autoloop_quick_select_controls,
             text="cwd 순차재기동",
             command=self.request_restart_selected_cwd_targets_for_autoloop,
-        ).grid(row=0, column=7, padx=(8, 0))
+        ).grid(row=0, column=8, padx=(8, 0))
         ttk.Button(
             target_autoloop_quick_select_controls,
             text="selected dirty 요약",
             command=self.preview_selected_dirty_target_autoloop_policy_save,
-        ).grid(row=0, column=8, padx=(8, 0))
+        ).grid(row=0, column=9, padx=(8, 0))
         ttk.Button(
             target_autoloop_quick_select_controls,
             text="선택 target 실행 준비",
             command=self.prepare_selected_target_autoloop_policy_cards_for_run,
-        ).grid(row=0, column=9, padx=(8, 0))
+        ).grid(row=0, column=10, padx=(8, 0))
         ttk.Button(
             target_autoloop_quick_select_controls,
             text="enabled publish-ready 켜기",
             command=self.enable_publish_ready_for_enabled_target_autoloop_policy_cards,
-        ).grid(row=0, column=10, padx=(8, 0))
+        ).grid(row=0, column=11, padx=(8, 0))
         codex_status_button = ttk.Button(
             target_autoloop_quick_select_controls,
             text="Codex 상태",
             command=self.request_codex_cli_update_status,
         )
-        codex_status_button.grid(row=0, column=11, padx=(8, 0))
+        codex_status_button.grid(row=0, column=12, padx=(8, 0))
         self.long_task_widgets.append(codex_status_button)
         latest_codex_check = ttk.Checkbutton(
             target_autoloop_quick_select_controls,
             text="cwd 최신 Codex",
             variable=self.target_autoloop_restart_use_latest_codex_var,
         )
-        latest_codex_check.grid(row=0, column=12, padx=(8, 0))
+        latest_codex_check.grid(row=0, column=13, padx=(8, 0))
         self._install_widget_tooltip(
             latest_codex_check,
             "켜면 cwd 재기동 때 전역 codex 대신 side-by-side 최신 Codex launch command를 명시적으로 사용합니다. "
             "작업 중 창은 건드리지 않고 재기동 대상 target에만 적용됩니다.",
         )
+        target_autoloop_snapshot_header = ttk.Frame(target_autoloop_policy_actions)
+        target_autoloop_snapshot_header.grid(row=5, column=0, sticky="w", pady=(8, 0))
+        ttk.Label(target_autoloop_snapshot_header, text="선택 snapshot").grid(row=0, column=0, sticky="w")
+        ttk.Button(
+            target_autoloop_snapshot_header,
+            textvariable=self.target_autoloop_policy_snapshot_controls_toggle_var,
+            command=self.toggle_target_autoloop_policy_snapshot_controls,
+        ).grid(row=0, column=1, sticky="w", padx=(8, 0))
         target_autoloop_selection_controls = ttk.Frame(target_autoloop_policy_actions)
-        target_autoloop_selection_controls.grid(row=4, column=1, columnspan=5, sticky="w", pady=(8, 0))
-        ttk.Label(target_autoloop_policy_actions, text="선택 snapshot").grid(row=4, column=0, sticky="w", pady=(8, 0))
+        self.target_autoloop_policy_snapshot_controls_frame = target_autoloop_selection_controls
+        target_autoloop_selection_controls.grid(row=5, column=1, columnspan=5, sticky="w", pady=(8, 0))
         self._render_policy_action_specs(
             target_autoloop_selection_controls,
             target_autoloop_selection_snapshot_action_specs(),
@@ -17122,9 +17422,17 @@ class RelayOperatorPanel(tk.Tk):
             start_column=0,
             padx=8,
         )
+        target_autoloop_danger_header = ttk.Frame(target_autoloop_policy_actions)
+        target_autoloop_danger_header.grid(row=6, column=0, sticky="w", pady=(8, 0))
+        ttk.Label(target_autoloop_danger_header, text="위험 적용").grid(row=0, column=0, sticky="w")
+        ttk.Button(
+            target_autoloop_danger_header,
+            textvariable=self.target_autoloop_policy_danger_controls_toggle_var,
+            command=self.toggle_target_autoloop_policy_danger_controls,
+        ).grid(row=0, column=1, sticky="w", padx=(8, 0))
         target_autoloop_danger_controls = ttk.Frame(target_autoloop_policy_actions)
-        target_autoloop_danger_controls.grid(row=5, column=1, columnspan=5, sticky="w", pady=(8, 0))
-        ttk.Label(target_autoloop_policy_actions, text="위험 적용").grid(row=5, column=0, sticky="w", pady=(8, 0))
+        self.target_autoloop_policy_danger_controls_frame = target_autoloop_danger_controls
+        target_autoloop_danger_controls.grid(row=6, column=1, columnspan=5, sticky="w", pady=(8, 0))
         self._render_policy_action_specs(
             target_autoloop_danger_controls,
             target_autoloop_danger_action_specs(),
@@ -17132,24 +17440,25 @@ class RelayOperatorPanel(tk.Tk):
             start_column=0,
             padx=8,
         )
+        self._apply_target_autoloop_policy_action_section_visibility()
         ttk.Label(
             target_autoloop_policy_actions,
             textvariable=self.target_autoloop_policy_closeout_var,
             wraplength=1180,
             justify="left",
-        ).grid(row=6, column=0, columnspan=6, sticky="w", pady=(8, 0))
+        ).grid(row=7, column=0, columnspan=6, sticky="w", pady=(8, 0))
         ttk.Label(
             target_autoloop_policy_actions,
             textvariable=self.target_autoloop_policy_filter_status_var,
             wraplength=1180,
             justify="left",
-        ).grid(row=7, column=0, columnspan=6, sticky="w", pady=(6, 0))
+        ).grid(row=8, column=0, columnspan=6, sticky="w", pady=(6, 0))
         ttk.Label(
             target_autoloop_policy_actions,
             textvariable=self.target_autoloop_policy_selection_warning_var,
             wraplength=1180,
             justify="left",
-        ).grid(row=8, column=0, columnspan=6, sticky="w", pady=(4, 0))
+        ).grid(row=9, column=0, columnspan=6, sticky="w", pady=(4, 0))
         for index, target_id in enumerate(BOARD_TARGET_FALLBACK):
             card_vars = self.target_autoloop_policy_card_vars[target_id]
             card_row = 1 + (index // 2)
@@ -20555,6 +20864,13 @@ class RelayOperatorPanel(tk.Tk):
         self.action_context_source = "controls"
         selected_pair = self._selected_pair_id()
         selected_target = self.target_id_var.get().strip()
+        if selected_target:
+            focus_var = self.__dict__.get("target_autoloop_policy_card_focus_target_var")
+            if focus_var is not None and hasattr(focus_var, "set"):
+                try:
+                    focus_var.set(selected_target)
+                except Exception:
+                    pass
         preview_synced = False
         if self.preview_rows and self._selected_preview_row() is None:
             preview_synced = self._sync_preview_selection_with_pair(selected_pair, target_id=selected_target)
@@ -20562,6 +20878,8 @@ class RelayOperatorPanel(tk.Tk):
             self._sync_message_scope_id_from_context()
             self._sync_home_pair_selection(selected_pair)
             self._sync_pair_scoped_views_with_action_context(refresh_artifacts=True)
+            if self._has_ui_attr("target_autoloop_policy_card_frames"):
+                self._apply_target_autoloop_policy_filter_layout(save_selection=False)
             self.update_pair_button_states()
             self.rebuild_panel_state()
             return
@@ -20570,6 +20888,8 @@ class RelayOperatorPanel(tk.Tk):
         self._sync_pair_scoped_views_with_action_context(refresh_artifacts=True)
         self.render_target_board()
         self._refresh_message_editor_for_current_context()
+        if self._has_ui_attr("target_autoloop_policy_card_frames"):
+            self._apply_target_autoloop_policy_filter_layout(save_selection=False)
         self.update_pair_button_states()
         self.rebuild_panel_state()
 
@@ -33533,6 +33853,18 @@ class RelayOperatorPanel(tk.Tk):
         visible_var = self.__dict__.get("target_autoloop_policy_card_detail_visible_var")
         if visible_var is not None and hasattr(visible_var, "set"):
             visible_var.set(detail_visible)
+        view_mode = str(payload.get("CardViewMode", payload.get("ViewMode", "full")) or "full").strip().lower()
+        if view_mode not in {"full", "compact"}:
+            view_mode = "full"
+        mode_var = self.__dict__.get("target_autoloop_policy_card_view_mode_var")
+        if mode_var is not None and hasattr(mode_var, "set"):
+            mode_var.set(view_mode)
+        focused_target_id = str(payload.get("FocusedTargetId", payload.get("FocusTargetId", "")) or "").strip()
+        if focused_target_id in set(BOARD_TARGET_FALLBACK):
+            focus_var = self.__dict__.get("target_autoloop_policy_card_focus_target_var")
+            if focus_var is not None and hasattr(focus_var, "set"):
+                focus_var.set(focused_target_id)
+        self._set_target_autoloop_policy_card_view_status(mode=view_mode, focus_target_id=focused_target_id or None)
 
     def _save_target_autoloop_card_view_preferences(self) -> None:
         visible_var = self.__dict__.get("target_autoloop_policy_card_detail_visible_var")
@@ -33542,6 +33874,8 @@ class RelayOperatorPanel(tk.Tk):
                 detail_visible = bool(visible_var.get())
             except Exception:
                 detail_visible = False
+        view_mode = self._target_autoloop_policy_card_view_mode()
+        focus_target_id = self._target_autoloop_policy_card_focus_target_id()
         preferences_path = self._target_autoloop_card_view_preferences_file_path()
         temp_path: Path | None = None
         try:
@@ -33550,6 +33884,8 @@ class RelayOperatorPanel(tk.Tk):
                 "SchemaVersion": TARGET_AUTOLOOP_CARD_VIEW_PREFERENCES_SCHEMA_VERSION,
                 "SavedAt": datetime.now().isoformat(timespec="seconds"),
                 "CardDetailVisible": detail_visible,
+                "CardViewMode": view_mode,
+                "FocusedTargetId": focus_target_id,
             }
             temp_path = preferences_path.with_name(
                 preferences_path.name + f".{os.getpid()}.{threading.get_ident()}.tmp"

@@ -274,12 +274,15 @@ class VarStub:
 
 class ButtonStub:
     def __init__(self) -> None:
+        self.style = ""
         self.state = ""
         self.text = ""
         self.values = ()
         self.focused = False
 
     def configure(self, **kwargs) -> None:
+        if "style" in kwargs:
+            self.style = kwargs["style"]
         if "state" in kwargs:
             self.state = kwargs["state"]
         if "text" in kwargs:
@@ -12713,6 +12716,15 @@ class RelayOperatorPanelMessageSlotTests(unittest.TestCase):
         }
         panel.target_autoloop_policy_card_detail_visible_var = VarStub(False)
         panel.target_autoloop_policy_card_detail_toggle_var = VarStub("")
+        panel.target_autoloop_policy_card_view_mode_var = VarStub("full")
+        panel.target_autoloop_policy_card_focus_target_var = VarStub("target01")
+        panel.target_autoloop_policy_card_view_status_var = VarStub("view=전체보기 / focus=target01")
+        panel.target_autoloop_policy_bulk_controls_collapsed_var = VarStub(True)
+        panel.target_autoloop_policy_bulk_controls_toggle_var = VarStub("일괄 작업 펼치기")
+        panel.target_autoloop_policy_snapshot_controls_collapsed_var = VarStub(True)
+        panel.target_autoloop_policy_snapshot_controls_toggle_var = VarStub("선택 snapshot 펼치기")
+        panel.target_autoloop_policy_danger_controls_collapsed_var = VarStub(True)
+        panel.target_autoloop_policy_danger_controls_toggle_var = VarStub("위험 적용 펼치기")
         panel.target_autoloop_policy_card_detail_widgets = {}
         panel.target_autoloop_card_view_preferences_path = (
             Path(make_workspace_tempdir("target-autoloop-card-view-preferences-slot"))
@@ -12723,6 +12735,13 @@ class RelayOperatorPanelMessageSlotTests(unittest.TestCase):
             target_id: GridFrameStub()
             for target_id in BOARD_TARGET_FALLBACK
         }
+        panel.target_autoloop_policy_focus_target_buttons = {
+            target_id: ButtonStub()
+            for target_id in BOARD_TARGET_FALLBACK
+        }
+        panel.target_autoloop_policy_bulk_controls_frame = GridFrameStub()
+        panel.target_autoloop_policy_snapshot_controls_frame = GridFrameStub()
+        panel.target_autoloop_policy_danger_controls_frame = GridFrameStub()
         panel.target_autoloop_policy_clone_source_var = VarStub("target01")
         panel.target_autoloop_policy_clone_target_var = VarStub("target02")
         panel.target_autoloop_policy_clone_source_combo = ButtonStub()
@@ -15441,6 +15460,32 @@ class RelayOperatorPanelMessageSlotTests(unittest.TestCase):
         self.assertTrue(target02_widgets[0].visible)
         self.assertEqual("카드 상세 접기", panel.target_autoloop_policy_card_detail_toggle_var.get())
 
+    def test_target_autoloop_policy_action_sections_default_to_collapsed(self) -> None:
+        panel = self._make_panel()
+
+        panel._apply_target_autoloop_policy_action_section_visibility()
+
+        self.assertFalse(panel.target_autoloop_policy_bulk_controls_frame.visible)
+        self.assertFalse(panel.target_autoloop_policy_snapshot_controls_frame.visible)
+        self.assertFalse(panel.target_autoloop_policy_danger_controls_frame.visible)
+        self.assertEqual("일괄 작업 펼치기", panel.target_autoloop_policy_bulk_controls_toggle_var.get())
+        self.assertEqual("선택 snapshot 펼치기", panel.target_autoloop_policy_snapshot_controls_toggle_var.get())
+        self.assertEqual("위험 적용 펼치기", panel.target_autoloop_policy_danger_controls_toggle_var.get())
+
+    def test_toggle_target_autoloop_policy_action_sections_updates_only_requested_section(self) -> None:
+        panel = self._make_panel()
+        panel._apply_target_autoloop_policy_action_section_visibility()
+
+        panel.toggle_target_autoloop_policy_bulk_controls()
+        panel.toggle_target_autoloop_policy_danger_controls()
+
+        self.assertTrue(panel.target_autoloop_policy_bulk_controls_frame.visible)
+        self.assertFalse(panel.target_autoloop_policy_snapshot_controls_frame.visible)
+        self.assertTrue(panel.target_autoloop_policy_danger_controls_frame.visible)
+        self.assertEqual("일괄 작업 접기", panel.target_autoloop_policy_bulk_controls_toggle_var.get())
+        self.assertEqual("선택 snapshot 펼치기", panel.target_autoloop_policy_snapshot_controls_toggle_var.get())
+        self.assertEqual("위험 적용 접기", panel.target_autoloop_policy_danger_controls_toggle_var.get())
+
     def test_apply_target_autoloop_policy_clone_to_visible_targets_copies_source_to_filtered_targets(self) -> None:
         panel = self._make_panel()
         panel.message_config_service.render_target_autoloop_route_matrix = lambda *_args, **_kwargs: {"Targets": []}
@@ -15467,12 +15512,45 @@ class RelayOperatorPanelMessageSlotTests(unittest.TestCase):
             self.assertEqual("4", target_store["max_cycle_var"].get(), target_id)
             self.assertEqual(r"C:\repo-autoloop-visible", target_store["work_repo_root_var"].get(), target_id)
             self.assertEqual("SAVE REQUIRED", target_store["policy_state_var"].get(), target_id)
-        self.assertIn("현재 보이는 target 7개에 일괄 적용", panel.target_autoloop_policy_editor_status_var.get())
+        self.assertIn("현재 필터 기준으로 보이는 target 7개에 일괄 적용", panel.target_autoloop_policy_editor_status_var.get())
         self.assertGreaterEqual(len(seed_refresh_calls), 2)
         self.assertEqual(
             "filter=disabled-only / visible=0 / hidden=8 / selected=0 / dirty=8 / attention=8 / cwdMismatch=0",
             panel.target_autoloop_policy_filter_status_var.get(),
         )
+
+    def test_apply_target_autoloop_policy_clone_to_visible_targets_uses_compact_display_target(self) -> None:
+        panel = self._make_panel()
+        panel.message_config_service.render_target_autoloop_route_matrix = lambda *_args, **_kwargs: {"Targets": []}
+        panel.refresh_target_autoloop_seed_composer = lambda: None
+        panel.refresh_target_autoloop_policy_editor(document=panel.message_config_doc)
+        source_store = panel.target_autoloop_policy_card_vars["target01"]
+        source_store["enabled_var"].set(True)
+        source_store["trigger_input_var"].set(True)
+        source_store["trigger_publish_var"].set(True)
+        source_store["max_cycle_var"].set("9")
+        source_store["work_repo_root_var"].set(r"C:\repo-autoloop-compact")
+        panel._refresh_target_autoloop_policy_card_loaded_badge("target01", document=panel.message_config_doc)
+        panel.target_autoloop_policy_clone_source_var.set("target01")
+        panel.target_autoloop_policy_card_view_mode_var.set("compact")
+        panel.target_autoloop_policy_card_focus_target_var.set("target08")
+        unchanged_before = {
+            target_id: str(panel.target_autoloop_policy_card_vars[target_id]["max_cycle_var"].get())
+            for target_id in BOARD_TARGET_FALLBACK[1:-1]
+        }
+
+        panel.apply_target_autoloop_policy_clone_to_visible_targets()
+
+        target08_store = panel.target_autoloop_policy_card_vars["target08"]
+        self.assertTrue(target08_store["enabled_var"].get())
+        self.assertTrue(target08_store["trigger_input_var"].get())
+        self.assertTrue(target08_store["trigger_publish_var"].get())
+        self.assertEqual("9", target08_store["max_cycle_var"].get())
+        self.assertEqual(r"C:\repo-autoloop-compact", target08_store["work_repo_root_var"].get())
+        self.assertEqual("SAVE REQUIRED", target08_store["policy_state_var"].get())
+        for target_id in BOARD_TARGET_FALLBACK[1:-1]:
+            self.assertEqual(unchanged_before[target_id], panel.target_autoloop_policy_card_vars[target_id]["max_cycle_var"].get(), target_id)
+        self.assertIn("현재 축소보기로 표시된 target 1개에 일괄 적용", panel.target_autoloop_policy_editor_status_var.get())
 
     def test_clear_target_autoloop_policy_filter_restores_all_targets(self) -> None:
         panel = self._make_panel()
@@ -15488,6 +15566,21 @@ class RelayOperatorPanelMessageSlotTests(unittest.TestCase):
             "filter=all / visible=8 / hidden=0 / selected=0 / dirty=1 / attention=1 / cwdMismatch=0",
             panel.target_autoloop_policy_filter_status_var.get(),
         )
+
+    def test_clear_target_autoloop_policy_filter_in_compact_view_keeps_focused_target_message(self) -> None:
+        panel = self._make_panel()
+        panel.target_autoloop_policy_card_vars["target01"]["policy_state_var"].set("SAVE REQUIRED")
+        panel.target_autoloop_policy_filter_var.set("dirty-only")
+        panel.target_autoloop_policy_card_view_mode_var.set("compact")
+        panel.target_autoloop_policy_card_focus_target_var.set("target08")
+
+        panel.clear_target_autoloop_policy_filter()
+
+        self.assertEqual("all", panel.target_autoloop_policy_filter_var.get())
+        self.assertTrue(panel.target_autoloop_policy_card_frames["target08"].visible)
+        self.assertFalse(panel.target_autoloop_policy_card_frames["target01"].visible)
+        self.assertIn("축소보기 상태라 target08 카드만 표시", panel.target_autoloop_policy_editor_status_var.get())
+        self.assertIn("view=compact / focus=target08", panel.target_autoloop_policy_filter_status_var.get())
 
     def test_select_visible_target_autoloop_policy_cards_marks_only_filtered_targets(self) -> None:
         panel = self._make_panel()
@@ -15506,6 +15599,19 @@ class RelayOperatorPanelMessageSlotTests(unittest.TestCase):
             "filter=enabled-only / visible=2 / hidden=6 / selected=2 / dirty=0 / attention=0 / cwdMismatch=0",
             panel.target_autoloop_policy_filter_status_var.get(),
         )
+
+    def test_select_visible_target_autoloop_policy_cards_uses_compact_display_target(self) -> None:
+        panel = self._make_panel()
+        panel.target_autoloop_policy_card_view_mode_var.set("compact")
+        panel.target_autoloop_policy_card_focus_target_var.set("target08")
+
+        panel.select_visible_target_autoloop_policy_cards()
+
+        for target_id in BOARD_TARGET_FALLBACK:
+            expected = target_id == "target08"
+            self.assertEqual(expected, panel.target_autoloop_policy_card_vars[target_id]["bulk_selected_var"].get(), target_id)
+        self.assertIn("현재 축소보기로 표시된 target 1개를 선택", panel.target_autoloop_policy_editor_status_var.get())
+        self.assertIn("view=compact / focus=target08", panel.target_autoloop_policy_filter_status_var.get())
 
     def test_select_all_target_autoloop_policy_cards_marks_every_target(self) -> None:
         panel = self._make_panel()
@@ -15536,6 +15642,86 @@ class RelayOperatorPanelMessageSlotTests(unittest.TestCase):
             "filter=selected-only / visible=2 / hidden=6 / selected=2 / dirty=0 / attention=0 / cwdMismatch=0",
             panel.target_autoloop_policy_filter_status_var.get(),
         )
+
+    def test_target_autoloop_policy_compact_view_shows_only_focused_target_without_changing_selection(self) -> None:
+        panel = self._make_panel()
+        panel.target_autoloop_policy_card_vars["target02"]["bulk_selected_var"].set(True)
+        panel.target_autoloop_policy_card_vars["target05"]["bulk_selected_var"].set(True)
+        panel.target_autoloop_policy_card_view_mode_var.set("compact")
+        panel.target_autoloop_policy_card_focus_target_var.set("target08")
+
+        panel._apply_target_autoloop_policy_filter_layout(document=panel.message_config_doc)
+
+        self.assertFalse(panel.target_autoloop_policy_card_frames["target01"].visible)
+        self.assertFalse(panel.target_autoloop_policy_card_frames["target02"].visible)
+        self.assertFalse(panel.target_autoloop_policy_card_frames["target05"].visible)
+        self.assertTrue(panel.target_autoloop_policy_card_frames["target08"].visible)
+        self.assertEqual(
+            {"row": 1, "column": 0, "columnspan": 2, "sticky": "nsew", "padx": (0, 0), "pady": (0, 8)},
+            panel.target_autoloop_policy_card_frames["target08"].grid_kwargs,
+        )
+        self.assertTrue(panel.target_autoloop_policy_card_vars["target02"]["bulk_selected_var"].get())
+        self.assertTrue(panel.target_autoloop_policy_card_vars["target05"]["bulk_selected_var"].get())
+        self.assertIn("view=compact / focus=target08", panel.target_autoloop_policy_filter_status_var.get())
+        self.assertEqual("view=축소보기 / focus=target08 / visible=1 / hidden=7", panel.target_autoloop_policy_card_view_status_var.get())
+        self.assertEqual("TargetAutoloopFocusTarget.TButton", panel.target_autoloop_policy_focus_target_buttons["target08"].style)
+        self.assertEqual("TButton", panel.target_autoloop_policy_focus_target_buttons["target01"].style)
+
+    def test_target_autoloop_policy_full_view_keeps_existing_filter_after_compact_view(self) -> None:
+        panel = self._make_panel()
+        panel.target_autoloop_policy_card_vars["target02"]["bulk_selected_var"].set(True)
+        panel.target_autoloop_policy_card_vars["target05"]["bulk_selected_var"].set(True)
+        panel.target_autoloop_policy_filter_var.set("selected-only")
+        panel.target_autoloop_policy_card_view_mode_var.set("compact")
+        panel.target_autoloop_policy_card_focus_target_var.set("target08")
+        panel._apply_target_autoloop_policy_filter_layout(document=panel.message_config_doc)
+
+        panel.target_autoloop_policy_card_view_mode_var.set("full")
+        panel._apply_target_autoloop_policy_filter_layout(document=panel.message_config_doc)
+
+        self.assertFalse(panel.target_autoloop_policy_card_frames["target01"].visible)
+        self.assertTrue(panel.target_autoloop_policy_card_frames["target02"].visible)
+        self.assertTrue(panel.target_autoloop_policy_card_frames["target05"].visible)
+        self.assertFalse(panel.target_autoloop_policy_card_frames["target08"].visible)
+        self.assertNotIn("view=compact", panel.target_autoloop_policy_filter_status_var.get())
+        self.assertEqual(
+            "filter=selected-only / visible=2 / hidden=6 / selected=2 / dirty=0 / attention=0 / cwdMismatch=0",
+            panel.target_autoloop_policy_filter_status_var.get(),
+        )
+
+    def test_show_target_autoloop_policy_card_for_target_switches_to_compact_view(self) -> None:
+        panel = self._make_panel()
+        panel.target_autoloop_policy_card_vars["target02"]["bulk_selected_var"].set(True)
+        panel.target_autoloop_policy_card_vars["target05"]["bulk_selected_var"].set(True)
+        panel.target_autoloop_policy_card_view_mode_var.set("full")
+        panel.target_autoloop_policy_card_focus_target_var.set("target01")
+        panel.target_id_var.set("target01")
+
+        panel.show_target_autoloop_policy_card_for_target("target08")
+
+        self.assertEqual("compact", panel.target_autoloop_policy_card_view_mode_var.get())
+        self.assertEqual("target08", panel.target_autoloop_policy_card_focus_target_var.get())
+        self.assertEqual("target08", panel.target_id_var.get())
+        self.assertTrue(panel.target_autoloop_policy_card_frames["target08"].visible)
+        self.assertFalse(panel.target_autoloop_policy_card_frames["target01"].visible)
+        self.assertEqual("TargetAutoloopFocusTarget.TButton", panel.target_autoloop_policy_focus_target_buttons["target08"].style)
+        self.assertEqual("TButton", panel.target_autoloop_policy_focus_target_buttons["target01"].style)
+        self.assertTrue(panel.target_autoloop_policy_card_vars["target02"]["bulk_selected_var"].get())
+        self.assertTrue(panel.target_autoloop_policy_card_vars["target05"]["bulk_selected_var"].get())
+
+    def test_target_autoloop_policy_focus_target_buttons_update_when_focus_changes(self) -> None:
+        panel = self._make_panel()
+        panel.target_autoloop_policy_card_focus_target_var.set("target03")
+        panel._refresh_target_autoloop_policy_focus_target_buttons()
+
+        self.assertEqual("TargetAutoloopFocusTarget.TButton", panel.target_autoloop_policy_focus_target_buttons["target03"].style)
+        self.assertEqual("TButton", panel.target_autoloop_policy_focus_target_buttons["target01"].style)
+
+        panel.target_autoloop_policy_card_focus_target_var.set("target07")
+        panel._refresh_target_autoloop_policy_focus_target_buttons()
+
+        self.assertEqual("TButton", panel.target_autoloop_policy_focus_target_buttons["target03"].style)
+        self.assertEqual("TargetAutoloopFocusTarget.TButton", panel.target_autoloop_policy_focus_target_buttons["target07"].style)
 
     def test_select_dirty_target_autoloop_policy_cards_marks_only_dirty_targets(self) -> None:
         panel = self._make_panel()
@@ -20232,6 +20418,9 @@ class RelayOperatorPanelWatcherOptionTests(unittest.TestCase):
         panel.target_autoloop_card_view_preferences_warning = ""
         panel.target_autoloop_policy_card_detail_visible_var = VarStub(False)
         panel.target_autoloop_policy_card_detail_toggle_var = VarStub("")
+        panel.target_autoloop_policy_card_view_mode_var = VarStub("full")
+        panel.target_autoloop_policy_card_focus_target_var = VarStub("target01")
+        panel.target_autoloop_policy_card_view_status_var = VarStub("view=전체보기 / focus=target01")
         panel.target_autoloop_policy_card_detail_widgets = {}
         panel.target_autoloop_seed_simple_text = TextWidgetStub("")
         panel.target_autoloop_seed_contract_text = TextWidgetStub("")
@@ -24732,16 +24921,22 @@ class RelayOperatorPanelWatcherOptionTests(unittest.TestCase):
                     {
                         "SchemaVersion": 1,
                         "CardDetailVisible": True,
+                        "CardViewMode": "compact",
+                        "FocusedTargetId": "target08",
                     }
                 ),
                 encoding="utf-8",
             )
             panel.target_autoloop_card_view_preferences_path = preferences_path
             panel.target_autoloop_policy_card_detail_visible_var.set(False)
+            panel.target_autoloop_policy_card_view_mode_var.set("full")
+            panel.target_autoloop_policy_card_focus_target_var.set("target01")
 
             panel._load_target_autoloop_card_view_preferences()
 
         self.assertTrue(panel.target_autoloop_policy_card_detail_visible_var.get())
+        self.assertEqual("compact", panel.target_autoloop_policy_card_view_mode_var.get())
+        self.assertEqual("target08", panel.target_autoloop_policy_card_focus_target_var.get())
         self.assertEqual("", panel.target_autoloop_card_view_preferences_warning)
 
     def test_toggle_target_autoloop_policy_card_details_persists_preference(self) -> None:
@@ -24752,6 +24947,8 @@ class RelayOperatorPanelWatcherOptionTests(unittest.TestCase):
             panel.target_autoloop_card_view_preferences_path = preferences_path
             panel.target_autoloop_policy_card_detail_visible_var.set(False)
             panel.target_autoloop_policy_card_detail_toggle_var.set("")
+            panel.target_autoloop_policy_card_view_mode_var.set("compact")
+            panel.target_autoloop_policy_card_focus_target_var.set("target06")
             panel.target_autoloop_policy_card_detail_widgets = {
                 "target01": target01_widgets,
             }
@@ -24766,6 +24963,8 @@ class RelayOperatorPanelWatcherOptionTests(unittest.TestCase):
         self.assertTrue(target01_widgets[1].visible)
         self.assertEqual(1, payload["SchemaVersion"])
         self.assertTrue(payload["CardDetailVisible"])
+        self.assertEqual("compact", payload["CardViewMode"])
+        self.assertEqual("target06", payload["FocusedTargetId"])
 
     def test_request_extend_target_autoloop_cycle_limit_invokes_helper_for_selected_target(self) -> None:
         panel = self._make_panel()
