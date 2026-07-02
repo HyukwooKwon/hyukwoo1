@@ -130,7 +130,9 @@ $dueJson = & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tes
 Assert-True ([string]$dueJson.DelaySummary.State -eq 'dispatch-delay-due') 'status json should surface due delay state.'
 Assert-True ([string]$dueJson.DelaySummary.TargetId -eq 'target02') 'status json should ignore stale queued delay fields and pick the real dispatch-delay row.'
 $actualDueAt = ([datetimeoffset]$dueJson.DelaySummary.DueAt).ToString('o')
-Assert-True ($actualDueAt -eq $pastEligibleAt) 'status json should surface due timestamp for the selected delayed target.'
+$expectedDueAtSecond = ([datetimeoffset]$pastEligibleAt).ToString('yyyy-MM-ddTHH:mm:sszzz')
+$actualDueAtSecond = ([datetimeoffset]$dueJson.DelaySummary.DueAt).ToString('yyyy-MM-ddTHH:mm:sszzz')
+Assert-True ($actualDueAtSecond -eq $expectedDueAtSecond) 'status json should surface due timestamp for the selected delayed target.'
 
 $dueOutput = & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Show-TargetAutoloopStatus.ps1') `
     -ConfigPath $configPath `

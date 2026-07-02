@@ -9564,6 +9564,22 @@ class RelayOperatorPanel(tk.Tk):
         return "manual-submit-only-retry" in policies or "submit-ready-no-dispatch" in stages
 
     @staticmethod
+    def _target_autoloop_retry_pending_item_is_user_active_hold(item: dict[str, object] | None) -> bool:
+        if not isinstance(item, dict):
+            return False
+        failure_category = str(item.get("failure_category", "") or "").strip()
+        failure_message = str(item.get("failure_message", "") or "").strip()
+        return failure_category == "user_active_hold" or "user_active_hold" in failure_message
+
+    @staticmethod
+    def _target_autoloop_retry_pending_item_missing_delivery_metadata(item: dict[str, object] | None) -> bool:
+        if not isinstance(item, dict):
+            return False
+        if "delivery_metadata_exists" not in item:
+            return False
+        return not bool(item.get("delivery_metadata_exists", False))
+
+    @staticmethod
     def _target_autoloop_retry_pending_items_require_manual_review(items: list[dict[str, object]]) -> bool:
         return any(RelayOperatorPanel._target_autoloop_retry_pending_item_requires_manual_review(item) for item in items)
 
@@ -9696,6 +9712,25 @@ class RelayOperatorPanel(tk.Tk):
                         + (f" {focus_hint}" if focus_hint else "")
                     ),
                 }
+            if self._target_autoloop_retry_pending_item_is_user_active_hold(current_retry_item):
+                missing_delivery_tail = (
+                    " delivery metadata가 없으면 재큐잉 시 자동으로 최소 metadata를 복구합니다."
+                    if self._target_autoloop_retry_pending_item_missing_delivery_metadata(current_retry_item)
+                    else ""
+                )
+                debug_log_path = str(current_retry_item.get("debug_log_path", "") or "").strip()
+                return {
+                    "label": f"{normalized_target_id} idle 후 재시도",
+                    "action_key": "requeue_retry_pending",
+                    "enabled": True,
+                    "detail": (
+                        f"current retry-pending {current_retry_count}개가 있지만 원인은 target/Codex 실패가 아니라 사용자 입력 감지입니다. "
+                        "Chrome/다른 창 조작으로 idle 조건을 만족하지 못해 안전하게 전송을 중단했습니다. "
+                        "마우스/키보드에서 손을 떼고 이 target만 재시도하세요."
+                        + missing_delivery_tail
+                        + (f" debugLog={debug_log_path}" if debug_log_path else "")
+                    ),
+                }
             if self._target_autoloop_retry_pending_items_require_manual_review(current_retry_items):
                 return {
                     "label": f"{normalized_target_id} 수동확인 필요",
@@ -9764,6 +9799,30 @@ class RelayOperatorPanel(tk.Tk):
         last_router_ready_path = str(status_row.get("LastRouterReadyPath", "") or "").strip()
         cycle_count = self._target_autoloop_int_or_zero(status_row.get("CycleCount", 0))
         max_cycle_count = self._target_autoloop_int_or_zero(status_row.get("MaxCycleCount", manifest_row.get("MaxCycleCount", 0)))
+        if self._target_autoloop_is_dispatch_delay_row(status_row):
+            eligible_at_text = str(status_row.get("PendingDispatchEligibleAt", "") or "").strip()
+            remaining_label = self._target_autoloop_remaining_delay_label(eligible_at_text)
+            pending_delay_seconds = self._target_autoloop_int_or_zero(status_row.get("PendingDispatchDelaySeconds", 0))
+            delay_range = self._target_autoloop_delay_range_summary_label(status_row)
+            detail_parts = [
+                f"{normalized_target_id} publish.ready는 감지됐고 설정된 지연 뒤 다음 전송을 예약한 상태입니다.",
+                "실패가 아니므로 전송보류 재시도/이어쓰기 재입력은 누르지 마세요.",
+            ]
+            if remaining_label:
+                detail_parts.append(remaining_label)
+            if eligible_at_text:
+                detail_parts.append(f"eligibleAt={eligible_at_text}")
+            if pending_delay_seconds > 0:
+                detail_parts.append(f"pendingDelay={pending_delay_seconds}s")
+            if delay_range:
+                detail_parts.append(f"delay={delay_range}")
+            return {
+                "label": f"{normalized_target_id} 전송 지연 대기",
+                "action_key": "",
+                "enabled": False,
+                "target_id": normalized_target_id,
+                "detail": " ".join(detail_parts),
+            }
         output_block_item = self._target_autoloop_output_block_item_for_target(
             runtime_snapshot,
             normalized_target_id,
@@ -24551,6 +24610,9 @@ class RelayOperatorPanel(tk.Tk):
                 elif manual_review_required:
                     label = f"{normalized_target_id} 수동확인 필요 {current_count}"
                     state = "disabled"
+                elif self._target_autoloop_retry_pending_item_is_user_active_hold(current_item):
+                    label = f"{normalized_target_id} idle 후 재시도 {current_count}"
+                    state = "normal" if not busy else "disabled"
                 else:
                     label = f"{normalized_target_id} 전송보류 재시도 {current_count}"
                     state = "normal" if not busy else "disabled"
@@ -24599,6 +24661,8 @@ class RelayOperatorPanel(tk.Tk):
         send_policy = str(item.get("send_retry_policy", "") or "").strip()
         send_stage = str(item.get("send_stage", "") or "").strip()
         focus_hint = str(item.get("operator_retry_hint", "") or "").strip()
+        user_active_hold = RelayOperatorPanel._target_autoloop_retry_pending_item_is_user_active_hold(item)
+        missing_delivery_metadata = RelayOperatorPanel._target_autoloop_retry_pending_item_missing_delivery_metadata(item)
         focus_tail = ""
         if send_policy and send_policy != "not-send-failure":
             focus_tail = f" retryPolicy={send_policy}."
@@ -24608,6 +24672,8 @@ class RelayOperatorPanel(tk.Tk):
             focus_tail += f" focusPolicy={focus_policy}."
         if focus_hint:
             focus_tail += f" {focus_hint}"
+        if missing_delivery_metadata:
+            focus_tail += " delivery metadata 누락은 재큐잉 시 자동 복구됩니다."
         if current > 0:
             if RelayOperatorPanel._target_autoloop_retry_pending_item_requires_submit_only(item):
                 if busy:
@@ -24624,6 +24690,16 @@ class RelayOperatorPanel(tk.Tk):
                     f"전송보류 상태: 수동확인 필요 - {normalized_target_id} current retry-pending {current}개 중 "
                     f"submit 이후 중복 전송 위험 항목이 있어 자동 재시도 버튼을 비활성화했습니다. "
                     f"셀창 진행 상태와 산출물을 먼저 확인하세요.{focus_tail}"
+                )
+            if user_active_hold:
+                if busy:
+                    return (
+                        f"전송보류 상태: 사용자 입력 감지 - {normalized_target_id} current retry-pending {current}개가 있지만 "
+                        f"다른 작업 실행 중이라 버튼이 잠시 비활성입니다.{focus_tail}"
+                    )
+                return (
+                    f"전송보류 상태: idle 후 재시도 가능 - {normalized_target_id} 전송 중 사용자가 다른 창/키보드/마우스를 사용해 "
+                    f"안전 중단됐습니다. 입력을 멈춘 뒤 [{normalized_target_id} idle 후 재시도]를 누르세요.{focus_tail}"
                 )
             if busy:
                 return (

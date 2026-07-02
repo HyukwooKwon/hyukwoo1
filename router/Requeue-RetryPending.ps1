@@ -64,7 +64,66 @@ function Update-RequeuedRetryMetadata {
     $metadata | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $MetadataPath -Encoding UTF8
 }
 
+function Get-RequeueLauncherSessionId {
+    param($Config)
+
+    $runtimeMapPath = ''
+    if ($Config -is [hashtable] -and $Config.ContainsKey('RuntimeMapPath')) {
+        $runtimeMapPath = [string]$Config['RuntimeMapPath']
+    }
+    elseif ($null -ne $Config.PSObject.Properties['RuntimeMapPath']) {
+        $runtimeMapPath = [string]$Config.RuntimeMapPath
+    }
+    if ([string]::IsNullOrWhiteSpace($runtimeMapPath) -or -not (Test-Path -LiteralPath $runtimeMapPath -PathType Leaf)) {
+        return ''
+    }
+
+    try {
+        $runtimeItems = @(Get-Content -LiteralPath $runtimeMapPath -Raw -Encoding UTF8 | ConvertFrom-Json)
+    }
+    catch {
+        return ''
+    }
+
+    $sessionIds = @(
+        $runtimeItems |
+            ForEach-Object {
+                if ($null -ne $_.PSObject.Properties['LauncherSessionId']) {
+                    [string]$_.LauncherSessionId
+                }
+            } |
+            Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+            Sort-Object -Unique
+    )
+    if ($sessionIds.Count -eq 1) {
+        return [string]$sessionIds[0]
+    }
+    return ''
+}
+
+function New-ReconstructedReadyDeliveryMetadata {
+    param(
+        [Parameter(Mandatory)][string]$TargetId,
+        [Parameter(Mandatory)][string]$SourceRetryPath,
+        [Parameter(Mandatory)][string]$DestinationPath,
+        [string]$LauncherSessionId = ''
+    )
+
+    return [ordered]@{
+        SchemaVersion = '1.0.0'
+        Kind = 'relay-ready'
+        CreatedAt = (Get-Date).ToString('o')
+        TargetId = $TargetId
+        MessageType = 'generic'
+        LauncherSessionId = $LauncherSessionId
+        SourceRetryPath = $SourceRetryPath
+        RequeuedReadyPath = $DestinationPath
+        ReconstructedFromRetryPending = $true
+    }
+}
+
 $retryPendingRoot = [string]$config.RetryPendingRoot
+$launcherSessionId = Get-RequeueLauncherSessionId -Config $config
 $files = @()
 if (@($RetryPath).Count -gt 0) {
     $normalizedRoot = ''
@@ -143,6 +202,15 @@ foreach ($file in $files) {
     }
     if (Test-Path -LiteralPath $deliveryMetadataPath -PathType Leaf) {
         Move-Item -LiteralPath $deliveryMetadataPath -Destination $destinationDeliveryMetadataPath -Force
+    }
+    else {
+        $reconstructedDeliveryMetadata = New-ReconstructedReadyDeliveryMetadata `
+            -TargetId $fileTargetId `
+            -SourceRetryPath ([string]$file.FullName) `
+            -DestinationPath $destinationPath `
+            -LauncherSessionId $launcherSessionId
+        $reconstructedDeliveryMetadata | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $destinationDeliveryMetadataPath -Encoding UTF8
+        Write-Host "reconstructed delivery metadata: $destinationDeliveryMetadataPath"
     }
     Write-Host "requeued: $destinationPath"
 }

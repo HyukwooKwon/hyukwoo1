@@ -103,4 +103,25 @@ Assert-True ($requeuedFilesAfterPathScope.Count -eq 2) 'path-scoped requeue shou
 Assert-True (-not (Test-Path -LiteralPath $currentRetryFile -PathType Leaf)) 'path-scoped requeue should remove the selected retry file.'
 Assert-True (Test-Path -LiteralPath $staleRetryFile -PathType Leaf) 'path-scoped requeue should leave unselected stale retry files in retry-pending root.'
 
+$missingDeliveryRetryFile = Join-Path $retryPendingRoot 'target01__20260414_000003_000__missing_delivery_message.ready.txt'
+[System.IO.File]::WriteAllText($missingDeliveryRetryFile, 'missing delivery', (New-Utf8NoBomEncoding))
+([ordered]@{
+    SchemaVersion = '1.0.0'
+    FailureCategory = 'user_active_hold'
+    FailureMessage = 'user active hold'
+} | ConvertTo-Json -Depth 4) | Set-Content -LiteralPath ($missingDeliveryRetryFile + '.meta.json') -Encoding UTF8
+
+& (Join-Path $root 'router\Requeue-RetryPending.ps1') -ConfigPath $configPath -RetryPath $missingDeliveryRetryFile 2>&1
+$requeuedFilesAfterMissingDelivery = @(Get-ChildItem -LiteralPath $targetInbox -Filter 'requeued_*.ready.txt' -File -ErrorAction SilentlyContinue)
+Assert-True ($requeuedFilesAfterMissingDelivery.Count -eq 3) 'missing-delivery requeue should still move the selected retry file into target inbox.'
+$missingDeliveryRequeued = @($requeuedFilesAfterMissingDelivery | Where-Object { $_.Name -like '*missing_delivery_message.ready.txt' })[0]
+Assert-True ($null -ne $missingDeliveryRequeued) 'missing-delivery requeue should preserve the source retry filename tail.'
+$reconstructedDeliveryMeta = ($missingDeliveryRequeued.FullName + '.delivery.json')
+Assert-True (Test-Path -LiteralPath $reconstructedDeliveryMeta -PathType Leaf) 'missing-delivery requeue should reconstruct delivery metadata.'
+$reconstructedDelivery = Get-Content -LiteralPath $reconstructedDeliveryMeta -Raw -Encoding UTF8 | ConvertFrom-Json
+Assert-True ([string]$reconstructedDelivery.Kind -eq 'relay-ready') 'reconstructed delivery metadata should be relay-ready.'
+Assert-True ([string]$reconstructedDelivery.TargetId -eq 'target01') 'reconstructed delivery metadata should include target id.'
+Assert-True ([string]$reconstructedDelivery.MessageType -eq 'generic') 'reconstructed delivery metadata should default message type to generic.'
+Assert-True ([bool]$reconstructedDelivery.ReconstructedFromRetryPending) 'reconstructed delivery metadata should mark reconstruction.'
+
 Write-Host ('requeue-retry-pending-metadata ok: inbox=' + $targetInbox)

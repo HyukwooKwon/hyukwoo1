@@ -23979,6 +23979,34 @@ class RelayOperatorPanelWatcherOptionTests(unittest.TestCase):
         self.assertTrue(spec["enabled"])
         self.assertIn("1개", spec["detail"])
 
+    def test_target_autoloop_policy_card_primary_action_explains_user_active_hold_retry(self) -> None:
+        panel = self._make_panel()
+
+        spec = panel._target_autoloop_policy_card_primary_action_spec(
+            {
+                "retry_pending_summary": {
+                    "current_items": [
+                        {
+                            "target_id": "target07",
+                            "path": r"C:\runs\target07.ready.txt",
+                            "failure_category": "user_active_hold",
+                            "failure_message": "AHK exit code: 43 user_active_hold",
+                            "debug_log_path": r"C:\logs\target07-user-active.log",
+                            "delivery_metadata_exists": False,
+                        },
+                    ],
+                },
+            },
+            "target07",
+        )
+
+        self.assertEqual("requeue_retry_pending", spec["action_key"])
+        self.assertEqual("target07 idle 후 재시도", spec["label"])
+        self.assertTrue(spec["enabled"])
+        self.assertIn("사용자 입력 감지", spec["detail"])
+        self.assertIn("마우스/키보드", spec["detail"])
+        self.assertIn("metadata", spec["detail"])
+
     def test_target_autoloop_policy_card_primary_action_uses_submit_only_for_submit_ready_retry(self) -> None:
         panel = self._make_panel()
 
@@ -24031,6 +24059,50 @@ class RelayOperatorPanelWatcherOptionTests(unittest.TestCase):
         self.assertEqual("결과 대기", spec["label"])
         self.assertFalse(spec["enabled"])
         self.assertIn("이미 전송", spec["detail"])
+
+    def test_target_autoloop_policy_card_primary_action_explains_dispatch_delay_wait(self) -> None:
+        panel = self._make_panel()
+        eligible_at = (datetime.now(timezone.utc) + timedelta(seconds=20)).isoformat()
+
+        spec = panel._target_autoloop_policy_card_primary_action_spec(
+            {
+                "targets": [
+                    {
+                        "TargetId": "target07",
+                        "Phase": "dispatch-delay",
+                        "NextAction": "wait-dispatch-delay",
+                        "CycleCount": 6,
+                        "MaxCycleCount": 10,
+                        "LastDispatchState": "dispatch-delay-waiting",
+                        "PendingDispatchEligibleAt": eligible_at,
+                        "PendingDispatchDelaySeconds": 24,
+                        "PublishReadyDispatchDelayMode": "range",
+                        "PublishReadyDispatchMinDelaySeconds": 15,
+                        "PublishReadyDispatchMaxDelaySeconds": 30,
+                    },
+                ],
+                "manifest_targets": [
+                    {"TargetId": "target07", "Enabled": True, "TriggerKinds": ["publish-ready"], "MaxCycleCount": 10},
+                ],
+                "output_block_summary": {
+                    "items": [
+                        {
+                            "target_id": "target07",
+                            "ready_unaccepted": True,
+                            "publish_ready_path": r"C:\runs\target07\source-outbox\publish.ready.json",
+                        },
+                    ],
+                },
+            },
+            "target07",
+        )
+
+        self.assertEqual("", spec["action_key"])
+        self.assertEqual("target07 전송 지연 대기", spec["label"])
+        self.assertFalse(spec["enabled"])
+        self.assertIn("실패가 아니므로", spec["detail"])
+        self.assertIn("전송보류 재시도/이어쓰기 재입력은 누르지 마세요", spec["detail"])
+        self.assertIn("pendingDelay=24s", spec["detail"])
 
     def test_target_autoloop_policy_card_primary_action_reports_uncovered_ready_marker(self) -> None:
         panel = self._make_panel()

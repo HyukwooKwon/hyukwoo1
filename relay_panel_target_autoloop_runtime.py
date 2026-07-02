@@ -778,7 +778,9 @@ def target_autoloop_retry_pending_summary(
             if allowed_targets and target_id not in allowed_targets:
                 continue
             metadata = read_json_dict_if_present(str(ready_path) + ".meta.json")
-            delivery = read_json_dict_if_present(str(ready_path) + ".delivery.json")
+            delivery_path = Path(str(ready_path) + ".delivery.json")
+            delivery_exists = delivery_path.exists() and delivery_path.is_file()
+            delivery = read_json_dict_if_present(str(delivery_path))
             if not _retry_pending_scope_match(ready_path, delivery, scope_run_roots=normalized_scope_roots):
                 ignored_out_of_scope_count += 1
                 continue
@@ -828,6 +830,8 @@ def target_autoloop_retry_pending_summary(
                     "failure_category": failure_category,
                     "failure_message": str(metadata.get("FailureMessage", "") or "").strip(),
                     "debug_log_path": debug_log_path,
+                    "delivery_metadata_exists": delivery_exists,
+                    "delivery_metadata_path": str(delivery_path),
                     "send_stage": send_stage,
                     "send_retry_policy": send_retry_policy,
                     "focus_lost_stage": focus_stage,
