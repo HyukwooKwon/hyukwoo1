@@ -9756,6 +9756,14 @@ class RelayOperatorPanel(tk.Tk):
             "items",
             normalized_target_id,
         )
+        router_ignored_summary = runtime_snapshot.get("router_ignored_summary", {})
+        if not isinstance(router_ignored_summary, dict):
+            router_ignored_summary = {}
+        router_ignored_count = self._target_autoloop_count_summary_items_for_target(
+            router_ignored_summary,
+            "items",
+            normalized_target_id,
+        )
 
         status_row = self._target_autoloop_row_for_target(
             runtime_snapshot.get("targets", []),
@@ -10035,6 +10043,31 @@ class RelayOperatorPanel(tk.Tk):
                 "action_key": "start_watch",
                 "enabled": True,
                 "detail": (start_detail or f"{normalized_target_id} 감지를 시작할 수 있습니다.") + f" 감지 target={start_scope_text}",
+            }
+
+        if router_ignored_count > 0:
+            ignored_item = self._target_autoloop_latest_summary_item_for_target(
+                router_ignored_summary,
+                "items",
+                normalized_target_id,
+            )
+            reason_code = str(ignored_item.get("reason_code", "") or "unknown").strip()
+            reason_detail = str(ignored_item.get("reason_detail", "") or "").strip()
+            ignored_path = str(ignored_item.get("path", "") or "").strip()
+            detail = (
+                f"{normalized_target_id} 최근 router ignored {router_ignored_count}개가 있습니다. "
+                f"reason={reason_code}. 전송보류 재시도/이어쓰기 전에 router가 이 ready 파일을 왜 무시했는지 먼저 확인하세요."
+            )
+            if reason_detail:
+                detail += f" detail={reason_detail}"
+            if ignored_path:
+                detail += f" path={ignored_path}"
+            return {
+                "label": f"{normalized_target_id} 최근 ignored 확인",
+                "action_key": "",
+                "enabled": False,
+                "target_id": normalized_target_id,
+                "detail": detail,
             }
 
         return {
@@ -22008,6 +22041,8 @@ class RelayOperatorPanel(tk.Tk):
             session_paths.get("runtime_map_path", ""),
             session_paths.get("RouterStatePath", ""),
             session_paths.get("router_state_path", ""),
+            session_paths.get("IgnoredRoot", ""),
+            session_paths.get("ignored_root", ""),
             session_paths.get("RetryPendingRoot", ""),
             session_paths.get("retry_pending_root", ""),
         ]
@@ -22199,6 +22234,11 @@ class RelayOperatorPanel(tk.Tk):
             manifest_targets,
             target_ids=manifest_target_ids,
         )
+        ignored_root = str(router_session_paths.get("ignored_root", "") or router_session.get("ignored_root", "") or "")
+        router_ignored_summary = target_autoloop_runtime.target_autoloop_recent_ignored_summary(
+            ignored_root,
+            target_ids=manifest_target_ids,
+        )
         output_block_summary = target_autoloop_runtime.target_autoloop_source_outbox_contract_summary(
             manifest_targets,
             targets,
@@ -22285,6 +22325,9 @@ class RelayOperatorPanel(tk.Tk):
             "retry_pending_root": str(retry_pending_summary.get("root", "") or ""),
             "router_inbox_ready_summary": router_inbox_ready_summary,
             "router_inbox_ready_count": int(router_inbox_ready_summary.get("count", 0) or 0),
+            "router_ignored_summary": router_ignored_summary,
+            "router_ignored_count": int(router_ignored_summary.get("count", 0) or 0),
+            "router_ignored_root": str(router_ignored_summary.get("root", "") or ""),
             "output_block_summary": output_block_summary,
             "output_block_count": int(output_block_summary.get("limit_reached_ready_unaccepted_count", 0) or 0),
             "acceptance_receipt_path": str(acceptance_receipt_path),
@@ -25865,6 +25908,13 @@ class RelayOperatorPanel(tk.Tk):
         router_inbox_ready_targets = router_inbox_ready_summary.get("target_ids", [])
         if not isinstance(router_inbox_ready_targets, list):
             router_inbox_ready_targets = []
+        router_ignored_summary = runtime_snapshot.get("router_ignored_summary", {})
+        if not isinstance(router_ignored_summary, dict):
+            router_ignored_summary = {}
+        router_ignored_count = int(router_ignored_summary.get("count", 0) or 0)
+        router_ignored_targets = router_ignored_summary.get("target_ids", [])
+        if not isinstance(router_ignored_targets, list):
+            router_ignored_targets = []
         router_session_state = str(runtime_snapshot.get("router_session_state", "") or "")
         if router_session_state and router_session_state != "not-configured":
             summary_text += f" / routerSession={router_session_state}"
@@ -25886,6 +25936,10 @@ class RelayOperatorPanel(tk.Tk):
         if router_inbox_ready_count > 0:
             router_inbox_target_text = ",".join(str(target_id or "").strip() for target_id in router_inbox_ready_targets if str(target_id or "").strip()) or "(none)"
             summary_text += f" / routerInboxReady={router_inbox_ready_count}:{router_inbox_target_text}"
+        if router_ignored_count > 0:
+            router_ignored_target_text = ",".join(str(target_id or "").strip() for target_id in router_ignored_targets if str(target_id or "").strip()) or "(none)"
+            router_ignored_reason = str(router_ignored_summary.get("latest_reason_code", "") or "unknown")
+            summary_text += f" / ignored={router_ignored_count}:{router_ignored_target_text}:{router_ignored_reason}"
         if watcher_stop_reason:
             summary_text += f" / watchStop={watcher_stop_reason}"
         if last_handled_action:

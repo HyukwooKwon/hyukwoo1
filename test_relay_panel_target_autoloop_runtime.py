@@ -135,6 +135,7 @@ class TargetAutoloopRuntimeTests(unittest.TestCase):
                     "@{",
                     r"  RuntimeMapPath = 'C:\runtime\from-file\target-runtime.json'",
                     r"  RouterStatePath = 'C:\runtime\from-file\router-state.json'",
+                    r"  IgnoredRoot = 'C:\runtime\from-file\ignored'",
                     r'  RetryPendingRoot = "C:\runtime\from-file\retry-pending"',
                     "}",
                 ]
@@ -156,9 +157,51 @@ class TargetAutoloopRuntimeTests(unittest.TestCase):
 
         self.assertEqual(r"C:\runtime\from-file\target-runtime.json", paths["runtime_map_path"])
         self.assertEqual(r"C:\runtime\from-file\router-state.json", paths["router_state_path"])
+        self.assertEqual(r"C:\runtime\from-file\ignored", paths["ignored_root"])
         self.assertEqual(r"C:\runtime\from-file\retry-pending", paths["retry_pending_root"])
         self.assertEqual("config-file", paths["source"])
         self.assertEqual(str(config_path.resolve()), paths["config_path"])
+
+    def test_recent_ignored_summary_reads_archive_reason_and_filters_target(self) -> None:
+        root = Path(make_workspace_tempdir("target-autoloop-runtime-ignored"))
+        ignored_root = root / "ignored"
+        ignored_root.mkdir()
+        target07_ready = ignored_root / "target07__20260702_120000_000__message.ready.txt"
+        target07_ready.write_text("payload", encoding="utf-8")
+        Path(str(target07_ready) + ".archive.json").write_text(
+            json.dumps(
+                {
+                    "ArchiveReasonCode": "metadata-missing",
+                    "ArchiveReasonDetail": "delivery metadata missing",
+                    "TargetId": "target07",
+                    "LauncherSessionId": "session-current",
+                }
+            ),
+            encoding="utf-8",
+        )
+        target08_ready = ignored_root / "target08__20260702_120001_000__message.ready.txt"
+        target08_ready.write_text("payload", encoding="utf-8")
+        Path(str(target08_ready) + ".archive.json").write_text(
+            json.dumps({"ArchiveReasonCode": "launcher-session-mismatch", "TargetId": "target08"}),
+            encoding="utf-8",
+        )
+        os.utime(target07_ready, (1000, 1000))
+        os.utime(target08_ready, (2000, 2000))
+
+        summary = runtime.target_autoloop_recent_ignored_summary(
+            str(ignored_root),
+            target_ids=["target07"],
+            max_items=5,
+        )
+
+        self.assertEqual(1, summary["count"])
+        self.assertEqual(["target07"], summary["target_ids"])
+        self.assertEqual(str(target07_ready), summary["latest_path"])
+        self.assertEqual("target07", summary["latest_target_id"])
+        self.assertEqual("metadata-missing", summary["latest_reason_code"])
+        self.assertEqual("delivery metadata missing", summary["latest_reason_detail"])
+        self.assertEqual(1, summary["ignored_target_filtered_count"])
+        self.assertEqual([{"reason_code": "metadata-missing", "count": 1}], summary["reason_counts"])
 
     def test_router_session_snapshot_reports_ok_for_matching_session(self) -> None:
         root = Path(make_workspace_tempdir("target-autoloop-runtime-ok"))
@@ -169,7 +212,14 @@ class TargetAutoloopRuntimeTests(unittest.TestCase):
             encoding="utf-8",
         )
         router_state_path.write_text(
-            json.dumps({"Status": "running", "LauncherSessionId": "session-1", "RouterPid": os.getpid()}),
+            json.dumps(
+                {
+                    "Status": "running",
+                    "LauncherSessionId": "session-1",
+                    "RouterPid": os.getpid(),
+                    "IgnoredRoot": str(root / "ignored-from-state"),
+                }
+            ),
             encoding="utf-8",
         )
 
@@ -188,6 +238,7 @@ class TargetAutoloopRuntimeTests(unittest.TestCase):
         self.assertEqual("session-1", snapshot["runtime_launcher_session_id"])
         self.assertEqual("session-1", snapshot["router_launcher_session_id"])
         self.assertEqual(str(os.getpid()), snapshot["router_pid"])
+        self.assertEqual(str(root / "ignored-from-state"), snapshot["ignored_root"])
         self.assertTrue(snapshot["router_pid_exists"])
 
     def test_router_session_snapshot_rejects_dead_matching_router_pid(self) -> None:

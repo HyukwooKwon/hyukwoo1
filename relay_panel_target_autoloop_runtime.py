@@ -690,6 +690,7 @@ def target_autoloop_router_session_paths_from_config_file(
     runtime_map_path = psd1_string_value(raw_text, "RuntimeMapPath")
     router_state_path = psd1_string_value(raw_text, "RouterStatePath")
     router_mutex_name = psd1_string_value(raw_text, "RouterMutexName")
+    ignored_root = psd1_string_value(raw_text, "IgnoredRoot")
     retry_pending_root = psd1_string_value(raw_text, "RetryPendingRoot")
     result: dict[str, str] = {"config_path": str(resolved_path)}
     if runtime_map_path:
@@ -698,6 +699,8 @@ def target_autoloop_router_session_paths_from_config_file(
         result["router_state_path"] = router_state_path
     if router_mutex_name:
         result["router_mutex_name"] = router_mutex_name
+    if ignored_root:
+        result["ignored_root"] = ignored_root
     if retry_pending_root:
         result["retry_pending_root"] = retry_pending_root
     return result
@@ -714,26 +717,140 @@ def target_autoloop_router_session_paths(
     runtime_map_path = str(config.get("RuntimeMapPath", "") or "").strip()
     router_state_path = str(config.get("RouterStatePath", "") or "").strip()
     router_mutex_name = str(config.get("RouterMutexName", "") or "").strip()
+    ignored_root = str(config.get("IgnoredRoot", "") or "").strip()
     retry_pending_root = str(config.get("RetryPendingRoot", "") or "").strip()
-    source = "effective-data" if (runtime_map_path or router_state_path or router_mutex_name or retry_pending_root) else ""
+    source = "effective-data" if (runtime_map_path or router_state_path or router_mutex_name or ignored_root or retry_pending_root) else ""
     file_paths = target_autoloop_router_session_paths_from_config_file(config_path, root=root)
     file_runtime_map_path = str(file_paths.get("runtime_map_path", "") or "").strip()
     file_router_state_path = str(file_paths.get("router_state_path", "") or "").strip()
     file_router_mutex_name = str(file_paths.get("router_mutex_name", "") or "").strip()
+    file_ignored_root = str(file_paths.get("ignored_root", "") or "").strip()
     file_retry_pending_root = str(file_paths.get("retry_pending_root", "") or "").strip()
-    if file_runtime_map_path or file_router_state_path or file_router_mutex_name or file_retry_pending_root:
+    if file_runtime_map_path or file_router_state_path or file_router_mutex_name or file_ignored_root or file_retry_pending_root:
         runtime_map_path = file_runtime_map_path or runtime_map_path
         router_state_path = file_router_state_path or router_state_path
         router_mutex_name = file_router_mutex_name or router_mutex_name
+        ignored_root = file_ignored_root or ignored_root
         retry_pending_root = file_retry_pending_root or retry_pending_root
         source = "config-file"
     return {
         "runtime_map_path": runtime_map_path,
         "router_state_path": router_state_path,
         "router_mutex_name": router_mutex_name,
+        "ignored_root": ignored_root,
         "retry_pending_root": retry_pending_root,
         "source": source,
         "config_path": str(file_paths.get("config_path", "") or ""),
+    }
+
+
+def _target_id_from_ready_archive_path(path: Path, archive: dict[str, object]) -> str:
+    for key in ("TargetId", "target_id"):
+        value = str(archive.get(key, "") or "").strip()
+        if value:
+            return value
+    segments = path.name.split("__", 2)
+    if len(segments) >= 3 and segments[0]:
+        return segments[0]
+    return ""
+
+
+def _reason_counts_from_items(items: list[dict[str, object]]) -> list[dict[str, object]]:
+    counts: dict[str, int] = {}
+    for item in items:
+        reason_code = str(item.get("reason_code", "") or "").strip() or "unknown"
+        counts[reason_code] = counts.get(reason_code, 0) + 1
+    return [
+        {"reason_code": reason_code, "count": count}
+        for reason_code, count in sorted(counts.items(), key=lambda entry: (-entry[1], entry[0]))
+    ]
+
+
+def target_autoloop_recent_ignored_summary(
+    ignored_root: object,
+    *,
+    target_ids: list[str] | tuple[str, ...] | set[str] | None = None,
+    max_items: int = 20,
+) -> dict[str, object]:
+    root_text = str(ignored_root or "").strip()
+    allowed_targets = {
+        str(target_id or "").strip()
+        for target_id in (target_ids or [])
+        if str(target_id or "").strip()
+    }
+    root_path = Path(root_text) if root_text else None
+    root_exists = bool(root_path is not None and root_path.exists() and root_path.is_dir())
+    items: list[dict[str, object]] = []
+    ignored_target_filtered_count = 0
+    limit = max(0, int(max_items))
+    if root_exists and root_path is not None and limit > 0:
+        ready_paths = list(root_path.glob("*.ready.txt"))
+        ready_paths.sort(key=lambda path: (_file_mtime_ns(path), path.name), reverse=True)
+        for ready_path in ready_paths:
+            archive_path = Path(str(ready_path) + ".archive.json")
+            archive_exists = archive_path.exists() and archive_path.is_file()
+            archive = read_json_dict_if_present(archive_path) if archive_exists else {}
+            target_id = _target_id_from_ready_archive_path(ready_path, archive)
+            if allowed_targets and target_id not in allowed_targets:
+                ignored_target_filtered_count += 1
+                continue
+            try:
+                stat = ready_path.stat()
+                last_write_time = stat.st_mtime
+                size_bytes = int(stat.st_size)
+            except OSError:
+                last_write_time = 0.0
+                size_bytes = 0
+            reason_code = str(archive.get("ArchiveReasonCode", "") or "").strip()
+            reason_detail = str(archive.get("ArchiveReasonDetail", "") or "").strip()
+            archive_error = ""
+            if not archive_exists:
+                reason_code = "archive-metadata-missing"
+                reason_detail = "archive metadata missing"
+            elif not archive:
+                reason_code = "archive-metadata-parse-failed"
+                reason_detail = "archive metadata parse failed"
+                archive_error = reason_detail
+            elif not reason_code:
+                reason_code = "unknown"
+            items.append(
+                {
+                    "target_id": target_id,
+                    "path": str(ready_path),
+                    "name": ready_path.name,
+                    "size_bytes": size_bytes,
+                    "last_write_time": last_write_time,
+                    "archive_path": str(archive_path),
+                    "archive_exists": archive_exists,
+                    "archive_parse_error": archive_error,
+                    "reason_code": reason_code,
+                    "reason_detail": reason_detail,
+                    "launcher_session_id": str(archive.get("LauncherSessionId", "") or "").strip(),
+                    "run_root": str(archive.get("RunRoot", "") or "").strip(),
+                    "message_type": str(archive.get("MessageType", "") or "").strip(),
+                }
+            )
+            if len(items) >= limit:
+                break
+    target_id_values: list[str] = []
+    for item in items:
+        target_id = str(item.get("target_id", "") or "").strip()
+        if target_id and target_id not in target_id_values:
+            target_id_values.append(target_id)
+    latest = items[0] if items else {}
+    return {
+        "root": root_text,
+        "root_exists": root_exists,
+        "count": len(items),
+        "target_ids": target_id_values,
+        "latest_path": str(latest.get("path", "") or ""),
+        "latest_target_id": str(latest.get("target_id", "") or ""),
+        "latest_reason_code": str(latest.get("reason_code", "") or ""),
+        "latest_reason_detail": str(latest.get("reason_detail", "") or ""),
+        "latest_archive_path": str(latest.get("archive_path", "") or ""),
+        "ignored_target_filtered_count": ignored_target_filtered_count,
+        "reason_counts": _reason_counts_from_items(items),
+        "items": items,
     }
 
 
@@ -1066,6 +1183,9 @@ def target_autoloop_router_session_snapshot(session_paths: dict[str, str], *, ro
     router_launcher_session_id = str(router_state.get("LauncherSessionId", "") or "").strip()
     router_pid = str(router_state.get("RouterPid", "") or "").strip()
     router_pid_exists = process_exists(router_pid)
+    ignored_root = str(session_paths.get("ignored_root", "") or "").strip()
+    if not ignored_root:
+        ignored_root = str(router_state.get("IgnoredRoot", "") or "").strip()
     configured_send_settings = router_config_send_settings_from_config_file(config_path, root=config_root)
     drift_reasons: list[str] = []
     observed_send_setting_keys = {
@@ -1145,6 +1265,7 @@ def target_autoloop_router_session_snapshot(session_paths: dict[str, str], *, ro
         "router_launcher_session_id": router_launcher_session_id,
         "router_pid": router_pid,
         "router_pid_exists": router_pid_exists,
+        "ignored_root": ignored_root,
         "router_mutex_name": router_mutex_name,
         "router_mutex_held": router_mutex_held,
         "router_config_drift": bool(drift_reasons),
