@@ -4,6 +4,16 @@
 
 `target-autoloop` closeout 단계에서는 새 기능 추가를 중지한다.
 
+## System Boundary
+
+TargetAutoloop는 Pair/paired exchange와 분리해서 판단한다.
+
+- `8 Cell Autoloop`, `TargetAutoloop`, `targetXX`, `cycle`, `ready marker`, `전송보류`, `idle 후 재시도`, `추가 N회+감지`, `summary.txt / review.zip / publish.ready.json` 문제는 독립셀 시스템 문제다.
+- 독립셀 문제를 볼 때는 `tests\Show-TargetAutoloopStatus.ps1`, 현재 TargetAutoloop RunRoot, `target-autoloop-status.json`, `target-state.json`, target별 `source-outbox`, `retry-pending`, `ignored`, router inbox를 먼저 확인한다.
+- 독립셀 문제 원인을 `pair01`, `top/bottom`, `roundtrip`, `paired status`, `Pair watcher`, `Run-LiveVisiblePairAcceptance.ps1` 기준으로 설명하지 않는다.
+- 같은 target 번호가 pair 설정에도 있어도, 현재 화면/요청이 `8 Cell Autoloop`이면 독립셀 target으로만 취급한다. 예: target05가 pair01-bottom에 매핑되어 있어도 TargetAutoloop에서 멈춘 문제는 target05 독립셀 cycle/trigger/contract 상태로 분석한다.
+- Pair 시스템은 사용자가 `Pair`, `roundtrip`, `handoff`, `Pair watcher`, `visible acceptance`를 명시했을 때만 사용한다.
+
 허용 변경:
 - selection/copy/export/status helper 분리
 - 작은 UI primitive 정리

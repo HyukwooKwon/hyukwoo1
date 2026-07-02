@@ -1,5 +1,15 @@
 # Agent Policy
 
+## System Boundary: TargetAutoloop vs Pair
+
+- 운영 질의는 먼저 **독립셀 TargetAutoloop**인지 **Pair/paired exchange**인지 판별한 뒤 답합니다.
+- 사용자가 `독립셀`, `8 Cell Autoloop`, `TargetAutoloop`, `targetXX`, `cycle`, `ready marker`, `전송보류`, `idle 후 재시도`, `추가 N회+감지`, `source-outbox`, `summary.txt`, `review.zip`, `publish.ready.json` 을 말하면 기본값은 **독립셀 TargetAutoloop**입니다.
+- 독립셀 TargetAutoloop 문제를 조사할 때는 `tests\Show-TargetAutoloopStatus.ps1`, `target-autoloop-status.json`, `target-state.json`, target별 `source-outbox`, target별 `retry-pending/ignored/router inbox` 를 먼저 봅니다.
+- 독립셀 TargetAutoloop에서는 `pair01`, `top/bottom`, `roundtrip`, `paired status`, `Pair watcher`, `Run-LiveVisiblePairAcceptance.ps1`, `show-paired-exchange-status.ps1`, `handoff_targetXX_to_targetYY` 로 원인을 설명하지 않습니다. 사용자가 pair 시스템이라고 명시했거나 Pair 탭/Pair acceptance를 언급했을 때만 pair 용어와 pair 스크립트를 사용합니다.
+- Pair/paired exchange 문제는 `Pair`, `pair01~pair04`, `top/bottom`, `roundtrip`, `handoff`, `Pair watcher`, `visible acceptance`, `Run-LiveVisiblePairAcceptance.ps1` 가 명시된 경우에만 해당 시스템으로 분류합니다.
+- 두 시스템은 같은 공식 8창과 `bottest-live-visible` lane을 공유할 수 있지만, 상태 머신과 운영 판단 기준은 분리합니다. 독립셀의 `cycle/maxCycle/trigger/publish-ready` 를 pair의 `roundtrip/top-bottom/forwarded` 와 섞어 해석하지 않습니다.
+- target05처럼 pair 설정에도 등장하는 번호라도, 현재 화면/요청이 `8 Cell Autoloop` 또는 TargetAutoloop이면 독립셀 target05로 취급합니다.
+
 ## Shared Visible Lane
 
 - `bottest-live-visible` shared lane에서는 공식 운영 8창만 사용합니다.
