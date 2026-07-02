@@ -5400,8 +5400,65 @@ class RelayOperatorPanel(tk.Tk):
 
     def destroy(self) -> None:
         self._cancel_pending_ui_callbacks()
+        self._launch_target_autoloop_shutdown_cleanup()
         self._write_panel_window_launch_guard(allow_launch=False, note="panel-destroy")
         super().destroy()
+
+    def _launch_target_autoloop_shutdown_cleanup(self) -> None:
+        if self.__dict__.get("_target_autoloop_shutdown_cleanup_started"):
+            return
+        self.__dict__["_target_autoloop_shutdown_cleanup_started"] = True
+
+        script_path = ROOT / "tests" / "Stop-TargetAutoloopAutomation.ps1"
+        if not script_path.exists():
+            return
+
+        config_path = ""
+        try:
+            config_path = self.config_path_var.get().strip()
+        except Exception:
+            config_path = ""
+
+        try:
+            command = self.command_service.build_powershell_file_command(
+                str(script_path),
+                extra=[
+                    "-GraceSeconds",
+                    "5",
+                    "-ForceAfterGrace",
+                    "-AsJson",
+                ],
+            )
+        except Exception:
+            command = [
+                "pwsh",
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(script_path),
+                "-GraceSeconds",
+                "5",
+                "-ForceAfterGrace",
+                "-AsJson",
+            ]
+        if config_path:
+            command.extend(["-ConfigPath", config_path])
+
+        creationflags = 0
+        if os.name == "nt":
+            creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        try:
+            subprocess.Popen(
+                command,
+                cwd=str(ROOT),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=creationflags,
+            )
+        except Exception:
+            return
 
     def _run_root_timing_snapshot(self, run_root: str) -> dict[str, object]:
         run_context = (self.effective_data or {}).get("RunContext", {}) or {}
