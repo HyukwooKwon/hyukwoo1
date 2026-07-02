@@ -710,6 +710,7 @@ class RelayOperatorPanel(tk.Tk):
         self.target_autoloop_policy_card_artifact_buttons: dict[str, dict[str, ttk.Button]] = {}
         self.target_autoloop_policy_card_process_once_buttons: dict[str, ttk.Button] = {}
         self.target_autoloop_policy_card_primary_action_buttons: dict[str, ttk.Button] = {}
+        self.target_autoloop_policy_card_diagnostic_copy_buttons: dict[str, ttk.Button] = {}
         self.target_autoloop_policy_card_detail_widgets: dict[str, list[object]] = {}
         self.pair_policy_clone_source_combo: ttk.Combobox | None = None
         self.pair_policy_clone_target_combo: ttk.Combobox | None = None
@@ -17982,6 +17983,7 @@ class RelayOperatorPanel(tk.Tk):
             runtime_summary_frame = ttk.Frame(card)
             runtime_summary_frame.grid(row=2, column=1, sticky="ew", pady=(6, 0))
             runtime_summary_frame.columnconfigure(0, weight=1)
+            runtime_summary_frame.columnconfigure(1, weight=0)
             ttk.Label(
                 runtime_summary_frame,
                 textvariable=card_vars["runtime_summary_var"],
@@ -17994,6 +17996,13 @@ class RelayOperatorPanel(tk.Tk):
                 wraplength=420,
                 justify="left",
             ).grid(row=1, column=0, sticky="e", pady=(2, 0))
+            diagnostic_copy_button = ttk.Button(
+                runtime_summary_frame,
+                text="진단 복사",
+                command=lambda current_target_id=target_id: self.copy_target_autoloop_policy_card_diagnostic_summary(current_target_id),
+            )
+            diagnostic_copy_button.grid(row=1, column=1, sticky="e", padx=(8, 0), pady=(2, 0))
+            self.target_autoloop_policy_card_diagnostic_copy_buttons[target_id] = diagnostic_copy_button
             primary_action_frame = ttk.Frame(card)
             primary_action_frame.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(8, 0))
             primary_action_frame.columnconfigure(5, weight=1)
@@ -24520,6 +24529,75 @@ class RelayOperatorPanel(tk.Tk):
             f"{next_step_text} / {runtime_text} / {extend_text} / {artifact_text} / "
             f"{process_once_text} / {retry_text} / {router_text}{watcher_text}"
         )
+
+    @staticmethod
+    def _target_autoloop_policy_card_var_value(store: dict[str, object], key: str) -> str:
+        value = store.get(key) if isinstance(store, dict) else None
+        if value is not None and hasattr(value, "get"):
+            try:
+                return str(value.get() or "").strip()
+            except Exception:
+                return ""
+        return str(value or "").strip()
+
+    def _target_autoloop_policy_card_diagnostic_text(
+        self,
+        target_id: str,
+        runtime_snapshot: dict[str, object] | None = None,
+    ) -> str:
+        normalized_target_id = str(target_id or "").strip()
+        if not normalized_target_id:
+            return ""
+        card_vars = self.__dict__.get("target_autoloop_policy_card_vars", {}) or {}
+        store = card_vars.get(normalized_target_id) if isinstance(card_vars, dict) else None
+        if not isinstance(store, dict):
+            return ""
+        snapshot = runtime_snapshot if isinstance(runtime_snapshot, dict) else {}
+        if not snapshot:
+            try:
+                snapshot = self._target_autoloop_runtime_snapshot()
+            except Exception:
+                snapshot = {}
+        compact_summary = self._target_autoloop_policy_card_var_value(store, "compact_action_var")
+        if snapshot and (not compact_summary or "다음 조치 대기" in compact_summary):
+            compact_summary = self._target_autoloop_policy_card_compact_action_text(
+                snapshot,
+                target_id=normalized_target_id,
+                store=store,
+            )
+            compact_var = store.get("compact_action_var")
+            if compact_var is not None and hasattr(compact_var, "set"):
+                try:
+                    compact_var.set(compact_summary)
+                except Exception:
+                    pass
+        lines = [
+            "[8 Cell Autoloop 독립셀 TargetAutoloop 진단]",
+            f"target={normalized_target_id}",
+            f"runRoot={str(snapshot.get('run_root', '') or '(unknown)') if isinstance(snapshot, dict) else '(unknown)'}",
+            f"compact={compact_summary or '(empty)'}",
+            f"runtime={self._target_autoloop_policy_card_var_value(store, 'runtime_summary_var') or '(empty)'}",
+            f"next={self._target_autoloop_policy_card_var_value(store, 'primary_action_var') or '(empty)'}",
+            f"retry={self._target_autoloop_policy_card_var_value(store, 'retry_pending_state_var') or '(empty)'}",
+            f"artifact={self._target_autoloop_policy_card_var_value(store, 'artifact_state_var') or '(empty)'}",
+            f"readyRecheck={self._target_autoloop_policy_card_var_value(store, 'process_once_state_var') or '(empty)'}",
+            f"cwd={self._target_autoloop_policy_card_var_value(store, 'cwd_state_var') or '(empty)'}",
+        ]
+        return "\n".join(lines)
+
+    def copy_target_autoloop_policy_card_diagnostic_summary(self, target_id: str) -> None:
+        normalized_target_id = str(target_id or "").strip()
+        text = self._target_autoloop_policy_card_diagnostic_text(normalized_target_id)
+        if not text:
+            self.set_operator_status("8 Cell Autoloop 독립셀 진단 복사 대기", "target 카드를 찾지 못했습니다.")
+            return
+        self._copy_to_clipboard(text)
+        self.set_operator_status(
+            "8 Cell Autoloop 독립셀 진단 복사 완료",
+            f"{normalized_target_id} 진단 요약을 클립보드로 복사했습니다.",
+        )
+        if self._has_ui_attr("output_text"):
+            self.set_text(self.output_text, text)
 
     def _target_autoloop_process_once_eligibility(
         self,

@@ -23956,6 +23956,38 @@ class RelayOperatorPanelWatcherOptionTests(unittest.TestCase):
         self.assertIn("router inbox 대기 1, 재입력 금지", compact_summary)
         self.assertNotIn("pair", compact_summary.casefold())
 
+    def test_copy_target_autoloop_policy_card_diagnostic_summary_copies_independent_target_block(self) -> None:
+        panel = self._make_panel()
+        copied: list[str] = []
+        statuses: list[tuple[str, str]] = []
+        panel._copy_to_clipboard = copied.append
+        panel.set_operator_status = lambda title, detail="", *_args: statuses.append((title, detail))
+        panel._target_autoloop_runtime_snapshot = lambda *_args, **_kwargs: {
+            "run_root": r"C:\runs\target-autoloop\run_1",
+        }
+        panel.target_autoloop_policy_card_vars = {
+            "target05": {
+                "compact_action_var": VarStub("독립셀 진단: phase=idle next=wait-for-output cycle=5/10 / router inbox 대기 1, 재입력 금지"),
+                "runtime_summary_var": VarStub("runtime=IDLE / phase=idle / cycle=5/10"),
+                "primary_action_var": VarStub("이 target 전용 권장 액션: 비활성 - router inbox ready 1개가 있어 시작문/이어쓰기 재입력은 금지입니다."),
+                "retry_pending_state_var": VarStub("전송보류 상태: 비활성 - target05 현재 전송과 연결된 retry-pending 항목이 없습니다."),
+                "artifact_state_var": VarStub("산출물 상태: target05 / summary=있음 / review.zip=있음 / publish.ready=있음"),
+                "process_once_state_var": VarStub("ready 재검사 상태: 비활성 - active watcher 감지 범위에 포함되어 있습니다."),
+                "cwd_state_var": VarStub("cwd: OK"),
+            },
+        }
+
+        panel.copy_target_autoloop_policy_card_diagnostic_summary("target05")
+
+        self.assertEqual(1, len(copied))
+        self.assertIn("[8 Cell Autoloop 독립셀 TargetAutoloop 진단]", copied[0])
+        self.assertIn("target=target05", copied[0])
+        self.assertIn(r"runRoot=C:\runs\target-autoloop\run_1", copied[0])
+        self.assertIn("router inbox 대기 1, 재입력 금지", copied[0])
+        self.assertIn("artifact=산출물 상태: target05", copied[0])
+        self.assertIn("8 Cell Autoloop 독립셀 진단 복사 완료", statuses[0][0])
+        self.assertNotIn("roundtrip", copied[0].casefold())
+
     def test_target_autoloop_policy_card_artifact_button_tooltip_text_names_target_and_path_kind(self) -> None:
         tooltip_text = RelayOperatorPanel._target_autoloop_policy_card_artifact_button_tooltip_text(
             target_id="target04",
