@@ -20513,6 +20513,110 @@ class RelayOperatorPanelWatcherOptionTests(unittest.TestCase):
             },
         }
 
+    def test_target_autoloop_background_conflict_processes_separates_current_runroot(self) -> None:
+        panel = RelayOperatorPanel.__new__(RelayOperatorPanel)
+        current_run_root = self._canonical_target_autoloop_run_root("run_current")
+        other_run_root = self._canonical_target_autoloop_run_root("run_other")
+        payload = {
+            "RemainingBeforeForce": [
+                {"ProcessId": 1001, "RunRoot": current_run_root, "Kind": "watcher"},
+                {"ProcessId": 1002, "RunRoot": other_run_root, "Kind": "worker"},
+                {"ProcessId": 1003, "RunRoot": "", "Kind": "launcher"},
+            ],
+        }
+
+        conflicts, matching = panel._target_autoloop_background_conflict_processes(payload, run_root=current_run_root)
+
+        self.assertEqual([1002, 1003], [row["ProcessId"] for row in conflicts])
+        self.assertEqual([1001], [row["ProcessId"] for row in matching])
+
+    def test_target_autoloop_start_background_guard_cancels_on_other_runroot(self) -> None:
+        panel = RelayOperatorPanel.__new__(RelayOperatorPanel)
+        current_run_root = self._canonical_target_autoloop_run_root("run_current")
+        other_run_root = self._canonical_target_autoloop_run_root("run_other")
+        captured: dict[str, object] = {}
+
+        class CommandServiceStub:
+            def build_powershell_file_command(self, script_path: str, extra: list[str] | None = None) -> list[str]:
+                return ["pwsh", "-File", script_path, *(extra or [])]
+
+            def run_json(self, command: list[str], *, timeout_sec: float | None = None) -> dict:
+                captured["command"] = command
+                captured["timeout_sec"] = timeout_sec
+                return {
+                    "Mode": "inspect",
+                    "Ok": True,
+                    "InitialProcessCount": 1,
+                    "RunRoots": [other_run_root],
+                    "RemainingBeforeForce": [
+                        {"ProcessId": 2002, "RunRoot": other_run_root, "Kind": "watcher"},
+                    ],
+                    "RemainingAfter": [
+                        {"ProcessId": 2002, "RunRoot": other_run_root, "Kind": "watcher"},
+                    ],
+                    "RemainingAfterCount": 1,
+                }
+
+        panel.command_service = CommandServiceStub()
+        panel.config_path_var = VarStub("cfg.psd1")
+        panel.last_command_var = VarStub("")
+        panel.target_autoloop_background_automation_var = VarStub("")
+        panel.target_autoloop_guidance_var = VarStub("")
+        panel.output_text = object()
+        panel.set_text = lambda _widget, value: setattr(panel, "_captured_output", value)
+        panel.set_operator_status = lambda title, detail="", last_result=None: setattr(panel, "_operator_status", (title, detail, last_result))
+
+        with mock.patch("relay_operator_panel.messagebox.askyesno", return_value=False) as askyesno:
+            allowed = panel._confirm_target_autoloop_start_background_guard(
+                run_root=current_run_root,
+                action_label="8 Cell Autoloop 독립셀 감지 시작",
+            )
+
+        self.assertFalse(allowed)
+        self.assertEqual(12.0, captured["timeout_sec"])
+        self.assertIn("-InspectOnly", captured["command"])
+        self.assertIn("현재 RunRoot와 다른", panel._captured_output)
+        self.assertIn("run_other:watcher", panel._captured_output)
+        self.assertIn("자동화만 종료", panel.target_autoloop_guidance_var.get())
+        askyesno.assert_called_once()
+
+    def test_target_autoloop_start_background_guard_allows_current_runroot(self) -> None:
+        panel = RelayOperatorPanel.__new__(RelayOperatorPanel)
+        current_run_root = self._canonical_target_autoloop_run_root("run_current")
+
+        class CommandServiceStub:
+            def build_powershell_file_command(self, script_path: str, extra: list[str] | None = None) -> list[str]:
+                return ["pwsh", "-File", script_path, *(extra or [])]
+
+            def run_json(self, command: list[str], *, timeout_sec: float | None = None) -> dict:
+                return {
+                    "Mode": "inspect",
+                    "Ok": True,
+                    "InitialProcessCount": 1,
+                    "RunRoots": [current_run_root],
+                    "RemainingBeforeForce": [
+                        {"ProcessId": 3001, "RunRoot": current_run_root, "Kind": "watcher"},
+                    ],
+                    "RemainingAfter": [
+                        {"ProcessId": 3001, "RunRoot": current_run_root, "Kind": "watcher"},
+                    ],
+                    "RemainingAfterCount": 1,
+                }
+
+        panel.command_service = CommandServiceStub()
+        panel.config_path_var = VarStub("cfg.psd1")
+        panel.last_command_var = VarStub("")
+        panel.target_autoloop_background_automation_var = VarStub("")
+
+        with mock.patch("relay_operator_panel.messagebox.askyesno", side_effect=AssertionError("no prompt expected")):
+            allowed = panel._confirm_target_autoloop_start_background_guard(
+                run_root=current_run_root,
+                action_label="8 Cell Autoloop 독립셀 감지 시작",
+            )
+
+        self.assertTrue(allowed)
+        self.assertIn("실행 중 1개", panel.target_autoloop_background_automation_var.get())
+
     @staticmethod
     def _install_router_ok_files(panel: RelayOperatorPanel, root: Path) -> None:
         runtime_map_path = root / "runtime-map.json"
@@ -24467,12 +24571,14 @@ class RelayOperatorPanelWatcherOptionTests(unittest.TestCase):
 
             panel.command_service = SimpleNamespace(run=run_command)
 
-            panel.request_target_autoloop_submit_only_retry_pending(
-                target_id="target08",
-                history_label="target08 Enter만 제출",
-                history_action_key="submit_only_retry",
-                history_detail="unit test",
-            )
+            with mock.patch("relay_operator_panel.messagebox.askyesnocancel", return_value=True) as askyesnocancel:
+                panel.request_target_autoloop_submit_only_retry_pending(
+                    target_id="target08",
+                    history_label="target08 Enter만 제출",
+                    history_action_key="submit_only_retry",
+                    history_detail="unit test",
+                )
+            askyesnocancel.assert_called_once()
 
             command = captured["command"]
             self.assertIsInstance(command, list)
@@ -24504,6 +24610,61 @@ class RelayOperatorPanelWatcherOptionTests(unittest.TestCase):
             self.assertIn("Enter만 1회 제출 완료", panel.operator_hint_var.get())
             self.assertEqual("submit_only_retry", history_calls[0]["action_key"])
             self.assertTrue(panel.__dict__.get("_target_autoloop_refreshed", False))
+
+    def test_request_target_autoloop_submit_only_retry_pending_requeues_when_input_missing(self) -> None:
+        panel = self._make_panel()
+        panel.request_target_autoloop_submit_only_retry_pending = (
+            RelayOperatorPanel.request_target_autoloop_submit_only_retry_pending.__get__(panel, RelayOperatorPanel)
+        )
+        panel.output_text = TextWidgetStub("")
+        panel.set_text = lambda widget, value: setattr(widget, "value", value)
+        panel.target_autoloop_guidance_var = VarStub("")
+        panel.refresh_target_autoloop_status_panel = lambda: setattr(panel, "_target_autoloop_refreshed", True)
+        calls: list[dict[str, object]] = []
+        panel.request_requeue_target_autoloop_retry_pending = lambda **kwargs: calls.append(kwargs)
+        run_calls: list[object] = []
+        panel.command_service = SimpleNamespace(run=lambda *args, **kwargs: run_calls.append((args, kwargs)))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            run_root = root / "run"
+            retry_root = root / "retry-pending"
+            retry_root.mkdir(parents=True)
+            run_root.mkdir()
+            retry_path = retry_root / "target08.ready.txt"
+            retry_path.write_text("payload should be resent", encoding="utf-8")
+            panel._current_run_root_for_actions = lambda: str(run_root)
+            panel._target_autoloop_runtime_snapshot = lambda _run_root=None: {
+                "run_root": str(run_root),
+                "retry_pending_summary": {
+                    "root": str(retry_root),
+                    "current_items": [
+                        {
+                            "target_id": "target08",
+                            "path": str(retry_path),
+                            "send_stage": "submit-ready-no-dispatch",
+                            "send_retry_policy": "manual-submit-only-retry",
+                        },
+                    ],
+                },
+            }
+
+            with mock.patch("relay_operator_panel.messagebox.askyesnocancel", return_value=False) as askyesnocancel:
+                panel.request_target_autoloop_submit_only_retry_pending(
+                    target_id="target08",
+                    history_label="target08 Enter만 제출",
+                    history_action_key="submit_only_retry",
+                    history_detail="unit test",
+                )
+
+        askyesnocancel.assert_called_once()
+        self.assertEqual([], run_calls)
+        self.assertEqual(1, len(calls))
+        self.assertEqual("target08", calls[0]["target_id"])
+        self.assertEqual("target08 입력부터 재시도", calls[0]["history_label"])
+        self.assertEqual("requeue_retry_pending", calls[0]["history_action_key"])
+        self.assertIn("입력 없음 선택", calls[0]["history_detail"])
+        self.assertIn("submit-only 대신 current retry-pending", panel.output_text.value)
 
     def test_run_target_autoloop_policy_card_retry_pending_blocks_manual_duplicate_risk(self) -> None:
         panel = self._make_panel()
@@ -24776,6 +24937,81 @@ class RelayOperatorPanelWatcherOptionTests(unittest.TestCase):
         self.assertIn("Next: active watcher가 target02를 포함하지 않아", panel._captured_output)
         self.assertEqual(1, len(scope_restart_calls))
         self.assertEqual("target02", scope_restart_calls[0]["target_id"])
+
+    def test_request_requeue_target_autoloop_retry_pending_reports_router_inbox_ready_after_requeue(self) -> None:
+        panel = self._make_panel()
+        panel.request_requeue_target_autoloop_retry_pending = (
+            RelayOperatorPanel.request_requeue_target_autoloop_retry_pending.__get__(panel, RelayOperatorPanel)
+        )
+        before_snapshot = {
+            "run_root": self._canonical_target_autoloop_run_root(),
+            "retry_pending_summary": {
+                "count": 1,
+                "current_count": 1,
+                "current_items": [
+                    {"target_id": "target06", "path": r"C:\runs\target06.ready.json"},
+                ],
+                "current_target_ids": ["target06"],
+            },
+        }
+        after_snapshot = {
+            "run_root": self._canonical_target_autoloop_run_root(),
+            "retry_pending_summary": {"count": 0},
+            "router_inbox_ready_summary": {
+                "count": 1,
+                "items": [
+                    {"target_id": "target06", "path": r"C:\router\inbox\target06.ready.txt"},
+                ],
+            },
+            "watcher_state": "running",
+            "watcher_target_ids": ["target06"],
+            "heartbeat_at": datetime.now(timezone.utc).isoformat(),
+        }
+        snapshots = [before_snapshot, after_snapshot]
+        panel._target_autoloop_runtime_snapshot = lambda _run_root=None: snapshots.pop(0) if snapshots else after_snapshot
+        panel._target_autoloop_watcher_is_fresh = lambda _snapshot=None: True
+        panel._target_autoloop_watcher_covers_target = (
+            RelayOperatorPanel._target_autoloop_watcher_covers_target.__get__(panel, RelayOperatorPanel)
+        )
+        panel._current_context = lambda: AppContext(config_path="cfg.psd1", run_root=self._canonical_target_autoloop_run_root())
+        panel.command_service = SimpleNamespace(
+            build_script_command=lambda script_name, *, config_path="", extra=None, **_kwargs: [script_name, *(extra or [])]
+        )
+
+        class StatusServiceStub:
+            def run_script(self, script_name, context, extra=None, **_kwargs):
+                return subprocess.CompletedProcess([script_name], 0, stdout="ok", stderr="")
+
+        recent_badges: list[dict[str, object]] = []
+        history_calls: list[dict[str, object]] = []
+        panel.status_service = StatusServiceStub()
+        panel.last_command_var = VarStub("")
+        panel.target_autoloop_status_var = VarStub("")
+        panel.target_autoloop_guidance_var = VarStub("")
+        panel._clear_target_autoloop_runtime_snapshot_cache = lambda: None
+        panel.refresh_target_autoloop_status_panel = lambda: setattr(panel, "_target_autoloop_refreshed", True)
+        panel._append_target_autoloop_recommendation_history = lambda **kwargs: history_calls.append(kwargs)
+        panel._apply_target_autoloop_recent_result_badge = lambda record: recent_badges.append(dict(record))
+        panel.request_restart_target_autoloop_watcher_with_target_scope = lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("watcher already covers target06")
+        )
+        panel.run_background_task = lambda **kwargs: kwargs["on_success"](kwargs["worker"]())
+
+        panel.request_requeue_target_autoloop_retry_pending(
+            target_id="target06",
+            history_label="target06 전송보류 재시도",
+            history_action_key="requeue_retry_pending",
+            history_detail="focus_lost",
+        )
+
+        self.assertIn("RouterInboxReadyAfter: 1", panel._captured_output)
+        self.assertIn("Next: router inbox ready 1개가 남아 있습니다", panel._captured_output)
+        self.assertIn("시작문/이어쓰기 재입력은 금지", panel._captured_output)
+        self.assertIn("routerInboxReady=1", panel.target_autoloop_status_var.get())
+        self.assertIn("router/visible dispatch", panel.target_autoloop_guidance_var.get())
+        self.assertIn("routerInboxReady=1", history_calls[0]["detail"])
+        self.assertIn("routerInboxReady=1", recent_badges[0]["detail"])
+        self.assertTrue(panel.__dict__.get("_target_autoloop_refreshed", False))
 
     def test_target_autoloop_policy_card_runtime_progress_shows_cycle_attempts(self) -> None:
         panel = self._make_panel()

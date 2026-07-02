@@ -3,7 +3,9 @@ param(
     [string]$ConfigPath,
     [string[]]$RunRoot = @(),
     [int]$GraceSeconds = 5,
+    [switch]$InspectOnly,
     [switch]$ForceAfterGrace,
+    [string]$LogPath,
     [switch]$AsJson
 )
 
@@ -53,6 +55,26 @@ function Get-NormalizedLookupKey {
     }
 
     return $normalized.ToLowerInvariant()
+}
+
+function Ensure-Directory {
+    param([Parameter(Mandatory)][string]$Path)
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Container)) {
+        New-Item -ItemType Directory -Path $Path -Force | Out-Null
+    }
+}
+
+function Write-JsonFileAtomically {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)]$PayloadJson
+    )
+
+    Ensure-Directory -Path (Split-Path -Parent $Path)
+    $tempPath = $Path + '.tmp'
+    Set-Content -LiteralPath $tempPath -Encoding UTF8 -Value $PayloadJson
+    Move-Item -LiteralPath $tempPath -Destination $Path -Force
 }
 
 function ConvertFrom-CommandLineRunRootToken {
@@ -210,13 +232,18 @@ $runRoots = @(
 )
 
 $stopRequests = @()
-foreach ($runRootValue in @($runRoots)) {
-    $stopRequests += Request-TargetAutoloopStop -RequestScript $requestScript -ConfigPath $ConfigPath -RunRoot $runRootValue
+if (-not $InspectOnly) {
+    foreach ($runRootValue in @($runRoots)) {
+        $stopRequests += Request-TargetAutoloopStop -RequestScript $requestScript -ConfigPath $ConfigPath -RunRoot $runRootValue
+    }
 }
 
 $remainingBeforeForce = @()
 $grace = [math]::Max(0, $GraceSeconds)
-if ($grace -gt 0 -and @($initialProcesses).Count -gt 0) {
+if ($InspectOnly) {
+    $remainingBeforeForce = @($initialProcesses)
+}
+elseif ($grace -gt 0 -and @($initialProcesses).Count -gt 0) {
     $deadline = (Get-Date).AddSeconds($grace)
     do {
         Start-Sleep -Milliseconds 500
@@ -231,7 +258,7 @@ else {
 }
 
 $forceStopped = @()
-if ($ForceAfterGrace -and @($remainingBeforeForce).Count -gt 0) {
+if ((-not $InspectOnly) -and $ForceAfterGrace -and @($remainingBeforeForce).Count -gt 0) {
     foreach ($process in @($remainingBeforeForce)) {
         try {
             Stop-Process -Id ([int]$process.ProcessId) -Force -ErrorAction Stop
@@ -258,9 +285,12 @@ if ($ForceAfterGrace -and @($remainingBeforeForce).Count -gt 0) {
 }
 
 $remainingAfter = @(Get-TargetAutoloopAutomationProcessSnapshot -RunRootFilter $runRootFilter -SelfProcessId $PID)
+$mode = if ($InspectOnly) { 'inspect' } else { 'stop' }
+$ok = if ($InspectOnly) { $true } else { @($remainingAfter).Count -eq 0 }
 $payload = [pscustomobject][ordered]@{
     SchemaVersion = '1.0.0'
-    Ok = (@($remainingAfter).Count -eq 0)
+    Mode = $mode
+    Ok = $ok
     ConfigPath = $ConfigPath
     InitialProcessCount = @($initialProcesses).Count
     RunRoots = @($runRoots)
@@ -273,8 +303,13 @@ $payload = [pscustomobject][ordered]@{
     RemainingAfterCount = @($remainingAfter).Count
 }
 
+$payloadJson = $payload | ConvertTo-Json -Depth 10
+if (Test-NonEmptyString $LogPath) {
+    Write-JsonFileAtomically -Path (Get-NormalizedPath -PathValue $LogPath) -PayloadJson $payloadJson
+}
+
 if ($AsJson) {
-    $payload | ConvertTo-Json -Depth 10
+    $payloadJson
     return
 }
 

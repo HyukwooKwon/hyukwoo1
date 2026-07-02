@@ -69,15 +69,34 @@ try {
     Assert-True (Test-ProcessAlive -ProcessId $fakeWatcherProcess.Id) 'fake target-autoloop watcher process should start.'
     Assert-True (Test-ProcessAlive -ProcessId $fakeWorkerProcess.Id) 'fake target-autoloop worker process should start.'
 
+    $inspectLogPath = Join-Path $tmpRoot 'inspect-result.json'
+    $inspectResult = & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Stop-TargetAutoloopAutomation.ps1') `
+        -RunRoot $fakeRunRoot `
+        -InspectOnly `
+        -GraceSeconds 0 `
+        -LogPath $inspectLogPath `
+        -AsJson | ConvertFrom-Json
+
+    Assert-True ([bool]$inspectResult.Ok) 'inspect-only cleanup should succeed without stopping processes.'
+    Assert-True ([string]$inspectResult.Mode -eq 'inspect') 'inspect-only cleanup should report inspect mode.'
+    Assert-True ([int]$inspectResult.InitialProcessCount -ge 2) 'inspect-only cleanup should detect the fake processes.'
+    Assert-True (Test-Path -LiteralPath $inspectLogPath -PathType Leaf) 'inspect-only cleanup should write a log file.'
+    Assert-True (Test-ProcessAlive -ProcessId $fakeWatcherProcess.Id) 'inspect-only cleanup should not stop the watcher process.'
+    Assert-True (Test-ProcessAlive -ProcessId $fakeWorkerProcess.Id) 'inspect-only cleanup should not stop the worker process.'
+
+    $stopLogPath = Join-Path $tmpRoot 'stop-result.json'
     $result = & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tests\Stop-TargetAutoloopAutomation.ps1') `
         -RunRoot $fakeRunRoot `
         -GraceSeconds 0 `
         -ForceAfterGrace `
+        -LogPath $stopLogPath `
         -AsJson | ConvertFrom-Json
 
     Assert-True ([bool]$result.Ok) 'cleanup should stop all matching target-autoloop automation processes.'
+    Assert-True ([string]$result.Mode -eq 'stop') 'cleanup should report stop mode.'
     Assert-True ([int]$result.InitialProcessCount -ge 2) 'cleanup should detect the fake watcher and worker processes.'
     Assert-True ([int]$result.RemainingAfterCount -eq 0) 'cleanup should leave no matching process for the filtered runroot.'
+    Assert-True (Test-Path -LiteralPath $stopLogPath -PathType Leaf) 'cleanup should write a stop result log file.'
 
     Start-Sleep -Milliseconds 500
     Assert-True (-not (Test-ProcessAlive -ProcessId $fakeWatcherProcess.Id)) 'fake watcher process should be terminated.'

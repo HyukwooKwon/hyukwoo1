@@ -469,6 +469,7 @@ class RelayOperatorPanel(tk.Tk):
         self.target_autoloop_detector_badge_var = tk.StringVar(
             value="감지 상태: 대기 | 마지막 sweep: - | 감지 target: - | queue: 0 / waiting-output: 0 / failed: 0"
         )
+        self.target_autoloop_background_automation_var = tk.StringVar(value="백그라운드 자동화: 미확인")
         self.target_autoloop_status_var = tk.StringVar(value="8 Cell Autoloop 상태/제어는 현재 RunRoot의 .state\\target-autoloop-status.json / target-autoloop-control.json 기준으로 표시됩니다.")
         self.target_autoloop_summary_var = tk.StringVar(value="controller/controlAction/delay/cycle 요약이 여기 표시됩니다.")
         self.target_autoloop_guidance_var = tk.StringVar(value="독립셀 감지기 health와 다음 권장 조치를 여기 표시합니다.")
@@ -5426,6 +5427,8 @@ class RelayOperatorPanel(tk.Tk):
                     "-GraceSeconds",
                     "5",
                     "-ForceAfterGrace",
+                    "-LogPath",
+                    str(self._target_autoloop_background_cleanup_log_path("shutdown")),
                     "-AsJson",
                 ],
             )
@@ -5440,6 +5443,8 @@ class RelayOperatorPanel(tk.Tk):
                 "-GraceSeconds",
                 "5",
                 "-ForceAfterGrace",
+                "-LogPath",
+                str(self._target_autoloop_background_cleanup_log_path("shutdown")),
                 "-AsJson",
             ]
         if config_path:
@@ -5459,6 +5464,289 @@ class RelayOperatorPanel(tk.Tk):
             )
         except Exception:
             return
+
+    def _target_autoloop_background_cleanup_log_path(self, label: str = "manual") -> Path:
+        normalized_label = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(label or "manual").strip()).strip("-") or "manual"
+        return SNAPSHOT_DIR / f"target-autoloop-background-automation-{normalized_label}.json"
+
+    def _target_autoloop_background_automation_command(
+        self,
+        *,
+        inspect_only: bool,
+        log_label: str = "manual",
+        grace_seconds: int = 5,
+        force_after_grace: bool = False,
+    ) -> list[str]:
+        script_path = ROOT / "tests" / "Stop-TargetAutoloopAutomation.ps1"
+        extra = [
+            "-GraceSeconds",
+            str(max(0, int(grace_seconds))),
+            "-LogPath",
+            str(self._target_autoloop_background_cleanup_log_path(log_label)),
+            "-AsJson",
+        ]
+        if inspect_only:
+            extra.insert(0, "-InspectOnly")
+        if force_after_grace:
+            extra.insert(0, "-ForceAfterGrace")
+        config_path = ""
+        try:
+            config_path = str(self.config_path_var.get() or "").strip()
+        except Exception:
+            config_path = ""
+        if config_path:
+            extra.extend(["-ConfigPath", config_path])
+        return self.command_service.build_powershell_file_command(str(script_path), extra=extra)
+
+    @staticmethod
+    def _target_autoloop_background_process_label(processes: list[object]) -> str:
+        rows = [row for row in list(processes or []) if isinstance(row, dict)]
+        if not rows:
+            return "(none)"
+        run_roots: dict[str, set[str]] = {}
+        for row in rows:
+            run_root = str(row.get("RunRoot", "") or "").strip() or "(unknown)"
+            kind = str(row.get("Kind", "") or "").strip() or "process"
+            run_roots.setdefault(run_root, set()).add(kind)
+        parts = []
+        for run_root, kinds in sorted(run_roots.items()):
+            name = Path(run_root).name if run_root not in {"", "(unknown)"} else run_root
+            parts.append(f"{name}:{','.join(sorted(kinds))}")
+        return "; ".join(parts)
+
+    @staticmethod
+    def _target_autoloop_path_key(path_value: object) -> str:
+        normalized = str(path_value or "").strip()
+        if not normalized:
+            return ""
+        try:
+            return os.path.normcase(os.path.abspath(os.path.normpath(normalized)))
+        except Exception:
+            return os.path.normcase(os.path.normpath(normalized))
+
+    def _target_autoloop_background_conflict_processes(
+        self,
+        payload: dict[str, object],
+        *,
+        run_root: str,
+    ) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+        processes = list(payload.get("RemainingBeforeForce", []) or payload.get("RemainingAfter", []) or [])
+        rows = [row for row in processes if isinstance(row, dict)]
+        current_run_root_key = self._target_autoloop_path_key(run_root)
+        matching: list[dict[str, object]] = []
+        conflicting: list[dict[str, object]] = []
+        for row in rows:
+            process_run_root = str(row.get("RunRoot", "") or "").strip()
+            process_key = self._target_autoloop_path_key(process_run_root)
+            if current_run_root_key and process_key and process_key == current_run_root_key:
+                matching.append(row)
+            else:
+                conflicting.append(row)
+        return conflicting, matching
+
+    def _confirm_target_autoloop_start_background_guard(self, *, run_root: str, action_label: str) -> bool:
+        command_service = self.__dict__.get("command_service")
+        if command_service is None or not hasattr(command_service, "run_json"):
+            return True
+        try:
+            command = self._target_autoloop_background_automation_command(
+                inspect_only=True,
+                log_label="start-guard",
+                grace_seconds=0,
+            )
+            if self._has_ui_attr("last_command_var"):
+                self.last_command_var.set(subprocess.list2cmdline(command))
+            payload = command_service.run_json(command, timeout_sec=12.0)
+        except Exception as exc:
+            detail = (
+                "감지 시작 전 백그라운드 자동화 확인에 실패했습니다.\n"
+                f"{self._format_background_exception(exc)}\n\n"
+                "공식 8셀 창은 건드리지 않았습니다. 그래도 감지 시작을 계속할까요?"
+            )
+            if self._has_ui_attr("target_autoloop_background_automation_var"):
+                self.target_autoloop_background_automation_var.set("백그라운드 자동화 확인 실패")
+            label = self.__dict__.get("target_autoloop_background_automation_label")
+            self._configure_optional_widget(label, text="백그라운드 자동화 확인 실패", bg="#B91C1C", fg="#FFFFFF")
+            return bool(messagebox.askyesno("백그라운드 자동화 확인 실패", detail))
+
+        self._apply_target_autoloop_background_automation_payload(payload)
+        conflicts, matching = self._target_autoloop_background_conflict_processes(payload, run_root=run_root)
+        if not conflicts:
+            return True
+
+        conflict_label = self._target_autoloop_background_process_label(conflicts)
+        matching_label = self._target_autoloop_background_process_label(matching)
+        detail = "\n".join(
+            [
+                f"{action_label} 전, 현재 RunRoot와 다른 target-autoloop 자동화가 실행 중입니다.",
+                "",
+                f"현재 RunRoot: {run_root}",
+                f"다른 자동화: {conflict_label}",
+                f"현재 RunRoot 자동화: {matching_label}",
+                "",
+                "권장: [자동화만 종료]로 watcher/launcher/worker만 정리한 뒤 다시 시작하세요.",
+                "공식 8셀 창과 Codex 창은 이 확인 과정에서 종료하지 않습니다.",
+                "",
+                "[예]를 누르면 정리하지 않고 감지 시작을 계속합니다.",
+                "[아니오]를 누르면 감지 시작을 취소합니다.",
+            ]
+        )
+        self.set_text(
+            self.output_text,
+            "[8 Cell Autoloop 시작 전 백그라운드 자동화 확인]\n"
+            + self._format_target_autoloop_background_automation_report(payload)
+            + "\n\n"
+            + detail,
+        )
+        self.set_operator_status("8 Cell Autoloop 감지 시작 전 확인 필요", f"다른 RunRoot 자동화 실행 중: {conflict_label}")
+        if self._has_ui_attr("target_autoloop_guidance_var"):
+            self.target_autoloop_guidance_var.set(
+                "다른 RunRoot target-autoloop 자동화가 실행 중입니다. 자동화만 종료 후 다시 감지 시작하는 것이 안전합니다."
+            )
+        return bool(messagebox.askyesno("다른 target-autoloop 자동화 실행 중", detail))
+
+    def _format_target_autoloop_background_automation_report(self, payload: dict[str, object]) -> str:
+        mode = str(payload.get("Mode", "") or "").strip() or "unknown"
+        initial_count = int(payload.get("InitialProcessCount", 0) or 0)
+        remaining_count = int(payload.get("RemainingAfterCount", 0) or 0)
+        run_roots = [str(item or "").strip() for item in list(payload.get("RunRoots", []) or []) if str(item or "").strip()]
+        remaining = list(payload.get("RemainingAfter", []) or [])
+        force_stopped = list(payload.get("ForceStopped", []) or [])
+        stop_requests = list(payload.get("StopRequests", []) or [])
+        lines = [
+            "[target-autoloop background automation]",
+            f"Mode: {mode}",
+            f"InitialProcessCount: {initial_count}",
+            f"RemainingAfterCount: {remaining_count}",
+            "RunRoots: " + (", ".join(run_roots) if run_roots else "(none)"),
+            "Processes: " + self._target_autoloop_background_process_label(list(payload.get("RemainingBeforeForce", []) or [])),
+            "Remaining: " + self._target_autoloop_background_process_label(remaining),
+        ]
+        if stop_requests:
+            lines.append("StopRequests:")
+            for row in stop_requests:
+                if not isinstance(row, dict):
+                    continue
+                lines.append(
+                    "  - {result} ok={ok} request={request} run={run}".format(
+                        result=str(row.get("Result", "") or ""),
+                        ok=bool(row.get("Ok", False)),
+                        request=str(row.get("RequestId", "") or "(none)"),
+                        run=str(row.get("RunRoot", "") or "(none)"),
+                    )
+                )
+        if force_stopped:
+            lines.append("ForceStopped:")
+            for row in force_stopped:
+                if not isinstance(row, dict):
+                    continue
+                lines.append(
+                    "  - pid={pid} stopped={stopped} kind={kind} run={run} error={error}".format(
+                        pid=row.get("ProcessId", ""),
+                        stopped=bool(row.get("Stopped", False)),
+                        kind=str(row.get("Kind", "") or ""),
+                        run=str(row.get("RunRoot", "") or ""),
+                        error=str(row.get("Error", "") or ""),
+                    )
+                )
+        return "\n".join(lines)
+
+    def _apply_target_autoloop_background_automation_payload(self, payload: dict[str, object]) -> None:
+        mode = str(payload.get("Mode", "") or "").strip()
+        initial_count = int(payload.get("InitialProcessCount", 0) or 0)
+        remaining_count = int(payload.get("RemainingAfterCount", 0) or 0)
+        process_label = self._target_autoloop_background_process_label(list(payload.get("RemainingAfter", []) or []))
+        if mode == "inspect":
+            count_text = f"{initial_count}개"
+            if initial_count <= 0:
+                text = "백그라운드 자동화: 없음"
+                background = "#15803D"
+            else:
+                text = f"백그라운드 자동화: 실행 중 {count_text} / {process_label}"
+                background = "#B45309"
+        else:
+            if remaining_count <= 0:
+                text = f"백그라운드 자동화 종료 완료: initial={initial_count}, remaining=0"
+                background = "#15803D"
+            else:
+                text = f"백그라운드 자동화 종료 미완료: remaining={remaining_count} / {process_label}"
+                background = "#B91C1C"
+        if self._has_ui_attr("target_autoloop_background_automation_var"):
+            self.target_autoloop_background_automation_var.set(text)
+        label = self.__dict__.get("target_autoloop_background_automation_label")
+        self._configure_optional_widget(label, text=text, bg=background, fg="#FFFFFF")
+
+    def inspect_target_autoloop_background_automation(self) -> None:
+        command = self._target_autoloop_background_automation_command(
+            inspect_only=True,
+            log_label="inspect",
+            grace_seconds=0,
+        )
+        self.last_command_var.set(subprocess.list2cmdline(command))
+
+        def worker() -> dict[str, object]:
+            return self.command_service.run_json(command, timeout_sec=20.0)
+
+        def on_success(payload: dict[str, object]) -> None:
+            self._apply_target_autoloop_background_automation_payload(payload)
+            self.set_text(self.output_text, self._format_target_autoloop_background_automation_report(payload))
+
+        def on_failure(exc: Exception) -> str:
+            if self._has_ui_attr("target_autoloop_background_automation_var"):
+                self.target_autoloop_background_automation_var.set("백그라운드 자동화 확인 실패")
+            label = self.__dict__.get("target_autoloop_background_automation_label")
+            self._configure_optional_widget(label, text="백그라운드 자동화 확인 실패", bg="#B91C1C", fg="#FFFFFF")
+            return self._format_background_exception(exc)
+
+        self.run_read_only_background_task(
+            label="target-autoloop background inspect",
+            worker=worker,
+            on_success=on_success,
+            on_failure=on_failure,
+        )
+
+    def request_stop_target_autoloop_background_automation(self) -> None:
+        detail = (
+            "target-autoloop watcher/launcher/worker 자동화 프로세스만 종료합니다.\n"
+            "공식 8셀 창, Codex 창, HWND binding은 종료하지 않습니다."
+        )
+        if not messagebox.askyesno("target-autoloop 자동화만 종료", detail):
+            return
+        command = self._target_autoloop_background_automation_command(
+            inspect_only=False,
+            log_label="manual-stop",
+            grace_seconds=5,
+            force_after_grace=True,
+        )
+        self.last_command_var.set(subprocess.list2cmdline(command))
+
+        def worker() -> dict[str, object]:
+            return self.command_service.run_json(command, timeout_sec=30.0)
+
+        def on_success(payload: dict[str, object]) -> None:
+            self._apply_target_autoloop_background_automation_payload(payload)
+            self.set_text(self.output_text, self._format_target_autoloop_background_automation_report(payload))
+            self._clear_target_autoloop_runtime_snapshot_cache()
+            self.refresh_target_autoloop_status_panel()
+
+        def on_failure(exc: Exception) -> str:
+            if self._has_ui_attr("target_autoloop_background_automation_var"):
+                self.target_autoloop_background_automation_var.set("백그라운드 자동화 종료 실패")
+            label = self.__dict__.get("target_autoloop_background_automation_label")
+            self._configure_optional_widget(label, text="백그라운드 자동화 종료 실패", bg="#B91C1C", fg="#FFFFFF")
+            return self._format_background_exception(exc)
+
+        self.run_background_task(
+            state="target-autoloop 자동화만 종료 중",
+            hint="8셀 창은 유지하고 watcher/worker 프로세스만 종료하는 중입니다.",
+            worker=worker,
+            on_success=on_success,
+            success_state="target-autoloop 자동화 종료 완료",
+            success_hint="target-autoloop watcher/worker 종료 상태를 확인했습니다.",
+            failure_state="target-autoloop 자동화 종료 실패",
+            failure_hint="cleanup 결과와 프로세스 상태를 확인하세요.",
+            on_failure=on_failure,
+        )
 
     def _run_root_timing_snapshot(self, run_root: str) -> dict[str, object]:
         run_context = (self.effective_data or {}).get("RunContext", {}) or {}
@@ -9193,7 +9481,7 @@ class RelayOperatorPanel(tk.Tk):
         if current_retry_count > 0:
             return f"현재 전송보류 재시도({current_retry_count})"
         if router_inbox_ready_count > 0:
-            return f"router 처리 대기({router_inbox_ready_count}), 시작문 재입력 금지"
+            return f"router 처리 대기({router_inbox_ready_count}), 시작문/이어쓰기 재입력 금지"
         if normalized_phase == "waiting-output" and (str(last_router_ready_path or "").strip() or normalized_dispatch == "router-ready-file-created"):
             if stale_retry_count > 0:
                 return f"이미 전송됨, 시작문 재입력 금지, stale pending={stale_retry_count}"
@@ -9558,7 +9846,10 @@ class RelayOperatorPanel(tk.Tk):
                 "label": "router 처리 대기",
                 "action_key": "",
                 "enabled": False,
-                "detail": f"router inbox ready {router_inbox_ready_count}개가 있어 시작문 재입력은 금지입니다.",
+                "detail": (
+                    f"router inbox ready {router_inbox_ready_count}개가 있어 시작문/이어쓰기 재입력은 금지입니다. "
+                    "이미 전송 대기열에 들어간 상태이므로 router/visible dispatch 상태와 focus_lost 로그를 확인하세요."
+                ),
             }
         if phase == "waiting-output" and (last_router_ready_path or dispatch_state == "router-ready-file-created"):
             detail = "이미 전송된 상태입니다. 해당 셀창 결과와 산출물을 기다리세요."
@@ -17914,6 +18205,18 @@ class RelayOperatorPanel(tk.Tk):
         )
         target_autoloop_detector_badge_label.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(8, 0))
         self.target_autoloop_detector_badge_label = target_autoloop_detector_badge_label
+        target_autoloop_background_automation_label = tk.Label(
+            target_autoloop_actions,
+            textvariable=self.target_autoloop_background_automation_var,
+            anchor="w",
+            justify="left",
+            bg="#6B7280",
+            fg="#FFFFFF",
+            padx=8,
+            pady=5,
+        )
+        target_autoloop_background_automation_label.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        self.target_autoloop_background_automation_label = target_autoloop_background_automation_label
         target_autoloop_runroot_attention_label = tk.Label(
             target_autoloop_actions,
             textvariable=self.target_autoloop_runroot_attention_var,
@@ -17924,10 +18227,10 @@ class RelayOperatorPanel(tk.Tk):
             padx=10,
             pady=7,
         )
-        target_autoloop_runroot_attention_label.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        target_autoloop_runroot_attention_label.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(6, 0))
         self.target_autoloop_runroot_attention_label = target_autoloop_runroot_attention_label
         target_autoloop_primary_buttons = ttk.Frame(target_autoloop_actions)
-        target_autoloop_primary_buttons.grid(row=3, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        target_autoloop_primary_buttons.grid(row=4, column=0, columnspan=2, sticky="w", pady=(8, 0))
         self.target_autoloop_refresh_button = ttk.Button(
             target_autoloop_primary_buttons,
             text="현재 RunRoot 다시 읽기",
@@ -17964,7 +18267,7 @@ class RelayOperatorPanel(tk.Tk):
         self.target_autoloop_start_button.grid(row=0, column=4, padx=(0, 8))
         self.long_task_widgets.append(self.target_autoloop_start_button)
         target_autoloop_control_buttons = ttk.Frame(target_autoloop_actions)
-        target_autoloop_control_buttons.grid(row=4, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        target_autoloop_control_buttons.grid(row=5, column=0, columnspan=2, sticky="w", pady=(8, 0))
         ttk.Label(target_autoloop_control_buttons, text="전체 감지기 제어").grid(row=0, column=0, sticky="w", padx=(0, 8))
         self.target_autoloop_pause_button = ttk.Button(
             target_autoloop_control_buttons,
@@ -18034,7 +18337,7 @@ class RelayOperatorPanel(tk.Tk):
         self.long_task_widgets.append(self.target_autoloop_extend_cycle_limit_button)
         self.long_task_widgets.append(self.target_autoloop_extend_and_start_button)
         target_autoloop_advanced_buttons = ttk.Frame(target_autoloop_actions)
-        target_autoloop_advanced_buttons.grid(row=5, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        target_autoloop_advanced_buttons.grid(row=6, column=0, columnspan=2, sticky="w", pady=(8, 0))
         ttk.Label(target_autoloop_advanced_buttons, text="고급/전체 실행").grid(row=0, column=0, sticky="w", padx=(0, 8))
         self.target_autoloop_prepare_runroot_button = ttk.Button(
             target_autoloop_advanced_buttons,
@@ -18043,8 +18346,22 @@ class RelayOperatorPanel(tk.Tk):
         )
         self.target_autoloop_prepare_runroot_button.grid(row=0, column=1, padx=(0, 8))
         self.long_task_widgets.append(self.target_autoloop_prepare_runroot_button)
+        self.target_autoloop_background_inspect_button = ttk.Button(
+            target_autoloop_advanced_buttons,
+            text="백그라운드 확인",
+            command=self.inspect_target_autoloop_background_automation,
+        )
+        self.target_autoloop_background_inspect_button.grid(row=0, column=2, padx=(0, 8))
+        self._register_read_only_widget(self.target_autoloop_background_inspect_button)
+        self.target_autoloop_background_stop_button = ttk.Button(
+            target_autoloop_advanced_buttons,
+            text="자동화만 종료",
+            command=self.request_stop_target_autoloop_background_automation,
+        )
+        self.target_autoloop_background_stop_button.grid(row=0, column=3, padx=(0, 8))
+        self.long_task_widgets.append(self.target_autoloop_background_stop_button)
         target_autoloop_artifact_buttons = ttk.Frame(target_autoloop_actions)
-        target_autoloop_artifact_buttons.grid(row=6, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        target_autoloop_artifact_buttons.grid(row=7, column=0, columnspan=2, sticky="w", pady=(8, 0))
         ttk.Label(target_autoloop_artifact_buttons, text="선택 target 산출물").grid(row=0, column=0, sticky="w", padx=(0, 8))
         self.target_autoloop_open_source_outbox_button = ttk.Button(
             target_autoloop_artifact_buttons,
@@ -18084,20 +18401,20 @@ class RelayOperatorPanel(tk.Tk):
             padx=8,
             pady=5,
         )
-        target_autoloop_selected_progress_badge_label.grid(row=7, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        target_autoloop_selected_progress_badge_label.grid(row=8, column=0, columnspan=2, sticky="ew", pady=(6, 0))
         self.target_autoloop_selected_progress_badge_label = target_autoloop_selected_progress_badge_label
         ttk.Label(
             target_autoloop_actions,
             textvariable=self.target_autoloop_selected_progress_var,
             wraplength=1180,
             justify="left",
-        ).grid(row=8, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        ).grid(row=9, column=0, columnspan=2, sticky="w", pady=(6, 0))
         ttk.Label(
             target_autoloop_actions,
             textvariable=self.target_autoloop_selected_artifact_var,
             wraplength=1180,
             justify="left",
-        ).grid(row=9, column=0, columnspan=2, sticky="w", pady=(2, 0))
+        ).grid(row=10, column=0, columnspan=2, sticky="w", pady=(2, 0))
         target_autoloop_start_precheck_badge_label = tk.Label(
             target_autoloop_actions,
             textvariable=self.target_autoloop_start_precheck_badge_var,
@@ -18108,40 +18425,40 @@ class RelayOperatorPanel(tk.Tk):
             padx=8,
             pady=5,
         )
-        target_autoloop_start_precheck_badge_label.grid(row=10, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        target_autoloop_start_precheck_badge_label.grid(row=11, column=0, columnspan=2, sticky="ew", pady=(6, 0))
         self.target_autoloop_start_precheck_badge_label = target_autoloop_start_precheck_badge_label
         ttk.Label(
             target_autoloop_actions,
             textvariable=self.target_autoloop_start_reason_var,
             wraplength=1180,
             justify="left",
-        ).grid(row=11, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        ).grid(row=12, column=0, columnspan=2, sticky="w", pady=(6, 0))
         ttk.Label(
             target_autoloop_actions,
             textvariable=self.target_autoloop_prepare_reason_var,
             wraplength=1180,
             justify="left",
-        ).grid(row=12, column=0, columnspan=2, sticky="w", pady=(2, 0))
+        ).grid(row=13, column=0, columnspan=2, sticky="w", pady=(2, 0))
         ttk.Label(
             target_autoloop_actions,
             textvariable=self.target_autoloop_process_once_reason_var,
             wraplength=1180,
             justify="left",
-        ).grid(row=13, column=0, columnspan=2, sticky="w", pady=(2, 0))
+        ).grid(row=14, column=0, columnspan=2, sticky="w", pady=(2, 0))
         ttk.Label(
             target_autoloop_actions,
             textvariable=self.target_autoloop_extend_reason_var,
             wraplength=1180,
             justify="left",
-        ).grid(row=14, column=0, columnspan=2, sticky="w", pady=(2, 0))
+        ).grid(row=15, column=0, columnspan=2, sticky="w", pady=(2, 0))
         ttk.Label(
             target_autoloop_actions,
             textvariable=self.target_autoloop_control_reason_var,
             wraplength=1180,
             justify="left",
-        ).grid(row=15, column=0, columnspan=2, sticky="w", pady=(2, 0))
+        ).grid(row=16, column=0, columnspan=2, sticky="w", pady=(2, 0))
         target_autoloop_diagnostic_buttons = ttk.Frame(target_autoloop_actions)
-        target_autoloop_diagnostic_buttons.grid(row=16, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        target_autoloop_diagnostic_buttons.grid(row=17, column=0, columnspan=2, sticky="w", pady=(8, 0))
         self.target_autoloop_stdout_log_button = ttk.Button(
             target_autoloop_diagnostic_buttons,
             text="stdout 로그",
@@ -26544,6 +26861,21 @@ class RelayOperatorPanel(tk.Tk):
         controller_state = str(runtime_snapshot.get("controller_state", "") or "")
         action_title = "8 Cell Autoloop 독립셀 감지 재시작" if controller_state == "stopped" else "8 Cell Autoloop 독립셀 감지 시작"
         action_label = "감지 재시작" if controller_state == "stopped" else "감지 시작"
+        if not self._confirm_target_autoloop_start_background_guard(run_root=run_root, action_label=action_title):
+            if history_action_key:
+                self._append_target_autoloop_recommendation_blocked_history(
+                    label=str(history_label or action_title),
+                    action_key=str(history_action_key),
+                    detail=str(history_detail or ""),
+                    blocked_reason="다른 RunRoot target-autoloop 자동화가 실행 중입니다.",
+                    runtime_snapshot=runtime_snapshot,
+                )
+            self.set_operator_status("8 Cell Autoloop 감지 시작 취소", "다른 RunRoot target-autoloop 자동화 확인 후 사용자가 취소했습니다.")
+            if self._has_ui_attr("target_autoloop_guidance_var"):
+                self.target_autoloop_guidance_var.set(
+                    "감지 시작을 취소했습니다. [자동화만 종료]로 watcher/worker만 정리한 뒤 다시 시작하세요."
+                )
+            return
         context = self._snapshot_context(run_root=run_root)
         start_target_ids = explicit_target_ids
         if not start_target_ids and scoped_target_id:
@@ -28693,6 +29025,46 @@ class RelayOperatorPanel(tk.Tk):
             self.refresh_target_autoloop_status_panel()
             return
 
+        confirm_detail = "\n".join(
+            [
+                f"{normalized_target_id} 셀창 입력칸에 고정문구/작업내용 전체가 이미 붙어 있는지 확인하세요.",
+                "",
+                "[예] 이미 입력되어 있음: Enter만 1회 제출",
+                "[아니오] 입력 안 됨/비어 있음: current retry-pending을 재큐잉해서 고정문구+payload 붙여넣기부터 다시 진행",
+                "[취소] 아무 동작도 하지 않음",
+                "",
+                f"RetryPath: {retry_path}",
+            ]
+        )
+        submit_only_choice = messagebox.askyesnocancel("submit-only 복구 확인", confirm_detail, parent=self)
+        if submit_only_choice is None:
+            detail = f"{normalized_target_id} submit-only 복구를 취소했습니다. 셀창 입력 상태를 확인한 뒤 다시 선택하세요."
+            self.set_text(self.output_text, f"[{action_title}]\n{detail}")
+            self.set_operator_status("8 Cell Autoloop submit-only 취소", detail)
+            if self._has_ui_attr("target_autoloop_guidance_var"):
+                self.target_autoloop_guidance_var.set(detail)
+            self.refresh_target_autoloop_status_panel()
+            return
+        if submit_only_choice is False:
+            detail = (
+                f"{normalized_target_id} 셀창에 payload가 없다고 확인되어 submit-only 대신 current retry-pending을 재큐잉합니다. "
+                "watcher/router가 고정문구+payload 붙여넣기와 Enter 제출을 다시 진행합니다."
+            )
+            self.set_text(self.output_text, f"[{action_title}]\n{detail}\nRetryPath: {retry_path}")
+            self.set_operator_status("8 Cell Autoloop submit-only 대신 재큐잉", detail)
+            if self._has_ui_attr("target_autoloop_guidance_var"):
+                self.target_autoloop_guidance_var.set(detail)
+            self.request_requeue_target_autoloop_retry_pending(
+                target_id=normalized_target_id,
+                history_label=f"{normalized_target_id} 입력부터 재시도",
+                history_action_key="requeue_retry_pending",
+                history_detail=(
+                    "submit-only 확인에서 입력 없음 선택 / "
+                    + str(history_detail or f"current retry-pending retryPath={retry_path}")
+                ),
+            )
+            return
+
         ahk_exe = self._target_autoloop_config_string_value("AhkExePath")
         ahk_script = self._target_autoloop_config_string_value("AhkScriptPath", str(ROOT / "sender" / "SendToWindow.ahk"))
         runtime_map = self._target_autoloop_config_string_value("RuntimeMapPath")
@@ -29525,6 +29897,47 @@ class RelayOperatorPanel(tk.Tk):
                 scope_restart_needed = bool(watcher_fresh_after_requeue and not watcher_covers_target)
                 if scope_restart_needed:
                     scope_restart_detail = watcher_scope_detail
+            after_router_inbox_ready_summary = after_snapshot.get("router_inbox_ready_summary", {})
+            if not isinstance(after_router_inbox_ready_summary, dict):
+                after_router_inbox_ready_summary = {}
+            router_target_ids = [
+                str(target_id or "").strip()
+                for target_id in ([auto_scope_target_id] if auto_scope_target_id else (normalized_current_target_ids or normalized_target_ids))
+                if str(target_id or "").strip()
+            ]
+            if router_target_ids:
+                after_router_inbox_ready_count = sum(
+                    self._target_autoloop_count_summary_items_for_target(
+                        after_router_inbox_ready_summary,
+                        "items",
+                        target_id,
+                    )
+                    for target_id in router_target_ids
+                )
+            else:
+                after_router_inbox_ready_count = int(after_router_inbox_ready_summary.get("count", 0) or 0)
+            if scope_restart_needed:
+                next_detail = (
+                    f"Next: active watcher가 {auto_scope_target_id}를 포함하지 않아 target 포함 감지 재시작을 자동으로 이어갑니다. "
+                    f"{scope_restart_detail}"
+                )
+                guidance_detail = (
+                    "현재 전송보류 ready를 target inbox로 되돌렸고, active watcher가 이 target을 포함하지 않아 포함 감지 재시작을 이어갑니다."
+                )
+            elif after_router_inbox_ready_count > 0:
+                next_detail = (
+                    f"Next: router inbox ready {after_router_inbox_ready_count}개가 남아 있습니다. "
+                    "시작문/이어쓰기 재입력은 금지입니다. router/visible dispatch가 처리 중인지 확인하고, 계속 남으면 router 상태와 focus_lost 로그를 확인하세요."
+                )
+                guidance_detail = (
+                    f"현재 전송보류 ready를 target inbox로 되돌렸지만 router inbox ready {after_router_inbox_ready_count}개가 남아 있습니다. "
+                    "시작문을 다시 넣지 말고 router/visible dispatch 상태를 확인하세요."
+                )
+            else:
+                next_detail = "Next: watcher가 running이면 다음 sweep에서 처리하고, stopped면 독립셀 감지 시작/재시작을 누르세요."
+                guidance_detail = (
+                    "현재 전송보류 ready를 target inbox로 되돌렸습니다. watcher가 running이면 다음 sweep에서 처리하고, stopped면 독립셀 감지 시작/재시작을 누르세요."
+                )
             self._clear_target_autoloop_runtime_snapshot_cache()
             self.set_text(
                 self.output_text,
@@ -29535,35 +29948,33 @@ class RelayOperatorPanel(tk.Tk):
                         f"Current: {retry_pending_current_count}",
                         f"Stale: {retry_pending_stale_count}",
                         f"After: {remaining_count}",
+                        f"RouterInboxReadyAfter: {after_router_inbox_ready_count}",
                         f"Targets: {','.join(normalized_current_target_ids or normalized_target_ids) if (normalized_current_target_ids or normalized_target_ids) else '(all)'}",
                         f"RetryPaths: {len(current_retry_paths) if current_retry_paths else '(target-scope fallback)'}",
-                        (
-                            f"Next: active watcher가 {auto_scope_target_id}를 포함하지 않아 target 포함 감지 재시작을 자동으로 이어갑니다. {scope_restart_detail}"
-                            if scope_restart_needed
-                            else "Next: watcher가 running이면 다음 sweep에서 처리하고, stopped면 독립셀 감지 시작/재시작을 누르세요."
-                        ),
+                        next_detail,
                         "",
                         "\n".join(str(line) for line in outputs if str(line).strip()) or "(no output)",
                     ]
                 ),
             )
             if self._has_ui_attr("target_autoloop_status_var"):
-                status_suffix = " / target 포함 감지 재시작" if scope_restart_needed else ""
+                status_suffix = ""
+                if scope_restart_needed:
+                    status_suffix += " / target 포함 감지 재시작"
+                if after_router_inbox_ready_count > 0:
+                    status_suffix += f" / routerInboxReady={after_router_inbox_ready_count}"
                 self.target_autoloop_status_var.set(f"retry-pending 재큐잉 완료: remaining={remaining_count}{status_suffix}")
             if self._has_ui_attr("target_autoloop_guidance_var"):
-                if scope_restart_needed:
-                    self.target_autoloop_guidance_var.set(
-                        "현재 전송보류 ready를 target inbox로 되돌렸고, active watcher가 이 target을 포함하지 않아 포함 감지 재시작을 이어갑니다."
-                    )
-                else:
-                    self.target_autoloop_guidance_var.set(
-                        "현재 전송보류 ready를 target inbox로 되돌렸습니다. watcher가 running이면 다음 sweep에서 처리하고, stopped면 독립셀 감지 시작/재시작을 누르세요."
-                    )
+                self.target_autoloop_guidance_var.set(guidance_detail)
             if history_action_key:
                 self._append_target_autoloop_recommendation_history(
                     label=str(history_label or "retry-pending 재큐잉"),
                     action_key=str(history_action_key),
-                    detail=f"{str(history_detail or '')} / remaining={remaining_count}" + (" / target 포함 감지 재시작 예정" if scope_restart_needed else ""),
+                    detail=(
+                        f"{str(history_detail or '')} / remaining={remaining_count}"
+                        + (f" / routerInboxReady={after_router_inbox_ready_count}" if after_router_inbox_ready_count > 0 else "")
+                        + (" / target 포함 감지 재시작 예정" if scope_restart_needed else "")
+                    ),
                     runtime_snapshot=after_snapshot,
                     outcome="ack",
                 )
@@ -29572,7 +29983,11 @@ class RelayOperatorPanel(tk.Tk):
                     "label": "retry-pending 재큐잉 완료",
                     "action_key": str(history_action_key or "requeue_retry_pending"),
                     "outcome": "ack",
-                    "detail": f"remaining={remaining_count}" + (" / target 포함 감지 재시작" if scope_restart_needed else ""),
+                    "detail": (
+                        f"remaining={remaining_count}"
+                        + (f" / routerInboxReady={after_router_inbox_ready_count}" if after_router_inbox_ready_count > 0 else "")
+                        + (" / target 포함 감지 재시작" if scope_restart_needed else "")
+                    ),
                 }
             )
             self.refresh_target_autoloop_status_panel()
