@@ -1569,6 +1569,7 @@ class RelayOperatorPanel(tk.Tk):
         normalized_kind_label = str(kind_label or "").strip() or normalized_short_label
         return (
             f"{normalized_target_id} {normalized_short_label}: 현재 RunRoot의 {normalized_kind_label} 경로를 엽니다. "
+            "history는 publish helper가 cycle별로 보존한 summary/review.zip/publish.ready.json 폴더입니다. "
             "비활성 상태이면 해당 파일/폴더가 아직 없거나 manifest 경로를 확인하지 못한 상태입니다."
         )
 
@@ -5243,6 +5244,8 @@ class RelayOperatorPanel(tk.Tk):
             str(router_inbox_ready_summary.get("latest_path", "") or ""),
             int(output_block_summary.get("count", 0) or 0),
             int(output_block_summary.get("limit_reached_ready_unaccepted_count", 0) or 0),
+            int(output_block_summary.get("ready_unaccepted_count", 0) or 0),
+            int(output_block_summary.get("ready_accepted_count", 0) or 0),
             str(output_block_summary.get("latest_publish_ready_path", "") or ""),
             self._target_autoloop_int_or_zero(output_block_summary.get("latest_cycle_count", 0)),
             self._target_autoloop_int_or_zero(output_block_summary.get("latest_max_cycle_count", 0)),
@@ -18179,6 +18182,7 @@ class RelayOperatorPanel(tk.Tk):
                 ("summary", "summary", "summary_path", "summary.txt"),
                 ("review_zip", "zip", "review_zip_path", "review.zip"),
                 ("publish_ready", "ready", "publish_ready_path", "publish.ready.json"),
+                ("artifact_history", "history", "artifact_history_path", "검토 history"),
             )
             self.target_autoloop_policy_card_artifact_buttons[target_id] = {}
             for artifact_index, (artifact_key, label, path_key, kind_label) in enumerate(artifact_button_specs, start=1):
@@ -18526,6 +18530,13 @@ class RelayOperatorPanel(tk.Tk):
         )
         self.target_autoloop_open_publish_ready_button.grid(row=0, column=4, padx=(0, 8))
         self._register_read_only_widget(self.target_autoloop_open_publish_ready_button)
+        self.target_autoloop_open_artifact_history_button = ttk.Button(
+            target_autoloop_artifact_buttons,
+            text="검토 history 열기",
+            command=self.open_target_autoloop_selected_artifact_history,
+        )
+        self.target_autoloop_open_artifact_history_button.grid(row=0, column=5, padx=(0, 8))
+        self._register_read_only_widget(self.target_autoloop_open_artifact_history_button)
         target_autoloop_selected_progress_badge_label = tk.Label(
             target_autoloop_actions,
             textvariable=self.target_autoloop_selected_progress_badge_var,
@@ -23900,6 +23911,7 @@ class RelayOperatorPanel(tk.Tk):
                 "summary": "summary",
                 "review_zip": "zip",
                 "publish_ready": "ready",
+                "artifact_history": "history",
             }
             for artifact_key, label in label_specs.items():
                 button = button_map.get(artifact_key)
@@ -24357,6 +24369,99 @@ class RelayOperatorPanel(tk.Tk):
             return f"다음 조치: 바로 실행 - {label} ({detail})" if detail else f"다음 조치: 바로 실행 - {label}"
         return f"다음 조치: {label} - {detail}" if detail else f"다음 조치: {label}"
 
+    def _target_autoloop_policy_card_detection_reason_text(
+        self,
+        runtime_snapshot: dict[str, object],
+        *,
+        target_id: str,
+        status_row: dict[str, object] | None = None,
+        manifest_row: dict[str, object] | None = None,
+        artifact_snapshot: dict[str, object] | None = None,
+        current_retry_count: int = 0,
+        router_inbox_ready_count: int = 0,
+    ) -> str:
+        normalized_target_id = str(target_id or "").strip() or "target"
+        snapshot = runtime_snapshot if isinstance(runtime_snapshot, dict) else {}
+        effective_status_row = status_row if isinstance(status_row, dict) else self._target_autoloop_row_for_target(
+            snapshot.get("targets", []),
+            normalized_target_id,
+        )
+        effective_manifest_row = manifest_row if isinstance(manifest_row, dict) else self._target_autoloop_row_for_target(
+            snapshot.get("manifest_targets", []),
+            normalized_target_id,
+        )
+        effective_artifact_snapshot = (
+            artifact_snapshot
+            if isinstance(artifact_snapshot, dict)
+            else self._target_autoloop_selected_target_artifact_snapshot(snapshot, target_id=normalized_target_id)
+        )
+        phase = str(effective_status_row.get("Phase", "") or effective_manifest_row.get("Phase", "") or "").strip()
+        next_action = str(effective_status_row.get("NextAction", "") or effective_manifest_row.get("NextAction", "") or "").strip()
+        dispatch_state = str(effective_status_row.get("LastDispatchState", "") or "").strip()
+        last_router_ready_path = str(effective_status_row.get("LastRouterReadyPath", "") or "").strip()
+        cycle_count = self._target_autoloop_int_or_zero(
+            effective_status_row.get("CycleCount", effective_artifact_snapshot.get("cycle_count", 0))
+        )
+        max_cycle_count = self._target_autoloop_int_or_zero(
+            effective_status_row.get(
+                "MaxCycleCount",
+                effective_manifest_row.get("MaxCycleCount", effective_artifact_snapshot.get("max_cycle_count", 0)),
+            )
+        )
+        limit_reached = phase == "limit-reached" or next_action == "limit-reached" or (
+            max_cycle_count > 0 and cycle_count >= max_cycle_count
+        )
+        output_block_item = self._target_autoloop_output_block_item_for_target(
+            snapshot,
+            normalized_target_id,
+        )
+        current_marker = str(output_block_item.get("current_marker_fingerprint", "") or "").strip()
+        last_handled = str(output_block_item.get("last_handled_output_fingerprint", "") or "").strip()
+        ready_unaccepted = bool(output_block_item.get("ready_unaccepted", False))
+        ready_accepted = bool(output_block_item.get("ready_accepted", False)) or bool(
+            current_marker and last_handled and current_marker == last_handled
+        )
+        if current_retry_count > 0:
+            return f"감지원인=전송보류 {current_retry_count}개, 자동 중복전송 차단"
+        if router_inbox_ready_count > 0:
+            return f"감지원인=router inbox 대기 {router_inbox_ready_count}개, 재입력 금지"
+        if phase == "dispatch-delay" or next_action == "wait-dispatch-delay":
+            return "감지원인=publish.ready 감지 후 dispatch delay 대기"
+        if ready_unaccepted:
+            watcher_health, watcher_detail = self._target_autoloop_watcher_health(snapshot)
+            if limit_reached:
+                return "감지원인=max count 도달 + 새 ready 미수락"
+            if watcher_health in {"stopped", "stale", "missing"}:
+                detail_suffix = f"({watcher_detail})" if watcher_detail else ""
+                return f"감지원인=watcher {watcher_health}{detail_suffix} 후 새 ready 존재"
+            covered, _coverage_detail = self._target_autoloop_watcher_covers_target(
+                snapshot,
+                target_id=normalized_target_id,
+            )
+            if not covered:
+                return "감지원인=새 ready 존재, 감지범위 누락"
+            return "감지원인=새 ready 수락 대기"
+        if limit_reached:
+            return "감지원인=max count 도달"
+        if ready_accepted:
+            if phase == "waiting-output" and (last_router_ready_path or dispatch_state == "router-ready-file-created"):
+                return "감지원인=기존 ready 처리됨, 새 산출물 대기"
+            return "감지원인=기존 ready 처리됨, 중복 marker 스킵 정상"
+        if phase == "waiting-output" and (last_router_ready_path or dispatch_state == "router-ready-file-created"):
+            return "감지원인=payload 전송 완료, 새 산출물 대기"
+        path_states = effective_artifact_snapshot.get("path_states", {})
+        if not isinstance(path_states, dict):
+            path_states = {}
+        if bool(path_states.get("summary", False)) and bool(path_states.get("review_zip", False)) and not bool(path_states.get("publish_ready", False)):
+            return "감지원인=summary/review.zip 있음, publish helper 대기"
+        if not bool(path_states.get("summary", False)) or not bool(path_states.get("review_zip", False)):
+            return "감지원인=산출물 생성 대기"
+        watcher_health, watcher_detail = self._target_autoloop_watcher_health(snapshot)
+        if watcher_health in {"stopped", "stale", "missing"}:
+            detail_suffix = f"({watcher_detail})" if watcher_detail else ""
+            return f"감지원인=watcher {watcher_health}{detail_suffix}"
+        return "감지원인=감지 대기"
+
     def _target_autoloop_policy_card_compact_action_text(
         self,
         runtime_snapshot: dict[str, object],
@@ -24523,10 +24628,22 @@ class RelayOperatorPanel(tk.Tk):
             snapshot,
             target_id=normalized_target_id,
         )
+        detection_reason_text = self._target_autoloop_compact_text(
+            self._target_autoloop_policy_card_detection_reason_text(
+                snapshot,
+                target_id=normalized_target_id,
+                status_row=status_row,
+                manifest_row=manifest_row,
+                artifact_snapshot=artifact_snapshot,
+                current_retry_count=current_retry_count,
+                router_inbox_ready_count=router_inbox_ready_count,
+            ),
+            max_chars=76,
+        )
 
         return (
             f"독립셀 진단: phase={phase} next={next_action} cycle={cycle_text} / "
-            f"{next_step_text} / {runtime_text} / {extend_text} / {artifact_text} / "
+            f"{next_step_text} / {detection_reason_text} / {runtime_text} / {extend_text} / {artifact_text} / "
             f"{process_once_text} / {retry_text} / {router_text}{watcher_text}"
         )
 
@@ -24571,11 +24688,21 @@ class RelayOperatorPanel(tk.Tk):
                     compact_var.set(compact_summary)
                 except Exception:
                     pass
+        detection_reason = ""
+        if snapshot:
+            try:
+                detection_reason = self._target_autoloop_policy_card_detection_reason_text(
+                    snapshot,
+                    target_id=normalized_target_id,
+                )
+            except Exception as exc:
+                detection_reason = "감지원인=계산 실패: " + self._target_autoloop_compact_text(str(exc), max_chars=80)
         lines = [
             "[8 Cell Autoloop 독립셀 TargetAutoloop 진단]",
             f"target={normalized_target_id}",
             f"runRoot={str(snapshot.get('run_root', '') or '(unknown)') if isinstance(snapshot, dict) else '(unknown)'}",
             f"compact={compact_summary or '(empty)'}",
+            f"detection={detection_reason or '(empty)'}",
             f"runtime={self._target_autoloop_policy_card_var_value(store, 'runtime_summary_var') or '(empty)'}",
             f"next={self._target_autoloop_policy_card_var_value(store, 'primary_action_var') or '(empty)'}",
             f"retry={self._target_autoloop_policy_card_var_value(store, 'retry_pending_state_var') or '(empty)'}",
@@ -25120,6 +25247,7 @@ class RelayOperatorPanel(tk.Tk):
             ("SelectedTargetSummaryPath", "summary_path"),
             ("SelectedTargetReviewZipPath", "review_zip_path"),
             ("SelectedTargetPublishReadyPath", "publish_ready_path"),
+            ("SelectedTargetArtifactHistoryPath", "artifact_history_path"),
             ("SelectedTargetStatusPath", "target_status_path"),
             ("SelectedTargetControlPath", "target_control_path"),
             ("SelectedTargetEventsPath", "target_events_path"),
@@ -25391,6 +25519,7 @@ class RelayOperatorPanel(tk.Tk):
             ("target_autoloop_open_summary_button", "summary.txt 열기", "summary"),
             ("target_autoloop_open_review_zip_button", "review.zip 열기", "review_zip"),
             ("target_autoloop_open_publish_ready_button", "publish.ready 열기", "publish_ready"),
+            ("target_autoloop_open_artifact_history_button", "검토 history 열기", "artifact_history"),
         )
         for attr_name, label, state_key in artifact_button_specs:
             if not self._has_ui_attr(attr_name):
@@ -25635,6 +25764,9 @@ class RelayOperatorPanel(tk.Tk):
         publish_ready_path = str(manifest_row.get("PublishReadyPath", "") or "").strip()
         if not publish_ready_path and source_outbox_path:
             publish_ready_path = str(Path(source_outbox_path) / "publish.ready.json")
+        artifact_history_path = str(manifest_row.get("ArtifactHistoryRoot", "") or "").strip()
+        if not artifact_history_path and source_outbox_path:
+            artifact_history_path = str(Path(source_outbox_path) / ".artifact-history")
         target_state_root = str(
             status_row.get("TargetStateRoot", "")
             or manifest_row.get("TargetStateRoot", "")
@@ -25734,7 +25866,19 @@ class RelayOperatorPanel(tk.Tk):
             "summary": self._target_autoloop_artifact_path_state(summary_path, kind="file"),
             "review_zip": self._target_autoloop_artifact_path_state(review_zip_path, kind="file"),
             "publish_ready": self._target_autoloop_artifact_path_state(publish_ready_path, kind="file"),
+            "artifact_history": self._target_autoloop_artifact_path_state(artifact_history_path, kind="folder"),
         }
+        artifact_history_count = 0
+        try:
+            artifact_history_root = Path(artifact_history_path)
+            if artifact_history_root.is_dir():
+                artifact_history_count = sum(
+                    1
+                    for item in artifact_history_root.iterdir()
+                    if item.is_dir() and (item / "artifact-history.json").is_file()
+                )
+        except Exception:
+            artifact_history_count = 0
         publish_ready_marker_state = self._target_autoloop_publish_ready_marker_state(
             target_id=target_id,
             summary_path=summary_path,
@@ -25750,10 +25894,11 @@ class RelayOperatorPanel(tk.Tk):
             "summary": "summary",
             "review_zip": "review.zip",
             "publish_ready": "publish.ready",
+            "artifact_history": "history",
         }
         artifact_state_reasons = {
             key: str(artifact_path_states[key].get("reason", "상태 미확인") or "상태 미확인")
-            for key in ("source_outbox", "summary", "review_zip", "publish_ready")
+            for key in ("source_outbox", "summary", "review_zip", "publish_ready", "artifact_history")
         }
         if path_states.get("publish_ready", False):
             marker_reason = str(publish_ready_marker_state.get("reason", "") or "marker-state-unknown")
@@ -25763,10 +25908,10 @@ class RelayOperatorPanel(tk.Tk):
                 artifact_state_reasons["publish_ready"] = f"invalid-marker:{marker_reason}"
         artifact_state_summary = " / ".join(
             f"{artifact_state_labels[key]}={artifact_state_reasons[key]}"
-            for key in ("source_outbox", "summary", "review_zip", "publish_ready")
+            for key in ("source_outbox", "summary", "review_zip", "publish_ready", "artifact_history")
         )
         disabled_reasons = []
-        for key in ("source_outbox", "summary", "review_zip", "publish_ready"):
+        for key in ("source_outbox", "summary", "review_zip", "publish_ready", "artifact_history"):
             if not bool(artifact_path_states[key].get("available", False)):
                 disabled_reasons.append(f"{artifact_state_labels[key]}={artifact_state_reasons[key]}")
                 continue
@@ -25799,6 +25944,7 @@ class RelayOperatorPanel(tk.Tk):
             f"summary={'있음' if path_states['summary'] else '없음'} / "
             f"review.zip={'있음' if path_states['review_zip'] else '없음'} / "
             f"publish.ready={'있음' if path_states['publish_ready'] else '없음'}"
+            f" / history={artifact_history_count}개"
         )
         if disabled_reasons:
             artifact_summary += " / 비활성 사유: " + "; ".join(disabled_reasons)
@@ -25825,6 +25971,8 @@ class RelayOperatorPanel(tk.Tk):
             "summary_path": summary_path,
             "review_zip_path": review_zip_path,
             "publish_ready_path": publish_ready_path,
+            "artifact_history_path": artifact_history_path,
+            "artifact_history_count": artifact_history_count,
             "target_state_root": target_state_root,
             "target_status_path": target_status_path,
             "target_control_path": target_control_path,
@@ -30402,6 +30550,9 @@ class RelayOperatorPanel(tk.Tk):
 
     def open_target_autoloop_selected_publish_ready(self) -> None:
         self._open_target_autoloop_selected_artifact_path("publish_ready_path", "publish.ready.json")
+
+    def open_target_autoloop_selected_artifact_history(self) -> None:
+        self._open_target_autoloop_selected_artifact_path("artifact_history_path", "검토 history")
 
     def show_target_autoloop_route_matrix(self) -> None:
         context = self._current_context()

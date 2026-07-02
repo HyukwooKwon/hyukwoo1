@@ -1977,6 +1977,7 @@ function Use-TargetAutoloopManifestTargetPaths {
             @{ Property = 'SourceSummaryPath'; Field = 'SourceSummaryPath' },
             @{ Property = 'SourceReviewZipPath'; Field = 'SourceReviewZipPath' },
             @{ Property = 'PublishReadyPath'; Field = 'PublishReadyPath' },
+            @{ Property = 'ArtifactHistoryRoot'; Field = 'ArtifactHistoryRoot' },
             @{ Property = 'ReceiptsRoot'; Field = 'ReceiptsRoot' },
             @{ Property = 'TargetStateRoot'; Field = 'TargetStateRoot' },
             @{ Property = 'TargetStatePath'; Field = 'TargetStatePath' },
@@ -2068,6 +2069,7 @@ function Get-TargetAutoloopTargetPaths {
     $inboxRoot = Join-Path $targetRoot 'inbox'
     $workRoot = Join-Path $targetRoot 'work'
     $sourceOutboxRoot = Join-Path $targetRoot 'source-outbox'
+    $artifactHistoryRoot = Join-Path $sourceOutboxRoot '.artifact-history'
     $receiptsRoot = Join-Path $targetRoot 'receipts'
     $targetStateRoot = Join-Path $targetRoot '.state'
     $stateFileName = if ($null -ne $Config) { [string](Get-ConfigValue -Object $Config -Name 'StateFileName' -DefaultValue 'target-state.json') } else { 'target-state.json' }
@@ -2092,6 +2094,7 @@ function Get-TargetAutoloopTargetPaths {
         SourceSummaryPath = Join-Path $sourceOutboxRoot 'summary.txt'
         SourceReviewZipPath = Join-Path $sourceOutboxRoot 'review.zip'
         PublishReadyPath = Join-Path $sourceOutboxRoot 'publish.ready.json'
+        ArtifactHistoryRoot = $artifactHistoryRoot
         ReceiptsRoot = $receiptsRoot
         TargetStateRoot = $targetStateRoot
         TargetStatePath = Join-Path $targetStateRoot $stateFileName
@@ -2114,6 +2117,7 @@ function Ensure-TargetAutoloopTargetDirectories {
             $Paths.InboxFailedRoot,
             $Paths.WorkRoot,
             $Paths.SourceOutboxRoot,
+            $Paths.ArtifactHistoryRoot,
             $Paths.ReceiptsRoot,
             $Paths.TargetStateRoot
         )) {
@@ -2191,6 +2195,7 @@ function New-TargetAutoloopTargetStateRecord {
         SourceSummaryPath = [string]$Paths.SourceSummaryPath
         SourceReviewZipPath = [string]$Paths.SourceReviewZipPath
         PublishReadyPath = [string]$Paths.PublishReadyPath
+        ArtifactHistoryRoot = [string]$Paths.ArtifactHistoryRoot
         ReceiptsRoot = [string]$Paths.ReceiptsRoot
         TargetStateRoot = [string]$Paths.TargetStateRoot
         TargetStatePath = [string]$Paths.TargetStatePath

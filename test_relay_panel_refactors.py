@@ -23722,12 +23722,14 @@ class RelayOperatorPanelWatcherOptionTests(unittest.TestCase):
                 "summary": ButtonStub(),
                 "review_zip": ButtonStub(),
                 "publish_ready": ButtonStub(),
+                "artifact_history": ButtonStub(),
             },
             "target02": {
                 "source_outbox": ButtonStub(),
                 "summary": ButtonStub(),
                 "review_zip": ButtonStub(),
                 "publish_ready": ButtonStub(),
+                "artifact_history": ButtonStub(),
             },
         }
 
@@ -23737,6 +23739,9 @@ class RelayOperatorPanelWatcherOptionTests(unittest.TestCase):
             target02_outbox = run_root / "targets" / "target02" / "source-outbox"
             target01_outbox.mkdir(parents=True)
             target02_outbox.mkdir(parents=True)
+            target01_history = target01_outbox / ".artifact-history"
+            target02_history = target02_outbox / ".artifact-history"
+            target01_history.mkdir()
             (target01_outbox / "summary.txt").write_text("summary", encoding="utf-8")
             (target01_outbox / "review.zip").write_bytes(b"PK\x05\x06" + b"\0" * 18)
             (target01_outbox / "publish.ready.json").write_text("{}", encoding="utf-8")
@@ -23756,6 +23761,7 @@ class RelayOperatorPanelWatcherOptionTests(unittest.TestCase):
                             "SourceSummaryPath": str(target01_outbox / "summary.txt"),
                             "SourceReviewZipPath": str(target01_outbox / "review.zip"),
                             "PublishReadyPath": str(target01_outbox / "publish.ready.json"),
+                            "ArtifactHistoryRoot": str(target01_history),
                         },
                         {
                             "TargetId": "target02",
@@ -23764,6 +23770,7 @@ class RelayOperatorPanelWatcherOptionTests(unittest.TestCase):
                             "SourceSummaryPath": str(target02_outbox / "summary.txt"),
                             "SourceReviewZipPath": str(target02_outbox / "review.zip"),
                             "PublishReadyPath": str(target02_outbox / "publish.ready.json"),
+                            "ArtifactHistoryRoot": str(target02_history),
                         },
                     ],
                 }
@@ -23773,18 +23780,22 @@ class RelayOperatorPanelWatcherOptionTests(unittest.TestCase):
         self.assertEqual("normal", panel.target_autoloop_policy_card_artifact_buttons["target01"]["summary"].state)
         self.assertEqual("normal", panel.target_autoloop_policy_card_artifact_buttons["target01"]["review_zip"].state)
         self.assertEqual("normal", panel.target_autoloop_policy_card_artifact_buttons["target01"]["publish_ready"].state)
+        self.assertEqual("normal", panel.target_autoloop_policy_card_artifact_buttons["target01"]["artifact_history"].state)
         self.assertEqual("normal", panel.target_autoloop_policy_card_artifact_buttons["target02"]["source_outbox"].state)
         self.assertEqual("disabled", panel.target_autoloop_policy_card_artifact_buttons["target02"]["summary"].state)
         self.assertEqual("disabled", panel.target_autoloop_policy_card_artifact_buttons["target02"]["review_zip"].state)
         self.assertEqual("disabled", panel.target_autoloop_policy_card_artifact_buttons["target02"]["publish_ready"].state)
+        self.assertEqual("disabled", panel.target_autoloop_policy_card_artifact_buttons["target02"]["artifact_history"].state)
         self.assertIn("target01 / source-outbox=있음", panel.target_autoloop_policy_card_vars["target01"]["artifact_state_var"].get())
         self.assertIn("summary=있음", panel.target_autoloop_policy_card_vars["target01"]["artifact_state_var"].get())
         self.assertIn("review.zip=있음", panel.target_autoloop_policy_card_vars["target01"]["artifact_state_var"].get())
-        self.assertIn("publish.ready=있음", panel.target_autoloop_policy_card_vars["target01"]["artifact_state_var"].get())
+        self.assertIn("publish.ready=invalid-marker", panel.target_autoloop_policy_card_vars["target01"]["artifact_state_var"].get())
+        self.assertIn("history=있음", panel.target_autoloop_policy_card_vars["target01"]["artifact_state_var"].get())
         self.assertIn("target02 / source-outbox=있음", panel.target_autoloop_policy_card_vars["target02"]["artifact_state_var"].get())
         self.assertIn("summary=파일 없음", panel.target_autoloop_policy_card_vars["target02"]["artifact_state_var"].get())
         self.assertIn("review.zip=파일 없음", panel.target_autoloop_policy_card_vars["target02"]["artifact_state_var"].get())
         self.assertIn("publish.ready=파일 없음", panel.target_autoloop_policy_card_vars["target02"]["artifact_state_var"].get())
+        self.assertIn("history=폴더 없음", panel.target_autoloop_policy_card_vars["target02"]["artifact_state_var"].get())
 
     def test_target_autoloop_policy_card_compact_action_summary_combines_operational_status(self) -> None:
         panel = self._make_panel()
@@ -23956,6 +23967,109 @@ class RelayOperatorPanelWatcherOptionTests(unittest.TestCase):
         self.assertIn("router inbox 대기 1, 재입력 금지", compact_summary)
         self.assertNotIn("pair", compact_summary.casefold())
 
+    def test_target_autoloop_policy_card_compact_action_summary_explains_duplicate_marker_wait(self) -> None:
+        panel = self._make_panel()
+        panel.target_autoloop_policy_card_vars = {
+            "target05": {
+                "runtime_badge_var": VarStub("target05 6번째 진행 중 / 5/10 완료 / 남은 5"),
+                "compact_action_var": VarStub(""),
+                "extend_cycles_var": VarStub("3"),
+            },
+        }
+
+        panel._update_target_autoloop_policy_card_compact_action_summaries(
+            {
+                "run_root": self._canonical_target_autoloop_run_root(),
+                "run_root_error": "",
+                "manifest_exists": True,
+                "manifest_error": "",
+                "manifest_run_mode": "target-autoloop",
+                "targets": [
+                    {
+                        "TargetId": "target05",
+                        "Phase": "waiting-output",
+                        "NextAction": "wait-for-output",
+                        "CycleCount": 6,
+                        "MaxCycleCount": 10,
+                        "LastDispatchState": "router-ready-file-created",
+                        "LastRouterReadyPath": r"C:\runtime\inbox\target05.ready.txt",
+                    },
+                ],
+                "manifest_targets": [
+                    {"TargetId": "target05", "Enabled": True, "TriggerKinds": ["input-file", "publish-ready"], "MaxCycleCount": 10},
+                ],
+                "output_block_summary": {
+                    "items": [
+                        {
+                            "target_id": "target05",
+                            "ready_accepted": True,
+                            "ready_unaccepted": False,
+                            "current_marker_fingerprint": "accepted-marker",
+                            "last_handled_output_fingerprint": "accepted-marker",
+                            "publish_ready_path": r"C:\runs\target05\source-outbox\publish.ready.json",
+                        },
+                    ],
+                },
+            }
+        )
+
+        compact_summary = panel.target_autoloop_policy_card_vars["target05"]["compact_action_var"].get()
+        self.assertIn("감지원인=기존 ready 처리됨, 새 산출물 대기", compact_summary)
+        self.assertIn("phase=waiting-output", compact_summary)
+        self.assertNotIn("pair", compact_summary.casefold())
+
+    def test_target_autoloop_policy_card_compact_action_summary_explains_stopped_watcher_new_ready(self) -> None:
+        panel = self._make_panel()
+        panel.target_autoloop_policy_card_vars = {
+            "target03": {
+                "runtime_badge_var": VarStub("target03 3/10"),
+                "compact_action_var": VarStub(""),
+                "extend_cycles_var": VarStub("3"),
+            },
+        }
+
+        panel._update_target_autoloop_policy_card_compact_action_summaries(
+            {
+                "run_root": self._canonical_target_autoloop_run_root(),
+                "run_root_error": "",
+                "manifest_exists": True,
+                "manifest_error": "",
+                "manifest_run_mode": "target-autoloop",
+                "watcher_state": "stopped",
+                "controller_state": "stopped",
+                "watcher_stop_reason": "control-stop-request",
+                "targets": [
+                    {
+                        "TargetId": "target03",
+                        "Phase": "idle",
+                        "NextAction": "wait-for-output",
+                        "CycleCount": 3,
+                        "MaxCycleCount": 10,
+                        "LastDispatchState": "router-ready-file-created",
+                    },
+                ],
+                "manifest_targets": [
+                    {"TargetId": "target03", "Enabled": True, "TriggerKinds": ["input-file", "publish-ready"], "MaxCycleCount": 10},
+                ],
+                "output_block_summary": {
+                    "items": [
+                        {
+                            "target_id": "target03",
+                            "ready_unaccepted": True,
+                            "current_marker_fingerprint": "new-marker",
+                            "last_handled_output_fingerprint": "old-marker",
+                            "publish_ready_path": r"C:\runs\target03\source-outbox\publish.ready.json",
+                        },
+                    ],
+                },
+            }
+        )
+
+        compact_summary = panel.target_autoloop_policy_card_vars["target03"]["compact_action_var"].get()
+        self.assertIn("감지원인=watcher stopped(stopped) 후 새 ready 존재", compact_summary)
+        self.assertIn("phase=idle", compact_summary)
+        self.assertNotIn("pair", compact_summary.casefold())
+
     def test_copy_target_autoloop_policy_card_diagnostic_summary_copies_independent_target_block(self) -> None:
         panel = self._make_panel()
         copied: list[str] = []
@@ -23984,6 +24098,7 @@ class RelayOperatorPanelWatcherOptionTests(unittest.TestCase):
         self.assertIn("target=target05", copied[0])
         self.assertIn(r"runRoot=C:\runs\target-autoloop\run_1", copied[0])
         self.assertIn("router inbox 대기 1, 재입력 금지", copied[0])
+        self.assertIn("detection=", copied[0])
         self.assertIn("artifact=산출물 상태: target05", copied[0])
         self.assertIn("8 Cell Autoloop 독립셀 진단 복사 완료", statuses[0][0])
         self.assertNotIn("roundtrip", copied[0].casefold())

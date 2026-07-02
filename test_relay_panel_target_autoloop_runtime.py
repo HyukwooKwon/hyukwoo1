@@ -438,11 +438,57 @@ class TargetAutoloopRuntimeTests(unittest.TestCase):
         self.assertEqual(2, summary["count"])
         self.assertEqual(1, summary["limit_reached_count"])
         self.assertEqual(1, summary["ready_unaccepted_count"])
+        self.assertEqual(0, summary["ready_accepted_count"])
         self.assertEqual(1, summary["limit_reached_ready_unaccepted_count"])
         self.assertEqual(1, summary["router_blocked_count"])
         self.assertEqual(["target01"], summary["limit_reached_ready_unaccepted_target_ids"])
         self.assertEqual("target01", summary["latest_target_id"])
         self.assertEqual("router-session-not-ready", summary["latest_last_dispatch_state"])
+
+    def test_source_outbox_contract_summary_detects_accepted_current_marker(self) -> None:
+        root = Path(make_workspace_tempdir("target-autoloop-runtime-source-outbox-accepted"))
+        outbox = root / "external-work" / "targets" / "target01" / "source-outbox"
+        outbox.mkdir(parents=True, exist_ok=True)
+        summary_path = outbox / "summary.txt"
+        review_path = outbox / "review.zip"
+        publish_path = outbox / "publish.ready.json"
+        summary_path.write_text("summary", encoding="utf-8")
+        review_path.write_bytes(b"zip")
+        publish_path.write_text(
+            json.dumps({"TargetId": "target01", "OutputFingerprint": "accepted-marker"}),
+            encoding="utf-8",
+        )
+
+        summary = runtime.target_autoloop_source_outbox_contract_summary(
+            [
+                {
+                    "TargetId": "target01",
+                    "Enabled": True,
+                    "TriggerKinds": ["publish-ready"],
+                    "SourceOutboxPath": str(outbox),
+                    "SourceSummaryPath": str(summary_path),
+                    "SourceReviewZipPath": str(review_path),
+                    "PublishReadyPath": str(publish_path),
+                },
+            ],
+            [
+                {
+                    "TargetId": "target01",
+                    "Phase": "waiting-output",
+                    "NextAction": "wait-for-output",
+                    "CycleCount": 6,
+                    "MaxCycleCount": 10,
+                    "LastHandledOutputFingerprint": "accepted-marker",
+                    "LastDispatchState": "router-ready-file-created",
+                },
+            ],
+        )
+
+        self.assertEqual(1, summary["ready_accepted_count"])
+        self.assertEqual(0, summary["ready_unaccepted_count"])
+        self.assertEqual(["target01"], summary["ready_accepted_target_ids"])
+        self.assertTrue(summary["items"][0]["ready_accepted"])
+        self.assertFalse(summary["items"][0]["ready_unaccepted"])
 
 
 if __name__ == "__main__":

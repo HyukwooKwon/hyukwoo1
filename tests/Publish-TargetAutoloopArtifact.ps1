@@ -105,6 +105,93 @@ function New-OutputFingerprint {
     return (Get-TextHashHex -Text $payload)
 }
 
+function New-TargetAutoloopArtifactHistoryEntryPath {
+    param(
+        [Parameter(Mandatory)][string]$HistoryRoot,
+        [Parameter(Mandatory)][int]$CycleId,
+        [Parameter(Mandatory)][string]$OutputFingerprint
+    )
+
+    $fingerprintPart = [string]$OutputFingerprint
+    if ($fingerprintPart.Length -gt 12) {
+        $fingerprintPart = $fingerprintPart.Substring(0, 12)
+    }
+    if (-not (Test-NonEmptyString $fingerprintPart)) {
+        $fingerprintPart = 'no-fingerprint'
+    }
+    $stamp = Get-Date -Format 'yyyyMMdd_HHmmss_fff'
+    $baseName = 'cycle_{0:D6}_{1}_{2}' -f $CycleId, $stamp, $fingerprintPart
+    $entryPath = Join-Path $HistoryRoot $baseName
+    $suffix = 2
+    while (Test-Path -LiteralPath $entryPath) {
+        $entryPath = Join-Path $HistoryRoot ('{0}_{1}' -f $baseName, $suffix)
+        $suffix += 1
+    }
+    return $entryPath
+}
+
+function Save-TargetAutoloopArtifactHistory {
+    param(
+        [Parameter(Mandatory)][string]$HistoryRoot,
+        [Parameter(Mandatory)][string]$EntryPath,
+        [Parameter(Mandatory)][string]$TargetId,
+        [Parameter(Mandatory)][string]$RunRoot,
+        [Parameter(Mandatory)][string]$SummaryPath,
+        [Parameter(Mandatory)][string]$ReviewZipPath,
+        [Parameter(Mandatory)][string]$PublishReadyPath,
+        [Parameter(Mandatory)]$MarkerPayload
+    )
+
+    Ensure-Directory -Path $EntryPath
+    $archivedSummaryPath = Join-Path $EntryPath 'summary.txt'
+    $archivedReviewZipPath = Join-Path $EntryPath 'review.zip'
+    $archivedPublishReadyPath = Join-Path $EntryPath 'publish.ready.json'
+    Copy-Item -LiteralPath $SummaryPath -Destination $archivedSummaryPath -Force
+    Copy-Item -LiteralPath $ReviewZipPath -Destination $archivedReviewZipPath -Force
+    Copy-Item -LiteralPath $PublishReadyPath -Destination $archivedPublishReadyPath -Force
+
+    $summaryItem = Get-Item -LiteralPath $archivedSummaryPath -ErrorAction Stop
+    $zipItem = Get-Item -LiteralPath $archivedReviewZipPath -ErrorAction Stop
+    $readyItem = Get-Item -LiteralPath $archivedPublishReadyPath -ErrorAction Stop
+    $historyPayload = [ordered]@{
+        SchemaVersion = $script:TargetAutoloopSchemaVersion
+        Kind = 'target-autoloop-artifact-history'
+        TargetId = $TargetId
+        RunRoot = $RunRoot
+        CycleId = [int](Get-ConfigValue -Object $MarkerPayload -Name 'CycleId' -DefaultValue 0)
+        ParentCycleId = [int](Get-ConfigValue -Object $MarkerPayload -Name 'ParentCycleId' -DefaultValue 0)
+        OutputFingerprint = [string](Get-ConfigValue -Object $MarkerPayload -Name 'OutputFingerprint' -DefaultValue '')
+        PublishedAt = [string](Get-ConfigValue -Object $MarkerPayload -Name 'PublishedAt' -DefaultValue '')
+        ArchivedAt = (Get-Date).ToString('o')
+        SourceSummaryPath = $SummaryPath
+        SourceReviewZipPath = $ReviewZipPath
+        SourcePublishReadyPath = $PublishReadyPath
+        ArtifactHistoryRoot = $HistoryRoot
+        ArtifactHistoryEntryPath = $EntryPath
+        ArchivedSummaryPath = $archivedSummaryPath
+        ArchivedReviewZipPath = $archivedReviewZipPath
+        ArchivedPublishReadyPath = $archivedPublishReadyPath
+        SummarySizeBytes = [int64]$summaryItem.Length
+        ReviewZipSizeBytes = [int64]$zipItem.Length
+        PublishReadySizeBytes = [int64]$readyItem.Length
+        SummarySha256 = (Get-FileHashHex -Path $archivedSummaryPath).ToLowerInvariant()
+        ReviewZipSha256 = (Get-FileHashHex -Path $archivedReviewZipPath).ToLowerInvariant()
+        PublishReadySha256 = (Get-FileHashHex -Path $archivedPublishReadyPath).ToLowerInvariant()
+    }
+    $historyMetadataPath = Join-Path $EntryPath 'artifact-history.json'
+    Write-JsonFileAtomically -Path $historyMetadataPath -Payload $historyPayload
+
+    return [pscustomobject]@{
+        ArtifactHistoryRoot = $HistoryRoot
+        ArtifactHistoryEntryPath = $EntryPath
+        ArchivedSummaryPath = $archivedSummaryPath
+        ArchivedReviewZipPath = $archivedReviewZipPath
+        ArchivedPublishReadyPath = $archivedPublishReadyPath
+        ArtifactHistoryMetadataPath = $historyMetadataPath
+        Metadata = [pscustomobject]$historyPayload
+    }
+}
+
 if (-not (Test-NonEmptyString $ConfigPath)) {
     $ConfigPath = Get-DefaultConfigPath -Root $root
 }
@@ -140,6 +227,10 @@ if ($null -eq $stateEntry) {
 $summaryPath = [string](Get-ConfigValue -Object $targetEntry -Name 'SourceSummaryPath' -DefaultValue '')
 $reviewZipPath = [string](Get-ConfigValue -Object $targetEntry -Name 'SourceReviewZipPath' -DefaultValue '')
 $publishReadyPath = [string](Get-ConfigValue -Object $targetEntry -Name 'PublishReadyPath' -DefaultValue '')
+$artifactHistoryRoot = [string](Get-ConfigValue -Object $targetEntry -Name 'ArtifactHistoryRoot' -DefaultValue '')
+if (-not (Test-NonEmptyString $artifactHistoryRoot)) {
+    $artifactHistoryRoot = Join-Path (Split-Path -Parent $publishReadyPath) '.artifact-history'
+}
 foreach ($pathInfo in @(
         @{ Label = 'summary'; Path = $summaryPath },
         @{ Label = 'review zip'; Path = $reviewZipPath }
@@ -171,6 +262,10 @@ else {
         -CycleId ([int]$cycleContext.CycleId) `
         -ParentCycleId ([int]$cycleContext.ParentCycleId)
 }
+$artifactHistoryEntryPath = New-TargetAutoloopArtifactHistoryEntryPath `
+    -HistoryRoot $artifactHistoryRoot `
+    -CycleId ([int]$cycleContext.CycleId) `
+    -OutputFingerprint $effectiveOutputFingerprint
 
 $markerPayload = [ordered]@{
     SchemaVersion = $script:TargetAutoloopSchemaVersion
@@ -188,16 +283,42 @@ $markerPayload = [ordered]@{
     ReviewZipSha256 = (Get-FileHashHex -Path $reviewZipPath).ToLowerInvariant()
     SourceContext = $effectiveSourceContext
     OutputFingerprint = $effectiveOutputFingerprint
+    ArtifactHistoryRoot = $artifactHistoryRoot
+    ArtifactHistoryEntryPath = $artifactHistoryEntryPath
+    ArchivedSummaryPath = (Join-Path $artifactHistoryEntryPath 'summary.txt')
+    ArchivedReviewZipPath = (Join-Path $artifactHistoryEntryPath 'review.zip')
+    ArchivedPublishReadyPath = (Join-Path $artifactHistoryEntryPath 'publish.ready.json')
     ValidationPassed = $true
     ValidationCompletedAt = $completedAt
     CurrentRequestPath = [string]$cycleContext.RequestPath
 }
 
 Write-JsonFileAtomically -Path $publishReadyPath -Payload $markerPayload
+$artifactHistory = Save-TargetAutoloopArtifactHistory `
+    -HistoryRoot $artifactHistoryRoot `
+    -EntryPath $artifactHistoryEntryPath `
+    -TargetId $TargetId `
+    -RunRoot $resolvedRunRoot `
+    -SummaryPath $summaryPath `
+    -ReviewZipPath $reviewZipPath `
+    -PublishReadyPath $publishReadyPath `
+    -MarkerPayload ([pscustomobject]$markerPayload)
 Append-TargetAutoloopEvent -Path $statePaths.EventsPath -EventType 'publish-ready-created' -TargetId $TargetId -TriggerKind 'publish-ready' -TriggerFingerprint $effectiveOutputFingerprint -Extra @{
     CycleId = [int]$cycleContext.CycleId
     ParentCycleId = [int]$cycleContext.ParentCycleId
     PublishReadyPath = $publishReadyPath
+    ArtifactHistoryEntryPath = [string]$artifactHistory.ArtifactHistoryEntryPath
+    ArchivedReviewZipPath = [string]$artifactHistory.ArchivedReviewZipPath
+}
+Append-TargetAutoloopEvent -Path $statePaths.EventsPath -EventType 'artifact-history-created' -TargetId $TargetId -TriggerKind 'publish-ready' -TriggerFingerprint $effectiveOutputFingerprint -Extra @{
+    CycleId = [int]$cycleContext.CycleId
+    ParentCycleId = [int]$cycleContext.ParentCycleId
+    ArtifactHistoryRoot = [string]$artifactHistory.ArtifactHistoryRoot
+    ArtifactHistoryEntryPath = [string]$artifactHistory.ArtifactHistoryEntryPath
+    ArchivedSummaryPath = [string]$artifactHistory.ArchivedSummaryPath
+    ArchivedReviewZipPath = [string]$artifactHistory.ArchivedReviewZipPath
+    ArchivedPublishReadyPath = [string]$artifactHistory.ArchivedPublishReadyPath
+    ArtifactHistoryMetadataPath = [string]$artifactHistory.ArtifactHistoryMetadataPath
 }
 
 $result = [pscustomobject][ordered]@{
@@ -205,7 +326,14 @@ $result = [pscustomobject][ordered]@{
     RunRoot = $resolvedRunRoot
     TargetId = $TargetId
     PublishReadyPath = $publishReadyPath
+    ArtifactHistoryRoot = [string]$artifactHistory.ArtifactHistoryRoot
+    ArtifactHistoryEntryPath = [string]$artifactHistory.ArtifactHistoryEntryPath
+    ArchivedSummaryPath = [string]$artifactHistory.ArchivedSummaryPath
+    ArchivedReviewZipPath = [string]$artifactHistory.ArchivedReviewZipPath
+    ArchivedPublishReadyPath = [string]$artifactHistory.ArchivedPublishReadyPath
+    ArtifactHistoryMetadataPath = [string]$artifactHistory.ArtifactHistoryMetadataPath
     Marker = [pscustomobject]$markerPayload
+    ArtifactHistory = $artifactHistory.Metadata
 }
 
 if ($AsJson) {

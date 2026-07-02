@@ -88,6 +88,14 @@ Assert-True ([int]$publish.Marker.CycleId -eq 1) 'publish helper should infer cy
 Assert-True ([int]$publish.Marker.ParentCycleId -eq 0) 'publish helper should infer parent cycle id from current request.'
 Assert-True (([string]$publish.Marker.OutputFingerprint).Length -gt 0) 'publish helper should populate output fingerprint.'
 Assert-True ([string]$publish.Marker.PublishedBy -eq 'publish-target-autoloop-artifact.ps1') 'publish helper should mark its publisher.'
+Assert-True ((Test-Path -LiteralPath ([string]$publish.ArtifactHistoryRoot) -PathType Container)) 'publish helper should create artifact history root.'
+Assert-True ((Test-Path -LiteralPath ([string]$publish.ArtifactHistoryEntryPath) -PathType Container)) 'publish helper should create artifact history entry.'
+Assert-True ((Test-Path -LiteralPath ([string]$publish.ArchivedSummaryPath) -PathType Leaf)) 'publish helper should archive summary.txt.'
+Assert-True ((Test-Path -LiteralPath ([string]$publish.ArchivedReviewZipPath) -PathType Leaf)) 'publish helper should archive review.zip.'
+Assert-True ((Test-Path -LiteralPath ([string]$publish.ArchivedPublishReadyPath) -PathType Leaf)) 'publish helper should archive publish.ready.json.'
+Assert-True ((Test-Path -LiteralPath ([string]$publish.ArtifactHistoryMetadataPath) -PathType Leaf)) 'publish helper should write artifact history metadata.'
+Assert-True ([string]$publish.Marker.ArtifactHistoryEntryPath -eq [string]$publish.ArtifactHistoryEntryPath) 'publish marker should reference artifact history entry.'
+Assert-True ([string]$publish.ArtifactHistory.ArchivedReviewZipPath -eq [string]$publish.ArchivedReviewZipPath) 'history metadata should reference archived review.zip.'
 
 $events = @(
     Get-Content -LiteralPath $start.EventsPath -Encoding UTF8 |
@@ -97,5 +105,8 @@ $events = @(
 $publishEvent = @($events | Where-Object { [string]$_.EventType -eq 'publish-ready-created' } | Select-Object -First 1)[0]
 Assert-True ($null -ne $publishEvent) 'publish helper should append a publish-ready-created event.'
 Assert-True ([int]$publishEvent.CycleId -eq 1) 'publish helper event should include cycle id.'
+$historyEvent = @($events | Where-Object { [string]$_.EventType -eq 'artifact-history-created' } | Select-Object -First 1)[0]
+Assert-True ($null -ne $historyEvent) 'publish helper should append an artifact-history-created event.'
+Assert-True ([string]$historyEvent.ArchivedReviewZipPath -eq [string]$publish.ArchivedReviewZipPath) 'history event should include archived review zip path.'
 
 Write-Host 'publish target autoloop artifact ok'

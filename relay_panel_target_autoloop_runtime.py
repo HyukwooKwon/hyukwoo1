@@ -523,6 +523,7 @@ def target_autoloop_source_outbox_contract_summary(
             max_cycle_count > 0 and cycle_count >= max_cycle_count
         )
         ready_unaccepted = bool(publish_valid and output_fingerprint != last_handled)
+        ready_accepted = bool(publish_valid and output_fingerprint and output_fingerprint == last_handled)
         router_blocked = last_dispatch_state in {"router-session-not-ready", "router-session-mismatch"}
         items.append(
             {
@@ -533,6 +534,7 @@ def target_autoloop_source_outbox_contract_summary(
                 "max_cycle_count": max_cycle_count,
                 "limit_reached": limit_reached,
                 "ready_unaccepted": ready_unaccepted,
+                "ready_accepted": ready_accepted,
                 "router_blocked": router_blocked,
                 "last_dispatch_state": last_dispatch_state,
                 "current_marker_fingerprint": output_fingerprint,
@@ -544,6 +546,7 @@ def target_autoloop_source_outbox_contract_summary(
 
     limit_items = [item for item in items if bool(item.get("limit_reached", False))]
     ready_items = [item for item in items if bool(item.get("ready_unaccepted", False))]
+    accepted_items = [item for item in items if bool(item.get("ready_accepted", False))]
     limit_ready_items = [
         item for item in items if bool(item.get("limit_reached", False)) and bool(item.get("ready_unaccepted", False))
     ]
@@ -555,6 +558,7 @@ def target_autoloop_source_outbox_contract_summary(
         "count": len(items),
         "limit_reached_count": len(limit_items),
         "ready_unaccepted_count": len(ready_items),
+        "ready_accepted_count": len(accepted_items),
         "limit_reached_ready_unaccepted_count": len(limit_ready_items),
         "router_blocked_count": len(router_blocked_items),
         "target_ids": [str(item.get("target_id", "")) for item in items if str(item.get("target_id", ""))],
@@ -563,6 +567,9 @@ def target_autoloop_source_outbox_contract_summary(
         ],
         "ready_unaccepted_target_ids": [
             str(item.get("target_id", "")) for item in ready_items if str(item.get("target_id", ""))
+        ],
+        "ready_accepted_target_ids": [
+            str(item.get("target_id", "")) for item in accepted_items if str(item.get("target_id", ""))
         ],
         "limit_reached_ready_unaccepted_target_ids": [
             str(item.get("target_id", "")) for item in limit_ready_items if str(item.get("target_id", ""))

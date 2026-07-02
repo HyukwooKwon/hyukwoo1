@@ -183,6 +183,7 @@ foreach ($target in @($config.Targets | Where-Object { $selectedSet.ContainsKey(
             SourceSummaryPath = [string]$paths.SourceSummaryPath
             SourceReviewZipPath = [string]$paths.SourceReviewZipPath
             PublishReadyPath = [string]$paths.PublishReadyPath
+            ArtifactHistoryRoot = [string]$paths.ArtifactHistoryRoot
             ReceiptsRoot = [string]$paths.ReceiptsRoot
             TargetStateRoot = [string]$paths.TargetStateRoot
             TargetStatePath = [string]$paths.TargetStatePath
