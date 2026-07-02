@@ -24362,6 +24362,21 @@ class RelayOperatorPanel(tk.Tk):
             snapshot,
             target_id=normalized_target_id,
         )
+        status_row = self._target_autoloop_row_for_target(
+            snapshot.get("targets", []),
+            normalized_target_id,
+        )
+        manifest_row = self._target_autoloop_row_for_target(
+            snapshot.get("manifest_targets", []),
+            normalized_target_id,
+        )
+        phase = str(status_row.get("Phase", "") or manifest_row.get("Phase", "") or "").strip() or "-"
+        next_action = str(status_row.get("NextAction", "") or manifest_row.get("NextAction", "") or "").strip() or "-"
+        cycle_count = self._target_autoloop_int_or_zero(status_row.get("CycleCount", artifact_snapshot.get("cycle_count", 0)))
+        max_cycle_count = self._target_autoloop_int_or_zero(
+            status_row.get("MaxCycleCount", manifest_row.get("MaxCycleCount", artifact_snapshot.get("max_cycle_count", 0)))
+        )
+        cycle_text = f"{cycle_count}/{max_cycle_count}" if max_cycle_count > 0 else f"{cycle_count}/unbounded"
 
         runtime_text = ""
         runtime_badge_var = card_store.get("runtime_badge_var")
@@ -24383,8 +24398,6 @@ class RelayOperatorPanel(tk.Tk):
         additional_cycles, extend_cycles_detail = self._target_autoloop_extend_cycles_value(
             target_id=normalized_target_id
         )
-        cycle_count = self._target_autoloop_int_or_zero(artifact_snapshot.get("cycle_count", 0))
-        max_cycle_count = self._target_autoloop_int_or_zero(artifact_snapshot.get("max_cycle_count", 0))
         if additional_cycles <= 0:
             extend_text = "추가 횟수 확인"
         else:
@@ -24456,6 +24469,42 @@ class RelayOperatorPanel(tk.Tk):
             retry_text = f"stale 보류 {stale_retry_count}, 재시도 제외"
         else:
             retry_text = "전송보류 없음"
+        router_inbox_ready_summary = snapshot.get("router_inbox_ready_summary", {})
+        if not isinstance(router_inbox_ready_summary, dict):
+            router_inbox_ready_summary = {}
+        router_inbox_ready_count = self._target_autoloop_count_summary_items_for_target(
+            router_inbox_ready_summary,
+            "items",
+            normalized_target_id,
+        )
+        router_ignored_summary = snapshot.get("router_ignored_summary", {})
+        if not isinstance(router_ignored_summary, dict):
+            router_ignored_summary = {}
+        router_ignored_recent_count = self._target_autoloop_count_summary_items_for_target(
+            router_ignored_summary,
+            "recent_items",
+            normalized_target_id,
+        )
+        router_ignored_total_count = self._target_autoloop_count_summary_items_for_target(
+            router_ignored_summary,
+            "items",
+            normalized_target_id,
+        )
+        if router_ignored_total_count > 0 and "recent_items" not in router_ignored_summary:
+            router_ignored_recent_count = router_ignored_total_count
+        router_ignored_stale_count = self._target_autoloop_count_summary_items_for_target(
+            router_ignored_summary,
+            "stale_items",
+            normalized_target_id,
+        )
+        if router_inbox_ready_count > 0:
+            router_text = f"router inbox 대기 {router_inbox_ready_count}, 재입력 금지"
+        elif router_ignored_recent_count > 0:
+            router_text = f"최근 ignored {router_ignored_recent_count}, 원인 확인"
+        elif router_ignored_stale_count > 0:
+            router_text = f"이전 ignored {router_ignored_stale_count}, 참고만"
+        else:
+            router_text = "router 대기 없음"
         watcher_coverage_text = self._target_autoloop_policy_card_watcher_coverage_text(
             snapshot,
             target_id=normalized_target_id,
@@ -24466,7 +24515,11 @@ class RelayOperatorPanel(tk.Tk):
             target_id=normalized_target_id,
         )
 
-        return f"요약: {next_step_text} / {runtime_text} / {extend_text} / {artifact_text} / {process_once_text} / {retry_text}{watcher_text}"
+        return (
+            f"독립셀 진단: phase={phase} next={next_action} cycle={cycle_text} / "
+            f"{next_step_text} / {runtime_text} / {extend_text} / {artifact_text} / "
+            f"{process_once_text} / {retry_text} / {router_text}{watcher_text}"
+        )
 
     def _target_autoloop_process_once_eligibility(
         self,

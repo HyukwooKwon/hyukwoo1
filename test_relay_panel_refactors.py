@@ -23834,12 +23834,16 @@ class RelayOperatorPanelWatcherOptionTests(unittest.TestCase):
             )
 
         compact_summary = panel.target_autoloop_policy_card_vars["target01"]["compact_action_var"].get()
-        self.assertIn("다음 조치: 바로 실행 - target01 추가 4회+감지", compact_summary)
+        self.assertIn("독립셀 진단", compact_summary)
+        self.assertIn("phase=limit-reached", compact_summary)
+        self.assertIn("cycle=5/5", compact_summary)
+        self.assertIn("다음 조치: 바로 실행 - target01 ready marker 재생성", compact_summary)
         self.assertIn("target01 5/5 완료", compact_summary)
         self.assertIn("추가 가능 +4", compact_summary)
         self.assertIn("산출물 완료", compact_summary)
         self.assertIn("ready 재검사 대기", compact_summary)
         self.assertIn("전송보류 없음", compact_summary)
+        self.assertIn("router 대기 없음", compact_summary)
         self.assertIn("감지범위 포함(target01)", compact_summary)
 
     def test_target_autoloop_policy_card_compact_action_summary_lists_missing_artifacts(self) -> None:
@@ -23887,14 +23891,70 @@ class RelayOperatorPanelWatcherOptionTests(unittest.TestCase):
             )
 
         compact_summary = panel.target_autoloop_policy_card_vars["target02"]["compact_action_var"].get()
+        self.assertIn("독립셀 진단", compact_summary)
+        self.assertIn("phase=waiting-output", compact_summary)
+        self.assertIn("cycle=1/5", compact_summary)
         self.assertIn("다음 조치: 바로 실행 - target02 포함 감지 재시작", compact_summary)
         self.assertIn("target02 2번째 진행 중", compact_summary)
         self.assertIn("추가 가능 +3", compact_summary)
         self.assertIn("산출물 1/4, 누락 summary/zip/ready", compact_summary)
         self.assertIn("ready 재검사 대기", compact_summary)
         self.assertIn("전송보류 없음", compact_summary)
+        self.assertIn("router 대기 없음", compact_summary)
         self.assertIn("감지범위 누락", compact_summary)
         self.assertIn("현재 감지 target=target03", compact_summary)
+
+    def test_target_autoloop_policy_card_compact_action_summary_surfaces_router_blocks(self) -> None:
+        panel = self._make_panel()
+        panel.target_autoloop_policy_card_vars = {
+            "target05": {
+                "runtime_badge_var": VarStub("target05 6번째 진행 중 / 5/10 완료 / 남은 5"),
+                "compact_action_var": VarStub(""),
+                "extend_cycles_var": VarStub("3"),
+            },
+        }
+
+        panel._update_target_autoloop_policy_card_compact_action_summaries(
+            {
+                "run_root": self._canonical_target_autoloop_run_root(),
+                "run_root_error": "",
+                "manifest_exists": True,
+                "manifest_error": "",
+                "manifest_run_mode": "target-autoloop",
+                "targets": [
+                    {
+                        "TargetId": "target05",
+                        "Phase": "idle",
+                        "NextAction": "wait-for-output",
+                        "CycleCount": 5,
+                        "MaxCycleCount": 10,
+                    },
+                ],
+                "manifest_targets": [
+                    {"TargetId": "target05", "Enabled": True, "TriggerKinds": ["input-file", "publish-ready"], "MaxCycleCount": 10},
+                ],
+                "router_inbox_ready_summary": {
+                    "items": [
+                        {"target_id": "target05", "path": r"C:\runtime\inbox\target05.ready.txt"},
+                    ],
+                },
+                "router_ignored_summary": {
+                    "recent_items": [
+                        {"target_id": "target05", "path": r"C:\runtime\ignored\target05.ready.txt", "reason_code": "metadata-missing"},
+                    ],
+                    "items": [
+                        {"target_id": "target05", "path": r"C:\runtime\ignored\target05.ready.txt", "reason_code": "metadata-missing"},
+                    ],
+                },
+            }
+        )
+
+        compact_summary = panel.target_autoloop_policy_card_vars["target05"]["compact_action_var"].get()
+        self.assertIn("독립셀 진단", compact_summary)
+        self.assertIn("phase=idle", compact_summary)
+        self.assertIn("cycle=5/10", compact_summary)
+        self.assertIn("router inbox 대기 1, 재입력 금지", compact_summary)
+        self.assertNotIn("pair", compact_summary.casefold())
 
     def test_target_autoloop_policy_card_artifact_button_tooltip_text_names_target_and_path_kind(self) -> None:
         tooltip_text = RelayOperatorPanel._target_autoloop_policy_card_artifact_button_tooltip_text(
