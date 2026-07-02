@@ -24060,6 +24060,39 @@ class RelayOperatorPanelWatcherOptionTests(unittest.TestCase):
         self.assertFalse(spec["enabled"])
         self.assertIn("이미 전송", spec["detail"])
 
+    def test_target_autoloop_policy_card_primary_action_starts_watch_when_waiting_output_but_watcher_stopped(self) -> None:
+        panel = self._make_panel()
+        panel._target_autoloop_scoped_start_eligibility = lambda _snapshot, target_id: (True, "start ready")
+
+        spec = panel._target_autoloop_policy_card_primary_action_spec(
+            {
+                "run_root": self._canonical_target_autoloop_run_root(),
+                "run_root_error": "",
+                "watcher_state": "stopped",
+                "targets": [
+                    {
+                        "TargetId": "target07",
+                        "Phase": "waiting-output",
+                        "CycleCount": 7,
+                        "MaxCycleCount": 10,
+                        "LastDispatchState": "router-ready-file-created",
+                        "LastRouterReadyPath": r"C:\runs\target07.ready.txt",
+                    },
+                ],
+                "manifest_targets": [
+                    {"TargetId": "target07", "Enabled": True, "TriggerKinds": ["publish-ready"], "MaxCycleCount": 10},
+                ],
+            },
+            "target07",
+        )
+
+        self.assertEqual("start_watch", spec["action_key"])
+        self.assertEqual("target07 감지 시작 필요", spec["label"])
+        self.assertTrue(spec["enabled"])
+        self.assertIn("이미 payload가 전송", spec["detail"])
+        self.assertIn("자동 감지/다음 cycle 진행이 안 될 수 있습니다", spec["detail"])
+        self.assertIn("같은 payload를 다시 넣지 말고", spec["detail"])
+
     def test_target_autoloop_policy_card_primary_action_explains_dispatch_delay_wait(self) -> None:
         panel = self._make_panel()
         eligible_at = (datetime.now(timezone.utc) + timedelta(seconds=20)).isoformat()

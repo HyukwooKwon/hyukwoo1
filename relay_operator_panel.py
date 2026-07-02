@@ -9911,6 +9911,32 @@ class RelayOperatorPanel(tk.Tk):
                 ),
             }
         if phase == "waiting-output" and (last_router_ready_path or dispatch_state == "router-ready-file-created"):
+            watcher_health, _watcher_health_detail = self._target_autoloop_watcher_health(runtime_snapshot)
+            start_allowed, start_detail = self._target_autoloop_scoped_start_eligibility(
+                runtime_snapshot,
+                target_id=normalized_target_id,
+            )
+            if watcher_health in {"stopped", "stale"}:
+                start_target_ids = self._target_autoloop_default_start_target_ids(
+                    runtime_snapshot,
+                    target_id=normalized_target_id,
+                )
+                start_scope_text = self._target_autoloop_join_target_ids(start_target_ids) if start_target_ids else normalized_target_id
+                detail = (
+                    f"{normalized_target_id}에는 이미 payload가 전송됐지만 watcher가 {watcher_health} 상태라 "
+                    "Codex가 산출물을 만들어도 자동 감지/다음 cycle 진행이 안 될 수 있습니다. "
+                    "같은 payload를 다시 넣지 말고 감지를 다시 시작하세요."
+                )
+                if start_detail:
+                    detail += f" {start_detail}"
+                detail += f" 감지 target={start_scope_text}"
+                return {
+                    "label": f"{normalized_target_id} 감지 시작 필요",
+                    "action_key": "start_watch",
+                    "enabled": bool(start_allowed),
+                    "target_id": normalized_target_id,
+                    "detail": detail,
+                }
             detail = "이미 전송된 상태입니다. 해당 셀창 결과와 산출물을 기다리세요."
             if stale_retry_count > 0:
                 detail += f" stale pending={stale_retry_count}개는 자동 재큐잉하지 않습니다."
